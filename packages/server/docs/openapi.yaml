@@ -1,0 +1,1455 @@
+openapi: 3.1.0
+info:
+  title: VaultGuard API
+  version: 0.1.3
+  description: |
+    HTTP contract that a VaultGuard-compatible backend must implement.
+
+    This document is the **client-facing contract** extracted from the
+    Obsidian plugin's API client (`src/api/client.ts`) and key-lease
+    manager (`src/crypto/key-manager.ts`). It enumerates every endpoint
+    the plugin actually calls, the request/response shapes it expects,
+    and the auth scheme it uses.
+
+    **For self-hosters.** VaultGuard Community Edition ships an AWS Lambda +
+    API Gateway + Terraform reference server, distributed under the
+    Sustainable Use License. Any compatible backend that satisfies this
+    contract will work with the unmodified plugin.
+
+    ## Architectural rules embodied in this contract
+
+    - **Vault scoping.** Every file and permission endpoint lives under
+      `/vaults/{vaultId}/...`. There is no root-level `/files/*` or
+      `/permissions/*`. See `docs/VAULTS.md`.
+    - **Authentication.** Bearer-style auth using a Cognito-issued
+      (or compatible OIDC) ID token, passed as the raw token in the
+      `Authorization` header. **No `Bearer ` prefix** for the main API
+      surface (see `getAuthHeaders` in `client.ts`). The key-lease
+      endpoints under `/auth/*` accept the token with a `Bearer ` prefix
+      (see `key-manager.ts`); compliant servers should accept either.
+    - **Error shape.** Failed responses return JSON matching
+      `#/components/schemas/ApiError`.
+    - **Encryption envelope.** File bodies are transported base64-encoded
+      inside a JSON `{ "content": "<base64>" }` field. The plugin
+      handles encryption locally; the server treats payloads as opaque
+      bytes.
+
+    ## What is *not* documented here
+
+    - The hosted billing / Stripe surface — the plugin uses
+      `endpoint-resolver.ts` route segments for billing, but it is Pro-only.
+    - WebSocket / push channels — the plugin polls.
+    - Admin-panel-only endpoints that the Obsidian plugin never invokes.
+
+servers:
+  - url: https://your-api.example.com
+    description: Self-hosted backend base URL. The plugin also accepts a CloudFront distribution URL that fronts API Gateway.
+
+tags:
+  - name: Auth
+    description: Login, logout, token refresh, and user-key recovery.
+  - name: KeyLease
+    description: |
+      Server-managed key leases (lease, scoped lease, refresh, heartbeat)
+      and zero-knowledge wrapped-key bootstrap. See
+      `docs/KEY-LEASE-AND-ZK-IMPLEMENTATION.md`.
+  - name: Vaults
+    description: Vault CRUD and membership management.
+  - name: Files
+    description: Vault-scoped file content CRUD and history.
+  - name: Permissions
+    description: Vault-scoped permission rule CRUD.
+  - name: Shares
+    description: Vault-scoped share-link CRUD — opaque deep-link tokens for in-team file sharing.
+  - name: Users
+    description: Org-level user directory, invitations, and lifecycle.
+  - name: Audit
+    description: Vault-scoped audit log query and CSV export.
+  - name: Organizations
+    description: Org-level settings.
+  - name: ReEncryption
+    description: Re-encryption job orchestration.
+
+security:
+  - cognitoIdToken: []
+
+paths:
+  # ─── Auth ────────────────────────────────────────────────────────────────
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Exchange credentials for tokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Invalidate the current session server-side
+      responses:
+        '204':
+          description: Logged out
+
+  /auth/recover:
+    post:
+      tags: [Auth]
+      summary: Recover an org-wrapped UMK for a user (admin recovery flow)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetUserId]
+              properties:
+                targetUserId: { type: string }
+      responses:
+        '200':
+          description: Wrapped UMK or status message
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  wrappedUMK_org: { type: string, description: Base64-encoded org-wrapped UMK material }
+                  message: { type: string }
+
+  # ─── Key Lease ───────────────────────────────────────────────────────────
+
+  /auth/key-lease:
+    get:
+      tags: [KeyLease]
+      summary: Request the default key lease for the current session
+      parameters:
+        - in: query
+          name: sessionId
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Lease issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyLeaseEnvelope'
+        '401':
+          description: Lease denied — caller should treat as access revoked
+
+  /auth/key-lease/scoped:
+    post:
+      tags: [KeyLease]
+      summary: Request a path-scoped key lease (one DEK per scope)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessionId, scope]
+              properties:
+                sessionId: { type: string }
+                scope: { type: string, description: 'Path glob (e.g. "/engineering/**")' }
+      responses:
+        '200':
+          description: Scoped lease issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyLeaseEnvelope'
+        '401': { description: Denied }
+        '403': { description: Denied }
+
+  /auth/refresh:
+    post:
+      tags: [KeyLease]
+      summary: Refresh an existing key lease before expiry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                keyId: { type: string }
+                leaseId: { type: string, description: Alias for keyId; both are sent for backward compatibility }
+                refreshToken: { type: string }
+                sessionId: { type: string }
+      responses:
+        '200':
+          description: Refreshed lease (key may be rotated)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyLeaseEnvelope'
+        '401':
+          description: Refresh denied — caller will revoke and wipe
+
+  /auth/heartbeat:
+    get:
+      tags: [KeyLease]
+      summary: Liveness probe used to detect server-initiated revocation
+      parameters:
+        - in: query
+          name: sessionId
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Heartbeat OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active: { type: boolean }
+                  reason: { type: string, description: Present when active=false to explain revocation }
+        '401':
+          description: Token invalid — caller will revoke and wipe
+
+  /auth/wrapped-key:
+    get:
+      tags: [KeyLease]
+      summary: Fetch wrapped key material for hybrid zero-knowledge login
+      description: |
+        Returns the user's encrypted UMK plus KDF parameters. The client
+        unwraps locally with the user's passphrase. See
+        `docs/KEY-LEASE-AND-ZK-IMPLEMENTATION.md`.
+      responses:
+        '200':
+          description: Wrapped key material
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZkLoginMaterial'
+                # TODO: exact field set is defined in src/crypto/passphrase-manager.ts;
+                # consult that file before implementing — the schema below is illustrative.
+
+  # ─── Vaults ──────────────────────────────────────────────────────────────
+
+  /vaults:
+    get:
+      tags: [Vaults]
+      summary: List vaults the current user is a member of
+      responses:
+        '200':
+          description: Vault list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vaults:
+                    type: array
+                    items: { $ref: '#/components/schemas/VaultRecord' }
+    post:
+      tags: [Vaults]
+      summary: Create a new vault in the caller's org
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                description: { type: string }
+                kind:
+                  type: string
+                  enum: [team, personal, shared]
+                defaultRole:
+                  type: string
+                  enum: [viewer, editor, admin]
+                slug: { type: string }
+      responses:
+        '200':
+          description: Vault created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vault: { $ref: '#/components/schemas/VaultRecord' }
+
+  /vaults/{vaultId}:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    get:
+      tags: [Vaults]
+      summary: Get a single vault record
+      responses:
+        '200':
+          description: Vault
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vault: { $ref: '#/components/schemas/VaultRecord' }
+    patch:
+      tags: [Vaults]
+      summary: Update mutable vault fields
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VaultRecord'
+              # PATCH accepts any subset of VaultRecord fields.
+      responses:
+        '200':
+          description: Updated vault
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vault: { $ref: '#/components/schemas/VaultRecord' }
+    delete:
+      tags: [Vaults]
+      summary: Archive (soft-delete) a vault
+      responses:
+        '204': { description: Archived }
+
+  /vaults/{vaultId}/members:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    get:
+      tags: [Vaults]
+      summary: List vault members
+      responses:
+        '200':
+          description: Member list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: '#/components/schemas/VaultMemberRecord' }
+    post:
+      tags: [Vaults]
+      summary: Add a user to the vault
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: string }
+                role:
+                  type: string
+                  enum: [viewer, editor, admin]
+      responses:
+        '200':
+          description: Membership created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  membership: { $ref: '#/components/schemas/VaultMemberRecord' }
+
+  /vaults/{vaultId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [Vaults]
+      summary: Change a member's vault role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  type: string
+                  enum: [viewer, editor, admin]
+      responses:
+        '200':
+          description: Updated membership
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  membership: { $ref: '#/components/schemas/VaultMemberRecord' }
+    delete:
+      tags: [Vaults]
+      summary: Remove a member from the vault
+      responses:
+        '204': { description: Removed }
+
+  # ─── Files (vault-scoped) ────────────────────────────────────────────────
+
+  /vaults/{vaultId}/files:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    get:
+      tags: [Files]
+      summary: List files in a vault, optionally filtered by path prefix
+      parameters:
+        - in: query
+          name: prefix
+          required: false
+          schema: { type: string }
+          description: Folder path prefix to filter results (URL-encoded).
+      responses:
+        '200':
+          description: File metadata list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  files:
+                    type: array
+                    items: { $ref: '#/components/schemas/FileMetadata' }
+
+  /vaults/{vaultId}/files/{path}:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+      - in: path
+        name: path
+        required: true
+        schema: { type: string }
+        description: Vault-relative file path, URL-encoded as a single segment.
+    get:
+      tags: [Files]
+      summary: Fetch a single file's content (base64-encoded, opaque to server)
+      responses:
+        '200':
+          description: File content envelope
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [content]
+                properties:
+                  content: { type: string, format: byte, description: Base64-encoded file bytes (may be ciphertext). }
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Files]
+      summary: Create or replace a file
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string, format: byte, description: Base64-encoded file bytes. }
+                contentType:
+                  type: string
+                  description: 'Hint sent by the client: "application/octet-stream" when encrypted, "text/markdown" otherwise.'
+      responses:
+        '200':
+          description: Stored file metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileMetadata' }
+    delete:
+      tags: [Files]
+      summary: Delete a file
+      responses:
+        '204': { description: Deleted }
+
+  /vaults/{vaultId}/files/{path}/history:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+      - in: path
+        name: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Files]
+      summary: Fetch version history for a file
+      responses:
+        '200':
+          description: Version list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [version, timestamp, userId]
+                  properties:
+                    version: { type: string }
+                    timestamp: { type: string, format: date-time }
+                    userId: { type: string }
+
+  # ─── Permissions (vault-scoped) ──────────────────────────────────────────
+
+  /vaults/{vaultId}/permissions:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    get:
+      tags: [Permissions]
+      summary: List permission rules in a vault
+      parameters:
+        - in: query
+          name: pathFilter
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Rule list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rules:
+                    type: array
+                    items: { $ref: '#/components/schemas/PermissionRule' }
+    post:
+      tags: [Permissions]
+      summary: Create a permission rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PermissionMutationInput' }
+      responses:
+        '200':
+          description: Created rule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rule: { $ref: '#/components/schemas/PermissionRule' }
+
+  /vaults/{vaultId}/permissions/{ruleId}:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+      - in: path
+        name: ruleId
+        required: true
+        schema: { type: string }
+    put:
+      tags: [Permissions]
+      summary: Update a permission rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PermissionMutationInput' }
+      responses:
+        '200':
+          description: Updated rule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rule: { $ref: '#/components/schemas/PermissionRule' }
+    delete:
+      tags: [Permissions]
+      summary: Delete a permission rule
+      responses:
+        '204': { description: Deleted }
+
+  /vaults/{vaultId}/permissions/user/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Permissions]
+      summary: List permission rules that apply to a specific user in this vault
+      responses:
+        '200':
+          description: Rule list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rules:
+                    type: array
+                    items: { $ref: '#/components/schemas/PermissionRule' }
+
+  # ─── Share Links ─────────────────────────────────────────────────────────
+  #
+  # Opaque deep-link tokens that route a teammate to a specific file. Each
+  # endpoint enforces vault membership AND file-level read permissions —
+  # tokens carry zero authority on their own.
+
+  /vaults/{vaultId}/shares:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    post:
+      tags: [Shares]
+      summary: Create a share link for a file in this vault
+      description: |
+        Mints an opaque pointer to a vault-relative path. Returns the public
+        https URL to copy into Slack/email. Caller must (a) be a vault
+        member, and (b) have `read` permission on the path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [relPath]
+              properties:
+                relPath:
+                  type: string
+                  description: Vault-relative path of the file (no leading slash required).
+                  example: Notes/Welcome.md
+                expiresAt:
+                  type: string
+                  format: date-time
+                  description: |
+                    Optional ISO-8601 timestamp after which the link is
+                    rejected. Must be in the future and within 1 year.
+      responses:
+        '201':
+          description: Share created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  share: { $ref: '#/components/schemas/ShareRecord' }
+                  url:
+                    type: string
+                    format: uri
+                    example: https://share.example.com/s/abcDEF123?v=vault-uuid
+        '400':
+          description: Invalid relPath, malformed expiresAt, or expiry out of range
+        '403':
+          description: Caller has no read permission for this path
+    get:
+      tags: [Shares]
+      summary: List active share links for this vault
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        '200':
+          description: Active shares (expired entries are filtered out)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shares:
+                    type: array
+                    items: { $ref: '#/components/schemas/ShareRecord' }
+                  count: { type: integer }
+
+  /vaults/{vaultId}/shares/{shareId}:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+      - in: path
+        name: shareId
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Shares]
+      summary: Resolve a share token to its (vault, path) target
+      description: |
+        Used by the plugin's `obsidian://vaultguard-share` URI handler.
+        Caller must be a vault member AND have `read` permission on the
+        underlying path; otherwise the endpoint returns 404 (not 403) so
+        a token can't be probed for existence by an unauthorised member.
+      responses:
+        '200':
+          description: Resolution success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shareId: { type: string }
+                  vaultId: { type: string }
+                  vaultName: { type: string }
+                  vaultSlug: { type: string }
+                  relPath: { type: string }
+                  createdBy: { type: string }
+                  createdAt: { type: string, format: date-time }
+                  expiresAt: { type: [string, 'null'], format: date-time }
+        '404':
+          description: Token not found, belongs to another vault, or recipient lacks read
+        '410':
+          description: Share link has expired
+    delete:
+      tags: [Shares]
+      summary: Revoke a share link
+      description: |
+        Creator can always revoke their own share. Vault admins can revoke
+        any share in the vault.
+      responses:
+        '200':
+          description: Revocation success
+        '404':
+          description: Share not found
+        '403':
+          description: Caller is not the creator and not a vault admin
+
+  # ─── Users (org-level) ───────────────────────────────────────────────────
+
+  /users:
+    get:
+      tags: [Users]
+      summary: List users in the caller's org
+      responses:
+        '200':
+          description: User list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UserListEntry' }
+
+  /users/roles:
+    get:
+      tags: [Users]
+      summary: List roles defined in the org
+      responses:
+        '200':
+          description: Role list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RoleEntry' }
+
+  /users/invite:
+    post:
+      tags: [Users]
+      summary: Invite a new user to the org
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role, sendWelcomeEmail]
+              properties:
+                email: { type: string, format: email }
+                role: { type: string }
+                sendWelcomeEmail: { type: boolean }
+                givenName: { type: string }
+                familyName: { type: string }
+      responses:
+        '204': { description: Invitation queued }
+
+  /users/{userId}/role:
+    parameters:
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string }
+    put:
+      tags: [Users]
+      summary: Change a user's org role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string }
+      responses:
+        '204': { description: Updated }
+
+  /users/{userId}/revoke:
+    parameters:
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Users]
+      summary: Revoke a user's access (suspend/disable)
+      responses:
+        '204': { description: Revoked }
+
+  /users/{userId}/reactivate:
+    parameters:
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Users]
+      summary: Reactivate a previously revoked user
+      responses:
+        '204': { description: Reactivated }
+
+  /users/{userId}/resend-invite:
+    parameters:
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Users]
+      summary: Resend the invitation email for a pending user
+      responses:
+        '204': { description: Resent }
+
+  /users/{userId}/profile:
+    parameters:
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string }
+    put:
+      tags: [Users]
+      summary: Update a user's display profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [displayName]
+              properties:
+                displayName: { type: string }
+      responses:
+        '204': { description: Updated }
+
+  /users/{userId}/activity:
+    parameters:
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Users]
+      summary: Recent activity entries for a user
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, default: 50 }
+      responses:
+        '200':
+          description: Activity list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UserActivityEntry' }
+
+  # ─── Audit (vault-scoped) ────────────────────────────────────────────────
+
+  /vaults/{vaultId}/audit:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    get:
+      tags: [Audit]
+      summary: Page through audit log entries for a vault
+      parameters:
+        - in: query
+          name: search
+          schema: { type: string }
+        - in: query
+          name: action
+          schema: { type: string }
+          description: 'Filter by action; "all" is treated as no filter and is omitted by the client.'
+        - in: query
+          name: startDate
+          schema: { type: string, format: date-time }
+        - in: query
+          name: endDate
+          schema: { type: string, format: date-time }
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50 }
+      responses:
+        '200':
+          description: Page of audit log entries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditLogPageResponse' }
+
+  /vaults/{vaultId}/audit/export:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    post:
+      tags: [Audit]
+      summary: Export filtered audit log as CSV
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [format]
+              properties:
+                search: { type: string }
+                action: { type: string }
+                startDate: { type: string, format: date-time }
+                endDate: { type: string, format: date-time }
+                outcome:
+                  type: string
+                  enum: [success, denied, error]
+                format:
+                  type: string
+                  enum: [csv]
+      responses:
+        '200':
+          description: CSV file
+          content:
+            text/csv:
+              schema: { type: string, format: binary }
+
+  # ─── Organizations ───────────────────────────────────────────────────────
+
+  /orgs/{slug}/config:
+    parameters:
+      - in: path
+        name: slug
+        required: true
+        schema: { type: string }
+        description: Organization slug, or orgId for legacy/self-hosted setups.
+    get:
+      tags: [Organizations]
+      summary: Public org config and server capability discovery
+      security: []
+      responses:
+        '200':
+          description: Public connection config for the Obsidian plugin
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrgConfigResponse' }
+
+  /orgs/{orgId}/settings:
+    parameters:
+      - in: path
+        name: orgId
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Organizations]
+      summary: Read org-wide settings
+      responses:
+        '200':
+          description: Settings
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrgSettingsResponse' }
+    put:
+      tags: [Organizations]
+      summary: Update org-wide settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrgSettingsResponse' }
+      responses:
+        '204': { description: Updated }
+    delete:
+      tags: [Organizations]
+      summary: Reset org settings to defaults
+      responses:
+        '204': { description: Reset }
+
+  # ─── Re-encryption ───────────────────────────────────────────────────────
+
+  /re-encryption/trigger:
+    post:
+      tags: [ReEncryption]
+      summary: Trigger a re-encryption job for a target user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetUserId]
+              properties:
+                targetUserId: { type: string }
+      responses:
+        '200':
+          description: Job started
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobId]
+                properties:
+                  jobId: { type: string }
+
+  /re-encryption/{jobId}:
+    parameters:
+      - in: path
+        name: jobId
+        required: true
+        schema: { type: string }
+    get:
+      tags: [ReEncryption]
+      summary: Get re-encryption job status
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job:
+                    type: object
+                    additionalProperties: true
+                    description: 'Server-defined job status object. TODO: exact shape is implementation-specific; the plugin treats it as opaque.'
+
+components:
+  securitySchemes:
+    cognitoIdToken:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        Cognito ID token (or compatible OIDC ID token) sent as the raw token
+        in the `Authorization` header — **no `Bearer ` prefix** for the main
+        API surface. The `/auth/key-lease`, `/auth/refresh`, `/auth/heartbeat`,
+        and `/auth/wrapped-key` endpoints are called by the key-manager
+        module which sends `Bearer <token>`; compliant servers should accept
+        either form.
+
+  parameters:
+    VaultId:
+      in: path
+      name: vaultId
+      required: true
+      schema: { type: string }
+      description: Server-side vault ID. Throws client-side if unbound.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid auth token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    RateLimited:
+      description: Too many requests
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    ServerError:
+      description: Server-side failure (retryable by client)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+
+  schemas:
+    ApiError:
+      type: object
+      required: [statusCode, message, code]
+      properties:
+        statusCode: { type: integer }
+        message: { type: string }
+        code: { type: string }
+        requestId: { type: string }
+
+    AuthTokens:
+      type: object
+      required: [accessToken, refreshToken, idToken, expiresAt]
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        idToken: { type: string }
+        expiresAt:
+          type: integer
+          format: int64
+          description: Unix epoch in milliseconds
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+        mfaCode: { type: string }
+
+    LoginResponse:
+      type: object
+      required: [tokens, user]
+      properties:
+        tokens: { $ref: '#/components/schemas/AuthTokens' }
+        user: { $ref: '#/components/schemas/UserInfo' }
+
+    UserInfo:
+      type: object
+      required: [id, email, displayName, role, orgId]
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        displayName: { type: string }
+        role: { type: string }
+        orgId: { type: string }
+
+    VaultRecord:
+      type: object
+      required: [orgId, vaultId, name, slug, kind, defaultRole, createdAt, createdBy, archived]
+      properties:
+        orgId: { type: string }
+        vaultId: { type: string }
+        name: { type: string }
+        slug: { type: string }
+        kind:
+          type: string
+          enum: [team, personal, shared]
+        defaultRole:
+          type: string
+          enum: [viewer, editor, admin]
+        createdAt: { type: string, format: date-time }
+        createdBy: { type: string }
+        archived: { type: boolean }
+        description: { type: string }
+        excludedPaths:
+          type: array
+          items: { type: string }
+        pluginAllowlist:
+          type: array
+          items: { $ref: '#/components/schemas/PluginAllowlistEntry' }
+
+    PluginAllowlistEntry:
+      type: object
+      required: [pluginId, displayName, addedAt, addedBy]
+      properties:
+        pluginId: { type: string }
+        displayName: { type: string }
+        version: { type: string }
+        bundleSha256: { type: string }
+        addedAt: { type: string, format: date-time }
+        addedBy: { type: string }
+        note: { type: string }
+
+    VaultMemberRecord:
+      type: object
+      required: [vaultId, userId, role, joinedAt, invitedBy]
+      properties:
+        vaultId: { type: string }
+        userId: { type: string }
+        role:
+          type: string
+          enum: [viewer, editor, admin]
+        joinedAt: { type: string, format: date-time }
+        invitedBy: { type: string }
+        displayName: { type: string, description: 'Optional: server may degrade if Cognito unreachable.' }
+        email: { type: string, format: email, description: 'Optional: see displayName.' }
+
+    FileMetadata:
+      type: object
+      required: [path, hash, size, lastModified, encryptedKey]
+      properties:
+        path: { type: string }
+        hash: { type: string, description: 'Content hash (algorithm is server-defined; treated as opaque by the plugin).' }
+        size: { type: integer }
+        lastModified: { type: string, format: date-time }
+        encryptedKey:
+          type: string
+          description: |
+            Per-file wrapped DEK (base64). Empty/absent for plaintext-mode
+            servers. The plugin uses presence to decide content-type hints
+            on PUT.
+
+    PermissionRule:
+      type: object
+      required: [id, vaultId, userId, role, pathPattern, actions, effect, priority, createdAt, updatedAt, createdBy]
+      properties:
+        id: { type: string }
+        vaultId: { type: string }
+        userId: { type: string }
+        role:
+          type: string
+          nullable: true
+        pathPattern: { type: string }
+        actions:
+          type: array
+          items:
+            type: string
+            enum: [read, write, delete, admin, list]
+        effect:
+          type: string
+          enum: [allow, deny]
+        priority: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        expiresAt:
+          type: string
+          format: date-time
+          description: Optional ISO timestamp after which the rule is ignored.
+        createdBy: { type: string }
+
+    ShareRecord:
+      type: object
+      required: [shareId, vaultId, relPath, createdAt, createdBy]
+      properties:
+        shareId:
+          type: string
+          description: Random URL-safe token. PK in the Shares table.
+        vaultId: { type: string }
+        relPath:
+          type: string
+          description: Vault-relative path of the shared file at mint time.
+        createdAt: { type: string, format: date-time }
+        createdBy:
+          type: string
+          description: User ID of the creator. They (and vault admins) can revoke.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Optional ISO timestamp after which the link is rejected.
+          nullable: true
+        url:
+          type: string
+          format: uri
+          description: Full https URL — copy into Slack/email.
+
+    PermissionMutationInput:
+      type: object
+      required: [pathPattern, actions, effect]
+      properties:
+        userId: { type: string }
+        role:
+          type: string
+          nullable: true
+        pathPattern: { type: string }
+        actions:
+          type: array
+          items:
+            type: string
+            enum: [read, write, delete, admin, list]
+        effect:
+          type: string
+          enum: [allow, deny]
+        priority: { type: integer }
+
+    UserListEntry:
+      type: object
+      required: [id, email, displayName, name, role, status, lastActive, createdAt, mfaEnabled, deviceCount, type]
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        displayName: { type: string }
+        name: { type: string }
+        givenName: { type: string }
+        familyName: { type: string }
+        role:
+          type: string
+          enum: [admin, editor, viewer, custom]
+        status:
+          type: string
+          enum: [active, suspended, revoked, pending]
+        lastActive: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        mfaEnabled: { type: boolean }
+        deviceCount: { type: integer }
+        type:
+          type: string
+          enum: [user]
+
+    RoleEntry:
+      type: object
+      required: [id, name, type]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type:
+          type: string
+          enum: [role]
+        description: { type: string }
+        memberCount: { type: integer }
+
+    UserActivityEntry:
+      type: object
+      required: [timestamp, action, resourcePath]
+      properties:
+        timestamp: { type: string, format: date-time }
+        action: { type: string }
+        resourcePath: { type: string }
+        deviceInfo: { type: string }
+
+    AuditLogEntry:
+      type: object
+      required: [id, timestamp, userId, action, resourcePath, outcome]
+      properties:
+        id: { type: string }
+        timestamp: { type: string, format: date-time }
+        orgId: { type: string }
+        vaultId: { type: string }
+        userId: { type: string }
+        userEmail: { type: string, format: email }
+        action: { type: string }
+        resourcePath: { type: string }
+        outcome:
+          type: string
+          enum: [success, denied, error]
+        ipAddress: { type: string }
+        userAgent: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+
+    AuditLogPageResponse:
+      type: object
+      required: [entries, count]
+      properties:
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/AuditLogEntry' }
+        count: { type: integer }
+        nextCursor:
+          type: string
+          nullable: true
+        lastEvaluatedKey:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: 'DynamoDB-style continuation token. TODO: opaque to clients; servers may omit.'
+
+    OrgSettingsResponse:
+      type: object
+      required:
+        - orgId
+        - orgName
+        - syncMode
+        - syncIntervalMinutes
+        - enforceEncryption
+        - maxSessionDurationHours
+        - requireMfa
+        - allowedDomains
+        - retentionDays
+        - autoLockMinutes
+      properties:
+        orgId: { type: string }
+        orgName: { type: string }
+        syncMode:
+          type: string
+          enum: [realtime, periodic, manual]
+        syncIntervalMinutes: { type: integer }
+        enforceEncryption: { type: boolean }
+        maxSessionDurationHours: { type: integer }
+        requireMfa: { type: boolean }
+        allowedDomains:
+          type: array
+          items: { type: string }
+        retentionDays: { type: integer }
+        autoLockMinutes: { type: integer }
+
+    OrgConfigResponse:
+      type: object
+      required:
+        - apiEndpoint
+        - cognitoUserPoolId
+        - cognitoClientId
+        - cognitoRegion
+        - orgId
+        - orgSlug
+        - orgName
+        - edition
+        - features
+      properties:
+        apiEndpoint: { type: string, format: uri }
+        cognitoUserPoolId: { type: string }
+        cognitoClientId: { type: string }
+        cognitoRegion: { type: string }
+        orgId: { type: string }
+        orgSlug: { type: string }
+        orgName: { type: string }
+        edition:
+          type: string
+          enum: [community, pro]
+        features:
+          type: object
+          required: [shareLinks, advancedAudit, billing, webAdmin]
+          properties:
+            shareLinks: { type: boolean }
+            advancedAudit: { type: boolean }
+            billing: { type: boolean }
+            webAdmin: { type: boolean }
+
+    KeyLeaseEnvelope:
+      type: object
+      description: |
+        Server response envelope for `/auth/key-lease*` and `/auth/refresh`.
+        The plugin accepts the lease under either `payload` or `keyLease`
+        (see `key-manager.ts`); compliant servers should populate one.
+      properties:
+        payload: { $ref: '#/components/schemas/KeyLease' }
+        keyLease: { $ref: '#/components/schemas/KeyLease' }
+
+    KeyLease:
+      type: object
+      required: [key, expiresAt]
+      properties:
+        keyId:
+          type: string
+          description: 'Lease identifier. Either `keyId` or `leaseId` must be present (the client treats them as aliases).'
+        leaseId: { type: string }
+        key:
+          type: string
+          format: byte
+          description: Base64-encoded raw DEK material.
+        expiresAt: { type: string, format: date-time }
+        issuedAt: { type: string, format: date-time }
+        refreshToken: { type: string }
+        scope:
+          type: string
+          description: 'Path glob this lease applies to. Defaults to `/**` if absent.'
+        gracePeriodMs:
+          type: integer
+          description: 'Optional offline grace period override.'
+
+    ZkLoginMaterial:
+      type: object
+      description: |
+        Wrapped key material returned by `/auth/wrapped-key` for hybrid
+        zero-knowledge login.
+        TODO: exact field set is defined in `src/crypto/passphrase-manager.ts`
+        (KDF parameters, wrapped UMK, salt, etc.). Treat this as a
+        placeholder and confirm against that module before implementing.
+      additionalProperties: true

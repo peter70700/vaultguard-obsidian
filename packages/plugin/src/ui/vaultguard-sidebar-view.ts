@@ -1,0 +1,1206 @@
+/**
+ * VaultGuard Sidebar View — a custom ItemView that shows a detailed
+ * permission overview of vault files with user avatars, sharing status,
+ * permission levels, and sync state.
+ *
+ * Registered as a workspace view and toggled via command or ribbon.
+ */
+
+import { ItemView, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { VaultGuardApiClient, PermissionRule, UserListEntry } from "../api/client";
+import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+
+export const VAULTGUARD_VIEW_TYPE = "vaultguard-files-view";
+const CACHE_TTL_MS = 60_000;
+const SEARCH_DEBOUNCE_MS = 120;
+
+// ─── Types ─────────────────────────────────────────────────────────────────
+
+interface FileEntry {
+  path: string;
+  name: string;
+  lowerPath: string;
+  lowerName: string;
+  level: string;
+  sharedWith: number;
+  principals: Array<{
+    id: string;
+    label: string;
+    level: string;
+    type: "user" | "role";
+  }>;
+  userIds: Set<string>;
+  roleIds: Set<string>;
+}
+
+interface ViewCacheEntry {
+  rules: PermissionRule[];
+  fetchedAt: number;
+}
+
+type SortMode = "name-asc" | "name-desc" | "level-desc" | "shared-desc";
+
+export interface VaultGuardSidebarViewConfig {
+  apiClient: VaultGuardApiClient;
+  currentUserId: string;
+  currentUserRole: string;
+  onNavigateToFile?: (path: string) => void;
+  onOpenMenu?: (evt?: MouseEvent) => void;
+  onOpenSettings?: () => void;
+}
+
+// ─── View Class ────────────────────────────────────────────────────────────
+
+export class VaultGuardSidebarView extends ItemView {
+  private config: VaultGuardSidebarViewConfig | null = null;
+  private ruleCache: Map<string, ViewCacheEntry> = new Map();
+  private filterLevel: string = "all";
+  private filterUser: string = "all";
+  private filterRole: string = "all";
+  private filterShared: boolean = false;
+  private searchQuery: string = "";
+  private sortMode: SortMode = "name-asc";
+  private entries: FileEntry[] = [];
+  private allRules: PermissionRule[] = [];
+  private knownUsers: Array<{ id: string; label: string }> = [];
+  private knownRoles: string[] = [];
+  private userMap: Map<string, UserListEntry> = new Map();
+  private isLoading = false;
+  private contentEl_: HTMLElement | null = null;
+  private revoked = false;
+  private revokeReason = "";
+  private leaseExpiresAt: number | null = null;
+
+  // References to filter/UI elements so we can update them in place
+  private userSelectEl: HTMLSelectElement | null = null;
+  private roleSelectEl: HTMLSelectElement | null = null;
+  private levelSelectEl: HTMLSelectElement | null = null;
+  private sortSelectEl: HTMLSelectElement | null = null;
+  private sharedToggleEl: HTMLInputElement | null = null;
+  private searchInputEl: HTMLInputElement | null = null;
+  private searchDebounce: number | null = null;
+
+  constructor(leaf: WorkspaceLeaf) {
+    super(leaf);
+  }
+
+  /**
+   * Inject configuration after construction (since Obsidian controls instantiation).
+   */
+  configure(config: VaultGuardSidebarViewConfig): void {
+    this.config = config;
+  }
+
+  getViewType(): string {
+    return VAULTGUARD_VIEW_TYPE;
+  }
+
+  getDisplayText(): string {
+    return "VaultGuard Files";
+  }
+
+  getIcon(): string {
+    return "vaultguard-shield";
+  }
+
+  async onOpen(): Promise<void> {
+    const container = this.containerEl.children[1] as HTMLElement;
+    container.empty();
+    container.addClass("vaultguard-sidebar");
+
+    this.contentEl_ = container;
+
+    if (!this.config) {
+      this.renderNotLoggedIn(container);
+      return;
+    }
+
+    this.renderShell(container);
+    await this.loadEntries();
+  }
+
+  async onClose(): Promise<void> {
+    if (this.searchDebounce !== null) {
+      window.clearTimeout(this.searchDebounce);
+      this.searchDebounce = null;
+    }
+    this.ruleCache.clear();
+    this.entries = [];
+    this.allRules = [];
+    this.knownUsers = [];
+    this.knownRoles = [];
+    this.userSelectEl = null;
+    this.roleSelectEl = null;
+    this.levelSelectEl = null;
+    this.sortSelectEl = null;
+    this.sharedToggleEl = null;
+    this.searchInputEl = null;
+  }
+
+  /**
+   * Force reload all entries. If the view was opened before login,
+   * this re-renders the full shell now that config is available.
+   *
+   * Also drops the cached user directory — a freshly-granted permission
+   * may target a teammate who was just invited and isn't in the prior
+   * map yet, which would otherwise render their chip as a raw UUID until
+   * the next session.
+   */
+  async reload(): Promise<void> {
+    this.ruleCache.clear();
+    this.userMap = new Map();
+
+    if (!this.contentEl_) return;
+
+    // If we previously showed "not logged in", rebuild the full shell
+    if (this.config && !this.contentEl_.querySelector(".vaultguard-sb-list")) {
+      this.contentEl_.empty();
+      this.renderShell(this.contentEl_);
+    }
+
+    if (this.config) {
+      await this.loadEntries();
+    }
+  }
+
+  // ─── Shell Rendering ──────────────────────────────────────────────────
+
+  private renderNotLoggedIn(container: HTMLElement): void {
+    const header = container.createDiv({ cls: "vaultguard-sb-header" });
+    const titleRow = header.createDiv({ cls: "vaultguard-sb-title-row" });
+    const titleIcon = titleRow.createSpan({ cls: "vaultguard-sb-title-icon" });
+    setIcon(titleIcon, "vaultguard-shield");
+    titleRow.createSpan({ cls: "vaultguard-sb-title-text", text: "VaultGuard Files" });
+
+    const emptyState = container.createDiv({ cls: "vaultguard-sb-empty" });
+    const icon = emptyState.createDiv({ cls: "vaultguard-sb-empty-icon" });
+    setIcon(icon, "lock");
+    emptyState.createEl("p", {
+      text: "Log in to VaultGuard to see file permissions and sharing status.",
+    });
+    emptyState.createEl("p", {
+      text: "Use the shield icon in the ribbon or run \"VaultGuard: Login\" from the command palette.",
+      cls: "vaultguard-sb-empty-hint",
+    });
+  }
+
+  /**
+   * Show a revocation notice in the sidebar. Called by the main plugin
+   * when the heartbeat or lease refresh detects revoked access.
+   */
+  showRevocationNotice(reason: string): void {
+    this.revoked = true;
+    this.revokeReason = reason;
+    if (this.contentEl_) {
+      this.contentEl_.empty();
+      this.renderRevocationNotice(this.contentEl_);
+    }
+  }
+
+  /**
+   * Update the lease expiry display. Called periodically by the main plugin.
+   */
+  updateLeaseExpiry(expiresAt: number | null): void {
+    this.leaseExpiresAt = expiresAt;
+    const el = this.contentEl_?.querySelector(".vaultguard-lease-warning");
+    if (el) {
+      this.renderLeaseExpiryContent(el as HTMLElement);
+    }
+  }
+
+  private renderRevocationNotice(container: HTMLElement): void {
+    const notice = container.createDiv({ cls: "vaultguard-revocation-notice" });
+
+    notice.createEl("h3", { text: "Access Revoked" });
+    notice.createEl("p", {
+      text: "Your access to this vault has been revoked by an administrator.",
+    });
+
+    if (this.revokeReason) {
+      notice.createEl("p", { text: `Reason: ${this.revokeReason}` });
+    }
+
+    notice.createEl("p", {
+      text: "All locally cached data has been securely wiped. " +
+        "If you believe this is an error, contact your organization administrator.",
+    });
+
+    notice.createEl("p", {
+      text: "To regain access, you must be re-invited to the organization. " +
+        "A new invitation will create fresh encryption keys.",
+      cls: "setting-item-description",
+    });
+  }
+
+  private renderLeaseStatus(container: HTMLElement): void {
+    if (!this.leaseExpiresAt) return;
+
+    const warning = container.createDiv({ cls: "vaultguard-lease-warning" });
+    this.renderLeaseExpiryContent(warning);
+  }
+
+  private renderLeaseExpiryContent(el: HTMLElement): void {
+    el.empty();
+
+    if (!this.leaseExpiresAt) {
+      el.style.display = "none";
+      return;
+    }
+
+    const remaining = this.leaseExpiresAt - Date.now();
+    const hoursLeft = Math.max(0, Math.floor(remaining / (1000 * 60 * 60)));
+    const minutesLeft = Math.max(0, Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60)));
+
+    el.style.display = "";
+
+    if (remaining <= 0) {
+      el.addClass("mod-critical");
+      el.setText("Offline key lease expired. Reconnect to continue accessing files.");
+    } else if (remaining < 30 * 60 * 1000) {
+      // Less than 30 minutes
+      el.addClass("mod-critical");
+      el.setText(`Key lease expires in ${minutesLeft}m. Reconnect soon to avoid losing offline access.`);
+    } else if (remaining < 2 * 60 * 60 * 1000) {
+      // Less than 2 hours
+      el.removeClass("mod-critical");
+      el.setText(`Offline access: ${hoursLeft}h ${minutesLeft}m remaining`);
+    } else {
+      el.style.display = "none";
+    }
+  }
+
+  private renderShell(container: HTMLElement): void {
+    // Revocation takes priority over normal view
+    if (this.revoked) {
+      this.renderRevocationNotice(container);
+      return;
+    }
+
+    // Lease expiry warning (shown above normal content)
+    this.renderLeaseStatus(container);
+
+    // Header
+    const header = container.createDiv({ cls: "vaultguard-sb-header" });
+    const titleRow = header.createDiv({ cls: "vaultguard-sb-title-row" });
+
+    const titleIcon = titleRow.createSpan({ cls: "vaultguard-sb-title-icon" });
+    setIcon(titleIcon, "vaultguard-shield");
+    titleRow.createSpan({ cls: "vaultguard-sb-title-text", text: "VaultGuard Files" });
+
+    const menuBtn = titleRow.createEl("button", {
+      cls: "vaultguard-sb-menu-btn clickable-icon",
+      attr: {
+        "aria-label": "VaultGuard menu",
+        title: "VaultGuard menu",
+      },
+    });
+    setIcon(menuBtn, "more-horizontal");
+    menuBtn.addEventListener("click", (evt) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      if (this.config?.onOpenMenu) {
+        this.config.onOpenMenu(evt);
+      } else {
+        this.config?.onOpenSettings?.();
+      }
+    });
+
+    const refreshBtn = titleRow.createEl("button", {
+      cls: "vaultguard-sb-refresh-btn clickable-icon",
+      attr: { "aria-label": "Refresh" },
+    });
+    setIcon(refreshBtn, "refresh-cw");
+    refreshBtn.addEventListener("click", () => this.reload());
+
+    // Search
+    const searchRow = header.createDiv({ cls: "vaultguard-sb-search-row" });
+    const searchWrap = searchRow.createDiv({ cls: "vaultguard-sb-search-wrap" });
+    const searchIcon = searchWrap.createSpan({ cls: "vaultguard-sb-search-icon" });
+    setIcon(searchIcon, "search");
+
+    const searchInput = searchWrap.createEl("input", {
+      cls: "vaultguard-sb-search",
+      attr: { placeholder: "Filter files...", type: "text", spellcheck: "false" },
+    });
+    this.searchInputEl = searchInput;
+
+    const searchClear = searchWrap.createEl("button", {
+      cls: "vaultguard-sb-search-clear",
+      attr: { "aria-label": "Clear search", type: "button", title: "Clear search" },
+    });
+    setIcon(searchClear, "x");
+    searchClear.style.display = "none";
+    searchClear.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.clearSearch();
+      searchInput.focus();
+    });
+
+    searchInput.addEventListener("input", () => {
+      const value = searchInput.value;
+      searchClear.style.display = value.length > 0 ? "" : "none";
+      if (this.searchDebounce !== null) window.clearTimeout(this.searchDebounce);
+      this.searchDebounce = window.setTimeout(() => {
+        this.searchDebounce = null;
+        this.searchQuery = value.toLowerCase().trim();
+        this.renderEntries();
+      }, SEARCH_DEBOUNCE_MS);
+    });
+    searchInput.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape" && searchInput.value.length > 0) {
+        evt.preventDefault();
+        evt.stopPropagation();
+        this.clearSearch();
+      }
+    });
+
+    // Filter row 1: level + shared
+    const filterRow1 = header.createDiv({ cls: "vaultguard-sb-filter-row" });
+
+    const levelSelect = filterRow1.createEl("select", {
+      cls: "vaultguard-sb-filter-select",
+      attr: { "aria-label": "Filter by access level" },
+    });
+    for (const [value, label] of [
+      ["all", "All Levels"],
+      ["admin", "Admin"],
+      ["write", "Write"],
+      ["read", "Read"],
+      ["none", "No Access"],
+    ]) {
+      levelSelect.createEl("option", { value, text: label });
+    }
+    levelSelect.value = this.filterLevel;
+    levelSelect.addEventListener("change", () => {
+      this.filterLevel = levelSelect.value;
+      this.renderEntries();
+    });
+    this.levelSelectEl = levelSelect;
+
+    const sharedToggle = filterRow1.createEl("label", {
+      cls: "vaultguard-sb-filter-toggle",
+      attr: { title: "Show only files shared with at least one other user or role" },
+    });
+    const checkbox = sharedToggle.createEl("input", { type: "checkbox" });
+    checkbox.checked = this.filterShared;
+    sharedToggle.createSpan({ text: "Shared only" });
+    checkbox.addEventListener("change", () => {
+      this.filterShared = checkbox.checked;
+      this.renderEntries();
+    });
+    this.sharedToggleEl = checkbox;
+
+    // Filter row 2: user + role
+    const filterRow2 = header.createDiv({ cls: "vaultguard-sb-filter-row" });
+
+    const userSelect = filterRow2.createEl("select", {
+      cls: "vaultguard-sb-filter-select",
+      attr: { "aria-label": "Filter by user" },
+    });
+    userSelect.createEl("option", { value: "all", text: "All Users" });
+    userSelect.addEventListener("change", () => {
+      this.filterUser = userSelect.value;
+      this.renderEntries();
+    });
+    this.userSelectEl = userSelect;
+
+    const roleSelect = filterRow2.createEl("select", {
+      cls: "vaultguard-sb-filter-select",
+      attr: { "aria-label": "Filter by role" },
+    });
+    roleSelect.createEl("option", { value: "all", text: "All Roles" });
+    roleSelect.addEventListener("change", () => {
+      this.filterRole = roleSelect.value;
+      this.renderEntries();
+    });
+    this.roleSelectEl = roleSelect;
+
+    // Filter row 3: sort
+    const filterRow3 = header.createDiv({ cls: "vaultguard-sb-filter-row" });
+    const sortSelect = filterRow3.createEl("select", {
+      cls: "vaultguard-sb-filter-select",
+      attr: { "aria-label": "Sort order" },
+    });
+    for (const [value, label] of [
+      ["name-asc", "Sort: Name A-Z"],
+      ["name-desc", "Sort: Name Z-A"],
+      ["level-desc", "Sort: Access High → Low"],
+      ["shared-desc", "Sort: Most Shared First"],
+    ]) {
+      sortSelect.createEl("option", { value, text: label });
+    }
+    sortSelect.value = this.sortMode;
+    sortSelect.addEventListener("change", () => {
+      this.sortMode = sortSelect.value as SortMode;
+      this.renderEntries();
+    });
+    this.sortSelectEl = sortSelect;
+
+    // Active filter chips row (populated dynamically in renderEntries)
+    header.createDiv({ cls: "vaultguard-sb-chips" });
+
+    // Entry list container
+    container.createDiv({ cls: "vaultguard-sb-list" });
+  }
+
+  private clearSearch(): void {
+    if (this.searchInputEl) {
+      this.searchInputEl.value = "";
+      const clearBtn = this.searchInputEl.parentElement?.querySelector(".vaultguard-sb-search-clear") as HTMLElement | null;
+      if (clearBtn) clearBtn.style.display = "none";
+    }
+    if (this.searchDebounce !== null) {
+      window.clearTimeout(this.searchDebounce);
+      this.searchDebounce = null;
+    }
+    this.searchQuery = "";
+    this.renderEntries();
+  }
+
+  private clearAllFilters(): void {
+    this.filterLevel = "all";
+    this.filterUser = "all";
+    this.filterRole = "all";
+    this.filterShared = false;
+    this.searchQuery = "";
+
+    if (this.levelSelectEl) this.levelSelectEl.value = "all";
+    if (this.userSelectEl) this.userSelectEl.value = "all";
+    if (this.roleSelectEl) this.roleSelectEl.value = "all";
+    if (this.sharedToggleEl) this.sharedToggleEl.checked = false;
+    if (this.searchInputEl) {
+      this.searchInputEl.value = "";
+      const clearBtn = this.searchInputEl.parentElement?.querySelector(".vaultguard-sb-search-clear") as HTMLElement | null;
+      if (clearBtn) clearBtn.style.display = "none";
+    }
+    if (this.searchDebounce !== null) {
+      window.clearTimeout(this.searchDebounce);
+      this.searchDebounce = null;
+    }
+
+    this.renderEntries();
+  }
+
+  private hasActiveFilters(): boolean {
+    return (
+      this.filterLevel !== "all" ||
+      this.filterUser !== "all" ||
+      this.filterRole !== "all" ||
+      this.filterShared ||
+      this.searchQuery.length > 0
+    );
+  }
+
+  // ─── Data Loading ─────────────────────────────────────────────────────
+
+  private async loadEntries(): Promise<void> {
+    if (!this.config || !this.contentEl_) return;
+
+    this.isLoading = true;
+    this.renderEntries();
+
+    try {
+      // Get all vault files
+      const allFiles = this.app.vault.getAllLoadedFiles();
+      const paths: string[] = [];
+
+      for (const file of allFiles) {
+        if (file instanceof TFile) {
+          paths.push(file.path);
+        }
+      }
+
+      // Fetch permissions and users — if the API calls fail, still show files with defaults
+      this.allRules = [];
+      try {
+        const [rules] = await Promise.all([
+          this.config.apiClient.getPermissions(),
+          this.loadUsersIfNeeded(),
+        ]);
+        this.allRules = rules;
+        this.ruleCache.set("__all__", { rules: this.allRules, fetchedAt: Date.now() });
+      } catch {
+        // API unavailable — proceed with empty rules (role-based defaults apply)
+      }
+
+      // Extract known users and roles from rules
+      this.extractUsersAndRoles(this.allRules);
+      this.populateFilterDropdowns();
+
+      // Build entries from vault files regardless of API state
+      this.entries = paths.map((path) => this.buildEntry(path, this.allRules));
+    } catch {
+      this.entries = [];
+    } finally {
+      this.isLoading = false;
+      this.renderEntries();
+    }
+  }
+
+  private async loadUsersIfNeeded(): Promise<void> {
+    if (this.userMap.size > 0) return;
+    try {
+      const users = await this.config!.apiClient.listUsers();
+      this.userMap = buildAccessUserMap(users);
+    } catch {
+      // Silently fail — degrades to showing user IDs
+    }
+  }
+
+  private resolveUserLabel(userId: string): string {
+    if (userId === "*") return "Everyone";
+    const user = this.userMap.get(userId);
+    return user ? getAccessUserDisplayName(user) : userId;
+  }
+
+  private extractUsersAndRoles(rules: PermissionRule[]): void {
+    const users = new Map<string, string>(); // id → label
+    const roles = new Set<string>();
+    const selfId = this.config?.currentUserId ?? "";
+
+    // Seed the dropdown with every user in the loaded directory, not just
+    // users who happen to have an explicit rule. Otherwise vault members
+    // with default role-based access would never appear as filter options.
+    // (userMap is keyed by id AND email — dedupe by user.id.)
+    const seenUserIds = new Set<string>();
+    for (const user of this.userMap.values()) {
+      if (seenUserIds.has(user.id)) continue;
+      seenUserIds.add(user.id);
+      // Skip self — buildEntry excludes self from principals, so filtering
+      // by self would always return 0.
+      if (user.id === selfId) continue;
+      // Skip revoked users — they're not actionable filter targets.
+      if (user.status === "revoked") continue;
+      users.set(user.id, getAccessUserDisplayName(user));
+    }
+
+    for (const rule of rules) {
+      if (rule.role) {
+        roles.add(rule.role);
+      }
+      if (rule.userId === "*") {
+        users.set("*", "Everyone");
+      }
+      // Fallback: include rule-targeted users who aren't in the directory
+      // (just-invited, soft-deleted, cross-org references, etc.) so a stale
+      // rule still surfaces in the filter.
+      if (
+        rule.userId &&
+        rule.userId !== "*" &&
+        rule.userId !== selfId &&
+        !users.has(rule.userId)
+      ) {
+        users.set(rule.userId, this.resolveUserLabel(rule.userId));
+      }
+    }
+
+    this.knownUsers = [...users.entries()]
+      .map(([id, label]) => ({ id, label }))
+      .sort((a, b) => {
+        // Pin "Everyone (*)" to the top
+        if (a.id === "*" && b.id !== "*") return -1;
+        if (b.id === "*" && a.id !== "*") return 1;
+        return a.label.localeCompare(b.label);
+      });
+
+    this.knownRoles = [...roles].sort();
+  }
+
+  private populateFilterDropdowns(): void {
+    if (this.userSelectEl) {
+      const current = this.userSelectEl.value;
+      while (this.userSelectEl.options.length > 1) {
+        this.userSelectEl.remove(1);
+      }
+      for (const user of this.knownUsers) {
+        this.userSelectEl.createEl("option", {
+          value: user.id,
+          text: user.id === "*" ? "Everyone (*)" : user.label,
+        });
+      }
+      if (Array.from(this.userSelectEl.options).some((o) => o.value === current)) {
+        this.userSelectEl.value = current;
+      } else {
+        this.userSelectEl.value = "all";
+        this.filterUser = "all";
+      }
+    }
+
+    if (this.roleSelectEl) {
+      const current = this.roleSelectEl.value;
+      while (this.roleSelectEl.options.length > 1) {
+        this.roleSelectEl.remove(1);
+      }
+      for (const role of this.knownRoles) {
+        this.roleSelectEl.createEl("option", { value: role, text: role });
+      }
+      if (Array.from(this.roleSelectEl.options).some((o) => o.value === current)) {
+        this.roleSelectEl.value = current;
+      } else {
+        this.roleSelectEl.value = "all";
+        this.filterRole = "all";
+      }
+    }
+  }
+
+  private buildEntry(path: string, allRules: PermissionRule[]): FileEntry {
+    // Filter rules that match this path
+    const matchingRules = allRules.filter((r) => this.ruleMatchesPath(r.pathPattern, path));
+
+    const myLevel = this.resolveMyLevel(matchingRules);
+
+    // Per-principal state with the same conflict-resolution semantics the
+    // header uses: more-specific path wins, deny wins at the same
+    // specificity. Without this, a deny rule on a folder was silently
+    // skipped while older allow rules kept the avatar visible — exactly
+    // the bug the user is asking to fix here.
+    interface PrincipalState {
+      id: string;
+      label: string;
+      level: string;
+      type: "user" | "role";
+      specificity: number;
+      denied: boolean;
+    }
+
+    const principals = new Map<string, PrincipalState>();
+
+    const shouldReplace = (
+      current: PrincipalState | undefined,
+      nextLevel: string,
+      specificity: number,
+      denied: boolean
+    ): boolean => {
+      if (!current) return true;
+      if (specificity > current.specificity) return true;
+      if (specificity < current.specificity) return false;
+      if (denied && !current.denied) return true;
+      if (!denied && current.denied) return false;
+      return this.levelRank(nextLevel) > this.levelRank(current.level);
+    };
+
+    for (const rule of matchingRules) {
+      const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+      const specificity = this.patternSpecificity(rule.pathPattern);
+      const denied = rule.effect === "deny";
+
+      if (rule.role) {
+        const key = `role:${rule.role}`;
+        if (!shouldReplace(principals.get(key), level, specificity, denied)) continue;
+        principals.set(key, {
+          id: rule.role,
+          label: rule.role,
+          level,
+          type: "role",
+          specificity,
+          denied,
+        });
+        continue;
+      }
+
+      if (rule.userId === this.config!.currentUserId) continue;
+      const key = `user:${rule.userId}`;
+      if (!shouldReplace(principals.get(key), level, specificity, denied)) continue;
+      principals.set(key, {
+        id: rule.userId,
+        label: this.resolveUserLabel(rule.userId),
+        level,
+        type: "user",
+        specificity,
+        denied,
+      });
+    }
+
+    const sortedPrincipals = [...principals.values()]
+      .filter((principal) => principal.level !== "none")
+      .map(({ id, label, level, type }) => ({ id, label, level, type }))
+      .sort((a, b) => this.levelRank(b.level) - this.levelRank(a.level));
+
+    const userIds = new Set<string>();
+    const roleIds = new Set<string>();
+    for (const p of sortedPrincipals) {
+      if (p.type === "user") userIds.add(p.id);
+      else roleIds.add(p.id);
+    }
+
+    const name = path.split("/").pop() ?? path;
+
+    return {
+      path,
+      name,
+      lowerPath: path.toLowerCase(),
+      lowerName: name.toLowerCase(),
+      level: myLevel,
+      sharedWith: sortedPrincipals.length,
+      principals: sortedPrincipals,
+      userIds,
+      roleIds,
+    };
+  }
+
+  // ─── Entry Rendering ──────────────────────────────────────────────────
+
+  private renderEntries(): void {
+    if (!this.contentEl_) return;
+
+    const listEl = this.contentEl_.querySelector(".vaultguard-sb-list") as HTMLElement | null;
+    const chipsEl = this.contentEl_.querySelector(".vaultguard-sb-chips") as HTMLElement | null;
+    if (!listEl) return;
+
+    listEl.empty();
+    if (chipsEl) chipsEl.empty();
+
+    if (this.isLoading) {
+      const loadingEl = listEl.createDiv({ cls: "vaultguard-sb-loading" });
+      const spinner = loadingEl.createSpan({ cls: "vaultguard-sb-spinner" });
+      setIcon(spinner, "loader");
+      loadingEl.createSpan({ text: "Loading permissions..." });
+      return;
+    }
+
+    // Active-filter chips
+    if (chipsEl && this.hasActiveFilters()) {
+      this.renderFilterChips(chipsEl);
+    }
+
+    // Apply filters
+    const total = this.entries.length;
+    let filtered = this.entries;
+
+    // Non-admins can't read "no access" rows — those files don't appear in
+    // the file-explorer either (HIDDEN_CLS), so showing them here would be
+    // misleading. Admins keep full visibility because resolveMyLevel always
+    // returns "admin" for them, so this filter is a no-op in their view.
+    if (!this.isViewerEffectivelyAdmin()) {
+      filtered = filtered.filter((e) => e.level !== "none");
+    }
+
+    if (this.filterLevel !== "all") {
+      filtered = filtered.filter((e) => e.level === this.filterLevel);
+    }
+
+    if (this.filterShared) {
+      filtered = filtered.filter((e) => e.sharedWith > 0);
+    }
+
+    if (this.filterUser !== "all") {
+      const target = this.filterUser;
+      // Use the resolved principals (effective access, deny-aware) — not
+      // raw rules — so that a more-specific deny correctly hides the file
+      // from this user's filter.
+      filtered = filtered.filter((e) => e.userIds.has(target));
+    }
+
+    if (this.filterRole !== "all") {
+      const target = this.filterRole;
+      filtered = filtered.filter((e) => e.roleIds.has(target));
+    }
+
+    if (this.searchQuery) {
+      const q = this.searchQuery;
+      filtered = filtered.filter((e) => e.lowerName.includes(q) || e.lowerPath.includes(q));
+    }
+
+    // Sort
+    filtered = this.applySort(filtered);
+
+    // Summary bar (always shown so the user sees totals/filtered count)
+    const summary = listEl.createDiv({ cls: "vaultguard-sb-summary" });
+    if (this.hasActiveFilters() && filtered.length !== total) {
+      summary.createSpan({
+        text: `${filtered.length} of ${total} files`,
+        cls: "vaultguard-sb-summary-count",
+      });
+    } else {
+      summary.createSpan({
+        text: `${filtered.length} ${filtered.length === 1 ? "file" : "files"}`,
+        cls: "vaultguard-sb-summary-count",
+      });
+    }
+    const sharedCount = filtered.filter((e) => e.sharedWith > 0).length;
+    if (sharedCount > 0) {
+      summary.createSpan({
+        text: `${sharedCount} shared`,
+        cls: "vaultguard-sb-summary-shared",
+      });
+    }
+
+    if (filtered.length === 0) {
+      const emptyEl = listEl.createDiv({ cls: "vaultguard-sb-empty" });
+      const icon = emptyEl.createDiv({ cls: "vaultguard-sb-empty-icon" });
+      setIcon(icon, this.hasActiveFilters() ? "filter" : "file-x");
+      emptyEl.createEl("p", {
+        text: this.hasActiveFilters()
+          ? "No files match the current filters."
+          : "No files in this vault yet.",
+      });
+      if (this.hasActiveFilters()) {
+        const resetBtn = emptyEl.createEl("button", {
+          cls: "vaultguard-sb-empty-action",
+          text: "Clear filters",
+        });
+        resetBtn.addEventListener("click", () => this.clearAllFilters());
+      }
+      return;
+    }
+
+    // Render each entry
+    for (const entry of filtered) {
+      this.renderEntry(listEl, entry);
+    }
+  }
+
+  private renderFilterChips(container: HTMLElement): void {
+    const addChip = (label: string, onClear: () => void) => {
+      const chip = container.createDiv({ cls: "vaultguard-sb-chip" });
+      chip.createSpan({ cls: "vaultguard-sb-chip-label", text: label });
+      const x = chip.createEl("button", {
+        cls: "vaultguard-sb-chip-clear",
+        attr: { "aria-label": `Remove ${label}`, type: "button", title: "Remove filter" },
+      });
+      setIcon(x, "x");
+      x.addEventListener("click", (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        onClear();
+      });
+    };
+
+    if (this.searchQuery) {
+      addChip(`Search: "${this.searchQuery}"`, () => this.clearSearch());
+    }
+    if (this.filterLevel !== "all") {
+      addChip(`Level: ${this.formatLevel(this.filterLevel)}`, () => {
+        this.filterLevel = "all";
+        if (this.levelSelectEl) this.levelSelectEl.value = "all";
+        this.renderEntries();
+      });
+    }
+    if (this.filterShared) {
+      addChip("Shared only", () => {
+        this.filterShared = false;
+        if (this.sharedToggleEl) this.sharedToggleEl.checked = false;
+        this.renderEntries();
+      });
+    }
+    if (this.filterUser !== "all") {
+      const userLabel = this.knownUsers.find((u) => u.id === this.filterUser)?.label ?? this.filterUser;
+      const display = this.filterUser === "*" ? "Everyone" : userLabel;
+      addChip(`User: ${display}`, () => {
+        this.filterUser = "all";
+        if (this.userSelectEl) this.userSelectEl.value = "all";
+        this.renderEntries();
+      });
+    }
+    if (this.filterRole !== "all") {
+      addChip(`Role: ${this.filterRole}`, () => {
+        this.filterRole = "all";
+        if (this.roleSelectEl) this.roleSelectEl.value = "all";
+        this.renderEntries();
+      });
+    }
+
+    // Clear-all button when there's more than one filter
+    const activeCount =
+      (this.searchQuery ? 1 : 0) +
+      (this.filterLevel !== "all" ? 1 : 0) +
+      (this.filterShared ? 1 : 0) +
+      (this.filterUser !== "all" ? 1 : 0) +
+      (this.filterRole !== "all" ? 1 : 0);
+
+    if (activeCount > 1) {
+      const clearAll = container.createEl("button", {
+        cls: "vaultguard-sb-chip-clear-all",
+        text: "Clear all",
+        attr: { type: "button" },
+      });
+      clearAll.addEventListener("click", (evt) => {
+        evt.preventDefault();
+        this.clearAllFilters();
+      });
+    }
+  }
+
+  private applySort(entries: FileEntry[]): FileEntry[] {
+    const arr = [...entries];
+    switch (this.sortMode) {
+      case "name-asc":
+        arr.sort((a, b) => a.lowerName.localeCompare(b.lowerName) || a.lowerPath.localeCompare(b.lowerPath));
+        break;
+      case "name-desc":
+        arr.sort((a, b) => b.lowerName.localeCompare(a.lowerName) || b.lowerPath.localeCompare(a.lowerPath));
+        break;
+      case "level-desc":
+        arr.sort((a, b) => {
+          const diff = this.levelRank(b.level) - this.levelRank(a.level);
+          if (diff !== 0) return diff;
+          return a.lowerName.localeCompare(b.lowerName);
+        });
+        break;
+      case "shared-desc":
+        arr.sort((a, b) => {
+          const diff = b.sharedWith - a.sharedWith;
+          if (diff !== 0) return diff;
+          return a.lowerName.localeCompare(b.lowerName);
+        });
+        break;
+    }
+    return arr;
+  }
+
+  private renderEntry(container: HTMLElement, entry: FileEntry): void {
+    const row = container.createDiv({ cls: "vaultguard-sb-entry" });
+
+    // Click to open file
+    row.addEventListener("click", () => {
+      const file = this.app.vault.getAbstractFileByPath(entry.path);
+      if (file instanceof TFile) {
+        this.app.workspace.getLeaf(false).openFile(file);
+      }
+    });
+
+    // Left: icon + file info
+    const left = row.createDiv({ cls: "vaultguard-sb-entry-left" });
+
+    const fileIcon = left.createSpan({ cls: "vaultguard-sb-entry-icon" });
+    setIcon(fileIcon, "file-text");
+
+    const info = left.createDiv({ cls: "vaultguard-sb-entry-info" });
+    const nameEl = info.createDiv({ cls: "vaultguard-sb-entry-name" });
+    this.renderHighlighted(nameEl, entry.name, this.searchQuery);
+
+    const pathDisplay = entry.path.includes("/")
+      ? entry.path.substring(0, entry.path.lastIndexOf("/"))
+      : "";
+    if (pathDisplay) {
+      const pathEl = info.createDiv({ cls: "vaultguard-sb-entry-path" });
+      this.renderHighlighted(pathEl, pathDisplay, this.searchQuery);
+    }
+
+    // Right: permission badge + avatar stack
+    const right = row.createDiv({ cls: "vaultguard-sb-entry-right" });
+
+    // Permission badge
+    const badge = right.createSpan({
+      cls: `vaultguard-sb-badge vaultguard-sb-badge-${entry.level}`,
+    });
+    badge.setText(this.formatLevel(entry.level));
+
+    // Avatar stack
+    if (entry.sharedWith > 0) {
+      const avatarStack = right.createDiv({ cls: "vaultguard-sb-avatars" });
+
+      const maxAvatars = 4;
+      const shown = entry.principals.slice(0, maxAvatars);
+
+      for (const principal of shown) {
+        const avatar = avatarStack.createSpan({
+          cls: `vaultguard-sb-avatar vaultguard-sb-avatar-${principal.level}`,
+        });
+
+        if (principal.type === "role") {
+          setIcon(avatar, "users");
+        } else if (principal.id === "*") {
+          setIcon(avatar, "globe");
+        } else {
+          avatar.setText(this.initials(principal.id));
+        }
+        avatar.title = `${principal.label} (${this.formatLevel(principal.level)})`;
+      }
+
+      if (entry.sharedWith > maxAvatars) {
+        avatarStack.createSpan({
+          cls: "vaultguard-sb-avatar-overflow",
+          text: `+${entry.sharedWith - maxAvatars}`,
+        });
+      }
+    }
+  }
+
+  /**
+   * Render text with case-insensitive search-term highlighting.
+   * Falls back to plain text when there's no query.
+   */
+  private renderHighlighted(target: HTMLElement, text: string, query: string): void {
+    if (!query) {
+      target.setText(text);
+      return;
+    }
+    const lowerText = text.toLowerCase();
+    let cursor = 0;
+    let idx = lowerText.indexOf(query, cursor);
+    if (idx === -1) {
+      target.setText(text);
+      return;
+    }
+    while (idx !== -1) {
+      if (idx > cursor) {
+        target.appendText(text.slice(cursor, idx));
+      }
+      target.createSpan({ cls: "vaultguard-sb-match", text: text.slice(idx, idx + query.length) });
+      cursor = idx + query.length;
+      idx = lowerText.indexOf(query, cursor);
+    }
+    if (cursor < text.length) {
+      target.appendText(text.slice(cursor));
+    }
+  }
+
+  // ─── Rule Matching ────────────────────────────────────────────────────
+
+  private ruleMatchesPath(pattern: string, path: string): boolean {
+    const normalizedPattern = pattern.replace(/^\/+/, "").replace(/\/+$/, "");
+    const normalizedPath = path.replace(/^\/+/, "").replace(/\/+$/, "");
+
+    // Exact match
+    if (normalizedPath === normalizedPattern) return true;
+
+    // Folder inheritance
+    if (normalizedPattern.endsWith("/") && normalizedPath.startsWith(normalizedPattern)) return true;
+    if (!normalizedPattern.includes("*") && normalizedPath.startsWith(normalizedPattern + "/")) return true;
+
+    // Wildcard * (single segment)
+    if (normalizedPattern === "*" || normalizedPattern === "**") return true;
+
+    // Glob matching
+    if (normalizedPattern.includes("*")) {
+      return this.matchGlob(normalizedPath, normalizedPattern);
+    }
+
+    return false;
+  }
+
+  private matchGlob(path: string, pattern: string): boolean {
+    let regexStr = "^";
+    let i = 0;
+
+    while (i < pattern.length) {
+      const char = pattern[i];
+      if (char === "*") {
+        if (pattern[i + 1] === "*") {
+          if (pattern[i + 2] === "/") {
+            regexStr += "(?:.+/)?";
+            i += 3;
+          } else {
+            regexStr += ".*";
+            i += 2;
+          }
+        } else {
+          regexStr += "[^/]*";
+          i++;
+        }
+      } else if (".+^${}()|[]\\".includes(char)) {
+        regexStr += "\\" + char;
+        i++;
+      } else {
+        regexStr += char;
+        i++;
+      }
+    }
+
+    regexStr += "$";
+
+    try {
+      return new RegExp(regexStr).test(path);
+    } catch {
+      return false;
+    }
+  }
+
+  // ─── Helpers ──────────────────────────────────────────────────────────
+
+  /**
+   * Mirrors `resolveMyLevel`'s admin short-circuit: org admins/owners
+   * always have full access, so the no-access filter must be skipped for
+   * them. Returns false until config is wired so the early-render path
+   * doesn't accidentally elide entries.
+   */
+  private isViewerEffectivelyAdmin(): boolean {
+    const role = this.config?.currentUserRole;
+    return role === "admin" || role === "owner";
+  }
+
+  private resolveMyLevel(rules: PermissionRule[]): string {
+    if (!this.config) return "read";
+    const role = this.config.currentUserRole;
+    if (role === "admin" || role === "owner") return "admin";
+
+    let bestLevel = "none";
+    let bestSpecificity = -1;
+
+    for (const rule of rules) {
+      const applies =
+        rule.userId === this.config.currentUserId ||
+        rule.userId === "*" ||
+        (rule.role && role === rule.role);
+
+      if (!applies) continue;
+
+      const specificity = this.patternSpecificity(rule.pathPattern);
+      if (specificity > bestSpecificity) {
+        bestSpecificity = specificity;
+        bestLevel = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+      } else if (specificity === bestSpecificity) {
+        const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+        if (this.levelRank(level) > this.levelRank(bestLevel)) {
+          bestLevel = level;
+        }
+      }
+    }
+
+    if (bestLevel === "none" && bestSpecificity === -1) {
+      if (role === "editor") return "write";
+      return "read";
+    }
+
+    return bestLevel;
+  }
+
+  private ruleLevelString(rule: PermissionRule): string {
+    if (rule.actions.includes("admin")) return "admin";
+    if (rule.actions.includes("write") || rule.actions.includes("delete")) return "write";
+    if (rule.actions.includes("read")) return "read";
+    return "none";
+  }
+
+  private patternSpecificity(pattern: string): number {
+    let score = 0;
+    score += (pattern.match(/\//g) || []).length * 10;
+    if (!pattern.includes("*")) score += 100;
+    if (pattern.includes("**")) score -= 50;
+    score += pattern.length;
+    return score;
+  }
+
+  private levelRank(level: string): number {
+    switch (level) {
+      case "admin": return 3;
+      case "write": return 2;
+      case "read": return 1;
+      default: return 0;
+    }
+  }
+
+  private formatLevel(level: string): string {
+    switch (level) {
+      case "admin": return "Admin";
+      case "write": return "Write";
+      case "read": return "Read";
+      default: return "No Access";
+    }
+  }
+
+  private initials(userId: string): string {
+    if (userId === "*") return "*";
+    const user = this.userMap.get(userId);
+    if (user) return getAccessUserNameInitials(user);
+    const parts = userId.split(/[\s@._-]+/).filter(Boolean);
+    return parts
+      .slice(0, 2)
+      .map((p) => p[0]?.toUpperCase() ?? "")
+      .join("");
+  }
+}

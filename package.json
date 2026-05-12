@@ -1,0 +1,8 @@
+{
+  "name": "vaultguard-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "license": "SEE LICENSE IN LICENSE"
+}

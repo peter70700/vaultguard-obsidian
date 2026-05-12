@@ -1,0 +1,4267 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   VaultGuard — Plugin Styles
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Shared Modal Reset ────────────────────────────────────────────────── */
+/* All vaultguard modals apply their class to modalEl (the outer .modal).
+   This reset overrides Obsidian's default padding so we have full control. */
+
+.modal.vaultguard-admin-modal,
+.modal.vaultguard-at-rest-recovery-modal,
+.modal.vaultguard-at-rest-restore-modal,
+.modal.vaultguard-dialog-modal,
+.modal.vaultguard-login-modal,
+.modal.vaultguard-mfa-setup-modal,
+.modal.vaultguard-permission-rule-modal,
+.modal.vaultguard-reconciliation-modal,
+.modal.vaultguard-vault-picker-modal,
+.modal.vaultguard-revoke-modal {
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.modal.vaultguard-admin-modal .modal-content,
+.modal.vaultguard-at-rest-recovery-modal .modal-content,
+.modal.vaultguard-at-rest-restore-modal .modal-content,
+.modal.vaultguard-dialog-modal .modal-content,
+.modal.vaultguard-login-modal .modal-content,
+.modal.vaultguard-mfa-setup-modal .modal-content,
+.modal.vaultguard-permission-rule-modal .modal-content,
+.modal.vaultguard-reconciliation-modal .modal-content,
+.modal.vaultguard-vault-picker-modal .modal-content,
+.modal.vaultguard-revoke-modal .modal-content,
+.vaultguard-admin-modal-content,
+.vaultguard-dialog-content,
+.vaultguard-mfa-setup-content,
+.vaultguard-reconciliation-content,
+.vaultguard-vault-picker-content,
+.vaultguard-login-modal-content {
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box;
+  margin: 0 !important;
+}
+
+.vaultguard-modal-title {
+  margin: 0 0 6px;
+  font-size: 1.25em;
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--text-normal);
+}
+
+.vaultguard-modal-description,
+.vaultguard-modal-note {
+  margin: 0 0 18px;
+  color: var(--text-muted);
+  font-size: 0.9em;
+  line-height: 1.45;
+}
+
+.vaultguard-modal-section-title {
+  margin: 18px 0 10px;
+  font-size: 0.98em;
+  font-weight: 700;
+  color: var(--text-normal);
+}
+
+.vaultguard-modal-divider {
+  margin: 18px 0 0;
+  border: 0;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.modal.vaultguard-dialog-modal {
+  width: 560px !important;
+  max-width: calc(100vw - 32px) !important;
+  max-height: calc(100vh - 48px) !important;
+}
+
+.modal.vaultguard-dialog-modal .modal-content,
+.vaultguard-dialog-content {
+  padding: 22px 24px 18px !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: calc(100vh - 64px);
+}
+
+/* ─── Admin Modal ───────────────────────────────────────────────────────── */
+
+.modal.vaultguard-admin-modal {
+  width: 820px !important;
+  max-width: 92vw !important;
+  max-height: 85vh;
+}
+
+.modal.vaultguard-admin-modal .modal-content,
+.vaultguard-admin-modal-content {
+  padding: 24px 28px 20px !important;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.vaultguard-admin-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-shrink: 0;
+}
+
+.vaultguard-admin-header h2 {
+  margin: 0;
+  font-size: 1.25em;
+  font-weight: 700;
+}
+
+/* ─── Connection Status ─────────────────────────────────────────────────── */
+
+.vaultguard-connection-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82em;
+  padding: 4px 10px;
+  border-radius: 12px;
+  background-color: var(--background-secondary);
+}
+
+.vaultguard-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.vaultguard-status-online {
+  background-color: var(--color-green);
+  box-shadow: 0 0 4px var(--color-green);
+}
+
+.vaultguard-status-offline {
+  background-color: var(--color-red);
+}
+
+.vaultguard-status-text {
+  color: var(--text-muted);
+}
+
+/* ─── Tab Navigation ────────────────────────────────────────────────────── */
+
+.vaultguard-tab-nav {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 16px;
+  padding-bottom: 0;
+  flex-shrink: 0;
+}
+
+.vaultguard-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-size: 0.88em;
+  font-weight: 500;
+  transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+  border-radius: 4px 4px 0 0;
+  user-select: none;
+}
+
+.vaultguard-tab:hover {
+  color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-tab-active {
+  color: var(--interactive-accent);
+  border-bottom-color: var(--interactive-accent);
+  font-weight: 600;
+}
+
+.vaultguard-tab-icon {
+  display: flex;
+  align-items: center;
+}
+
+.vaultguard-tab-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.vaultguard-tab-content {
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1;
+  min-height: 0;
+  padding-right: 4px;
+}
+
+/* Scrollbar styling for tab content */
+.vaultguard-tab-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.vaultguard-tab-content::-webkit-scrollbar-thumb {
+  background-color: var(--background-modifier-border);
+  border-radius: 3px;
+}
+
+.vaultguard-tab-content::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-faint);
+}
+
+/* ─── Toolbar ───────────────────────────────────────────────────────────── */
+
+.vaultguard-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.vaultguard-search-input {
+  min-width: 200px;
+}
+
+.vaultguard-date-input {
+  max-width: 150px;
+}
+
+/* ─── Loading / Empty / Error States ────────────────────────────────────── */
+
+.vaultguard-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 16px;
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.vaultguard-empty-state {
+  text-align: center;
+  padding: 40px 16px;
+  color: var(--text-muted);
+  font-size: 0.9em;
+  line-height: 1.5;
+}
+
+.vaultguard-info-callout {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background-color: var(--background-secondary);
+  border-left: 3px solid var(--interactive-accent);
+  color: var(--text-muted);
+  font-size: 0.86em;
+  line-height: 1.5;
+}
+
+.vaultguard-admin-tab-description {
+  margin: -4px 0 14px;
+}
+
+/* Error: visible text on translucent red — works in light and dark themes */
+.vaultguard-error {
+  padding: 12px 16px;
+  color: var(--text-normal);
+  background-color: rgba(255, 50, 50, 0.1);
+  border-radius: 6px;
+  border-left: 3px solid var(--color-red, #e03e3e);
+  font-size: 0.9em;
+  line-height: 1.4;
+}
+
+/* ─── User List ─────────────────────────────────────────────────────────── */
+
+.vaultguard-user-summary {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  background-color: var(--background-secondary);
+  border-radius: 6px;
+  font-size: 0.84em;
+  font-weight: 500;
+}
+
+.vaultguard-summary-stat {
+  color: var(--text-muted);
+}
+
+.vaultguard-stat-active {
+  color: var(--color-green);
+}
+
+.vaultguard-stat-suspended {
+  color: var(--color-orange);
+}
+
+.vaultguard-stat-pending {
+  color: var(--color-blue);
+}
+
+.vaultguard-user-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  transition: background-color 0.1s;
+}
+
+.vaultguard-user-item:last-child {
+  border-bottom: none;
+}
+
+.vaultguard-user-item:hover {
+  background-color: var(--background-modifier-hover);
+  border-radius: 4px;
+}
+
+.vaultguard-user-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.vaultguard-user-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75em;
+  font-weight: 600;
+  flex-shrink: 0;
+  letter-spacing: 0.02em;
+}
+
+.vaultguard-user-details {
+  min-width: 0;
+}
+
+.vaultguard-user-name {
+  font-weight: 600;
+  font-size: 0.93em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-user-email {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-user-badges {
+  display: flex;
+  gap: 5px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.vaultguard-user-meta {
+  font-size: 0.78em;
+  color: var(--text-muted);
+  text-align: right;
+  flex-shrink: 0;
+  line-height: 1.5;
+}
+
+.vaultguard-user-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* ─── Badge Styles ──────────────────────────────────────────────────────── */
+
+.vaultguard-status-badge,
+.vaultguard-role-badge,
+.vaultguard-mfa-badge,
+.vaultguard-permission-badge,
+.vaultguard-action-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.72em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.vaultguard-status-active {
+  background-color: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+.vaultguard-status-suspended {
+  background-color: rgba(var(--color-orange-rgb), 0.15);
+  color: var(--color-orange);
+}
+
+.vaultguard-status-revoked {
+  background-color: rgba(var(--color-red-rgb), 0.15);
+  color: var(--color-red);
+}
+
+.vaultguard-status-pending {
+  background-color: rgba(var(--color-blue-rgb), 0.15);
+  color: var(--color-blue);
+}
+
+.vaultguard-role-admin {
+  background-color: rgba(var(--color-purple-rgb), 0.15);
+  color: var(--color-purple);
+}
+
+.vaultguard-role-editor {
+  background-color: rgba(var(--color-blue-rgb), 0.15);
+  color: var(--color-blue);
+}
+
+.vaultguard-role-viewer {
+  background-color: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+.vaultguard-mfa-badge {
+  background-color: rgba(var(--color-green-rgb), 0.1);
+  color: var(--color-green);
+}
+
+.vaultguard-mfa-badge svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* ─── Permission Levels ─────────────────────────────────────────────────── */
+
+.vaultguard-level-none {
+  background-color: rgba(var(--color-red-rgb), 0.15);
+  color: var(--color-red);
+}
+
+.vaultguard-level-read {
+  background-color: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+.vaultguard-level-write {
+  background-color: rgba(var(--color-blue-rgb), 0.15);
+  color: var(--color-blue);
+}
+
+.vaultguard-level-admin {
+  background-color: rgba(var(--color-purple-rgb), 0.15);
+  color: var(--color-purple);
+}
+
+/* ─── Action Badges ─────────────────────────────────────────────────────── */
+
+.vaultguard-action-read {
+  background-color: rgba(var(--color-green-rgb), 0.12);
+  color: var(--color-green);
+}
+
+.vaultguard-action-write {
+  background-color: rgba(var(--color-blue-rgb), 0.12);
+  color: var(--color-blue);
+}
+
+.vaultguard-action-delete {
+  background-color: rgba(var(--color-red-rgb), 0.12);
+  color: var(--color-red);
+}
+
+.vaultguard-action-share {
+  background-color: rgba(var(--color-purple-rgb), 0.12);
+  color: var(--color-purple);
+}
+
+.vaultguard-action-permission_change {
+  background-color: rgba(var(--color-orange-rgb), 0.12);
+  color: var(--color-orange);
+}
+
+/* ─── Icon Buttons ──────────────────────────────────────────────────────── */
+
+.vaultguard-icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 5px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.1s, background-color 0.1s;
+}
+
+.vaultguard-icon-btn:hover {
+  color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-icon-btn.vaultguard-danger:hover {
+  color: var(--color-red, #e03e3e);
+  background-color: rgba(255, 50, 50, 0.1);
+}
+
+.vaultguard-icon-btn.vaultguard-success:hover {
+  color: var(--color-green);
+  background-color: rgba(var(--color-green-rgb), 0.1);
+}
+
+.vaultguard-icon-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* ─── Permission Tree ───────────────────────────────────────────────────── */
+
+.vaultguard-permission-tree {
+  margin-top: 4px;
+}
+
+.vaultguard-tree-node {
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-tree-node:last-child {
+  border-bottom: none;
+}
+
+.vaultguard-tree-node-header {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "icon path actions"
+    ". badges actions";
+  align-items: start;
+  column-gap: 8px;
+  row-gap: 5px;
+  padding: 10px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background-color 0.1s;
+}
+
+.vaultguard-tree-node-header:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-tree-icon {
+  display: flex;
+  align-items: center;
+  grid-area: icon;
+  padding-top: 2px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.vaultguard-tree-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.vaultguard-tree-path {
+  grid-area: path;
+  font-family: var(--font-monospace);
+  font-size: 0.88em;
+  line-height: 1.45;
+  min-width: 0;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.vaultguard-tree-badges {
+  display: flex;
+  grid-area: badges;
+  gap: 5px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.vaultguard-tree-actions {
+  display: flex;
+  grid-area: actions;
+  justify-self: end;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.vaultguard-tree-node-header:hover .vaultguard-tree-actions {
+  opacity: 1;
+}
+
+.vaultguard-tree-node-header:focus-within .vaultguard-tree-actions {
+  opacity: 1;
+}
+
+/* ─── Tables (Audit, Permissions, Activity) ─────────────────────────────── */
+
+.vaultguard-audit-table,
+.vaultguard-permissions-table,
+.vaultguard-activity-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84em;
+}
+
+.vaultguard-audit-table th,
+.vaultguard-permissions-table th,
+.vaultguard-activity-table th {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 2px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.vaultguard-audit-table td,
+.vaultguard-permissions-table td,
+.vaultguard-activity-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  vertical-align: middle;
+}
+
+.vaultguard-audit-table tbody tr:hover,
+.vaultguard-permissions-table tbody tr:hover,
+.vaultguard-activity-table tbody tr:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-monospace {
+  font-family: var(--font-monospace);
+  font-size: 0.88em;
+  word-break: break-all;
+}
+
+/* ─── Audit Filters ─────────────────────────────────────────────────────── */
+
+.vaultguard-audit-filters {
+  gap: 6px;
+}
+
+.vaultguard-audit-vault-context {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-left-width: 3px;
+  border-left-color: var(--interactive-accent);
+  border-radius: 6px;
+  background: var(--background-secondary);
+}
+
+.vaultguard-audit-vault-title {
+  font-size: 0.92em;
+  font-weight: 700;
+  color: var(--text-normal);
+}
+
+.vaultguard-audit-vault-meta {
+  margin-top: 3px;
+  color: var(--text-muted);
+}
+
+.vaultguard-audit-entry-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vaultguard-audit-entry {
+  padding: 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+}
+
+.vaultguard-audit-entry-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.vaultguard-audit-entry-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.vaultguard-audit-entry-time {
+  color: var(--text-muted);
+  font-size: 0.78em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.vaultguard-audit-outcome {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.72em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.vaultguard-audit-outcome-success {
+  color: var(--color-green);
+  background: rgba(var(--color-green-rgb), 0.14);
+}
+
+.vaultguard-audit-outcome-denied {
+  color: var(--color-red);
+  background: rgba(var(--color-red-rgb), 0.14);
+}
+
+.vaultguard-audit-outcome-error {
+  color: var(--color-orange);
+  background: rgba(var(--color-orange-rgb), 0.14);
+}
+
+.vaultguard-audit-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 14px;
+  margin-top: 10px;
+}
+
+.vaultguard-audit-detail {
+  min-width: 0;
+}
+
+.vaultguard-audit-detail-label,
+.vaultguard-audit-metadata-label {
+  margin-bottom: 2px;
+  color: var(--text-muted);
+  font-size: 0.72em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.vaultguard-audit-detail-value {
+  color: var(--text-normal);
+  font-size: 0.84em;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.vaultguard-audit-metadata,
+.vaultguard-audit-raw {
+  margin-top: 10px;
+}
+
+.vaultguard-audit-raw summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.78em;
+  font-weight: 600;
+}
+
+.vaultguard-audit-json {
+  margin: 4px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 5px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: 0.78em;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 700px) {
+  .vaultguard-audit-entry-header {
+    flex-direction: column;
+  }
+
+  .vaultguard-audit-entry-time {
+    white-space: normal;
+  }
+
+  .vaultguard-audit-detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ─── Pagination ────────────────────────────────────────────────────────── */
+
+.vaultguard-pagination {
+  display: flex;
+  justify-content: center;
+  padding: 16px 0 4px;
+}
+
+/* ─── Permission Rule Modal ─────────────────────────────────────────────── */
+
+.modal.vaultguard-permission-rule-modal {
+  width: 600px !important;
+  max-width: 88vw !important;
+}
+
+.modal.vaultguard-permission-rule-modal .modal-content {
+  padding: 24px 24px 20px !important;
+}
+
+.vaultguard-path-input {
+  width: 100%;
+}
+
+.vaultguard-path-suggestions {
+  position: absolute;
+  z-index: 100;
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.vaultguard-suggestion-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 0.88em;
+}
+
+.vaultguard-suggestion-item:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-suggestion-icon {
+  display: flex;
+  color: var(--text-muted);
+}
+
+.vaultguard-suggestion-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.vaultguard-rule-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--background-modifier-border);
+  flex-wrap: wrap;
+}
+
+/* ─── Conflict Check ────────────────────────────────────────────────────── */
+
+.vaultguard-conflicts {
+  margin-top: 12px;
+}
+
+.vaultguard-no-conflicts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  color: var(--color-green);
+  font-size: 0.88em;
+  background-color: rgba(var(--color-green-rgb), 0.06);
+  border-radius: 6px;
+}
+
+.vaultguard-check-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.vaultguard-conflict {
+  padding: 10px 14px;
+  margin-bottom: 6px;
+  border-radius: 6px;
+  font-size: 0.85em;
+  line-height: 1.4;
+}
+
+.vaultguard-conflict-override {
+  background-color: rgba(var(--color-orange-rgb), 0.08);
+  border-left: 3px solid var(--color-orange);
+}
+
+.vaultguard-conflict-contradiction {
+  background-color: rgba(255, 50, 50, 0.08);
+  border-left: 3px solid var(--color-red, #e03e3e);
+}
+
+.vaultguard-conflict-redundant {
+  background-color: rgba(var(--color-blue-rgb), 0.08);
+  border-left: 3px solid var(--color-blue);
+}
+
+.vaultguard-conflict-type {
+  font-weight: 700;
+  font-size: 0.78em;
+  letter-spacing: 0.04em;
+}
+
+.vaultguard-conflict-detail {
+  margin-top: 4px;
+  font-family: var(--font-monospace);
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+/* ─── Effective Permission Preview ──────────────────────────────────────── */
+
+.vaultguard-effective-preview {
+  margin-top: 12px;
+}
+
+.vaultguard-effective-entry {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-effective-source {
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+.vaultguard-inheritance-chain {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  font-size: 0.8em;
+  color: var(--text-muted);
+  flex-wrap: wrap;
+}
+
+.vaultguard-chain-label {
+  font-weight: 600;
+}
+
+.vaultguard-chain-arrow svg {
+  width: 12px;
+  height: 12px;
+}
+
+.vaultguard-chain-path {
+  font-family: var(--font-monospace);
+  padding: 1px 5px;
+  background-color: var(--background-secondary);
+  border-radius: 3px;
+  font-size: 0.95em;
+}
+
+/* ─── Modal Actions / Confirm Buttons ───────────────────────────────────── */
+
+.vaultguard-modal-actions,
+.vaultguard-confirm-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--background-modifier-border);
+  flex-wrap: wrap;
+}
+
+.vaultguard-modal-actions button,
+.vaultguard-confirm-buttons button {
+  min-height: 34px;
+  white-space: nowrap;
+}
+
+/* ─── Vault Picker Modal ───────────────────────────────────────────────── */
+
+.modal.vaultguard-vault-picker-modal {
+  width: 640px !important;
+  max-width: calc(100vw - 32px) !important;
+  max-height: calc(100vh - 48px) !important;
+}
+
+.modal.vaultguard-vault-picker-modal .modal-content,
+.vaultguard-vault-picker-content {
+  padding: 24px 28px 22px !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: calc(100vh - 64px);
+}
+
+.vaultguard-vault-picker-error {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--color-red, #e03e3e);
+  border-radius: 6px;
+  background-color: rgba(255, 50, 50, 0.12);
+  color: var(--text-normal);
+  font-size: 0.88em;
+  line-height: 1.4;
+}
+
+.vaultguard-vault-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.vaultguard-vault-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background-color: var(--background-secondary);
+}
+
+.vaultguard-vault-picker-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.vaultguard-vault-picker-name {
+  display: block;
+  margin-bottom: 2px;
+  overflow: hidden;
+  color: var(--text-normal);
+  font-size: 0.95em;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vaultguard-vault-picker-meta {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.82em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vaultguard-vault-picker-row button {
+  flex-shrink: 0;
+  min-height: 32px;
+}
+
+.vaultguard-vault-picker-create {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vaultguard-vault-picker-textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.vaultguard-vault-picker-create-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+/* ─── Binding Reconciliation Modal ─────────────────────────────────────── */
+
+.modal.vaultguard-reconciliation-modal {
+  width: 640px !important;
+  max-width: calc(100vw - 32px) !important;
+  max-height: calc(100vh - 48px) !important;
+}
+
+.modal.vaultguard-reconciliation-modal .modal-content,
+.vaultguard-reconciliation-content {
+  padding: 24px 28px 22px !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: calc(100vh - 64px);
+}
+
+.vaultguard-reconciliation-summary {
+  display: grid;
+  grid-template-columns: minmax(36px, auto) minmax(0, 1fr);
+  gap: 8px 16px;
+  margin: 14px 0 18px;
+  padding: 14px 0;
+  border-top: 1px solid var(--background-modifier-border);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-reconciliation-count {
+  color: var(--text-normal);
+  font-size: 1.05em;
+  text-align: right;
+}
+
+.vaultguard-reconciliation-row-text {
+  min-width: 0;
+}
+
+.vaultguard-reconciliation-row-label {
+  color: var(--text-normal);
+  font-weight: 600;
+}
+
+.vaultguard-reconciliation-details {
+  margin-bottom: 16px;
+}
+
+.vaultguard-reconciliation-details summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.vaultguard-reconciliation-details ul {
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 10px 0 0;
+  padding-left: 20px;
+}
+
+.vaultguard-reconciliation-details li {
+  word-break: break-word;
+}
+
+/* ─── MFA Setup Modal ──────────────────────────────────────────────────── */
+
+.modal.vaultguard-mfa-setup-modal {
+  width: 520px !important;
+  max-width: calc(100vw - 32px) !important;
+  max-height: calc(100vh - 48px) !important;
+}
+
+.modal.vaultguard-mfa-setup-modal .modal-content,
+.vaultguard-mfa-setup-content {
+  padding: 24px 28px 22px !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: calc(100vh - 64px);
+}
+
+.vaultguard-mfa-qr-container {
+  display: flex;
+  justify-content: center;
+  margin: 14px 0;
+}
+
+.vaultguard-mfa-qr {
+  width: 200px;
+  height: 200px;
+  max-width: 100%;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background-color: #fff;
+  padding: 10px;
+  box-sizing: border-box;
+}
+
+.vaultguard-mfa-manual {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  margin: 12px 0 16px;
+  padding: 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background-color: var(--background-secondary);
+}
+
+.vaultguard-mfa-manual-label {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.82em;
+}
+
+.vaultguard-mfa-secret {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.82em;
+}
+
+.vaultguard-mfa-copy-btn,
+.vaultguard-mfa-copy-all-btn {
+  min-height: 32px;
+  white-space: nowrap;
+}
+
+.vaultguard-mfa-recovery-warning,
+.vaultguard-mfa-recovery-note {
+  color: var(--text-muted);
+  font-size: 0.9em;
+  line-height: 1.45;
+}
+
+.vaultguard-mfa-recovery-codes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.vaultguard-mfa-recovery-code {
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 0.86em;
+  text-align: center;
+}
+
+.vaultguard-mfa-ack-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--text-normal);
+  font-size: 0.9em;
+}
+
+.vaultguard-mfa-ack-checkbox {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 520px) {
+  .modal.vaultguard-vault-picker-modal .modal-content,
+  .vaultguard-vault-picker-content,
+  .modal.vaultguard-reconciliation-modal .modal-content,
+  .vaultguard-reconciliation-content,
+  .modal.vaultguard-mfa-setup-modal .modal-content,
+  .vaultguard-mfa-setup-content,
+  .modal.vaultguard-dialog-modal .modal-content,
+  .vaultguard-dialog-content {
+    padding: 20px 18px 18px !important;
+  }
+
+  .vaultguard-vault-picker-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .vaultguard-vault-picker-row button,
+  .vaultguard-vault-picker-create-actions button {
+    width: 100%;
+  }
+
+  .vaultguard-mfa-manual,
+  .vaultguard-mfa-recovery-codes {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ─── Settings Tab ──────────────────────────────────────────────────────── */
+
+.vaultguard-settings-tab h3 {
+  margin-top: 24px;
+  margin-bottom: 8px;
+  font-size: 1em;
+  font-weight: 700;
+  color: var(--text-normal);
+}
+
+.vaultguard-settings-tab h3:first-child {
+  margin-top: 0;
+}
+
+.vaultguard-settings-actions {
+  margin-top: 16px;
+}
+
+.vaultguard-number-setting input[type="number"] {
+  width: 96px;
+}
+
+.vaultguard-admin-textarea-setting {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.vaultguard-admin-textarea-setting .setting-item-info,
+.vaultguard-admin-textarea-setting .setting-item-control {
+  width: 100%;
+}
+
+.vaultguard-admin-textarea-setting .setting-item-control {
+  margin-top: 10px;
+  margin-left: 0;
+}
+
+.vaultguard-admin-textarea-setting textarea {
+  box-sizing: border-box;
+  min-height: 84px;
+  resize: vertical;
+  width: 100%;
+}
+
+.vaultguard-excluded-paths-setting {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.vaultguard-excluded-paths-setting .setting-item-info,
+.vaultguard-excluded-paths-setting .setting-item-control {
+  width: 100%;
+}
+
+.vaultguard-excluded-paths-setting .setting-item-control {
+  margin-top: 10px;
+  margin-left: 0;
+}
+
+.vaultguard-excluded-paths-setting textarea {
+  box-sizing: border-box;
+  min-height: 132px;
+  resize: vertical;
+  width: 100%;
+}
+
+.vaultguard-current-vault-settings {
+  margin-bottom: 20px;
+}
+
+.vaultguard-current-vault-loading {
+  padding: 8px 0;
+}
+
+.vaultguard-current-vault-description {
+  margin: -6px 0 8px;
+  line-height: 1.45;
+}
+
+.vaultguard-current-vault-id {
+  font-family: var(--font-monospace);
+  font-size: 0.82em;
+  user-select: text;
+}
+
+.vaultguard-current-vault-heading {
+  margin: 16px 0 4px;
+  font-size: 0.95em;
+}
+
+/* ─── Revoke Access Modal ───────────────────────────────────────────────── */
+
+.modal.vaultguard-revoke-modal {
+  width: 520px !important;
+  max-width: 88vw !important;
+}
+
+.modal.vaultguard-revoke-modal .modal-content {
+  padding: 24px 24px 20px !important;
+}
+
+.vaultguard-danger-title {
+  color: var(--color-red, #e03e3e);
+  margin: 0 0 12px;
+}
+
+.vaultguard-revoke-consequences {
+  padding-left: 20px;
+  font-size: 0.88em;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.vaultguard-revoke-consequences li {
+  margin-bottom: 4px;
+}
+
+.vaultguard-warning-text {
+  color: var(--color-red, #e03e3e);
+  font-weight: 600;
+  font-size: 0.88em;
+  line-height: 1.4;
+}
+
+.vaultguard-recovery-key-output {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 96px;
+  margin: 8px 0 10px;
+  padding: 10px 12px;
+  resize: vertical;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-modifier-form-field);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.vaultguard-recovery-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+.vaultguard-current-role {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.9em;
+}
+
+/* ─── Expiry Input ──────────────────────────────────────────────────────── */
+
+.vaultguard-expiry-input {
+  max-width: 200px;
+}
+
+/* ─── Login Modal ───────────────────────────────────────────────────────── */
+
+.modal.vaultguard-login-modal {
+  width: 420px !important;
+  max-width: calc(100vw - 32px) !important;
+  max-height: calc(100vh - 48px) !important;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal.vaultguard-login-modal .modal-close-button {
+  top: 8px;
+  right: 8px;
+  z-index: 10;
+}
+
+.modal.vaultguard-login-modal .modal-content,
+.vaultguard-login-modal-content {
+  padding: 32px 28px 24px !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+.modal.vaultguard-login-modal .modal-content::-webkit-scrollbar,
+.vaultguard-login-modal-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.modal.vaultguard-login-modal .modal-content::-webkit-scrollbar-thumb,
+.vaultguard-login-modal-content::-webkit-scrollbar-thumb {
+  background-color: var(--background-modifier-border);
+  border-radius: 3px;
+}
+
+.vaultguard-login-icon {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 12px;
+  color: var(--interactive-accent);
+  line-height: 1;
+}
+
+.vaultguard-login-icon svg {
+  display: block;
+  width: 48px;
+  height: 48px;
+}
+
+.vaultguard-login-title {
+  text-align: center;
+  margin: 0 0 4px;
+  font-size: 1.35em;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.vaultguard-login-subtitle {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.88em;
+  margin: 0 0 24px;
+  line-height: 1.4;
+}
+
+.vaultguard-login-error {
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  background-color: rgba(255, 50, 50, 0.12);
+  color: var(--text-normal);
+  border-radius: 6px;
+  border-left: 3px solid var(--color-red, #e03e3e);
+  font-size: 0.88em;
+  text-align: left;
+  line-height: 1.4;
+}
+
+.vaultguard-login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.vaultguard-field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.vaultguard-field-label {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+
+.vaultguard-field-hint {
+  font-size: 0.78em;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+  line-height: 1.3;
+}
+
+.vaultguard-field-input {
+  width: 100% !important;
+  min-height: 38px;
+  padding: 9px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.95em;
+  line-height: 1.3;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  box-sizing: border-box;
+  box-shadow: none;
+}
+
+.vaultguard-field-input:focus {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px rgba(var(--interactive-accent-rgb, 124, 58, 237), 0.18);
+}
+
+.vaultguard-field-input::placeholder {
+  color: var(--text-faint);
+}
+
+.vaultguard-mfa-container {
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 16px;
+  margin-top: 2px;
+}
+
+.vaultguard-mfa-input {
+  max-width: 180px !important;
+  text-align: center;
+  font-size: 1.3em;
+  letter-spacing: 0.35em;
+  font-family: var(--font-monospace);
+  padding: 10px 12px;
+}
+
+.vaultguard-login-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid var(--background-modifier-border);
+  flex-shrink: 0;
+}
+
+.vaultguard-login-actions button {
+  flex: 1;
+  min-width: 0;
+  min-height: 36px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 0.92em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s, opacity 0.15s;
+  white-space: nowrap;
+}
+
+.vaultguard-login-actions .mod-cta {
+  font-weight: 600;
+}
+
+.vaultguard-login-actions button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ─── ZK Passphrase Warning ───────────────────────────────────────────── */
+
+.vaultguard-zk-warning {
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  background-color: rgba(255, 170, 0, 0.1);
+  border-left: 3px solid var(--color-orange, #e8a838);
+  border-radius: 6px;
+  font-size: 0.84em;
+  line-height: 1.5;
+  color: var(--text-normal);
+}
+
+.vaultguard-zk-warning strong {
+  color: var(--text-normal);
+}
+
+/* ─── Forgot Password / Reset ────────────────────────────────────────── */
+
+.vaultguard-forgot-link {
+  text-align: right;
+  margin-top: -8px;
+}
+
+.vaultguard-forgot-link a {
+  font-size: 0.82em;
+  color: var(--interactive-accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.vaultguard-forgot-link a:hover {
+  text-decoration: underline;
+}
+
+.vaultguard-reset-success {
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  background-color: rgba(50, 200, 100, 0.12);
+  color: var(--text-normal);
+  border-radius: 6px;
+  border-left: 3px solid var(--color-green, #2ea043);
+  font-size: 0.88em;
+  text-align: left;
+  line-height: 1.4;
+}
+
+.vaultguard-reset-send-row {
+  margin-top: 4px;
+}
+
+.vaultguard-reset-send-row button {
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 0.92em;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: normal;
+}
+
+.vaultguard-reset-confirm-section {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 16px;
+  margin-top: 4px;
+}
+
+@media (max-width: 420px) {
+  .modal.vaultguard-login-modal .modal-content,
+  .vaultguard-login-modal-content {
+    padding: 28px 20px 20px !important;
+  }
+
+  .vaultguard-login-actions {
+    flex-direction: column-reverse;
+  }
+
+  .vaultguard-login-actions button {
+    width: 100%;
+  }
+}
+
+/* ─── Revocation Notice ───────────────────────────────────────────────── */
+
+.vaultguard-revocation-notice {
+  padding: 20px;
+  text-align: center;
+  background-color: rgba(255, 50, 50, 0.08);
+  border: 1px solid rgba(255, 50, 50, 0.2);
+  border-radius: 8px;
+  margin: 16px;
+}
+
+.vaultguard-revocation-notice h3 {
+  color: var(--color-red, #e03e3e);
+  margin-bottom: 8px;
+}
+
+.vaultguard-revocation-notice p {
+  font-size: 0.9em;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+/* ─── Lease Expiry Warning ────────────────────────────────────────────── */
+
+.vaultguard-lease-warning {
+  padding: 8px 12px;
+  background-color: rgba(255, 170, 0, 0.1);
+  border-radius: 6px;
+  font-size: 0.82em;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vaultguard-lease-warning.mod-critical {
+  background-color: rgba(255, 50, 50, 0.1);
+  color: var(--color-red, #e03e3e);
+}
+
+/* ─── Confirmation Dialog ─────────────────────────────────────────────── */
+
+.vaultguard-confirm-input {
+  width: 100%;
+  padding: 8px 12px;
+  margin-top: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.9em;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Read-only banner — shown when the editor is locked because the user has
+   below-WRITE access to the active file.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.vaultguard-readonly-banner {
+  position: relative;
+  z-index: 9;
+  flex-shrink: 0;
+  padding: 6px 14px;
+  font-size: 0.78em;
+  font-weight: 600;
+  color: var(--color-orange);
+  background-color: rgba(var(--color-orange-rgb), 0.10);
+  border-bottom: 1px solid rgba(var(--color-orange-rgb), 0.25);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   No-Access Overlay — covers the editor when the user has zero permission
+   on the open file. The file's content is still in the local cache (so
+   that sync works) but must never be shown to a user who has been denied.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.vaultguard-noaccess-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--background-primary);
+  padding: 24px;
+}
+
+.vaultguard-noaccess-card {
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  padding: 28px 32px;
+  border-radius: 10px;
+  background-color: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+.vaultguard-noaccess-title {
+  font-size: 1.05em;
+  font-weight: 700;
+  color: var(--text-normal);
+}
+
+.vaultguard-noaccess-body {
+  font-size: 0.88em;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.vaultguard-noaccess-close {
+  margin-top: 4px;
+  padding: 6px 14px;
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--text-on-accent);
+  background-color: var(--interactive-accent);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.vaultguard-noaccess-close:hover {
+  background-color: var(--interactive-accent-hover);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   File Permission Header — per-file access bar above the editor
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Header Bar ───────────────────────────────────────────────────────── */
+
+.vaultguard-file-header {
+  position: relative;
+  z-index: 10;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary);
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.vaultguard-fh-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 14px;
+  min-height: 34px;
+}
+
+/* Background-refresh indicator: small spinner that appears beside the
+   header content while a refetch is in flight after stale cached data
+   has already been rendered. */
+.vaultguard-fh-refresh-indicator {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+  margin-right: 4px;
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+.vaultguard-fh-popover-spinner {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  color: var(--text-muted);
+}
+
+/* ─── Permission Level Section ─────────────────────────────────────────── */
+
+.vaultguard-fh-level {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.vaultguard-fh-lock-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+.vaultguard-fh-lock-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.vaultguard-fh-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 0.72em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.vaultguard-fh-badge-loading {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-muted);
+  overflow: hidden;
+  position: relative;
+}
+
+.vaultguard-fh-badge-admin {
+  background-color: rgba(var(--color-purple-rgb), 0.15);
+  color: var(--color-purple);
+}
+
+.vaultguard-fh-badge-write {
+  background-color: rgba(var(--color-blue-rgb), 0.15);
+  color: var(--color-blue);
+}
+
+.vaultguard-fh-badge-read {
+  background-color: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+.vaultguard-fh-badge-none {
+  background-color: rgba(var(--color-red-rgb), 0.15);
+  color: var(--color-red);
+}
+
+/* ─── Skeleton / Shimmer ──────────────────────────────────────────────── */
+
+.vaultguard-fh-shimmer {
+  display: inline-block;
+}
+
+@keyframes vaultguard-shimmer {
+  0%   { opacity: 0.5; }
+  50%  { opacity: 1; }
+  100% { opacity: 0.5; }
+}
+
+.vaultguard-fh-badge-loading .vaultguard-fh-shimmer {
+  animation: vaultguard-shimmer 1.4s ease-in-out infinite;
+}
+
+.vaultguard-fh-chip-skeleton {
+  width: 60px;
+  height: 22px;
+  border-radius: 12px;
+  background-color: var(--background-modifier-hover);
+  animation: vaultguard-shimmer 1.4s ease-in-out infinite;
+}
+
+.vaultguard-fh-chip-skeleton:nth-child(2) {
+  animation-delay: 0.15s;
+  width: 50px;
+}
+
+.vaultguard-fh-chip-skeleton:nth-child(3) {
+  animation-delay: 0.3s;
+  width: 44px;
+}
+
+/* ─── Separator ───────────────────────────────────────────────────────── */
+
+.vaultguard-fh-separator {
+  width: 1px;
+  height: 18px;
+  background-color: var(--background-modifier-border);
+  flex-shrink: 0;
+}
+
+/* ─── Shared Count ────────────────────────────────────────────────────── */
+
+.vaultguard-fh-shared-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.72em;
+  font-weight: 600;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  margin-right: 2px;
+}
+
+.vaultguard-fh-shared-count-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-faint);
+}
+
+.vaultguard-fh-shared-count-icon svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* ─── Access List Section ──────────────────────────────────────────────── */
+
+.vaultguard-fh-access {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vaultguard-fh-no-access {
+  font-size: 0.8em;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.vaultguard-fh-avatar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.vaultguard-fh-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px 2px 4px;
+  border-radius: 12px;
+  font-size: 0.75em;
+  white-space: nowrap;
+  background-color: var(--background-modifier-hover);
+  transition: background-color 0.12s, box-shadow 0.12s, transform 0.12s;
+  max-width: 160px;
+  overflow: hidden;
+  border: 1px solid transparent;
+}
+
+.vaultguard-fh-chip:hover {
+  background-color: var(--background-modifier-border);
+}
+
+.vaultguard-fh-chip-clickable {
+  cursor: pointer;
+}
+
+.vaultguard-fh-chip-clickable:hover {
+  border-color: var(--background-modifier-border-hover, var(--background-modifier-border));
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  transform: translateY(-1px);
+}
+
+.vaultguard-fh-chip-clickable:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+.vaultguard-fh-chip-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.vaultguard-fh-chip-icon svg {
+  width: 12px;
+  height: 12px;
+}
+
+.vaultguard-fh-chip-initials {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-size: 0.7em;
+  font-weight: 700;
+  flex-shrink: 0;
+  line-height: 1;
+  transition: transform 0.12s;
+}
+
+/* Level-colored avatar initials */
+.vaultguard-fh-initials-admin {
+  background-color: var(--color-purple);
+  color: #fff;
+}
+
+.vaultguard-fh-initials-write {
+  background-color: var(--color-blue);
+  color: #fff;
+}
+
+.vaultguard-fh-initials-read {
+  background-color: var(--color-green);
+  color: #fff;
+}
+
+.vaultguard-fh-initials-none {
+  background-color: var(--text-faint);
+  color: #fff;
+}
+
+.vaultguard-fh-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-normal);
+}
+
+.vaultguard-fh-chip-level {
+  font-size: 0.85em;
+  font-weight: 600;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.vaultguard-fh-dot-admin { color: var(--color-purple); }
+.vaultguard-fh-dot-write { color: var(--color-blue); }
+.vaultguard-fh-dot-read  { color: var(--color-green); }
+.vaultguard-fh-dot-none  { color: var(--color-red); }
+
+.vaultguard-fh-overflow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72em;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background-color: var(--background-modifier-hover);
+  cursor: pointer;
+  transition: background-color 0.12s, color 0.12s;
+}
+
+.vaultguard-fh-overflow:hover {
+  background-color: var(--background-modifier-border);
+  color: var(--text-normal);
+}
+
+/* ─── Action Buttons ───────────────────────────────────────────────────── */
+
+.vaultguard-fh-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.vaultguard-fh-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-muted);
+  font-size: 0.78em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background-color 0.12s;
+  white-space: nowrap;
+}
+
+.vaultguard-fh-btn:hover {
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-fh-btn-manage:hover {
+  color: var(--interactive-accent);
+}
+
+.vaultguard-fh-btn-icon {
+  display: flex;
+  align-items: center;
+}
+
+.vaultguard-fh-btn-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* ─── User Popover ────────────────────────────────────────────────────── */
+
+.vaultguard-fh-popover-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 998;
+}
+
+.vaultguard-fh-popover {
+  position: fixed;
+  z-index: 999;
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.08);
+  overflow: hidden;
+  animation: vaultguard-popover-in 0.15s ease-out;
+}
+
+@keyframes vaultguard-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.vaultguard-fh-popover-inner {
+  padding: 14px;
+}
+
+.vaultguard-fh-popover-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.vaultguard-fh-popover-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.82em;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+  background-color: var(--interactive-accent);
+}
+
+.vaultguard-fh-popover-name-col {
+  flex: 1;
+  min-width: 0;
+}
+
+.vaultguard-fh-popover-name {
+  font-size: 0.9em;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-normal);
+}
+
+.vaultguard-fh-popover-email {
+  font-size: 0.76em;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-fh-popover-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 0;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-fh-popover-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vaultguard-fh-popover-label {
+  font-size: 0.78em;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.vaultguard-fh-popover-value {
+  font-size: 0.78em;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+
+.vaultguard-fh-popover-status {
+  font-size: 0.72em;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.vaultguard-fh-popover-status-active {
+  background-color: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+.vaultguard-fh-popover-status-pending {
+  background-color: rgba(var(--color-yellow-rgb), 0.15);
+  color: var(--color-yellow);
+}
+
+.vaultguard-fh-popover-status-suspended {
+  background-color: rgba(var(--color-orange-rgb), 0.15);
+  color: var(--color-orange);
+}
+
+.vaultguard-fh-popover-status-revoked {
+  background-color: rgba(var(--color-red-rgb), 0.15);
+  color: var(--color-red);
+}
+
+.vaultguard-fh-popover-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-fh-popover-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: 0.78em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background-color 0.12s;
+}
+
+.vaultguard-fh-popover-btn:hover {
+  color: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  background-color: var(--background-modifier-hover);
+}
+
+/* ─── Inline Edit Name Form ───────────────────────────────────────────── */
+
+.vaultguard-fh-popover-edit-form {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.vaultguard-fh-popover-edit-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.82em;
+}
+
+.vaultguard-fh-popover-edit-input:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.vaultguard-fh-popover-edit-save {
+  padding: 4px 10px;
+  border: none;
+  border-radius: 4px;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-size: 0.78em;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.12s;
+}
+
+.vaultguard-fh-popover-edit-save:hover {
+  opacity: 0.85;
+}
+
+.vaultguard-fh-popover-edit-save:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ─── Popover Level Select ────────────────────────────────────────────── */
+
+.vaultguard-fh-popover-level-select {
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.78em;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.12s;
+}
+
+.vaultguard-fh-popover-level-select:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.vaultguard-fh-popover-level-select:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   File Permission Panel — dropdown for managing per-file access
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Backdrop ─────────────────────────────────────────────────────────── */
+
+.vaultguard-fp-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+}
+
+/* ─── Panel Container ──────────────────────────────────────────────────── */
+
+.vaultguard-fp-panel {
+  position: fixed;
+  z-index: 1000;
+  width: 380px;
+  max-width: 95vw;
+  max-height: 420px;
+  overflow-y: auto;
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.08);
+  padding: 0;
+}
+
+/* Scrollbar */
+.vaultguard-fp-panel::-webkit-scrollbar { width: 5px; }
+.vaultguard-fp-panel::-webkit-scrollbar-thumb {
+  background-color: var(--background-modifier-border);
+  border-radius: 3px;
+}
+
+/* ─── Panel Header ─────────────────────────────────────────────────────── */
+
+.vaultguard-fp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px 8px;
+  position: sticky;
+  top: 0;
+  background-color: var(--background-primary);
+  z-index: 1;
+}
+
+.vaultguard-fp-header h4 {
+  margin: 0;
+  font-size: 0.95em;
+  font-weight: 700;
+}
+
+.vaultguard-fp-filepath {
+  padding: 0 14px 8px;
+  font-family: var(--font-monospace);
+  font-size: 0.78em;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-fp-divider {
+  margin: 0;
+  border: none;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+/* ─── Rule List ────────────────────────────────────────────────────────── */
+
+.vaultguard-fp-list {
+  padding: 4px 0;
+}
+
+.vaultguard-fp-empty {
+  padding: 20px 14px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.84em;
+  line-height: 1.5;
+}
+
+.vaultguard-fp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  transition: background-color 0.1s;
+}
+
+.vaultguard-fp-row:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+/* Avatar */
+.vaultguard-fp-row-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background-color: var(--background-modifier-hover);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.vaultguard-fp-row-avatar svg {
+  width: 14px;
+  height: 14px;
+}
+
+.vaultguard-fp-row-initials {
+  font-size: 0.72em;
+  font-weight: 700;
+  color: var(--text-normal);
+}
+
+/* Info */
+.vaultguard-fp-row-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.vaultguard-fp-row-name {
+  font-size: 0.88em;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-fp-row-meta {
+  font-size: 0.75em;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Level controls */
+.vaultguard-fp-row-level {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.vaultguard-fp-level-select {
+  padding: 3px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.78em;
+  cursor: pointer;
+}
+
+.vaultguard-fp-level-select:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.vaultguard-fp-row-level .vaultguard-icon-btn {
+  padding: 3px;
+}
+
+.vaultguard-fp-row-level .vaultguard-icon-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* ─── Add Rule Section ─────────────────────────────────────────────────── */
+
+.vaultguard-fp-add {
+  padding: 10px 14px 14px;
+}
+
+.vaultguard-fp-add-title {
+  font-size: 0.8em;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 8px;
+}
+
+.vaultguard-fp-add-form {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.vaultguard-fp-add-input {
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.82em;
+}
+
+.vaultguard-fp-add-input:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.vaultguard-fp-add-principal {
+  flex: 1;
+  min-width: 100px;
+}
+
+.vaultguard-fp-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--interactive-accent);
+  border-radius: 6px;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  cursor: pointer;
+  transition: opacity 0.12s;
+  flex-shrink: 0;
+}
+
+.vaultguard-fp-add-btn:hover {
+  opacity: 0.85;
+}
+
+.vaultguard-fp-add-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.vaultguard-fp-add-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* ─── Shared Access Picker ─────────────────────────────────────────────── */
+
+.vaultguard-access-picker {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: 12px;
+  background-color: var(--background-secondary-alt);
+}
+
+.vaultguard-access-picker-note {
+  margin: 0 0 10px;
+  padding: 0 2px;
+  font-size: 0.76em;
+  color: var(--text-muted);
+}
+
+.vaultguard-access-picker-state {
+  padding: 10px 12px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 10px;
+  background-color: var(--background-primary);
+  color: var(--text-muted);
+  font-size: 0.78em;
+  line-height: 1.45;
+}
+
+.vaultguard-access-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 210px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.vaultguard-access-picker-item {
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 52px;
+  margin: 0;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+  text-align: left;
+  font: inherit;
+  line-height: 1.2;
+  vertical-align: top;
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.12s, background-color 0.12s, transform 0.12s;
+}
+
+.vaultguard-access-picker-item:hover:not(:disabled) {
+  border-color: var(--interactive-accent);
+  background-color: var(--background-modifier-hover);
+  transform: translateY(-1px);
+}
+
+.vaultguard-access-picker-item.is-selected {
+  border-color: var(--interactive-accent);
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-access-picker-item.is-disabled,
+.vaultguard-access-picker-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.75;
+}
+
+.vaultguard-access-picker-avatar {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  max-width: 28px;
+  max-height: 28px;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+  background-color: var(--background-modifier-hover);
+  box-sizing: border-box;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  align-self: center;
+  flex-shrink: 0;
+  font-size: 0.68em;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--text-normal);
+}
+
+.vaultguard-access-picker-avatar span {
+  display: block;
+  line-height: 1;
+}
+
+.vaultguard-access-picker-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.vaultguard-access-picker-name {
+  font-size: 0.86em;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-access-picker-meta {
+  font-size: 0.74em;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-access-picker-pill {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background-color: var(--background-modifier-hover);
+  color: var(--text-muted);
+  font-size: 0.72em;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.vaultguard-access-picker-pill-level-admin {
+  background-color: rgba(var(--color-purple-rgb), 0.15);
+  color: var(--color-purple);
+}
+
+.vaultguard-access-picker-pill-level-write {
+  background-color: rgba(var(--color-blue-rgb), 0.15);
+  color: var(--color-blue);
+}
+
+.vaultguard-access-picker-pill-level-read {
+  background-color: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+.vaultguard-access-picker-pill-level-none {
+  background-color: rgba(var(--color-red-rgb), 0.15);
+  color: var(--color-red);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Path Permissions Modal — right-click context menu modal
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.modal.vaultguard-path-perms-modal {
+  width: 480px !important;
+  max-width: 92vw !important;
+  max-height: 80vh;
+  padding: 0 !important;
+}
+
+.modal.vaultguard-path-perms-modal .modal-content,
+.vaultguard-path-perms-content {
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box;
+  margin: 0 !important;
+  padding: 20px 24px 16px !important;
+  overflow-y: auto;
+}
+
+/* ─── Header ───────────────────────────────────────────────────────────── */
+
+.vaultguard-pp-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.vaultguard-pp-header-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.vaultguard-pp-header-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.vaultguard-pp-header-text {
+  min-width: 0;
+}
+
+.vaultguard-pp-header-text h3 {
+  margin: 0 0 2px;
+  font-size: 1.1em;
+  font-weight: 700;
+}
+
+.vaultguard-pp-path {
+  font-family: var(--font-monospace);
+  font-size: 0.82em;
+  color: var(--text-faint);
+  word-break: break-all;
+  line-height: 1.3;
+}
+
+/* ─── My Access ────────────────────────────────────────────────────────── */
+
+.vaultguard-pp-my-access {
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  border-radius: 8px;
+  background-color: var(--background-secondary);
+}
+
+.vaultguard-pp-my-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vaultguard-pp-my-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+.vaultguard-pp-my-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.vaultguard-pp-my-label {
+  font-size: 0.88em;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+/* ─── Sections ─────────────────────────────────────────────────────────── */
+
+.vaultguard-pp-section {
+  margin-bottom: 12px;
+}
+
+.vaultguard-pp-section-title {
+  font-size: 0.78em;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+/* ─── Rule List ────────────────────────────────────────────────────────── */
+
+.vaultguard-pp-list {
+  margin-bottom: 4px;
+}
+
+.vaultguard-pp-empty {
+  padding: 16px 0;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.84em;
+  line-height: 1.5;
+}
+
+.vaultguard-pp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 4px;
+  border-radius: 4px;
+  transition: background-color 0.1s;
+}
+
+.vaultguard-pp-row:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+/* Avatar */
+.vaultguard-pp-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background-color: var(--background-modifier-hover);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.vaultguard-pp-avatar svg {
+  width: 14px;
+  height: 14px;
+}
+
+.vaultguard-pp-initials {
+  font-size: 0.72em;
+  font-weight: 700;
+  color: var(--text-normal);
+}
+
+/* Info */
+.vaultguard-pp-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.vaultguard-pp-name {
+  font-size: 0.88em;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-pp-meta {
+  font-size: 0.75em;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Level */
+.vaultguard-pp-level {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.vaultguard-pp-select {
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.8em;
+  cursor: pointer;
+}
+
+.vaultguard-pp-select:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.vaultguard-pp-level .vaultguard-icon-btn {
+  padding: 3px;
+}
+
+.vaultguard-pp-level .vaultguard-icon-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* ─── Add Form ─────────────────────────────────────────────────────────── */
+
+.vaultguard-pp-add-form {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.vaultguard-pp-input {
+  padding: 5px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.84em;
+}
+
+.vaultguard-pp-input:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.vaultguard-pp-input-principal {
+  flex: 1;
+  min-width: 100px;
+}
+
+/* ─── Advanced Link ────────────────────────────────────────────────────── */
+
+.vaultguard-pp-advanced {
+  padding-top: 4px;
+}
+
+.vaultguard-pp-advanced-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.78em;
+  cursor: pointer;
+  padding: 2px 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.vaultguard-pp-advanced-btn:hover {
+  color: var(--interactive-accent);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   File Explorer Decorations — badges, dots, and avatar stacks
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Decoration Container ────────────────────────────────────────────── */
+
+.vaultguard-fe-decoration {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding-left: 6px;
+  flex-shrink: 0;
+  pointer-events: auto;
+}
+
+/* Make nav items flex so decoration pushes to the right */
+.nav-file-title,
+.nav-folder-title {
+  display: flex;
+  align-items: center;
+}
+
+.nav-file-title .nav-file-title-content,
+.nav-folder-title .nav-folder-title-content,
+.nav-file-title .tree-item-inner,
+.nav-folder-title .tree-item-inner {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Permission Level Dot ────────────────────────────────────────────── */
+
+.vaultguard-fe-level-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-block;
+}
+
+.vaultguard-fe-dot-admin {
+  background-color: var(--color-purple);
+  box-shadow: 0 0 3px var(--color-purple);
+}
+
+.vaultguard-fe-dot-write {
+  background-color: var(--color-blue);
+  box-shadow: 0 0 3px var(--color-blue);
+}
+
+.vaultguard-fe-dot-read {
+  background-color: var(--color-green);
+  box-shadow: 0 0 3px var(--color-green);
+}
+
+.vaultguard-fe-dot-none {
+  background-color: var(--color-red);
+  box-shadow: 0 0 3px var(--color-red);
+}
+
+/* ─── Sharing Indicator ───────────────────────────────────────────────── */
+
+.vaultguard-fe-share-indicator {
+  display: inline-flex;
+  align-items: center;
+}
+
+.vaultguard-fe-avatar-stack {
+  display: inline-flex;
+  align-items: center;
+  flex-direction: row-reverse;
+}
+
+.vaultguard-fe-mini-avatar {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 7px;
+  font-weight: 700;
+  color: var(--text-on-accent);
+  margin-left: -4px;
+  border: 1.5px solid var(--background-primary);
+  flex-shrink: 0;
+  line-height: 1;
+  overflow: hidden;
+}
+
+.vaultguard-fe-mini-avatar:last-child {
+  margin-left: 0;
+}
+
+.vaultguard-fe-mini-avatar svg {
+  width: 9px;
+  height: 9px;
+}
+
+.vaultguard-fe-avatar-admin {
+  background-color: var(--color-purple);
+}
+
+.vaultguard-fe-avatar-write {
+  background-color: var(--color-blue);
+}
+
+.vaultguard-fe-avatar-read {
+  background-color: var(--color-green);
+}
+
+.vaultguard-fe-avatar-none {
+  background-color: var(--text-faint);
+}
+
+/* Files and folders the current user has no permission on are hidden
+   from the explorer entirely. Folders are only hidden when no descendant
+   grants access — otherwise we'd hide a folder containing accessible
+   children. The class is applied to .nav-file-title / .nav-folder-title;
+   hide the matching wrapper so the row collapses cleanly. */
+.nav-file:has(.nav-file-title.vaultguard-fe-hidden),
+.nav-file-title.vaultguard-fe-hidden,
+.nav-folder:has(> .nav-folder-title.vaultguard-fe-hidden),
+.nav-folder-title.vaultguard-fe-hidden {
+  display: none !important;
+}
+
+.vaultguard-fe-avatar-overflow {
+  font-size: 8px;
+  color: var(--text-muted);
+  margin-left: 2px;
+  white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   VaultGuard Sidebar View — detailed permission panel
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Container ───────────────────────────────────────────────────────── */
+
+.vaultguard-sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* ─── Header ──────────────────────────────────────────────────────────── */
+
+.vaultguard-sb-header {
+  padding: 12px 12px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex-shrink: 0;
+}
+
+.vaultguard-sb-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.vaultguard-sb-title-icon {
+  display: flex;
+  align-items: center;
+  color: var(--interactive-accent);
+}
+
+.vaultguard-sb-title-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.vaultguard-sb-title-text {
+  font-size: 1em;
+  font-weight: 700;
+  flex: 1;
+}
+
+.vaultguard-sb-menu-btn,
+.vaultguard-sb-refresh-btn {
+  color: var(--text-muted);
+}
+
+.vaultguard-sb-menu-btn:hover,
+.vaultguard-sb-refresh-btn:hover {
+  color: var(--text-normal);
+}
+
+/* ─── Search ──────────────────────────────────────────────────────────── */
+
+.vaultguard-sb-search-row {
+  margin-bottom: 8px;
+}
+
+.vaultguard-sb-search-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background-color: var(--background-primary);
+  transition: border-color 0.1s ease, box-shadow 0.1s ease;
+  box-sizing: border-box;
+}
+
+.vaultguard-sb-search-wrap:focus-within {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px rgba(var(--interactive-accent-rgb), 0.12);
+}
+
+.vaultguard-sb-search-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-faint);
+  padding-left: 8px;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+.vaultguard-sb-search-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.vaultguard-sb-search {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 6px 6px 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-normal);
+  font-size: 0.85em;
+  outline: none;
+  box-shadow: none;
+  box-sizing: border-box;
+}
+
+.vaultguard-sb-search:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.vaultguard-sb-search::placeholder {
+  color: var(--text-faint);
+}
+
+.vaultguard-sb-search-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 4px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+  flex-shrink: 0;
+  box-shadow: none;
+}
+
+.vaultguard-sb-search-clear:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.vaultguard-sb-search-clear svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* ─── Filters ─────────────────────────────────────────────────────────── */
+
+.vaultguard-sb-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.vaultguard-sb-filter-row:last-child {
+  margin-bottom: 0;
+}
+
+.vaultguard-sb-filter-select {
+  padding: 4px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.8em;
+  cursor: pointer;
+  flex: 1;
+  min-width: 0;
+  max-width: 50%;
+}
+
+.vaultguard-sb-filter-select:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.vaultguard-sb-filter-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8em;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.vaultguard-sb-filter-toggle input[type="checkbox"] {
+  margin: 0;
+}
+
+/* ─── Active filter chips ─────────────────────────────────────────────── */
+
+.vaultguard-sb-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.vaultguard-sb-chips:empty {
+  display: none;
+}
+
+.vaultguard-sb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px 2px 8px;
+  background-color: rgba(var(--interactive-accent-rgb), 0.12);
+  color: var(--interactive-accent);
+  border-radius: 10px;
+  font-size: 0.72em;
+  font-weight: 500;
+  max-width: 100%;
+}
+
+.vaultguard-sb-chip-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.vaultguard-sb-chip-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+  box-shadow: none;
+}
+
+.vaultguard-sb-chip-clear:hover {
+  background-color: rgba(var(--interactive-accent-rgb), 0.2);
+  opacity: 1;
+}
+
+.vaultguard-sb-chip-clear svg {
+  width: 10px;
+  height: 10px;
+}
+
+.vaultguard-sb-chip-clear-all {
+  align-self: center;
+  margin-left: auto;
+  padding: 2px 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.72em;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: 10px;
+  box-shadow: none;
+}
+
+.vaultguard-sb-chip-clear-all:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+/* ─── Search-term highlighting in entries ─────────────────────────────── */
+
+.vaultguard-sb-match {
+  background-color: rgba(var(--interactive-accent-rgb), 0.22);
+  color: var(--text-normal);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* ─── Empty-state action ──────────────────────────────────────────────── */
+
+.vaultguard-sb-empty-action {
+  margin-top: 12px;
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  color: var(--text-normal);
+  font-size: 0.8em;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.vaultguard-sb-empty-action:hover {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+
+/* ─── Entry List ──────────────────────────────────────────────────────── */
+
+.vaultguard-sb-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.vaultguard-sb-list::-webkit-scrollbar {
+  width: 5px;
+}
+
+.vaultguard-sb-list::-webkit-scrollbar-thumb {
+  background-color: var(--background-modifier-border);
+  border-radius: 3px;
+}
+
+/* ─── Summary Bar ─────────────────────────────────────────────────────── */
+
+.vaultguard-sb-summary {
+  display: flex;
+  gap: 12px;
+  padding: 8px 12px;
+  font-size: 0.78em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-sb-summary-shared {
+  color: var(--color-blue);
+}
+
+/* ─── Loading / Empty ─────────────────────────────────────────────────── */
+
+.vaultguard-sb-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 16px;
+  color: var(--text-muted);
+  font-size: 0.88em;
+}
+
+.vaultguard-sb-spinner svg {
+  width: 16px;
+  height: 16px;
+  animation: vaultguard-spin 1s linear infinite;
+}
+
+/* Inline spinner inside a button keeps the text baseline aligned. */
+.vaultguard-btn-spinner {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.vaultguard-btn-spinner svg {
+  width: 14px;
+  height: 14px;
+}
+
+button .vaultguard-btn-spinner:only-child {
+  margin-right: 0;
+}
+
+@keyframes vaultguard-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.vaultguard-sb-empty {
+  text-align: center;
+  padding: 32px 16px;
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+.vaultguard-sb-empty-icon {
+  margin-bottom: 12px;
+  color: var(--text-faint);
+}
+
+.vaultguard-sb-empty-icon svg {
+  width: 32px;
+  height: 32px;
+}
+
+.vaultguard-sb-empty-hint {
+  font-size: 0.78em;
+  color: var(--text-faint);
+  margin-top: 8px;
+}
+
+/* ─── File Entry ──────────────────────────────────────────────────────── */
+
+.vaultguard-sb-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background-color 0.1s;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-sb-entry:last-child {
+  border-bottom: none;
+}
+
+.vaultguard-sb-entry:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-sb-entry-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.vaultguard-sb-entry-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.vaultguard-sb-entry-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.vaultguard-sb-entry-info {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.vaultguard-sb-entry-name {
+  font-size: 0.88em;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vaultguard-sb-entry-path {
+  font-size: 0.72em;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-monospace);
+}
+
+/* ─── Entry Right Side ────────────────────────────────────────────────── */
+
+.vaultguard-sb-entry-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ─── Permission Badge ────────────────────────────────────────────────── */
+
+.vaultguard-sb-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 0.65em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.vaultguard-sb-badge-admin {
+  background-color: rgba(var(--color-purple-rgb), 0.15);
+  color: var(--color-purple);
+}
+
+.vaultguard-sb-badge-write {
+  background-color: rgba(var(--color-blue-rgb), 0.15);
+  color: var(--color-blue);
+}
+
+.vaultguard-sb-badge-read {
+  background-color: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+.vaultguard-sb-badge-none {
+  background-color: rgba(var(--color-red-rgb), 0.15);
+  color: var(--color-red);
+}
+
+/* ─── Avatar Stack ────────────────────────────────────────────────────── */
+
+.vaultguard-sb-avatars {
+  display: flex;
+  align-items: center;
+  flex-direction: row-reverse;
+}
+
+.vaultguard-sb-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 8px;
+  font-weight: 700;
+  color: var(--text-on-accent);
+  margin-left: -5px;
+  border: 2px solid var(--background-primary);
+  flex-shrink: 0;
+  line-height: 1;
+  overflow: hidden;
+}
+
+.vaultguard-sb-avatar:last-child {
+  margin-left: 0;
+}
+
+.vaultguard-sb-avatar svg {
+  width: 10px;
+  height: 10px;
+}
+
+.vaultguard-sb-avatar-admin {
+  background-color: var(--color-purple);
+}
+
+.vaultguard-sb-avatar-write {
+  background-color: var(--color-blue);
+}
+
+.vaultguard-sb-avatar-read {
+  background-color: var(--color-green);
+}
+
+.vaultguard-sb-avatar-none {
+  background-color: var(--text-faint);
+}
+
+.vaultguard-sb-avatar-overflow {
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-left: 3px;
+  white-space: nowrap;
+}
+
+/* ─── Plugin allowlist consent modal ─────────────────────────────────── */
+
+.vaultguard-plugin-allowlist-modal .modal {
+  max-width: 540px;
+}
+
+.vaultguard-allowlist-meta {
+  margin: 12px 0;
+  padding: 10px 12px;
+  background-color: var(--background-secondary);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.vaultguard-allowlist-row {
+  display: flex;
+  gap: 6px;
+  margin: 2px 0;
+}
+
+.vaultguard-allowlist-row strong {
+  min-width: 90px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.vaultguard-allowlist-status {
+  margin: 12px 0;
+  padding: 10px 12px;
+  background-color: var(--background-modifier-form-field);
+  border-left: 3px solid var(--text-accent);
+  border-radius: 0 6px 6px 0;
+  font-size: 13px;
+}
+
+.vaultguard-allowlist-status details {
+  margin-top: 8px;
+}
+
+.vaultguard-allowlist-status code,
+.vaultguard-allowlist-status p {
+  word-break: break-all;
+  font-size: 11px;
+  font-family: var(--font-monospace);
+}
+
+.vaultguard-allowlist-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* ── At-rest encryption ─────────────────────────────────────────────── */
+
+.vaultguard-at-rest-panel {
+  margin: 10px 0 20px;
+  padding: 14px 16px 4px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+}
+
+.vaultguard-at-rest-status {
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-left-width: 3px;
+}
+
+.vaultguard-at-rest-status-unlocked {
+  color: var(--text-muted);
+  background: var(--background-primary);
+  border-left-color: var(--color-green, var(--text-success));
+}
+
+.vaultguard-at-rest-status-warning {
+  color: var(--text-muted);
+  background: var(--background-primary);
+  border-left-color: var(--text-warning);
+}
+
+.vaultguard-at-rest-status-needs-recovery,
+.vaultguard-at-rest-status-disabled {
+  color: var(--text-error);
+  background: var(--background-modifier-error);
+  border-left-color: var(--text-error);
+}
+
+.vaultguard-at-rest-status-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  margin-bottom: 3px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--background-secondary);
+  font-weight: 700;
+  color: var(--text-normal);
+}
+
+.vaultguard-at-rest-status-title::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--text-muted);
+  flex: 0 0 auto;
+}
+
+.vaultguard-at-rest-status-unlocked .vaultguard-at-rest-status-title {
+  color: var(--text-success);
+}
+
+.vaultguard-at-rest-status-unlocked .vaultguard-at-rest-status-title::before {
+  background: var(--color-green, var(--text-success));
+}
+
+.vaultguard-at-rest-status-warning .vaultguard-at-rest-status-title {
+  color: var(--text-warning);
+}
+
+.vaultguard-at-rest-status-warning .vaultguard-at-rest-status-title::before {
+  background: var(--text-warning);
+}
+
+.vaultguard-at-rest-status-body {
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+
+.vaultguard-at-rest-tally {
+  margin: 0 0 4px;
+  padding: 8px 12px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font-monospace);
+}
+
+.vaultguard-at-rest-tally-warning {
+  margin-top: 4px;
+  color: var(--text-warning);
+  white-space: normal;
+}
+
+.vaultguard-at-rest-tally-error {
+  color: var(--text-error);
+}
+
+.vaultguard-at-rest-action {
+  padding: 12px 0;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-at-rest-action:last-child {
+  padding-bottom: 0;
+}
+
+.vaultguard-at-rest-action .setting-item-control {
+  justify-content: flex-end;
+}
+
+.vaultguard-recovery-code {
+  margin: 16px 0;
+  padding: 16px 18px;
+  border-radius: 8px;
+  background: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+  font-family: var(--font-monospace);
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  word-break: break-all;
+  white-space: pre-wrap;
+  user-select: all;
+  -webkit-user-select: all;
+  line-height: 1.7;
+}
+
+.vaultguard-agent-bridge-connection {
+  margin: 12px 0;
+  padding: 12px 14px;
+  max-height: 240px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  user-select: all;
+  -webkit-user-select: all;
+}
+
+.vaultguard-agent-bridge-block {
+  margin: 18px 0 4px;
+  padding-top: 14px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-agent-bridge-block:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.vaultguard-agent-bridge-block h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.vaultguard-agent-bridge-server,
+.vaultguard-agent-bridge-reveal,
+.vaultguard-agent-bridge-lease {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.vaultguard-agent-bridge-inline-actions,
+.vaultguard-agent-bridge-lease .vaultguard-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.vaultguard-agent-bridge-lease-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vaultguard-agent-bridge-lease-badge {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.vaultguard-agent-bridge-lease-details {
+  display: grid;
+  grid-template-columns: minmax(80px, max-content) minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+
+.vaultguard-agent-bridge-lease-details dt {
+  color: var(--text-muted);
+}
+
+.vaultguard-agent-bridge-lease-details dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.vaultguard-agent-bridge-copy-block {
+  margin-top: 12px;
+}
+
+.vaultguard-agent-bridge-copy-block h4 {
+  margin: 0 0 4px;
+  font-size: 13px;
+}
+
+.vaultguard-modal-hint {
+  margin: 6px 0 0;
+  padding: 0 4px;
+  font-size: 12px;
+  min-height: 16px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.vaultguard-modal-hint-error {
+  color: var(--text-error);
+}
+
+.vaultguard-modal-hint-warning {
+  color: var(--text-warning, var(--color-yellow, #b48a00));
+}
+
+.vaultguard-modal-hint-ok {
+  color: var(--text-muted);
+}
+
+.vaultguard-recovery-code-input {
+  width: 100%;
+  margin: 12px 0;
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-modifier-form-field);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: 13px;
+  resize: vertical;
+  min-height: 90px;
+}
+
+.modal.vaultguard-at-rest-recovery-modal .vaultguard-modal-warning,
+.modal.vaultguard-at-rest-restore-modal .vaultguard-modal-warning {
+  margin: 12px 0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: var(--background-modifier-error-hover);
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 1.5;
+  border-left: 3px solid var(--text-error);
+}
+
+.modal.vaultguard-at-rest-recovery-modal .vaultguard-modal-warning strong,
+.modal.vaultguard-at-rest-restore-modal .vaultguard-modal-warning strong {
+  color: var(--text-error);
+}
+
+.modal.vaultguard-at-rest-recovery-modal .vaultguard-modal-actions,
+.modal.vaultguard-at-rest-restore-modal .vaultguard-modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
+.modal.vaultguard-at-rest-recovery-modal .vaultguard-modal-status,
+.modal.vaultguard-at-rest-restore-modal .vaultguard-modal-status {
+  min-height: 18px;
+  margin: 8px 0;
+  font-size: 12px;
+  color: var(--text-error);
+}
+
+.modal.vaultguard-at-rest-recovery-modal .vaultguard-modal-description,
+.modal.vaultguard-at-rest-restore-modal .vaultguard-modal-description {
+  margin: 6px 0 14px;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.modal.vaultguard-at-rest-recovery-modal,
+.modal.vaultguard-at-rest-restore-modal {
+  width: 560px !important;
+  max-width: calc(100vw - 32px) !important;
+}
+
+.modal.vaultguard-at-rest-recovery-modal .modal-content,
+.modal.vaultguard-at-rest-restore-modal .modal-content {
+  padding: 24px !important;
+  overflow-x: hidden;
+}
+
+@media (max-width: 640px) {
+  .vaultguard-at-rest-panel {
+    padding: 12px 12px 2px;
+  }
+
+  .vaultguard-at-rest-action {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .vaultguard-at-rest-action .setting-item-info,
+  .vaultguard-at-rest-action .setting-item-control {
+    width: 100%;
+  }
+
+  .vaultguard-at-rest-action .setting-item-control {
+    margin-top: 10px;
+    margin-left: 0;
+  }
+
+  .vaultguard-at-rest-action button {
+    width: 100%;
+  }
+}
+
+.vaultguard-confirm-password-input {
+  width: 100%;
+  margin: 8px 0 4px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-modifier-form-field);
+  color: var(--text-normal);
+  font-size: 14px;
+}
+
+.vaultguard-at-rest-confirm-modal .modal {
+  max-width: 460px;
+}
+
+/* Plugin allowlist display */
+.vaultguard-allowlist-display {
+  font-size: 13px;
+  margin-top: 0;
+}
+
+.vaultguard-allowlist-hash-pin {
+  color: var(--text-success);
+  font-size: 12px;
+}
+
+/* Inline status message under settings actions */
+.vaultguard-status-msg {
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.vaultguard-status-msg.is-error {
+  background: var(--background-modifier-error);
+  color: var(--text-error);
+}
+
+.vaultguard-status-msg.is-success {
+  background: var(--background-modifier-success);
+  color: var(--text-success);
+}
+
+/* Inline-save button next to a settings text input */
+.vaultguard-inline-save-btn {
+  margin-left: 8px;
+}
+
+/* Wider monospace textareas for path lists, etc. */
+.vaultguard-mono-textarea {
+  width: 100%;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+}
+
+/* Notice (toast) action links */
+.vaultguard-notice-link {
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.vaultguard-notice-dismiss {
+  cursor: pointer;
+  opacity: 0.7;
+}

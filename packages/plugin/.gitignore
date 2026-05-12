@@ -1,0 +1,46 @@
+# Build artifacts
+main.js
+*.js.map
+dist/
+.build/
+
+# Dependencies
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Obsidian plugin dev
+data.json
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/*.tfstate.*.backup
+terraform/.terraform.tfstate.lock.info
+terraform/*.tfplan
+terraform/**/.terraform/
+terraform/**/.build/
+terraform/modules/lambda/.build/
+terraform/environments/*.tfvars
+
+infrastructure/node_modules/
+
+# Environment secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Cache
+.vaultguard-cache/

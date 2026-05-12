@@ -1,0 +1,29 @@
+{
+  "name": "vaultguard-infrastructure",
+  "version": "1.0.0",
+  "description": "VaultGuard Server (Community Edition) — Lambda source.",
+  "scripts": {
+    "build": "tsc && node build-lambdas.mjs",
+    "build:lambdas": "node build-lambdas.mjs",
+    "watch": "tsc -w",
+    "test-emails": "npx esbuild --bundle send-test-emails.ts --platform=node --format=cjs --packages=external --outfile=dist/test-emails.cjs && node dist/test-emails.cjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.1032.0",
+    "@aws-sdk/client-dynamodb": "^3.500.0",
+    "@aws-sdk/client-eventbridge": "^3.1033.0",
+    "@aws-sdk/client-kms": "^3.500.0",
+    "@aws-sdk/client-s3": "^3.500.0",
+    "@aws-sdk/client-secrets-manager": "^3.500.0",
+    "@aws-sdk/client-ses": "^3.1033.0",
+    "@aws-sdk/lib-dynamodb": "^3.500.0",
+    "aws-jwt-verify": "^4.0.0",
+    "source-map-support": "^0.5.21"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.131",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.28.0",
+    "typescript": "~5.4.0"
+  }
+}

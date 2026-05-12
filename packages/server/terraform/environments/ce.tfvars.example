@@ -1,0 +1,25 @@
+# VaultGuard Server (Community Edition) — example tfvars.
+#
+# Copy this to environments/ce.tfvars (or your stage name) and fill in the
+# values for your AWS deployment. See README.md for the full guide.
+
+stage         = "dev"
+domain_name   = ""              # Optional: "vaultguard.example.com" for custom domain
+admin_email   = "you@example.com"
+sender_email  = "no-reply@example.com"
+sender_domain = "example.com"
+
+# Cognito OAuth callback URLs — point at your client app(s).
+cognito_callback_urls = ["http://localhost:5173"]
+cognito_logout_urls   = ["http://localhost:5173"]
+
+# Lease + session knobs (defaults are sensible).
+key_lease_duration_seconds = 14400  # 4 hours
+session_duration_seconds   = 28800  # 8 hours
+max_file_size_bytes        = 26214400  # 25 MiB
+vaultguard_edition              = "community"
+vaultguard_allow_public_signup  = false
+
+# Optional Google Workspace verification — leave blank if not using.
+google_workspace_verification_token = ""
+google_workspace_dkim_value         = ""

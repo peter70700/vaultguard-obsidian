@@ -1,0 +1,9 @@
+{
+  "id": "vaultguard",
+  "name": "VaultGuard",
+  "version": "0.1.5",
+  "minAppVersion": "1.4.0",
+  "description": "Enterprise vault security with permission-aware encrypted cloud sync. Replaces standard file sync with a system that enforces per-file permissions, end-to-end encryption, and full audit logging through an AWS backend.",
+  "author": "Dropie.io",
+  "isDesktopOnly": false
+}
