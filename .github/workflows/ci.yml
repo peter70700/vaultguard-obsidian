@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install workspace dependencies
+        run: npm install
+
+      - name: Lint (Biome)
+        run: npx biome check .
+
+      - name: Typecheck (plugin)
+        run: npx tsc -p packages/plugin/tsconfig.json --noEmit
+
+      - name: Typecheck (server)
+        run: npx tsc -p packages/server/infrastructure/tsconfig.json --noEmit
+
+      - name: Test (Vitest)
+        run: npm run -w vaultguard test

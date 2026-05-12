@@ -1,0 +1,85 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.0.0/schema.json",
+  "files": {
+    "includes": [
+      "**",
+      "!node_modules",
+      "!**/node_modules/**",
+      "!dist",
+      "!**/dist/**",
+      "!build",
+      "!**/build/**",
+      "!main.js",
+      "!packages/plugin/main.js",
+      "!infrastructure/dist",
+      "!.obsidian",
+      "!**/*.tsbuildinfo",
+      "!**/*.min.js",
+      "!**/*.min.css",
+      "!.planning/**",
+      "!admin-panel/**",
+      "!landing/**",
+      "!share-bridge/**",
+      "!dev-server/**",
+      "!src/**",
+      "!tests/**",
+      "!infrastructure/lambda/**",
+      "!infrastructure/send-test-emails.ts",
+      "!esbuild.config.mjs",
+      "!version-bump.mjs",
+      "!vitest.config.ts",
+      "!manifest.json",
+      "!versions.json",
+      "!tsconfig.json",
+      "!docs/**",
+      "!terraform/**",
+      "!packages/**"
+    ]
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "suspicious": {
+        "useBiomeIgnoreFolder": "off"
+      }
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "off"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": false,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "all"
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "scripts/**",
+        "*.config.*",
+        "esbuild.config.mjs",
+        "version-bump.mjs",
+        "infrastructure/lambda/**"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": { "noConsole": "off" }
+        }
+      }
+    }
+  ]
+}

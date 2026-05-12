@@ -4,5 +4,13 @@
   "workspaces": [
     "packages/*"
   ],
-  "license": "SEE LICENSE IN LICENSE"
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc -noEmit -skipLibCheck"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0"
+  }
 }

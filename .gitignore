@@ -19,3 +19,15 @@ desktop.ini
 # Logs
 *.log
 npm-debug.log*
+
+# Terraform local state + secrets
+terraform/environments/*.tfvars
+!terraform/environments/*.tfvars.example
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+
+# Environment files
+.env
+.env.*

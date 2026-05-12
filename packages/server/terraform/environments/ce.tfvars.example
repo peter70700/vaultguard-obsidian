@@ -1,7 +1,11 @@
-# VaultGuard Server (Community Edition) — example tfvars.
+# terraform/environments/ce.tfvars.example
 #
-# Copy this to environments/ce.tfvars (or your stage name) and fill in the
-# values for your AWS deployment. See README.md for the full guide.
+# Copy this file to environments/ce.tfvars (or your stage name) and fill in
+# the real values for your AWS deployment. See docs/SELF-HOSTING.md for the
+# full walkthrough.
+#
+# The real ce.tfvars file is gitignored (see terraform/environments/*.tfvars
+# in the root .gitignore). NEVER commit a populated ce.tfvars.
 
 stage         = "dev"
 domain_name   = ""              # Optional: "vaultguard.example.com" for custom domain

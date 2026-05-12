@@ -1,0 +1,412 @@
+# VaultGuard — Self-Hosting Guide (BYO AWS)
+
+End-to-end guide for running VaultGuard Community Edition on your own AWS account
+using the public Terraform modules. No managed cloud account required.
+
+This is the Path A self-hosting story for VaultGuard v1: you bring an AWS account,
+run `terraform apply` against the open-source modules, and connect the Obsidian
+plugin to the resulting API. (Non-AWS Docker Compose self-hosting is on the v2
+roadmap.)
+
+***
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Clone the Repository](#clone-the-repository)
+- [Install AWS CLI and Terraform](#install-aws-cli-and-terraform)
+- [Configure the Terraform Variables](#configure-the-terraform-variables)
+- [Deploy the Infrastructure](#deploy-the-infrastructure)
+- [Create the First Admin User](#create-the-first-admin-user)
+- [Install the Obsidian Plugin](#install-the-obsidian-plugin)
+- [Configure the Plugin to Connect to Your Server](#configure-the-plugin-to-connect-to-your-server)
+- [Verify the Deployment End-to-End](#verify-the-deployment-end-to-end)
+- [Common Errors](#common-errors)
+
+***
+
+## Prerequisites
+
+### Required Tools
+
+| Tool       | Version  | Purpose                                |
+| ---------- | -------- | -------------------------------------- |
+| AWS CLI    | >= 2.x   | AWS account interaction                |
+| Node.js    | >= 20.x  | Lambda bundling and plugin build       |
+| Terraform  | >= 1.6   | Infrastructure deployment              |
+| npm        | Latest   | Package management                     |
+| Git        | >= 2.x   | Source control                         |
+| Obsidian   | >= 1.4.0 | Plugin host                            |
+
+### AWS Account Requirements
+
+- An AWS account with administrator access (or, at minimum, permissions for
+  **IAM, Cognito, DynamoDB, S3, Lambda, API Gateway, CloudWatch, KMS, and SES**).
+- A registered domain for the API endpoint is **optional** — if you set
+  `domain_name`, you must also have a matching Route53 hosted zone in the same
+  AWS account.
+- AWS CLI configured with credentials: `aws configure`.
+
+### Verify Prerequisites
+
+```bash
+aws --version        # AWS CLI v2.x
+node --version       # v20+
+terraform --version  # 1.6+
+npm --version        # 9+
+git --version        # 2.x
+```
+
+***
+
+## Clone the Repository
+
+The public monorepo contains the plugin (under `packages/plugin/`) and the
+server stack (under `packages/server/`). Clone it and install root workspace
+dependencies in one step:
+
+```bash
+git clone https://github.com/peter70700/vaultguard-obsidian.git
+cd vaultguard-obsidian
+npm install
+```
+
+`npm install` at the repo root materializes the npm workspaces and any
+shared dev dependencies. Each package also has its own `npm install` step
+documented below.
+
+***
+
+## Install AWS CLI and Terraform
+
+If you do not already have AWS CLI v2 and Terraform installed, follow the
+upstream installation docs:
+
+- AWS CLI v2: <https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html>
+- Terraform: <https://developer.hashicorp.com/terraform/install>
+
+Then configure AWS credentials. The credentials need permission to create the
+resources listed under [AWS Account Requirements](#prerequisites) above.
+
+```bash
+aws configure
+# AWS Access Key ID:     [paste]
+# AWS Secret Access Key: [paste]
+# Default region:        eu-central-1   (or your preferred region)
+# Default output format: json
+```
+
+Confirm you can reach the account:
+
+```bash
+aws sts get-caller-identity
+```
+
+***
+
+## Configure the Terraform Variables
+
+The Terraform inputs for a Community Edition deployment live in
+`packages/server/terraform/environments/ce.tfvars.example`. Copy it to a real
+tfvars file (which is gitignored by default — never commit a populated tfvars):
+
+```bash
+cd packages/server/terraform
+cp environments/ce.tfvars.example environments/ce.tfvars
+```
+
+Open `environments/ce.tfvars` in your editor and review each variable. The
+defaults are sensible for a first deployment; you only need to change
+`admin_email` (and optionally `domain_name`) to get a working stack.
+
+### Variable Walkthrough
+
+- **`stage`** — `"dev"`, `"staging"`, or `"prod"`. Becomes the suffix on every
+  AWS resource name so multiple stages can co-exist in one account.
+- **`domain_name`** — Leave as `""` to use AWS-default domains (API Gateway
+  invoke URLs, Cognito hosted UI default). Set to a domain you own
+  (e.g. `vaultguard.example.com`) if you want custom URLs. Requires a matching
+  Route53 hosted zone.
+- **`admin_email`** — Where SNS sends operational alerts. Set this to a real
+  inbox you read.
+- **`sender_email`** — `From:` address for transactional mail sent through SES.
+- **`sender_domain`** — The SES-verified domain identity. Must match
+  `sender_email`'s domain.
+- **`cognito_callback_urls` / `cognito_logout_urls`** — OAuth redirect URIs.
+  The defaults point at `http://localhost:5173` for local development.
+- **`key_lease_duration_seconds`** — How long a cloud DEK lease is valid before
+  the plugin must renew. Default `14400` (4 hours).
+- **`session_duration_seconds`** — How long a user session token is valid.
+  Default `28800` (8 hours).
+- **`max_file_size_bytes`** — Hard upload ceiling. Default `26214400` (25 MiB).
+- **`vaultguard_edition`** — **Keep this as `"community"`**. It is the
+  runtime gate that disables Pro-only features (share links, hosted admin
+  panel, billing, advanced audit) on the Lambda layer.
+- **`vaultguard_allow_public_signup`** — When `true`, `POST /signup` stays open
+  after your first admin organization is created. Set to `false` for a closed
+  deployment.
+- **`google_workspace_verification_token` / `google_workspace_dkim_value`** —
+  **Optional**. Leave blank unless you front the domain's inbound mail with
+  Google Workspace. Outbound transactional mail goes through AWS SES whether
+  these are set or not.
+
+***
+
+## Deploy the Infrastructure
+
+### 1. Build the Lambda Bundles
+
+The Terraform module deploys pre-bundled Lambda artifacts from
+`infrastructure/dist/`. Build them first:
+
+```bash
+cd packages/server/infrastructure
+npm install
+npm run build:lambdas
+```
+
+### 2. Terraform Init / Plan / Apply
+
+```bash
+cd ../terraform
+terraform init
+terraform plan -var-file=environments/ce.tfvars
+terraform apply -var-file=environments/ce.tfvars
+```
+
+The first `terraform apply` typically takes 4–8 minutes. When it finishes,
+note the outputs:
+
+```bash
+terraform output
+```
+
+Critical values you'll need for the plugin:
+
+- **`api_url`** — Base URL for the VaultGuard API (e.g.
+  `https://abc123def4.execute-api.eu-central-1.amazonaws.com/dev`).
+- **`cognito_user_pool_id`** — Cognito User Pool ID
+  (e.g. `eu-central-1_XXXXXXXXX`).
+- **`cognito_client_id`** — Cognito App Client ID.
+- **`vault_bucket_name`** — The S3 bucket that stores encrypted vault content
+  (you only need this for ops/diagnostics).
+
+Save these — the plugin asks for them in Settings.
+
+### 3. Re-deploying After Code Changes
+
+When you pull updated Lambda source, rebuild before each apply:
+
+```bash
+cd packages/server/infrastructure
+npm run build:lambdas
+cd ../terraform
+terraform apply -var-file=environments/ce.tfvars
+```
+
+***
+
+## Create the First Admin User
+
+A fresh deployment has no users. Create your first admin via the AWS CLI
+directly against Cognito — this skips the normal sign-up flow (which is
+disabled by default in Community Edition).
+
+```bash
+# Pull the User Pool ID from terraform output.
+USER_POOL_ID=$(terraform output -raw cognito_user_pool_id)
+
+# Create the user, mark their email as already verified, and set the admin role
+# claim. Replace the email + temp password with your real values.
+aws cognito-idp admin-create-user \
+  --user-pool-id "$USER_POOL_ID" \
+  --username you@example.com \
+  --user-attributes \
+    Name=email,Value=you@example.com \
+    Name=email_verified,Value=true \
+    Name=custom:role,Value=admin \
+  --temporary-password "TempP@ss123!"
+
+# Set a permanent password so the user isn't forced through a reset flow on
+# first login.
+aws cognito-idp admin-set-user-password \
+  --user-pool-id "$USER_POOL_ID" \
+  --username you@example.com \
+  --password "YourSecurePassword123!" \
+  --permanent
+```
+
+You now have a single admin user. Subsequent users are typically created via
+the plugin's invite flow once an organization has been initialised.
+
+***
+
+## Install the Obsidian Plugin
+
+There are two ways to install the plugin into your Obsidian vault:
+
+### Option 1: Obsidian Community Plugin Directory (easy path, future)
+
+Once VaultGuard is listed in Obsidian's community plugin directory:
+
+1. Open Obsidian → **Settings → Community plugins → Browse**.
+2. Search for **VaultGuard** and click **Install**.
+3. Enable the plugin.
+
+This path only works after the Obsidian directory submission lands — until then,
+use Option 2.
+
+### Option 2: Manual Install From a GitHub Release (works today)
+
+1. Go to the public repo's Releases page:
+   <https://github.com/peter70700/vaultguard-obsidian/releases>.
+2. Download `main.js`, `manifest.json`, and `styles.css` from the latest tag
+   (tag format is bare semver, e.g. `1.0.0`).
+3. Create the plugin directory inside your vault:
+
+   ```bash
+   mkdir -p /path/to/your/vault/.obsidian/plugins/vaultguard
+   ```
+
+4. Copy the three files into that directory.
+5. Open Obsidian, go to **Settings → Community plugins**, and enable
+   **VaultGuard**.
+
+### Option 3: Build From Source
+
+If you want to run a development build:
+
+```bash
+cd packages/plugin
+npm install
+npm run build
+# Output: main.js, manifest.json, styles.css
+```
+
+Copy those three files into your vault's `.obsidian/plugins/vaultguard/`
+directory and enable the plugin in Obsidian.
+
+***
+
+## Configure the Plugin to Connect to Your Server
+
+Once the plugin is enabled, open **Settings → VaultGuard → Connection** and
+fill in the values from your `terraform output`:
+
+| Setting              | Value                                                            |
+| -------------------- | ---------------------------------------------------------------- |
+| API endpoint         | `api_url` output (e.g. `https://abc123.execute-api...`)         |
+| Cognito User Pool ID | `cognito_user_pool_id` output                                    |
+| Cognito Client ID    | `cognito_client_id` output                                       |
+| Region               | The AWS region you deployed into (e.g. `eu-central-1`)           |
+
+Click **Save** and then **Log in** with the admin email + password you set in
+the previous step. On a successful login, the plugin will pick up your
+organization, fetch its feature config, and (because `vaultguard_edition` is
+`"community"`) hide the Pro-only UI surfaces.
+
+***
+
+## Verify the Deployment End-to-End
+
+Run through this smoke test to confirm the deployment is healthy:
+
+1. **Log in as admin** in the plugin. The connection status indicator should
+   transition to "Connected".
+2. **Create a test note** in your vault. Save it.
+3. **Confirm the note appears in S3** as encrypted content (raw bytes, not
+   readable plaintext):
+
+   ```bash
+   aws s3 ls s3://<vault_bucket_name>/ --recursive
+   aws s3 cp s3://<vault_bucket_name>/<some-key> /tmp/check.bin
+   file /tmp/check.bin
+   # Expected: "data" — the file is encrypted ciphertext, NOT a markdown file.
+   ```
+
+4. **Edit the note** in Obsidian, save, and re-list S3: the object should have
+   a new last-modified timestamp.
+5. **Log out** of the plugin and **log back in** with the same credentials.
+   The note should still open and decrypt correctly.
+
+If all five steps pass, your self-hosted Community Edition deployment is
+working end-to-end.
+
+***
+
+## Common Errors
+
+### `terraform apply` fails: certificate not in `us-east-1`
+
+CloudFront-attached ACM certificates **must** live in `us-east-1`. The DNS
+module pins the `aws.us_east_1` provider alias for this case. If you see an
+error like `certificate not in us-east-1`, confirm:
+
+1. Your default region is set (`aws_region` variable, defaults to
+   `eu-central-1`).
+2. The `aws.us_east_1` provider alias is configured in `versions.tf`.
+3. You have not edited the DNS module to remove the us-east-1 alias.
+
+API-Gateway-attached regional certs (when `domain_name` is set without
+CloudFront) live in the same region as the rest of the stack — that's normal.
+
+### `terraform apply` fails: Route53 hosted zone not found
+
+If `domain_name` is non-empty, you must already have a Route53 hosted zone for
+that domain (or its parent) in the same AWS account. Either:
+
+- Create the hosted zone in the AWS Console, **or**
+- Set `domain_name = ""` to skip the custom-domain logic entirely (the API
+  will be reachable via its default API Gateway invoke URL).
+
+### `npm run build:lambdas` fails with a Node version error
+
+Lambda bundling requires **Node.js 20** locally. If `node --version` reports
+18 or lower (or 22+), install Node 20 via `nvm` or your platform's package
+manager and retry:
+
+```bash
+nvm install 20
+nvm use 20
+node --version  # v20.x.x
+```
+
+### Terraform state lock stuck after an interrupted apply
+
+If an apply was interrupted (Ctrl-C, network drop) the state may be
+left locked. Unlock with:
+
+```bash
+terraform force-unlock <LOCK_ID>
+```
+
+The lock ID is printed in the error message.
+
+### Default state backend is local — for production, use S3
+
+The repo ships with **local Terraform state** for simplicity. For a real
+deployment you should configure an S3 backend (with DynamoDB locking) so the
+state survives a lost laptop and can be shared across team members. Add a
+`backend "s3" { ... }` block to `terraform/versions.tf` and run
+`terraform init -migrate-state`.
+
+### Plugin reports "Cannot connect to API"
+
+Check, in order:
+
+1. **API endpoint URL** in the plugin settings matches `terraform output -raw
+   api_url`. The plugin requires `https://` and no trailing slash.
+2. **Cognito User Pool ID** and **Client ID** match
+   `terraform output -raw cognito_user_pool_id` and
+   `terraform output -raw cognito_client_id`.
+3. **Region** in the plugin matches the region where you deployed.
+4. The Lambda functions are healthy (CloudWatch Logs under
+   `/aws/lambda/vaultguard-<stage>-*`).
+
+### Pro feature appears in the plugin UI
+
+If a share-link, hosted-admin-panel, or billing button appears, your server
+is advertising `edition: "pro"` instead of `"community"`. Confirm
+`vaultguard_edition = "community"` is set in `ce.tfvars` and re-apply
+Terraform. The `/orgs/{slug}/config` endpoint reports the active edition; the
+plugin reads it on every login and hides Pro UI when it is `"community"`.
