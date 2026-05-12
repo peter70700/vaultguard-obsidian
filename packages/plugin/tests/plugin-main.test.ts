@@ -28,6 +28,8 @@ function makePlugin() {
     ...DEFAULT_SETTINGS,
     vaultBindingId: "test-vault-binding",
     serverVaultId: "vault-abc",
+    cognitoUserPoolId: "test-pool",       // Phase 4 hardening (D-42a item 2): avoid SAAS_DEFAULTS env drift
+    cognitoClientId: "test-client",        // Phase 4 hardening (D-42a item 2): avoid SAAS_DEFAULTS env drift
     maxRetryAttempts: 2,
     showStatusBar: false,
     debugLogging: false,
@@ -874,6 +876,134 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     });
 
     expect(Object.keys(plugin.persistedSessions)).toEqual(["good-binding"]);
+  });
+
+  it("keeps at-rest-cipher envelopes through normalization", () => {
+    const plugin = makePlugin();
+
+    plugin.persistedSessions = plugin.normalizePersistedSessions({
+      "safe-storage-binding": {
+        v: 1,
+        storage: "electron-safe-storage",
+        ciphertext: "abc",
+      },
+      "at-rest-binding": {
+        v: 1,
+        storage: "at-rest-cipher",
+        ciphertext: "def",
+      },
+    });
+
+    expect(Object.keys(plugin.persistedSessions).sort()).toEqual([
+      "at-rest-binding",
+      "safe-storage-binding",
+    ]);
+  });
+
+  it("falls back to AtRestCipher when safeStorage is unavailable", async () => {
+    const plugin = makePlugin();
+    const session = makeSession();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+
+    // No safeStorage, but a ready at-rest cipher. Round-trip through the
+    // mocked cipher: encryptString returns deterministic bytes we can
+    // decrypt back via decryptString.
+    const cipherStore = new Map<string, string>();
+    plugin.atRestCipher = {
+      isReady: () => true,
+      encryptString: vi.fn(async (plaintext: string) => {
+        const id = `cipher-${cipherStore.size + 1}`;
+        cipherStore.set(id, plaintext);
+        return new TextEncoder().encode(id).buffer;
+      }),
+      decryptString: vi.fn(async (bytes: ArrayBuffer | Uint8Array) => {
+        const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const id = new TextDecoder().decode(view);
+        const plaintext = cipherStore.get(id);
+        if (!plaintext) throw new Error(`Unknown cipher id: ${id}`);
+        return plaintext;
+      }),
+    };
+
+    await plugin.persistSession(session);
+
+    const rawStored = localStorage.getItem("vaultguard-session:test-vault-binding");
+    const stored = JSON.parse(rawStored ?? "null");
+
+    expect(stored).toEqual(expect.objectContaining({
+      v: 1,
+      storage: "at-rest-cipher",
+      ciphertext: expect.any(String),
+    }));
+    // Tokens must not leak into the envelope.
+    expect(rawStored).not.toContain("refresh-token");
+    expect(rawStored).not.toContain("access-token");
+
+    // Sync path returns null (envelope is at-rest, not safeStorage), async path resolves it.
+    expect(plugin.loadSessionFromStore()).toBeNull();
+    await expect(plugin.loadAtRestSessionFromStore()).resolves.toMatchObject({
+      userId: "user-1",
+      refreshToken: "refresh-token",
+    });
+    expect(plugin.atRestCipher.encryptString).toHaveBeenCalledOnce();
+    expect(plugin.atRestCipher.decryptString).toHaveBeenCalledOnce();
+
+    // The Notice must NOT fire when at-rest fallback succeeded.
+    const credentialNotices = mockNotice.mock.calls.filter(([msg]) =>
+      typeof msg === "string" && msg.includes("secure credential storage")
+    );
+    expect(credentialNotices).toHaveLength(0);
+  });
+
+  it("notifies only when both safeStorage AND the at-rest cipher are unavailable", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    // No safeStorage; no cipher.
+    plugin.atRestCipher = null;
+
+    await plugin.persistSession(makeSession());
+
+    const credentialNotices = mockNotice.mock.calls.filter(([msg]) =>
+      typeof msg === "string" && msg.includes("secure credential storage")
+    );
+    expect(credentialNotices).toHaveLength(1);
+    expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+
+  it("restoreSession resolves an at-rest envelope when safeStorage is gone", async () => {
+    const plugin = makePlugin();
+    const session = makeSession();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    plugin.initializeApiClientFromSession = vi.fn();
+    plugin.decodeJwtPayload = vi.fn(() => ({}));
+    plugin.syncSettingsFromTokenPayload = vi.fn(() => false);
+
+    const cipherStore = new Map<string, string>();
+    plugin.atRestCipher = {
+      isReady: () => true,
+      encryptString: vi.fn(async (plaintext: string) => {
+        const id = `cipher-${cipherStore.size + 1}`;
+        cipherStore.set(id, plaintext);
+        return new TextEncoder().encode(id).buffer;
+      }),
+      decryptString: vi.fn(async (bytes: ArrayBuffer | Uint8Array) => {
+        const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const id = new TextDecoder().decode(view);
+        const plaintext = cipherStore.get(id);
+        if (!plaintext) throw new Error(`Unknown cipher id: ${id}`);
+        return plaintext;
+      }),
+    };
+
+    await plugin.persistSession(session);
+    plugin.session = null; // simulate plugin reload
+
+    await plugin.restoreSession();
+
+    expect(plugin.session).toMatchObject({
+      userId: "user-1",
+      displayName: "Test User",
+    });
   });
 
   it("rejects decrypted sessions missing required fields", () => {

@@ -142,7 +142,11 @@ type VaultGuardPluginData = Partial<VaultGuardSettings> & {
 
 interface ProtectedSessionEnvelope {
   v: 1;
-  storage: "electron-safe-storage";
+  // "electron-safe-storage": desktop, sealed by Electron's safeStorage (OS keystore).
+  // "at-rest-cipher": mobile / safeStorage-less hosts, sealed by AtRestCipher (AES-GCM
+  // with the LAK whose own KEK falls back to a localStorage-stored AES key — same
+  // security ceiling as the local at-rest encryption of vault content).
+  storage: "electron-safe-storage" | "at-rest-cipher";
   ciphertext: string;
 }
 
@@ -503,8 +507,20 @@ export default class VaultGuardPlugin extends Plugin {
     // Create API client (tokens are set later during session restore or login)
     this.rebuildApiClient();
 
-    // Restore session synchronously from localStorage (never blocks)
-    this.restoreSession();
+    // Bring up the local at-rest cipher BEFORE restoring the session. On
+    // mobile (no Electron `safeStorage`), session blobs are sealed with the
+    // LAK rather than the OS keystore, so we need the cipher ready to
+    // decrypt them. On desktop with a working safeStorage the session
+    // decrypts via the synchronous path and doesn't touch the cipher.
+    // If init fails (no keychain on this device, broken wrap) we surface
+    // the reason in a Notice and continue in degraded plaintext mode so
+    // the plugin remains usable while the user investigates.
+    await this.initAtRestCipher();
+
+    // Restore session — synchronous safeStorage path first, async at-rest
+    // path second. On desktop this is effectively zero-cost; on mobile it
+    // adds a single AES-GCM decrypt (a few ms).
+    await this.restoreSession();
 
     // Capabilities are public metadata. Refresh them in the background so
     // manual/self-hosted installs and restored sessions don't temporarily
@@ -512,13 +528,6 @@ export default class VaultGuardPlugin extends Plugin {
     void this.refreshServerCapabilitiesFromConfiguredEndpoint().catch((err) => {
       this.logError("Server capability refresh failed", err);
     });
-
-    // Bring up the local at-rest cipher *before* the adapter is intercepted
-    // so the very first read after onload can already decrypt on-disk
-    // ciphertext. If init fails (no keychain on this device, broken wrap)
-    // we surface the reason in a Notice and continue in degraded plaintext
-    // mode so the plugin remains usable while the user investigates.
-    await this.initAtRestCipher();
 
     // Track local activity so org auto-lock policies can be enforced.
     this.registerSessionActivityTracking();
@@ -1651,11 +1660,20 @@ export default class VaultGuardPlugin extends Plugin {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Restores session from localStorage. Fully synchronous — never blocks plugin load.
-   * Token refresh happens in the background from onload if needed.
+   * Restores session from localStorage. On desktop the safeStorage envelope
+   * decrypts synchronously; on mobile (or any host with no safeStorage) we
+   * fall through to the AtRestCipher-sealed envelope, which is async. Total
+   * cost on mobile is one AES-GCM decrypt — a few milliseconds.
+   *
+   * Token refresh still happens in the background from onload.
    */
-  private restoreSession(): void {
-    const storedSession = this.loadSessionFromStore();
+  private async restoreSession(): Promise<void> {
+    let storedSession = this.loadSessionFromStore();
+    if (!storedSession) {
+      // safeStorage path returned nothing — either there's no session at all
+      // or it was sealed via the AtRestCipher (mobile / safeStorage-less).
+      storedSession = await this.loadAtRestSessionFromStore();
+    }
     if (!storedSession) {
       this.log("No stored session found.");
       return;
@@ -6078,7 +6096,7 @@ export default class VaultGuardPlugin extends Plugin {
     // zero-byte. Send a single newline as a placeholder — the body is only
     // ever read to verify the folder's existence, never displayed.
     const markerBody = "\n";
-    const markerBase64 = Buffer.from(markerBody, "utf8").toString("base64");
+    const markerBase64 = this.bytesToBase64(new TextEncoder().encode(markerBody));
     const response = await this.apiRequest(
       "PUT",
       this.vaultPath(`/files/${encodeURIComponent(markerPath)}`),
@@ -8368,8 +8386,9 @@ export default class VaultGuardPlugin extends Plugin {
    * Wraps a session for at-rest storage using Electron's `safeStorage` (OS
    * keystore: DPAPI on Windows, Keychain on macOS, kwallet/libsecret on
    * Linux). Returns `null` only when the OS keystore is genuinely unreachable
-   * — callers must treat that as "do not persist" and never fall back to
-   * plaintext on disk.
+   * — callers must treat that as "do not persist via safeStorage" and try the
+   * AtRestCipher fallback (`protectSessionWithAtRest`) before giving up. We
+   * never fall back to plaintext on disk.
    */
   private protectSessionForStorage(session: UserSession): ProtectedSessionEnvelope | null {
     const safeStorage = probeSafeStorage();
@@ -8390,18 +8409,47 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Unwraps a stored session envelope. Strict: only the `v:1` safeStorage
-   * envelope is accepted. Anything else (unknown shape, future formats,
-   * truncated JSON) returns `null` and the user re-authenticates. We never
-   * trust a session blob that wasn't sealed by the OS keystore.
+   * Mobile / safeStorage-less fallback: wrap the session via `AtRestCipher`.
+   * Same security ceiling as the local at-rest encryption of vault content
+   * (AES-256-GCM with the LAK, whose KEK either lives in the OS keystore on
+   * desktop or in localStorage on mobile). Returns `null` if the cipher
+   * isn't ready or encryption fails — the caller decides whether to warn.
+   */
+  private async protectSessionWithAtRest(
+    session: UserSession
+  ): Promise<ProtectedSessionEnvelope | null> {
+    const cipher = this.atRestCipher;
+    if (!cipher?.isReady()) return null;
+
+    try {
+      const ciphertext = await cipher.encryptString(JSON.stringify(session));
+      const bytes = new Uint8Array(ciphertext);
+      return {
+        v: 1,
+        storage: "at-rest-cipher",
+        ciphertext: this.bytesToBase64(bytes),
+      };
+    } catch (error) {
+      this.logError("Failed to protect session with AtRestCipher", error);
+      return null;
+    }
+  }
+
+  /**
+   * Unwraps a stored session envelope synchronously. Handles the
+   * `electron-safe-storage` variant only — the `at-rest-cipher` variant
+   * decrypts via WebCrypto (async) and is routed through
+   * `unprotectAtRestSession` / `loadAtRestSessionFromStore` instead.
+   * Anything else (unknown shape, future formats, truncated JSON) returns
+   * `null` and the caller falls through to the async path or forces re-auth.
    */
   private unprotectStoredSession(value: unknown): UserSession | null {
     if (!value || typeof value !== "object") return null;
     const envelope = value as Partial<ProtectedSessionEnvelope>;
     if (
       envelope.v !== 1 ||
-      envelope.storage !== "electron-safe-storage" ||
-      !this.isNonEmptyString(envelope.ciphertext)
+      !this.isNonEmptyString(envelope.ciphertext) ||
+      envelope.storage !== "electron-safe-storage"
     ) {
       return null;
     }
@@ -8423,10 +8471,46 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Loads a stored session. localStorage is the synchronous fast path so
-   * `restoreSession` can run to completion inside `onload` without awaiting.
-   * Obsidian's plugin-data file is the restart-safe backup that survives
-   * WebView storage clears.
+   * Async counterpart for the `at-rest-cipher` envelope variant. Used on
+   * mobile / safeStorage-less hosts where the LAK seals the session blob.
+   * Returns `null` if the envelope shape is wrong, the cipher isn't ready,
+   * or decryption fails.
+   */
+  private async unprotectAtRestSession(value: unknown): Promise<UserSession | null> {
+    if (!value || typeof value !== "object") return null;
+    const envelope = value as Partial<ProtectedSessionEnvelope>;
+    if (
+      envelope.v !== 1 ||
+      envelope.storage !== "at-rest-cipher" ||
+      !this.isNonEmptyString(envelope.ciphertext)
+    ) {
+      return null;
+    }
+
+    const cipher = this.atRestCipher;
+    if (!cipher?.isReady()) {
+      // The LAK isn't loaded (cipher in needs-recovery / disabled state).
+      // We can't decrypt the envelope; treat it as "no session" so the
+      // user re-authenticates. No Notice — the cipher init path already
+      // surfaces its own banner when this happens.
+      return null;
+    }
+
+    try {
+      const ciphertext = this.base64ToBytes(envelope.ciphertext);
+      const plaintext = await cipher.decryptString(ciphertext);
+      const parsed = JSON.parse(plaintext) as Partial<UserSession>;
+      return this.materializeSession(parsed);
+    } catch (error) {
+      this.logError("Failed to restore at-rest-protected session", error);
+      return null;
+    }
+  }
+
+  /**
+   * Loads a stored session via the synchronous safeStorage path. Returns
+   * `null` for the `at-rest-cipher` variant; callers should chain
+   * `loadAtRestSessionFromStore()` to cover that case.
    */
   private loadSessionFromStore(): UserSession | null {
     const bindingId = this.getSessionBindingId();
@@ -8446,10 +8530,39 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Async counterpart for the `at-rest-cipher` envelope. Mirror of
+   * `loadSessionFromStore` but routed through `unprotectAtRestSession`.
+   * Called after the sync path returns `null` so desktop users with a
+   * working safeStorage pay zero async cost.
+   */
+  private async loadAtRestSessionFromStore(): Promise<UserSession | null> {
+    const bindingId = this.getSessionBindingId();
+    if (!bindingId) return null;
+
+    try {
+      const raw = localStorage.getItem(this.getSessionStorageKey(bindingId));
+      if (raw) {
+        const session = await this.unprotectAtRestSession(JSON.parse(raw));
+        if (session) return session;
+      }
+    } catch {
+      // Fall through to data.json backup.
+    }
+
+    return this.unprotectAtRestSession(this.persistedSessions[bindingId]);
+  }
+
+  /**
    * Persists a session to localStorage and Obsidian's plugin data store.
    *
-   * If the OS keystore is unreachable we DO NOT touch existing on-disk state
-   * — the in-memory session keeps working for this run, the user is warned
+   * Write priority:
+   *   1. Electron `safeStorage` (desktop — OS keystore-backed).
+   *   2. `AtRestCipher` fallback (mobile / safeStorage-less hosts — same LAK
+   *      that encrypts vault content; on mobile its KEK lives in localStorage
+   *      since there's no OS keystore exposed to the renderer).
+   *
+   * If BOTH paths are unavailable we DO NOT touch existing on-disk state —
+   * the in-memory session keeps working for this run, the user is warned
    * once, and the next plugin launch will require re-auth. We never silently
    * delete the previously-stored session, and we never write a plaintext
    * fallback.
@@ -8458,7 +8571,13 @@ export default class VaultGuardPlugin extends Plugin {
     const bindingId = this.getSessionBindingId();
     if (!bindingId) return;
 
-    const protectedSession = this.protectSessionForStorage(session);
+    let protectedSession = this.protectSessionForStorage(session);
+    if (!protectedSession) {
+      // Desktop with broken keychain or mobile renderer — try the at-rest
+      // cipher before warning. On mobile this is the normal path and the
+      // user shouldn't see any Notice at all.
+      protectedSession = await this.protectSessionWithAtRest(session);
+    }
     if (!protectedSession) {
       this.notifySafeStorageUnavailable();
       return;
@@ -8504,17 +8623,20 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * One-shot user warning when Electron's safeStorage isn't reachable from
-   * the renderer (e.g. an Obsidian build without `@electron/remote`, or
-   * Linux without a working secret-service backend). The plugin keeps
-   * working in-memory for the current session; the user just has to log
-   * in again next launch.
+   * One-shot user warning when *no* secure session storage is available —
+   * neither Electron's `safeStorage` nor the local `AtRestCipher`. This is
+   * the truly degraded state (e.g. broken Linux keyring AND a cipher in
+   * needs-recovery). On mobile Obsidian the at-rest cipher takes over
+   * transparently and this Notice never fires.
+   *
+   * The in-memory session keeps working for the current run; the user just
+   * has to log in again next launch.
    */
   private notifySafeStorageUnavailable(): void {
     if (this.safeStorageUnavailableNotified) return;
     this.safeStorageUnavailableNotified = true;
     this.log(
-      "Electron safeStorage unreachable from this renderer — session will not be persisted to disk."
+      "No secure session storage available (safeStorage unreachable AND at-rest cipher unavailable) — session will not be persisted to disk."
     );
     new Notice(
       "VaultGuard: Your platform doesn't expose secure credential storage. " +
@@ -8526,8 +8648,9 @@ export default class VaultGuardPlugin extends Plugin {
 
   /**
    * Filters the on-load `storedSessions` map down to entries that look like
-   * the current safeStorage envelope. Anything else is dropped — we don't
-   * carry broken or foreign blobs through to subsequent saves.
+   * a recognised envelope (either safeStorage- or AtRestCipher-sealed).
+   * Anything else is dropped — we don't carry broken or foreign blobs
+   * through to subsequent saves.
    */
   private normalizePersistedSessions(
     storedSessions: Record<string, unknown> | undefined
@@ -8538,9 +8661,10 @@ export default class VaultGuardPlugin extends Plugin {
     for (const [bindingId, value] of Object.entries(storedSessions)) {
       if (!value || typeof value !== "object") continue;
       const envelope = value as Partial<ProtectedSessionEnvelope>;
+      const storage = envelope.storage;
       if (
         envelope.v === 1 &&
-        envelope.storage === "electron-safe-storage" &&
+        (storage === "electron-safe-storage" || storage === "at-rest-cipher") &&
         this.isNonEmptyString(envelope.ciphertext)
       ) {
         normalized[bindingId] = value;

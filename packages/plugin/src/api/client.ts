@@ -301,6 +301,29 @@ const DEFAULT_CONFIG: VaultGuardApiConfig = {
   healthCheckIntervalMs: 30000,
 };
 
+// ─── Base64 helpers ─────────────────────────────────────────────────────────
+//
+// Browser-native base64 over Uint8Array. We deliberately don't use Node's
+// `Buffer` here so the plugin runs on Obsidian mobile without relying on a
+// Buffer polyfill being present in the renderer.
+
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
 // ─── API Client ─────────────────────────────────────────────────────────────
 
 export class VaultGuardApiClient {
@@ -539,13 +562,12 @@ export class VaultGuardApiClient {
 
   async getFile(path: string): Promise<ArrayBuffer> {
     const response = await this.request<{ content: string }>("GET", `${this.vaultBase()}/files/${encodeURIComponent(path)}`);
-    const bytes = Buffer.from(response.content, "base64");
-    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    return base64ToArrayBuffer(response.content);
   }
 
   async putFile(path: string, content: ArrayBuffer, metadata: Partial<FileMetadata>): Promise<FileMetadata> {
     const response = await this.request<FileMetadata>("PUT", `${this.vaultBase()}/files/${encodeURIComponent(path)}`, {
-      content: Buffer.from(new Uint8Array(content)).toString("base64"),
+      content: uint8ToBase64(new Uint8Array(content)),
       contentType: metadata.encryptedKey ? "application/octet-stream" : "text/markdown",
     });
     return response;
