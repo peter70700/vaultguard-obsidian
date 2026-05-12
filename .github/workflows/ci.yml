@@ -34,6 +34,16 @@ jobs:
       - name: Typecheck (plugin)
         run: npx tsc -p packages/plugin/tsconfig.json --noEmit
 
+      # The server lambda code lives at packages/server/infrastructure/ — one
+      # level below the workspace boundary (packages/server/ has no package.json
+      # of its own). Workspace install at the root does NOT reach into
+      # packages/server/infrastructure/, so its devDependencies (@types/node,
+      # @types/aws-lambda, typescript) aren't on disk before this step. Run a
+      # local install inside packages/server/infrastructure to populate them.
+      - name: Install server (infrastructure) deps
+        working-directory: packages/server/infrastructure
+        run: npm install --ignore-scripts --no-audit --no-fund
+
       - name: Typecheck (server)
         run: npx tsc -p packages/server/infrastructure/tsconfig.json --noEmit
 
