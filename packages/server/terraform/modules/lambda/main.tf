@@ -722,6 +722,13 @@ data "aws_iam_policy_document" "signup_lambda" {
       var.vault_members_table_arn, "${var.vault_members_table_arn}/index/*",
     ]
   }
+  # DynamoDB Scan — Community Edition hasAnyOrg() single-tenant gate.
+  # Used only when VAULTGUARD_EDITION=community + VAULTGUARD_ALLOW_PUBLIC_SIGNUP!=true
+  # to decide whether public signup is locked. Scoped to Organizations table.
+  statement {
+    actions   = ["dynamodb:Scan"]
+    resources = [var.organizations_table_arn]
+  }
   # KMS — decrypt DynamoDB table data (tables use KMS encryption)
   statement {
     actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
