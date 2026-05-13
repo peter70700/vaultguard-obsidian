@@ -6,6 +6,9 @@
  * The same compiled binary serves both Cloud and CE — Pro backends never open
  * this modal because their featureEnabled() returns true at the call sites.
  *
+ * The modal opens with a prominent "PRO FEATURE — Not available in Community
+ * Edition" badge above the title; banner classes are styled in styles.css.
+ *
  * No URLs in the copy: the public-plugin export scrubber rewrites the hosted
  * production domain to a placeholder (scripts/export-public-plugin-repo.mjs
  * DOMAIN_REPLACEMENTS), which would leave nonsensical text in the binary
@@ -24,7 +27,7 @@ interface FeatureCopy {
 }
 
 const COMMON_FOOTER =
-  "Available in VaultGuard Pro / VaultGuard Cloud. The same plugin binary works against both editions — connect it to a Pro backend to unlock these surfaces.";
+  "Connect to a VaultGuard Pro backend to unlock this surface — the same plugin binary works against both editions.";
 
 const FEATURE_COPY: Record<ProFeature, FeatureCopy> = {
   shareLinks: {
@@ -89,6 +92,15 @@ export class ProUpsellModal extends Modal {
     const copy = FEATURE_COPY[this.feature];
     const c = this.contentEl;
     c.empty();
+    const badge = c.createDiv({ cls: "vaultguard-pro-upsell-badge" });
+    badge.createDiv({
+      cls: "vaultguard-pro-upsell-badge-headline",
+      text: "PRO FEATURE",
+    });
+    badge.createDiv({
+      cls: "vaultguard-pro-upsell-badge-subline",
+      text: "Not available in Community Edition",
+    });
     c.createEl("h2", { text: copy.title });
     c.createEl("p", { text: copy.tagline });
     const ul = c.createEl("ul");
