@@ -18,3 +18,11 @@ export async function handler(_event: APIGatewayProxyEvent): Promise<APIGatewayP
     }),
   };
 }
+
+// No-op cross-handler exports for CE (callers in users/handler + reconciler).
+// See export-public-server-repo.mjs:buildStubHandler() for rationale.
+export async function syncStripeSeats(
+  _orgId: string,
+): Promise<{ synced: boolean; currentUsers: number; quantity?: number; message?: string; reason?: string }> {
+  return { synced: false, currentUsers: 0, message: "Billing not enabled in Community Edition" };
+}

@@ -24,6 +24,8 @@ variable "organizations_table_name" { type = string }
 variable "organizations_table_arn" { type = string }
 variable "subscriptions_table_name" { type = string }
 variable "subscriptions_table_arn" { type = string }
+variable "stripe_webhook_events_table_name" { type = string }
+variable "stripe_webhook_events_table_arn" { type = string }
 variable "leases_table_name" { type = string }
 variable "leases_table_arn" { type = string }
 variable "reencryption_jobs_table_name" { type = string }
@@ -68,6 +70,11 @@ variable "sender_email" {
 variable "domain_name" {
   type    = string
   default = ""
+}
+variable "reconciler_schedule" {
+  type        = string
+  default     = "cron(0 3 * * ? *)"
+  description = "EventBridge schedule expression for the nightly user-count reconciler. Override per-stage if desired."
 }
 
 data "aws_region" "current" {}
@@ -151,6 +158,12 @@ data "archive_file" "reencryption_lambda" {
   type        = "zip"
   source_dir  = "${path.module}/../../../infrastructure/dist/reencryption"
   output_path = "${path.module}/.build/reencryption.zip"
+}
+
+data "archive_file" "reconciler_lambda" {
+  type        = "zip"
+  source_dir  = "${path.module}/../../../infrastructure/dist/reconciler"
+  output_path = "${path.module}/.build/reconciler.zip"
 }
 
 data "archive_file" "vaults_lambda" {
@@ -633,6 +646,11 @@ data "aws_iam_policy_document" "billing_lambda" {
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
     resources = [var.subscriptions_table_arn, "${var.subscriptions_table_arn}/index/*"]
   }
+  # DynamoDB — Stripe webhook dedup (PutItem only; TTL handles cleanup)
+  statement {
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.stripe_webhook_events_table_arn]
+  }
   # DynamoDB — organizations
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
@@ -673,9 +691,10 @@ resource "aws_lambda_function" "billing" {
 
   environment {
     variables = merge(local.common_env, {
-      STRIPE_SECRET_ARN   = var.stripe_secret_arn
-      SUBSCRIPTIONS_TABLE = var.subscriptions_table_name
-      BASE_URL            = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
+      STRIPE_SECRET_ARN           = var.stripe_secret_arn
+      SUBSCRIPTIONS_TABLE         = var.subscriptions_table_name
+      STRIPE_WEBHOOK_EVENTS_TABLE = var.stripe_webhook_events_table_name
+      BASE_URL                    = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
     })
   }
 
@@ -1032,6 +1051,122 @@ resource "aws_lambda_permission" "allow_eventbridge_reencryption" {
   source_arn    = aws_cloudwatch_event_rule.user_access_revoked.arn
 }
 
+# ─── Reconciler Lambda ───────────────────────────────────────────────────────
+# Nightly defense-in-depth job: re-derives ORGANIZATIONS_TABLE.currentUsers
+# from Cognito ground truth and re-syncs Stripe seats via the existing
+# syncStripeSeats helper from billing/handler. EventBridge-only — no API
+# Gateway surface.
+
+resource "aws_iam_role" "reconciler_lambda" {
+  name               = "vaultguard-${var.stage}-reconciler-lambda"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "reconciler_logging" {
+  role       = aws_iam_role.reconciler_lambda.name
+  policy_arn = aws_iam_policy.lambda_logging.arn
+}
+
+data "aws_iam_policy_document" "reconciler_lambda" {
+  # Cognito — list users across the pool, filter by `custom:org` in code
+  # (Cognito ListUsers does not support filters on custom attributes).
+  statement {
+    actions   = ["cognito-idp:ListUsers"]
+    resources = [var.cognito_user_pool_arn]
+  }
+  # Organizations — Scan for the all-orgs sweep, Query on orgId-index for the
+  # ad-hoc single-org path, GetItem + UpdateItem for the drift fix.
+  statement {
+    actions   = ["dynamodb:Scan", "dynamodb:Query", "dynamodb:GetItem", "dynamodb:UpdateItem"]
+    resources = [var.organizations_table_arn, "${var.organizations_table_arn}/index/*"]
+  }
+  # Subscriptions — needed transitively by syncStripeSeats to read the org's
+  # stripeSubscriptionId and upsert the local quantity record.
+  statement {
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+    resources = [var.subscriptions_table_arn, "${var.subscriptions_table_arn}/index/*"]
+  }
+  # Audit — one reconciler.org_reconciled row per active org per run.
+  statement {
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.audit_table_arn]
+  }
+  # KMS — Organizations / Subscriptions / Audit tables are encrypted with the
+  # project master key; without Decrypt/GenerateDataKey, the first table
+  # access errors.
+  statement {
+    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+    resources = [var.kms_key_arn]
+  }
+  # Secrets Manager — Stripe key retrieval inside syncStripeSeats.
+  # Skipped on Community Edition where stripe_secret_arn = "" (FEATURES.billing
+  # is false at runtime so the helper is never called).
+  dynamic "statement" {
+    for_each = var.stripe_secret_arn != "" ? [1] : []
+    content {
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.stripe_secret_arn]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "reconciler_lambda" {
+  name   = "reconciler-lambda-policy"
+  role   = aws_iam_role.reconciler_lambda.id
+  policy = data.aws_iam_policy_document.reconciler_lambda.json
+}
+
+resource "aws_lambda_function" "reconciler" {
+  function_name = "vaultguard-reconciler-${var.stage}"
+  description   = "Nightly user-count + Stripe seat drift reconciler"
+  role          = aws_iam_role.reconciler_lambda.arn
+  handler       = "handler.handler"
+  runtime       = "nodejs22.x"
+  architectures = ["arm64"]
+  memory_size   = 512
+  timeout       = 300
+
+  filename         = data.archive_file.reconciler_lambda.output_path
+  source_code_hash = data.archive_file.reconciler_lambda.output_base64sha256
+
+  tracing_config { mode = "Active" }
+
+  environment {
+    variables = merge(local.common_env, {
+      SUBSCRIPTIONS_TABLE = var.subscriptions_table_name
+      STRIPE_SECRET_ARN   = var.stripe_secret_arn
+      BASE_URL            = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
+    })
+  }
+
+  tags = { Name = "vaultguard-reconciler-${var.stage}" }
+}
+
+resource "aws_cloudwatch_log_group" "reconciler" {
+  name              = "/aws/lambda/${aws_lambda_function.reconciler.function_name}"
+  retention_in_days = local.log_retention
+}
+
+resource "aws_cloudwatch_event_rule" "reconciler_schedule" {
+  name                = "vaultguard-${var.stage}-reconciler-schedule"
+  description         = "Nightly user-count + Stripe seat reconciliation"
+  schedule_expression = var.reconciler_schedule
+}
+
+resource "aws_cloudwatch_event_target" "reconciler" {
+  rule      = aws_cloudwatch_event_rule.reconciler_schedule.name
+  target_id = "vaultguard-reconciler-${var.stage}"
+  arn       = aws_lambda_function.reconciler.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge_reconciler" {
+  statement_id  = "AllowExecutionFromReconcilerSchedule"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.reconciler.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.reconciler_schedule.arn
+}
+
 # ─── Vaults Lambda ──────────────────────────────────────────────────────────
 
 resource "aws_iam_role" "vaults_lambda" {
@@ -1255,3 +1390,6 @@ output "users_function_name" { value = aws_lambda_function.users.function_name }
 
 output "reencryption_function_invoke_arn" { value = aws_lambda_function.reencryption.invoke_arn }
 output "reencryption_function_name" { value = aws_lambda_function.reencryption.function_name }
+
+output "reconciler_function_arn" { value = aws_lambda_function.reconciler.arn }
+output "reconciler_function_name" { value = aws_lambda_function.reconciler.function_name }

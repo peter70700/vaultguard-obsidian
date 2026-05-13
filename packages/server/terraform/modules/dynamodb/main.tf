@@ -431,6 +431,38 @@ resource "aws_dynamodb_table" "subscriptions" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# StripeWebhookEvents Table — Idempotency dedup for Stripe webhook retries
+# PK: eventId (Stripe event.id, e.g. "evt_1Abc...")
+# TTL: expiresAt (7 days)
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_dynamodb_table" "stripe_webhook_events" {
+  name         = "VaultGuard-${var.stage}-StripeWebhookEvents"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "eventId"
+
+  deletion_protection_enabled = local.deletion_protection
+  point_in_time_recovery { enabled = local.pitr_enabled }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  attribute {
+    name = "eventId"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expiresAt"
+    enabled        = true
+  }
+
+  tags = { Name = "VaultGuard-${var.stage}-StripeWebhookEvents" }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Leases Table (Encryption Key Leases)
 # PK: leaseId
 # ─────────────────────────────────────────────────────────────────────────────
@@ -875,6 +907,9 @@ output "organizations_table_arn" { value = aws_dynamodb_table.organizations.arn 
 
 output "subscriptions_table_name" { value = aws_dynamodb_table.subscriptions.name }
 output "subscriptions_table_arn" { value = aws_dynamodb_table.subscriptions.arn }
+
+output "stripe_webhook_events_table_name" { value = aws_dynamodb_table.stripe_webhook_events.name }
+output "stripe_webhook_events_table_arn" { value = aws_dynamodb_table.stripe_webhook_events.arn }
 
 output "leases_table_name" { value = aws_dynamodb_table.leases.name }
 output "leases_table_arn" { value = aws_dynamodb_table.leases.arn }

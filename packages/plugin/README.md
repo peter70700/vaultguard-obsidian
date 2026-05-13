@@ -18,7 +18,7 @@ the operational layer most teams want once they scale past a few users,
 | | Community Edition | Pro | Enterprise |
 | --- | --- | --- | --- |
 | **Where it runs** | Your own AWS | Our AWS (managed) | Dedicated infra |
-| **Price** | Free, self-hosted | $12 / user / month | Custom |
+| **Price** | Free, self-hosted | €12 / user / month | Custom |
 | **Edition (code)** | `community` | `pro` | `pro` |
 | **License** | Sustainable Use License | Cloud ToS | Commercial contract |
 | **User cap** | Unlimited (you provision) | Up to 100 | Unlimited |

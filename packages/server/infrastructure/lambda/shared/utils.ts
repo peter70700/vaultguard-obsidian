@@ -1406,7 +1406,12 @@ export async function updateOrgStorageUsage(orgSlug: string, deltaBytes: number)
       })
     );
   } catch (err) {
-    console.error('[ORG_STORAGE_UPDATE_FAILURE]', (err as Error).message);
+    console.error(JSON.stringify({
+      event: 'ORG_STORAGE_UPDATE_FAILURE',
+      orgSlug,
+      delta: deltaBytes,
+      error: (err as Error).message,
+    }));
   }
 }
 
@@ -1427,7 +1432,12 @@ export async function updateOrgUserCount(orgSlug: string, delta: number): Promis
       })
     );
   } catch (err) {
-    console.error('[ORG_USER_COUNT_UPDATE_FAILURE]', (err as Error).message);
+    console.error(JSON.stringify({
+      event: 'ORG_USER_COUNT_UPDATE_FAILURE',
+      orgSlug,
+      delta,
+      error: (err as Error).message,
+    }));
   }
 }
 
