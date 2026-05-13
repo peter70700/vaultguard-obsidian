@@ -45,6 +45,7 @@ import { UpdateChecker } from "./update-checker";
 import { AtRestCipher, AtRestStorage } from "../crypto/at-rest-cipher";
 import { SafeStorageLike, probeSafeStorage } from "../crypto/safe-storage";
 import { PathPermissionsModal } from "../ui/path-permissions-modal";
+import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
 import { VaultGuardSidebarView, VAULTGUARD_VIEW_TYPE } from "../ui/vaultguard-sidebar-view";
 import type { VaultGuardSidebarViewConfig } from "../ui/vaultguard-sidebar-view";
@@ -1417,8 +1418,9 @@ export default class VaultGuardPlugin extends Plugin {
       callback: () => this.performSync({ userInitiated: true, forceCatchup: true }),
     });
 
-    // Share-link lifecycle: list active links and revoke leaked ones. Hidden
-    // from the palette on Community Edition backends.
+    // Share-link lifecycle: list active links and revoke leaked ones. On
+    // Community Edition the command opens a Pro-upsell modal instead of the
+    // share-management modal — same compiled binary, show-but-block UX.
     this.addCommand({
       id: "manage-share-links",
       name: "Manage share links",
@@ -1426,10 +1428,15 @@ export default class VaultGuardPlugin extends Plugin {
         const ready =
           !!this.session &&
           !!this.apiClient &&
-          !!this.settings.serverVaultId &&
-          this.featureEnabled('shareLinks');
+          !!this.settings.serverVaultId;
         if (checking) return ready;
-        if (ready) this.openShareManagementModal();
+        if (ready) {
+          if (!this.featureEnabled('shareLinks')) {
+            new ProUpsellModal(this.app, "shareLinks").open();
+          } else {
+            this.openShareManagementModal();
+          }
+        }
       },
     });
 
@@ -1597,14 +1604,19 @@ export default class VaultGuardPlugin extends Plugin {
         });
 
         // "Copy share link" — files only, any vault member can mint a link
-        // since the link itself grants nothing without team membership.
-        // Hidden on Community Edition backends where share links are unavailable.
-        if (!isFolder && this.featureEnabled('shareLinks')) {
+        // since the link itself grants nothing without team membership. On
+        // Community Edition this opens a Pro-upsell modal explaining the
+        // feature instead of minting a link.
+        if (!isFolder) {
           menu.addItem((item) => {
             item
               .setTitle("VaultGuard: Copy share link")
               .setIcon("link")
               .onClick(() => {
+                if (!this.featureEnabled('shareLinks')) {
+                  new ProUpsellModal(this.app, "shareLinks").open();
+                  return;
+                }
                 void this.copyShareLinkForPath(path);
               });
           });

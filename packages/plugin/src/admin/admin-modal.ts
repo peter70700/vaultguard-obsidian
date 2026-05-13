@@ -22,6 +22,7 @@ import { PermissionEditor } from "./permission-editor";
 import { buildFallbackOrgSettings, shouldUseFallbackOrgSettings } from "./settings-support";
 import { UserManager } from "./user-manager";
 import { getAccessUserDisplayName } from "../ui/access-user-utils";
+import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import type { ServerFeatures } from "../types";
 
 type TabId = "users" | "permissions" | "audit" | "settings" | "recovery";
@@ -714,13 +715,19 @@ export class AdminModal extends Modal {
         await this.fetchAndRenderAuditLog(logContainer, this.auditFilters, false, auditVault);
       });
 
-    // Export CSV is Pro-only ("advanced" audit). Hidden on Community Edition.
+    // Export CSV — Pro-only ("advanced" audit). On Community Edition the
+    // button is still visible but opens a Pro-upsell modal on click so users
+    // see the value of upgrading.
     const advancedAuditEnabled = this.context.features?.advancedAudit ?? true;
-    if (advancedAuditEnabled) {
-      new ButtonComponent(toolbar)
-        .setButtonText("Export CSV")
-        .onClick(() => this.exportAuditLog());
-    }
+    new ButtonComponent(toolbar)
+      .setButtonText("Export CSV")
+      .onClick(() => {
+        if (!advancedAuditEnabled) {
+          new ProUpsellModal(this.app, "advancedAudit").open();
+          return;
+        }
+        void this.exportAuditLog();
+      });
 
     // Log entries container
     const logContainer = container.createDiv({ cls: "vaultguard-audit-log" });
