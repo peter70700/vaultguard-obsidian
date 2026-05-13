@@ -208,36 +208,109 @@ terraform apply -var-file=environments/ce.tfvars
 
 ## Create the First Admin User
 
-A fresh deployment has no users. Create your first admin via the AWS CLI
-directly against Cognito — this skips the normal sign-up flow (which is
-disabled by default in Community Edition).
+A fresh deployment has zero users, zero organizations, and zero vaults. The
+bootstrap path is a single call to the public `POST /signup` endpoint. On a
+fresh deployment Community Edition's single-tenant gate is open because no
+organization exists yet; the moment this first call succeeds, the gate
+auto-locks so drive-by strangers cannot create their own orgs on your
+deployment.
+
+> **Note:** Do **not** bootstrap with `aws cognito-idp admin-create-user`.
+> Earlier versions of these docs (and some third-party guides) suggested that
+> path — it only creates a Cognito user with no organization, no vault, no
+> VaultMember row, and no permission rule, which leaves every API call after
+> login at `403`.
+
+Run the bootstrap from the same shell you used for `terraform apply`:
 
 ```bash
-# Pull the User Pool ID from terraform output.
-USER_POOL_ID=$(terraform output -raw cognito_user_pool_id)
+API_URL=$(terraform output -raw api_url)
 
-# Create the user, mark their email as already verified, and set the admin role
-# claim. Replace the email + temp password with your real values.
-aws cognito-idp admin-create-user \
-  --user-pool-id "$USER_POOL_ID" \
-  --username you@example.com \
-  --user-attributes \
-    Name=email,Value=you@example.com \
-    Name=email_verified,Value=true \
-    Name=custom:role,Value=admin \
-  --temporary-password "TempP@ss123!"
-
-# Set a permanent password so the user isn't forced through a reset flow on
-# first login.
-aws cognito-idp admin-set-user-password \
-  --user-pool-id "$USER_POOL_ID" \
-  --username you@example.com \
-  --password "YourSecurePassword123!" \
-  --permanent
+curl -X POST "$API_URL/signup" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "orgName": "Acme Corp",
+    "orgSlug": "acme-corp",
+    "email": "you@example.com",
+    "password": "YourSecurePassword123!",
+    "displayName": "Your Name"
+  }'
 ```
 
-You now have a single admin user. Subsequent users are typically created via
-the plugin's invite flow once an organization has been initialised.
+### Request body
+
+| Field         | Description                                                              |
+| ------------- | ------------------------------------------------------------------------ |
+| `orgName`     | Display name for the organization (e.g. `Acme Corp`).                    |
+| `orgSlug`     | URL-safe organization identifier. Lowercased server-side.                |
+| `email`       | Admin user email. Lowercased server-side. Used as the Cognito username.  |
+| `password`    | Admin user password (see policy below).                                  |
+| `displayName` | Admin user display name.                                                 |
+
+### Slug rules
+
+- 3-48 characters.
+- Regex: `^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$` — lowercase alphanumeric and
+  hyphens only.
+- Cannot start or end with a hyphen.
+- Reserved slugs (rejected with `400`): `admin`, `api`, `app`, `www`, `auth`,
+  `signup`, `login`, `vaultguard`, `support`, `help`, `docs`.
+
+### Password policy
+
+Minimum 12 characters and must include at least one uppercase letter, one
+lowercase letter, one digit, and one symbol. Passwords that fail this policy
+are rejected with `400` and the message
+`Password does not meet requirements: min 12 chars, uppercase, lowercase, digit, symbol`.
+
+### What the call creates atomically
+
+A successful `POST /signup` creates, in one transaction:
+
+- The Cognito user with a **permanent** password — no forced reset on first
+  login.
+- The `org-{slug}` Cognito group, plus the `admin` Cognito group (the user is
+  added to both).
+- The organization record (`VaultGuard-{stage}-Organizations`).
+- A default vault for the organization (`VaultGuard-{stage}-Vaults`), named
+  `{orgName} — Default`.
+- The owner `VaultMember` row binding the new user to the default vault with
+  the `admin` role.
+- A default allow-all permission rule scoped to the new vault so the admin can
+  immediately read and write files.
+
+### Auto-lock behavior
+
+As soon as the first organization exists, subsequent `POST /signup` calls
+return `403` with the message
+`Public signup is disabled on this Community Edition deployment.` This is the
+correct behavior for a single-tenant self-host.
+
+If you want to re-enable public signup later (for example, you are running
+Community Edition as a community service), set
+`vaultguard_allow_public_signup = true` in your tfvars and re-run
+`terraform apply`. Terraform passes that through as the
+`VAULTGUARD_ALLOW_PUBLIC_SIGNUP` env var on the signup Lambda. Most
+self-hosters should leave it `false`. See also the "Single-tenant lockdown"
+notes in `docs/SERVER_README.md`.
+
+### Troubleshooting
+
+If the curl call returns `403` with a `Public signup is disabled` message on
+what you believe is a fresh deployment, an organization already exists in the
+DynamoDB table. Confirm with:
+
+```bash
+aws dynamodb scan --table-name VaultGuard-{stage}-Organizations
+```
+
+Replace `{stage}` with the value of the `stage` variable in your `ce.tfvars`
+(e.g. `VaultGuard-dev-Organizations`). If the scan returns items, the gate is
+working as designed — either log in with the existing admin or flip
+`vaultguard_allow_public_signup = true` as described above.
+
+Additional admins and users are created via the plugin's invite flow once you
+log in with the admin account you just created.
 
 ***
 

@@ -264,10 +264,29 @@ class MockMenu {
   }
 }
 
+// Mutable Platform flag — individual tests can flip `Platform.isMobileApp`
+// via `Object.assign(Platform, { isMobileApp: true })` to exercise the
+// mobile code paths. Defaults to desktop so the existing suite is unaffected.
+const Platform = {
+  isMobile: false,
+  isMobileApp: false,
+  isDesktop: true,
+  isDesktopApp: true,
+  isIosApp: false,
+  isAndroidApp: false,
+  isPhone: false,
+  isTablet: false,
+  isMacOS: true,
+  isWin: false,
+  isLinux: false,
+  isSafari: false,
+};
+
 vi.mock('obsidian', () => ({
   requestUrl: vi.fn(),
   Notice: vi.fn(),
   Plugin: MockPlugin,
+  Platform,
   App: MockApp,
   Modal: MockModal,
   PluginSettingTab: MockPluginSettingTab,

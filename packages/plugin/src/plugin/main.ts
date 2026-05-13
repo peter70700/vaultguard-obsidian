@@ -12,7 +12,7 @@
  * - Offline support: Graceful degradation with cached keys and queued changes.
  */
 
-import { Notice, Plugin, TFile, TFolder, TAbstractFile, Menu, normalizePath, addIcon, requestUrl, RequestUrlResponse } from "obsidian";
+import { Notice, Plugin, Platform, TFile, TFolder, TAbstractFile, Menu, normalizePath, addIcon, requestUrl, RequestUrlResponse } from "obsidian";
 import pluginStyles from "../../styles.css";
 import { VaultGuardSettingTab, DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
@@ -1470,10 +1470,14 @@ export default class VaultGuardPlugin extends Plugin {
       callback: () => this.activateVaultGuardSidebar(),
     });
 
+    // Agent bridge needs Node `http` (local MCP server) — desktop only.
+    // We still register on mobile via checkCallback returning false so the
+    // command palette doesn't surface a broken entry.
     this.addCommand({
       id: "create-agent-bridge-lease",
       name: "Create Agent Bridge Lease",
       checkCallback: (checking: boolean) => {
+        if (Platform.isMobileApp) return false;
         const ready = !!this.session && !!this.settings.serverVaultId;
         if (checking) return ready;
         this.openAgentBridgeLeaseModal();
@@ -1483,7 +1487,9 @@ export default class VaultGuardPlugin extends Plugin {
     this.addCommand({
       id: "revoke-agent-bridge-leases",
       name: "Revoke Agent Bridge Leases",
-      callback: () => {
+      checkCallback: (checking: boolean) => {
+        if (Platform.isMobileApp) return false;
+        if (checking) return true;
         this.revokeAllAgentBridgeLeases();
         void this.stopAgentBridgeServer().catch((err) =>
           this.logError("Stopping agent bridge server failed", err)

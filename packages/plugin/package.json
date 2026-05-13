@@ -1,6 +1,6 @@
 {
   "name": "vaultguard",
-  "version": "0.1.5",
+  "version": "1.0.0",
   "description": "Enterprise vault security with permission-aware encrypted cloud sync for Obsidian",
   "main": "main.js",
   "scripts": {

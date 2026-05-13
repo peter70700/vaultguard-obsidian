@@ -40,6 +40,37 @@ After `terraform apply` finishes, the outputs section prints:
 - `vault_bucket_name` — S3 bucket holding encrypted vault content.
 - `kms_key_arn` — your customer-managed KMS key.
 
+### 5. Create your first admin user
+
+Steps 1-4 deploy the infrastructure, but the deployment lands with zero users
+and zero organizations. Bootstrap a single admin via the public `POST /signup`
+endpoint:
+
+```bash
+API_URL=$(terraform output -raw api_url)
+
+curl -X POST "$API_URL/signup" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "orgName": "Acme Corp",
+    "orgSlug": "acme-corp",
+    "email": "you@example.com",
+    "password": "YourSecurePassword123!",
+    "displayName": "Your Name"
+  }'
+```
+
+This call creates, in one transaction, the Cognito admin user (permanent
+password), the `org-{slug}` and `admin` Cognito groups, the organization
+record, a default vault, the owner VaultMember row, and a default allow-all
+permission rule.
+
+For slug rules, password policy, the auto-lock behavior, and troubleshooting,
+see [`docs/SELF-HOSTING.md#create-the-first-admin-user`](SELF-HOSTING.md#create-the-first-admin-user).
+After this first call succeeds, Community Edition locks public signup — see
+[Single-tenant lockdown](#single-tenant-lockdown) below for re-enabling it
+later via `vaultguard_allow_public_signup = true`.
+
 ## What you get
 
 | Capability | Included |

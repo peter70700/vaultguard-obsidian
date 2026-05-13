@@ -4,7 +4,7 @@
  * encrypted cloud sync system.
  */
 
-import { App, ButtonComponent, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, ButtonComponent, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
 import {
   AtRestPasswordConfirmModal,
   AtRestRecoveryCodeModal,
@@ -212,9 +212,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    */
   private renderAtRestSection(containerEl: HTMLElement): void {
     containerEl.createEl("h2", { text: "Local at-rest encryption" });
+    const atRestDesc = Platform.isMobileApp
+      ? "Vault files on this device are encrypted on disk with a per-device key kept in this app's secure storage. Without VaultGuard running, the files on disk are ciphertext — useful if your phone backs up app data to iCloud / Google Drive."
+      : "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard running, opening files in Finder shows ciphertext.";
     containerEl.createEl("p", {
-      text:
-        "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard running, opening files in Finder shows ciphertext.",
+      text: atRestDesc,
       cls: "setting-item-description",
     });
 
@@ -1847,6 +1849,20 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    */
   private renderAgentBridgeSection(containerEl: HTMLElement): void {
     containerEl.createEl("h2", { text: "Agent bridge connections" });
+
+    // Agent bridge needs a local HTTP server (Node `http` module). That's
+    // only reachable in desktop Obsidian's renderer. On mobile we surface
+    // the limitation up-front instead of letting the user click "Create
+    // bridge lease" and see a confusing failure later.
+    if (Platform.isMobileApp) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text:
+          "Agent bridge is desktop-only. It exposes VaultGuard's tools to local MCP clients (Claudian, Claude Code, Cursor) via a localhost HTTP server, which Obsidian mobile renderers can't host. Manage agent leases from a desktop install of this same vault.",
+      });
+      return;
+    }
+
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text:
