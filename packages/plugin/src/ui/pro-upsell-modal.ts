@@ -1,10 +1,12 @@
 /**
- * ProUpsellModal — shown when a CE user clicks a Pro-only UI surface.
- * Replaces the historic "hide on CE" behavior with show-and-explain so users
- * see the value of upgrading instead of silently missing controls.
+ * ProUpsellModal — shown when a Community Edition user clicks a Pro-Edition-
+ * only UI surface. Replaces the historic "hide on Community Edition" behavior
+ * with show-and-explain so users see the value of upgrading instead of
+ * silently missing controls.
  *
- * The same compiled binary serves both Cloud and CE — Pro backends never open
- * this modal because their featureEnabled() returns true at the call sites.
+ * The same compiled binary serves Pro Edition backends (e.g. VaultGuard Cloud)
+ * and Community Edition self-hosts; Pro Edition backends never open this modal
+ * because their featureEnabled() returns true at the call sites.
  *
  * The modal opens with a prominent "PRO FEATURE — Not available in Community
  * Edition" badge above the title; banner classes are styled in styles.css.
@@ -27,13 +29,13 @@ interface FeatureCopy {
 }
 
 const COMMON_FOOTER =
-  "Connect to a VaultGuard Pro backend to unlock this surface — the same plugin binary works against both editions.";
+  "Available in VaultGuard Pro Edition (the managed VaultGuard Cloud, or a paid self-host). Your plugin binary is identical across editions — connect it to a Pro Edition backend to unlock this surface.";
 
 const FEATURE_COPY: Record<ProFeature, FeatureCopy> = {
   shareLinks: {
     title: "Share links",
     tagline:
-      "Send time-limited links to people outside your team without giving them an Obsidian login. Per-file permissions still apply. Links can be revoked at any time.",
+      "Send a teammate a one-click link to a specific file. Recipients must already be vault members with read permission. Links are time-limited and revocable.",
     bullets: [
       "Mint a link to any file a vault member can read",
       "Recipient opens it in their own Obsidian via a one-click bridge",
@@ -51,7 +53,7 @@ const FEATURE_COPY: Record<ProFeature, FeatureCopy> = {
       "Scheduled exports delivered to your inbox",
       "Per-user and per-file activity reports",
       "Anomaly alerts on unusual access patterns",
-      "Extended retention beyond the Community default",
+      "Extended retention — query up to your retentionDays setting (default 365 days); Community caps at 30 days",
     ],
     footer: COMMON_FOOTER,
   },

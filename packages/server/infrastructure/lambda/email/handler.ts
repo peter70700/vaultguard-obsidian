@@ -79,13 +79,22 @@ interface SubscriptionCancelledParams {
   accessEndDate: string;
 }
 
+interface TrialActivationParams {
+  email: string;
+  orgName: string;
+  adminName: string;
+  /** Where to send the user to start the trial (admin panel billing page). */
+  billingUrl?: string;
+}
+
 type EmailType =
   | 'welcome'
   | 'invitation'
   | 'password-reset'
   | 'payment-success'
   | 'payment-failed'
-  | 'subscription-cancelled';
+  | 'subscription-cancelled'
+  | 'trial-activation';
 
 type EmailParams =
   | WelcomeParams
@@ -93,7 +102,8 @@ type EmailParams =
   | PasswordResetParams
   | PaymentSuccessParams
   | PaymentFailedParams
-  | SubscriptionCancelledParams;
+  | SubscriptionCancelledParams
+  | TrialActivationParams;
 
 interface EmailPayload {
   type: EmailType;
@@ -529,6 +539,51 @@ function buildSubscriptionCancelledEmail(params: SubscriptionCancelledParams): {
   return { subject, html: renderEmail(subject, bodyHtml) };
 }
 
+function buildTrialActivationEmail(params: TrialActivationParams): { subject: string; html: string } {
+  const subject = `Your VaultGuard Pro trial is ready, ${params.adminName}`;
+  const billingUrl = params.billingUrl || 'https://admin.example.com/#/billing';
+  const bodyHtml = `
+    <h1 style="margin:0 0 8px 0;font-size:24px;font-weight:700;color:${TEXT_COLOR};">Start your 14-day Pro trial</h1>
+    <p style="margin:0 0 24px 0;font-size:14px;color:${TEXT_MUTED};">Every Pro feature, unlocked for 14 days.</p>
+
+    <p style="margin:0 0 16px 0;font-size:15px;color:${TEXT_COLOR};">
+      Hi ${escapeHtml(params.adminName)},
+    </p>
+    <p style="margin:0 0 16px 0;font-size:15px;color:${TEXT_COLOR};line-height:1.7;">
+      Your organization <strong style="color:${ACCENT};">${escapeHtml(params.orgName)}</strong> is ready
+      to start a <strong>14-day VaultGuard Pro trial</strong> &mdash; share links, advanced audit, the
+      hosted admin panel, and every other Pro feature unlocked.
+    </p>
+
+    ${renderInfoCard('What you get during the trial', `
+      <ul style="margin:0;padding-left:20px;font-size:14px;color:${TEXT_COLOR};line-height:1.7;">
+        <li>Share links + share-bridge for outside collaborators</li>
+        <li>Advanced audit dashboards, alerts, and CSV export</li>
+        <li>Hosted web admin panel for non-technical admins</li>
+        <li>Up to 100 users and 100 GB of vault storage</li>
+        <li>Managed AWS infrastructure with daily backups</li>
+      </ul>
+    `)}
+
+    ${renderButton('Start trial', billingUrl)}
+
+    <p style="margin:24px 0 16px 0;font-size:13px;color:${TEXT_MUTED};line-height:1.6;">
+      If the button doesn't work, paste this into your browser:<br>
+      <a href="${escapeHtml(billingUrl)}" style="color:${ACCENT};word-break:break-all;font-size:12px;">${escapeHtml(billingUrl)}</a>
+    </p>
+
+    <p style="margin:0 0 12px 0;font-size:13px;color:${TEXT_MUTED};line-height:1.6;">
+      Prefer to keep things in your own AWS? Our open-source
+      <strong>Community Edition</strong> is free forever &mdash; it includes the full
+      encryption, sync, and per-file permissions stack. Pro-only surfaces stay gated off.
+    </p>
+
+    <p style="margin:0;font-size:13px;color:${TEXT_MUTED};">
+      Questions? Reply to this email &mdash; we read every response.
+    </p>`;
+  return { subject, html: renderEmail(subject, bodyHtml) };
+}
+
 // ─── Email Dispatch ──────────────────────────────────────────────────────────
 
 /**
@@ -585,6 +640,12 @@ export async function sendEmail(type: EmailType, params: EmailParams, options?: 
       const p = params as SubscriptionCancelledParams;
       toAddress = p.email;
       ({ subject, html } = buildSubscriptionCancelledEmail(p));
+      break;
+    }
+    case 'trial-activation': {
+      const p = params as TrialActivationParams;
+      toAddress = p.email;
+      ({ subject, html } = buildTrialActivationEmail(p));
       break;
     }
     default:

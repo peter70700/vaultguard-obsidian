@@ -887,6 +887,7 @@ export class FilePermissionHeader {
       isAdmin: this.ctx.isAdmin,
       currentUserId: this.ctx.currentUserId,
       anchorEl: headerEl,
+      initialUsers: this.users,
       onRulesChanged: async () => {
         this.invalidateCache(file.path);
         await this.update({ force: true });

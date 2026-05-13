@@ -83,6 +83,7 @@ import {
 } from '../shared/utils';
 import { UsersRouteContext, resolveUsersRouteContext } from '../shared/route-utils';
 import { sendEmail } from '../email/handler';
+import { syncStripeSeats } from '../billing/handler';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -106,6 +107,27 @@ type ResolvedTargetUser = {
   user: AdminGetUserCommandOutput;
   attributes: Record<string, string>;
 };
+
+/**
+ * Best-effort server-side Stripe seat sync after a user mutation. Never throws:
+ * a Stripe outage or DynamoDB hiccup logs to CloudWatch but does not fail the
+ * parent user mutation. Free-tier orgs (no stripeSubscriptionId) are skipped
+ * silently by the underlying helper.
+ *
+ * Awaited (not fire-and-forget) so the Lambda execution context stays warm
+ * long enough for the Stripe HTTP request to complete.
+ */
+async function bestEffortSeatSync(orgId: string): Promise<void> {
+  try {
+    const result = await syncStripeSeats(orgId);
+    if (result.synced) {
+      console.log('[SEAT_SYNC]', { orgId, quantity: result.quantity, currentUsers: result.currentUsers });
+    }
+  } catch (err) {
+    // Best-effort: never fail a user mutation on Stripe outage.
+    console.error('[SEAT_SYNC_FAILURE]', orgId, (err as Error).message);
+  }
+}
 
 // ─── Main Handler ────────────────────────────────────────────────────────────
 
@@ -408,6 +430,7 @@ async function handleInviteUser(
   const orgResult = await getActiveOrg(admin.orgId);
   if (orgResult.org) {
     await updateOrgUserCount(orgResult.org.slug, 1);
+    await bestEffortSeatSync(admin.orgId);
   }
 
   // Send our own branded invitation email (no plaintext password — user sets
@@ -646,6 +669,7 @@ async function handleRevokeUser(
   const orgResult = await getActiveOrg(admin.orgId);
   if (orgResult.org) {
     await updateOrgUserCount(orgResult.org.slug, -1);
+    await bestEffortSeatSync(admin.orgId);
   }
 
   const cryptoRevocation = await revokeUserCryptoAccess({
@@ -847,6 +871,7 @@ async function handleReactivateUser(
   const orgResult = await getActiveOrg(admin.orgId);
   if (orgResult.org) {
     await updateOrgUserCount(orgResult.org.slug, 1);
+    await bestEffortSeatSync(admin.orgId);
   }
 
   await logAudit({

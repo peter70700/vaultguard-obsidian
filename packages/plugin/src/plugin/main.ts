@@ -1456,6 +1456,30 @@ export default class VaultGuardPlugin extends Plugin {
       callback: () => this.showVaultGuardMenu(),
     });
 
+    // Audit log — admin/owner only; opens AdminModal preset to the audit tab.
+    this.addCommand({
+      id: "open-audit-log",
+      name: "Open Audit Log",
+      checkCallback: (checking: boolean) => {
+        const isAdmin =
+          this.session?.role === "admin" || this.session?.role === "owner";
+        const ready = !!this.session && isAdmin && !!this.apiClient;
+        if (checking) return ready;
+        if (ready) this.openAuditLog();
+      },
+    });
+
+    // Web admin panel — any logged-in user; CE-branch shows ProUpsellModal.
+    this.addCommand({
+      id: "open-web-admin",
+      name: "Open Web Admin Panel",
+      checkCallback: (checking: boolean) => {
+        const ready = !!this.session;
+        if (checking) return ready;
+        if (ready) this.openWebAdminPanel();
+      },
+    });
+
     // Direct settings entry point
     this.addCommand({
       id: "open-settings",
@@ -3033,6 +3057,23 @@ export default class VaultGuardPlugin extends Plugin {
         .setTitle("View my permissions")
         .setIcon("shield-check")
         .onClick(() => this.showPermissionsModal())
+    );
+
+    if (isAdmin) {
+      menu.addItem((item) =>
+        item
+          .setTitle("Audit log")
+          .setIcon("file-text")
+          .setDisabled(!this.apiClient)
+          .onClick(() => this.openAuditLog())
+      );
+    }
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Web admin panel")
+        .setIcon("external-link")
+        .onClick(() => this.openWebAdminPanel())
     );
 
     menu.addItem((item) =>
@@ -8155,6 +8196,48 @@ export default class VaultGuardPlugin extends Plugin {
       this.createAdminModalContext()
     );
     modal.open();
+  }
+
+  /**
+   * Opens the admin modal preset to the audit log tab. Admin/owner only — the
+   * caller (command checkCallback or ribbon-menu item) gates on role.
+   */
+  private openAuditLog(): void {
+    if (!this.session) return;
+    if (!this.apiClient) {
+      new Notice("VaultGuard: not connected to a server.");
+      return;
+    }
+    // 4th arg is permissionsUserId; passing it puts AdminModal in
+    // single-user-permissions mode (only "My vault access" tab shown), which
+    // would hide the audit tab and override initialTab="audit" back to
+    // "permissions" (admin-modal.ts:211). Pass null to get the full admin
+    // view with all 5 tabs including audit.
+    new AdminModal(
+      this.app,
+      this.apiClient,
+      "audit",
+      null,
+      this.createAdminModalContext()
+    ).open();
+  }
+
+  /**
+   * Opens the web admin panel in a new browser tab. On Community Edition
+   * servers (featureEnabled('webAdmin') === false) shows ProUpsellModal
+   * instead of navigating.
+   */
+  private openWebAdminPanel(): void {
+    if (!this.session) return;
+    if (!this.featureEnabled("webAdmin")) {
+      new ProUpsellModal(this.app, "webAdmin").open();
+      return;
+    }
+    const slug = this.settings.orgSlug?.trim() || "";
+    const url = slug
+      ? `https://admin.example.com/${encodeURIComponent(slug)}`
+      : "https://admin.example.com";
+    window.open(url, "_blank", "noopener,noreferrer");
   }
 
   /**

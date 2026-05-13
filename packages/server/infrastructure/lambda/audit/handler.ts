@@ -48,6 +48,20 @@ import { FEATURES } from '../shared/edition';
 // Required env var — see shared/utils.ts for rationale on dropping silent fallbacks.
 const ALERTS_TABLE = process.env.ALERTS_TABLE!;
 const ANOMALY_THRESHOLD_DENIED = parseInt(process.env.ANOMALY_THRESHOLD_DENIED || '5', 10);
+
+/**
+ * Soft cap on the retention window for audit-log queries on Community Edition.
+ *
+ * Pro Edition honors the full `orgSettings.retentionDays` (default 365 days).
+ * Community Edition clamps the query window to the most recent 30 days,
+ * matching the ProUpsellModal copy and the SERVER_README marketing table.
+ *
+ * This is a *query-time* cap only — records are still stored per the org's
+ * retentionDays and any DynamoDB TTL. CE users can upgrade to Pro to read
+ * older entries without re-ingesting data.
+ */
+export const CE_AUDIT_RETENTION_DAYS = 30;
+
 const ANOMALY_THRESHOLD_BULK = parseInt(process.env.ANOMALY_THRESHOLD_BULK || '50', 10);
 const ANOMALY_WINDOW_MINUTES = parseInt(process.env.ANOMALY_WINDOW_MINUTES || '10', 10);
 const ANOMALY_THRESHOLD_DISTINCT_IPS = parseInt(process.env.ANOMALY_THRESHOLD_DISTINCT_IPS || '3', 10);
@@ -842,13 +856,16 @@ function normalizeEndTimestamp(value?: string): string | undefined {
   return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
 }
 
-async function applyRetentionWindow(
+export async function applyRetentionWindow(
   orgId: string,
   startDate?: string,
   endDate?: string
 ): Promise<{ startDate?: string; endDate?: string }> {
   const settings = await getEffectiveOrgSettings(orgId);
-  const retentionDays = settings?.retentionDays ?? DEFAULT_ORG_SETTINGS.retentionDays;
+  const orgRetentionDays = settings?.retentionDays ?? DEFAULT_ORG_SETTINGS.retentionDays;
+  const retentionDays = FEATURES.advancedAudit
+    ? orgRetentionDays
+    : Math.min(orgRetentionDays, CE_AUDIT_RETENTION_DAYS);
   const retentionStart = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
 
   let effectiveStartDate = startDate;

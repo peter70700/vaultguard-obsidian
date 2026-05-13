@@ -1,5 +1,15 @@
 # Self-Hosted Plugin Setup
 
+> ⚠️ **DEPRECATED — superseded by Community Edition.** This document describes
+> the older "plugin-only public repo" story (plugin open, backend closed),
+> which predates the current open-core model. The shipping story is now
+> **VaultGuard Community Edition**: both plugin **and** server are open-source,
+> deployable via Terraform on your own AWS.
+>
+> **Canonical replacement:** [`docs/SELF-HOSTING.md`](SELF-HOSTING.md). See
+> also [`docs/TERMINOLOGY.md`](TERMINOLOGY.md) for the edition / plan /
+> deployment word map.
+
 The free self-hosted release is a plugin-only public repository. It does not
 include the VaultGuard SaaS backend, web admin panel, deployment code, billing
 code, or hosted infrastructure.

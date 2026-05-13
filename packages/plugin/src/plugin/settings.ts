@@ -88,6 +88,12 @@ const VAULT_ROLE_LABELS: Record<VaultMemberRole, string> = {
 const VAULT_KINDS: VaultKind[] = ["team", "personal", "shared"];
 const VAULT_ROLES: VaultMemberRole[] = ["viewer", "editor", "admin"];
 
+interface UserLabelIdentity {
+  email?: string;
+  displayName?: string;
+  name?: string;
+}
+
 interface AgentBridgeConnectionReveal {
   leaseId: string;
   agentName: string;
@@ -918,15 +924,28 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           .then((users) => ({ users, error: null as unknown }))
           .catch((error) => ({ users: [] as UserListEntry[], error })),
       ]);
-      const users = usersResult.users;
-      const userById = new Map(users.map((user) => [user.id, user]));
       const canManage = this.canManageVault(session, memberRole) && !vault.archived;
+      const users = usersResult.users;
+      const userById = this.buildVaultMemberUserLabelMap(members);
+      userById.set(session.userId, {
+        email: session.email,
+        displayName: session.displayName,
+        name: session.displayName,
+      });
+      for (const user of users) {
+        userById.set(user.id, user);
+      }
+      const allMembersHaveLabels = members.every((member) => userById.has(member.userId));
 
       membersEl.empty();
-      if (usersResult.error) {
+      if (usersResult.error && (canManage || !allMembersHaveLabels)) {
         new Setting(membersEl)
-          .setName("User directory unavailable")
-          .setDesc(`Members are shown by ID. ${this.errorMessage(usersResult.error)}`);
+          .setName(canManage ? "Add-member directory unavailable" : "User directory unavailable")
+          .setDesc(
+            allMembersHaveLabels
+              ? `Existing members use vault member names. ${this.errorMessage(usersResult.error)}`
+              : `Members without vault member names are shown by ID. ${this.errorMessage(usersResult.error)}`
+          );
       }
 
       if (members.length === 0) {
@@ -968,7 +987,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     session: UserSession,
     vault: VaultRecord,
     member: VaultMemberRecord,
-    userById: Map<string, UserListEntry>,
+    userById: Map<string, UserLabelIdentity>,
     canManage: boolean
   ): void {
     const user = userById.get(member.userId);
@@ -1141,10 +1160,26 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     return Number.isNaN(timestamp) ? value : new Date(timestamp).toLocaleDateString();
   }
 
-  private formatUserLabel(userId: string, user?: UserListEntry): string {
+  private buildVaultMemberUserLabelMap(members: VaultMemberRecord[]): Map<string, UserLabelIdentity> {
+    const userById = new Map<string, UserLabelIdentity>();
+    for (const member of members) {
+      const displayName = member.displayName?.trim() ?? "";
+      const email = member.email?.trim() ?? "";
+      if (!displayName && !email) continue;
+      userById.set(member.userId, {
+        email,
+        displayName,
+        name: displayName,
+      });
+    }
+    return userById;
+  }
+
+  private formatUserLabel(userId: string, user?: UserLabelIdentity): string {
     if (!user) return userId;
-    const name = user.displayName || user.name || user.email;
-    return user.email && name !== user.email ? `${name} (${user.email})` : name;
+    const email = user.email?.trim() ?? "";
+    const name = user.displayName?.trim() || user.name?.trim() || email || userId;
+    return email && name !== email ? `${name} (${email})` : name;
   }
 
   private errorMessage(error: unknown): string {
@@ -1185,7 +1220,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // ── Header ──────────────────────────────────────────────────────────────
     containerEl.createEl("h1", { text: "VaultGuard" });
     containerEl.createEl("p", {
-      text: "Enterprise vault security with permission-aware encrypted cloud sync.",
+      text: "Enterprise-grade vault security with permission-aware encrypted cloud sync.",
       cls: "setting-item-description",
     });
 

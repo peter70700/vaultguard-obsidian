@@ -1,6 +1,6 @@
 # VaultGuard Server — Community Edition
 
-Open-source server stack for [VaultGuard](https://example.com) — an
+Open-source server stack for [VaultGuard](https://vaultguard.cloud) — an
 end-to-end encrypted, permission-aware sync backend for Obsidian vaults.
 
 This repository ships the AWS infrastructure you self-host. Pair it with the
@@ -82,20 +82,20 @@ later via `vaultguard_allow_public_signup = true`.
 | Plugin allowlist enforcement | ✅ |
 | Time-bound key leases (4h default, configurable) | ✅ |
 | Cognito-based auth (federate to your IdP if desired) | ✅ |
-| Basic audit trail (`GET /vaults/{vaultId}/audit/logs`) | ✅ |
+| Basic audit trail (`GET /vaults/{vaultId}/audit/logs` — last 30 days on CE) | ✅ |
 | In-Obsidian admin UI (users / permissions / settings) | ✅ |
 | Transactional email via AWS SES | ✅ |
 | Unlimited users, no seat caps | ✅ |
 
 ## What's NOT included
 
-These features stay in the managed Pro plan ([upgrade](https://example.com)):
+These features stay in the managed Pro plan ([upgrade](https://vaultguard.cloud)):
 
 | Feature | Why it's in Pro |
 |---|---|
-| **Share links** for external collaborators | Token resolver + share-bridge SPA — Pro infrastructure |
-| **Hosted web admin panel** (`admin.example.com`) | React app for non-technical admins to manage users/permissions/audit without opening Obsidian |
-| **Advanced audit** (dashboards, alerts, CSV export, per-user/per-file reports) | Anomaly detection, scheduled reports, long retention |
+| **Share links** for internal teammates | Token resolver + share-bridge SPA — Pro infrastructure |
+| **Hosted web admin panel** (`admin.vaultguard.cloud`) | React app for non-technical admins to manage users/permissions/audit without opening Obsidian |
+| **Advanced audit** (dashboards, alerts, CSV export, per-user/per-file reports) | Anomaly detection, scheduled reports, full retention window (CE caps audit queries at 30 days) |
 | **Stripe-backed billing** | Managed subscription lifecycle |
 | **Managed AWS infrastructure** | We run it, patch it, back it up |
 | **Daily backups, 99.9% uptime SLA** | Operational guarantees |
@@ -206,15 +206,15 @@ new org, and you're done. Your CE deployment can be torn down with
 
 Migrating data between CE and Pro is not automated — vault content lives in
 S3 in your account on CE and in our account on Pro. Contact
-[support@example.com](mailto:support@example.com) for a
+[support@vaultguard.cloud](mailto:support@vaultguard.cloud) for a
 managed migration if you want to move a large team.
 
 ## Support
 
 - **Bugs / feature requests:** open an issue on this repo.
 - **General questions:** [GitHub Discussions](https://github.com/peter70700/vaultguard-obsidian/discussions).
-- **Security disclosures:** email support@example.com.
-- **Commercial support, SLA, SSO, compliance:** [example.com](https://example.com).
+- **Security disclosures:** email support@vaultguard.cloud.
+- **Commercial support, SLA, SSO, compliance:** [vaultguard.cloud](https://vaultguard.cloud).
 
 ## License
 

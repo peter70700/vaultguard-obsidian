@@ -851,6 +851,22 @@ data "aws_iam_policy_document" "users_lambda" {
     actions   = ["events:PutEvents"]
     resources = ["*"]
   }
+  # Secrets Manager — read Stripe secret for server-side seat sync after
+  # invite/revoke/reactivate. Guarded for Community Edition where
+  # stripe_secret_arn = "" (billing is a 404 stub and seat-sync is a no-op).
+  dynamic "statement" {
+    for_each = var.stripe_secret_arn != "" ? [1] : []
+    content {
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.stripe_secret_arn]
+    }
+  }
+  # DynamoDB — Subscriptions table for seat-sync helper (read the sub record,
+  # update local quantity after Stripe accepts the new seat count).
+  statement {
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+    resources = [var.subscriptions_table_arn]
+  }
 }
 
 resource "aws_iam_role_policy" "users_lambda" {
@@ -876,7 +892,9 @@ resource "aws_lambda_function" "users" {
 
   environment {
     variables = merge(local.common_env, {
-      USER_POOL_ID = var.cognito_user_pool_id
+      USER_POOL_ID        = var.cognito_user_pool_id
+      STRIPE_SECRET_ARN   = var.stripe_secret_arn
+      SUBSCRIPTIONS_TABLE = var.subscriptions_table_name
     })
   }
 

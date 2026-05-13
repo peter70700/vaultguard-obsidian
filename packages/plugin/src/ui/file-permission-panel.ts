@@ -36,6 +36,7 @@ export interface FilePermissionPanelConfig {
   isAdmin: boolean;
   currentUserId: string;
   anchorEl: HTMLElement;
+  initialUsers?: UserListEntry[];
   onRulesChanged: () => Promise<void>;
   onClose: () => void;
 }
@@ -66,6 +67,8 @@ export class FilePermissionPanel {
   constructor(cfg: FilePermissionPanelConfig) {
     this.cfg = cfg;
     this.rules = [...cfg.rules];
+    this.users = sortAccessUsers(cfg.initialUsers ?? []);
+    this.userMap = buildAccessUserMap(this.users);
     this.usersLoading = cfg.isAdmin;
 
     // Floating backdrop keeps outside-click handling simple while the panel

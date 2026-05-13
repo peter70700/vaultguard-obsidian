@@ -6,7 +6,8 @@
     "build": "tsc && node build-lambdas.mjs",
     "build:lambdas": "node build-lambdas.mjs",
     "watch": "tsc -w",
-    "test-emails": "npx esbuild --bundle send-test-emails.ts --platform=node --format=cjs --packages=external --outfile=dist/test-emails.cjs && node dist/test-emails.cjs"
+    "test-emails": "npx esbuild --bundle send-test-emails.ts --platform=node --format=cjs --packages=external --outfile=dist/test-emails.cjs && node dist/test-emails.cjs",
+    "blast-trial": "npx esbuild --bundle blast-trial-activation.ts --platform=node --format=cjs --packages=external --outfile=dist/blast-trial.cjs && node dist/blast-trial.cjs"
   },
   "dependencies": {
     "@aws-sdk/client-cognito-identity-provider": "^3.1032.0",
