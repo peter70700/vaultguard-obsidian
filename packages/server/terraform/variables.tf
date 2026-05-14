@@ -34,9 +34,9 @@ variable "cognito_logout_urls" {
 }
 
 variable "key_lease_duration_seconds" {
-  description = "Duration of encryption key leases in seconds"
+  description = "Duration of encryption key leases in seconds. CE defaults to 4 hours."
   type        = number
-  default     = 3600
+  default     = 14400
 }
 
 variable "session_duration_seconds" {

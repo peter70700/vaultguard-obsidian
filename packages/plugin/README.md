@@ -37,9 +37,9 @@ Identical in every tier — security primitives are never paywalled.
 | Time-bound key leases (4h default, configurable) | ✓ | ✓ | ✓ |
 | Multi-vault support per organization | ✓ | ✓ | ✓ |
 | Plugin allowlist enforcement | ✓ | ✓ | ✓ |
-| Cognito auth (federate to your IdP) | ✓ | ✓ | ✓ |
+| Cognito auth (password + BYO IdP via Cognito) | ✓ | ✓ | ✓ |
 | Local at-rest encryption via OS keychain | ✓ | ✓ | ✓ |
-| TLS 1.3 in transit | ✓ | ✓ | ✓ |
+| TLS 1.2+ in transit (TLS 1.3 when negotiated) | ✓ | ✓ | ✓ |
 
 ### Admin & operations
 
@@ -50,7 +50,7 @@ Where Pro starts to earn its keep.
 | In-Obsidian admin (users / permissions / settings / recovery) | ✓ | ✓ | ✓ |
 | Hosted web admin panel (admin.vaultguard.cloud) | ✗ | ✓ | ✓ |
 | Share links + share-bridge for internal teammates | ✗ | ✓ | ✓ |
-| Basic audit log (`GET /audit/logs`) | ✓ | ✓ | ✓ |
+| Basic audit log (`GET /vaults/{vaultId}/audit/logs`) | ✓ | ✓ | ✓ |
 | Advanced audit — dashboards, alerts, CSV export, per-user / per-file reports | ✗ | ✓ | ✓ |
 | Audit retention | 30 days (configurable) | 1 year | Custom |
 | Stripe-backed billing | ✗ | ✓ | ✓ |
@@ -113,17 +113,15 @@ SSO, dedicated infra, and compliance attestations on top of Pro.
 > — no card required. Or [contact Enterprise sales](mailto:support@vaultguard.cloud?subject=VaultGuard%20Enterprise%20Inquiry)
 > for SSO and compliance.
 
-## Free Self-Hosted Edition
+## Self-Hosting (Community Edition)
 
-The free self-hosted edition is plugin-only:
+VaultGuard Community Edition is a monorepo: this `packages/plugin/` is the
+Obsidian client, and `packages/server/` is the AWS backend (Cognito, API
+Gateway, Lambda, DynamoDB, S3, KMS, SES) deployable with Terraform on your own
+AWS account. Single-tenant by default; Pro-only features (web admin, share
+links, Stripe billing, landing page) are excluded.
 
-- No hosted SaaS backend.
-- No React web admin panel.
-- No Terraform, Lambda, Stripe, or landing-page code.
-- No secrets or customer-specific configuration.
-
-Bring your own compatible VaultGuard API endpoint and Cognito app client, then
-configure the plugin manually from Obsidian settings.
+The end-to-end deploy walkthrough lives at [`docs/SELF-HOSTING.md`](docs/SELF-HOSTING.md).
 
 ## Hosted Mode
 
@@ -133,8 +131,16 @@ connection settings automatically.
 
 ## Install From a Release
 
-1. Download `vaultguard-<version>.zip` from the latest GitHub release.
-2. Extract it into:
+1. Open the [latest release](https://github.com/peter70700/vaultguard-obsidian/releases/latest)
+   and download these three files:
+
+   ```text
+   main.js
+   manifest.json
+   styles.css
+   ```
+
+2. Place them into your vault at:
 
    ```text
    <Vault>/.obsidian/plugins/vaultguard/
@@ -143,31 +149,19 @@ connection settings automatically.
 3. Restart Obsidian.
 4. Enable VaultGuard under Settings > Community plugins.
 
-The plugin folder must contain:
-
-```text
-main.js
-manifest.json
-styles.css
-```
-
 ## Build From Source
 
 ```bash
 npm install
-npm run build
+npm run -w vaultguard build
 ```
 
-To package the release zip:
+The build produces `packages/plugin/main.js` alongside the existing
+`packages/plugin/manifest.json` and `packages/plugin/styles.css`. To install
+the built plugin directly into a local vault:
 
 ```bash
-npm run package
-```
-
-To install directly into a local vault:
-
-```bash
-npm run install:plugin -- "/absolute/path/to/YourVault"
+npm run -w vaultguard install:plugin -- "/absolute/path/to/YourVault"
 ```
 
 ## Self-Hosted Configuration
@@ -179,11 +173,11 @@ Open Settings > VaultGuard > Connection, enable manual configuration, then enter
 - Cognito User Pool ID
 - Cognito Client ID
 
-See [packages/plugin/docs/SELF_HOSTED_PLUGIN.md](packages/plugin/docs/SELF_HOSTED_PLUGIN.md)
-for the plugin-only self-hosting setup contract, and
-[packages/plugin/docs/openapi.yaml](packages/plugin/docs/openapi.yaml) for the
-OpenAPI 3.1 schema describing the backend HTTP contract a self-hosted server
-must implement.
+See [`docs/SELF-HOSTING.md`](docs/SELF-HOSTING.md) for the end-to-end
+Community Edition deploy walkthrough, and
+[`packages/plugin/docs/openapi.yaml`](packages/plugin/docs/openapi.yaml) for
+the OpenAPI 3.1 schema describing the backend HTTP contract a self-hosted
+server must implement.
 
 ## Network Use
 
@@ -211,8 +205,8 @@ shown only to you and is never sent to the backend.
 ## Development
 
 ```bash
-npm run dev
-npm test
+npm run -w vaultguard dev    # esbuild watch
+npm run -w vaultguard test   # vitest
 ```
 
 ## License
