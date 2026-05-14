@@ -110,7 +110,7 @@ This runs the production build, validates release metadata, copies the plugin
 assets to `dist/vaultguard/`, and creates:
 
 ```text
-dist/vaultguard-<version>.zip
+dist/vaultguard-sync-<version>.zip
 ```
 
 The zip contains only `main.js`, `manifest.json`, and `styles.css` at the zip
@@ -127,25 +127,25 @@ npm run install:plugin -- "/absolute/path/to/YourVault"
 This builds the plugin and copies the release assets into:
 
 ```text
-/absolute/path/to/YourVault/.obsidian/plugins/vaultguard/
+/absolute/path/to/YourVault/.obsidian/plugins/vaultguard-sync/
 ```
 
-Then restart Obsidian and enable VaultGuard under Settings > Community plugins.
+Then restart Obsidian and enable VaultGuard Sync under Settings > Community plugins.
 
 ## Install on Another Device
 
 For another device before the plugin is in the community gallery:
 
 1. Run `npm run package`.
-2. Send `dist/vaultguard-<version>.zip` to the test device.
+2. Send `dist/vaultguard-sync-<version>.zip` to the test device.
 3. Extract it into the test vault:
 
    ```text
-   <Vault>/.obsidian/plugins/vaultguard/
+   <Vault>/.obsidian/plugins/vaultguard-sync/
    ```
 
 4. Restart Obsidian.
-5. Enable VaultGuard under Settings > Community plugins.
+5. Enable VaultGuard Sync under Settings > Community plugins.
 
 For less manual beta testing, use BRAT with the public GitHub repository and
 release assets.
@@ -176,7 +176,7 @@ packages the plugin, and creates a GitHub release with:
 - `main.js`
 - `manifest.json`
 - `styles.css`
-- `dist/vaultguard-<version>.zip`
+- `dist/vaultguard-sync-<version>.zip`
 
 The tag must exactly match `manifest.json` version.
 

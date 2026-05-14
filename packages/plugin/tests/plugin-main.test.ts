@@ -1638,7 +1638,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     const files = [
       { path: "Welcome.md" },
       { path: "notes/idea.md" },
-      { path: ".obsidian/plugins/vaultguard/data.json" },
+      { path: ".obsidian/plugins/vaultguard-sync/data.json" },
       { path: "secret/private.md" },
     ];
     const folders = ["notes", "empty"];
@@ -1657,7 +1657,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     expect(manifest["/Welcome.md"]).toBe("");
     expect(manifest["/notes/idea.md"]).toBe("");
-    expect(manifest).not.toHaveProperty("/.obsidian/plugins/vaultguard/data.json");
+    expect(manifest).not.toHaveProperty("/.obsidian/plugins/vaultguard-sync/data.json");
     expect(manifest).not.toHaveProperty("/secret/private.md");
     expect(manifest["/notes/.vaultguard-folder"]).toBe("");
     expect(manifest["/empty/.vaultguard-folder"]).toBe("");

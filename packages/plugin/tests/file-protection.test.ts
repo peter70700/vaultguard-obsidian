@@ -212,7 +212,7 @@ describe('File Protection: Vault Adapter Interception', () => {
         .rejects.toThrow('Login required to open "docs/readme.md"');
 
       expect(mockNotice).toHaveBeenCalledWith(
-        expect.stringContaining('VaultGuard: Login required to open "docs/readme.md".'),
+        expect.stringContaining('VaultGuard Sync: Login required to open "docs/readme.md".'),
         9000
       );
       expect(plugin.originalAdapterMethods.read).not.toHaveBeenCalled();

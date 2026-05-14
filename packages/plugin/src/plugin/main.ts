@@ -790,18 +790,18 @@ export default class VaultGuardPlugin extends Plugin {
     const linkVaultId = (params.vaultId ?? "").trim();
 
     if (!token) {
-      new Notice("VaultGuard: Share link is missing its token.");
+      new Notice("VaultGuard Sync: Share link is missing its token.");
       return;
     }
 
     if (!this.session || !this.apiClient) {
-      new Notice("VaultGuard: Log in first, then click the share link again.");
+      new Notice("VaultGuard Sync: Log in first, then click the share link again.");
       return;
     }
 
     const boundVaultId = this.settings.serverVaultId;
     if (!boundVaultId) {
-      new Notice("VaultGuard: This Obsidian vault isn't connected to a VaultGuard vault yet.");
+      new Notice("VaultGuard Sync: This Obsidian vault isn't connected to a VaultGuard vault yet.");
       return;
     }
 
@@ -810,7 +810,7 @@ export default class VaultGuardPlugin extends Plugin {
     // we can short-circuit with a clear message before doing any network I/O.
     if (linkVaultId && linkVaultId !== boundVaultId) {
       new Notice(
-        `VaultGuard: This share link points to a different VaultGuard vault. ` +
+        `VaultGuard Sync: This share link points to a different VaultGuard vault. ` +
         `Switch to the Obsidian vault bound to that VaultGuard vault and click the link again.`,
         8000
       );
@@ -822,14 +822,14 @@ export default class VaultGuardPlugin extends Plugin {
       resolved = await this.apiClient.resolveShare(boundVaultId, token);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      new Notice(`VaultGuard: Couldn't open share link — ${msg}`, 8000);
+      new Notice(`VaultGuard Sync: Couldn't open share link — ${msg}`, 8000);
       return;
     }
 
     const file = this.app.vault.getAbstractFileByPath(normalizePath(resolved.relPath));
     if (!(file instanceof TFile)) {
       new Notice(
-        `VaultGuard: "${resolved.relPath}" isn't available in this vault — ` +
+        `VaultGuard Sync: "${resolved.relPath}" isn't available in this vault — ` +
         `it may not be synced yet, or the source file was renamed or deleted.`,
         8000
       );
@@ -840,7 +840,7 @@ export default class VaultGuardPlugin extends Plugin {
       await this.app.workspace.getLeaf(false).openFile(file);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      new Notice(`VaultGuard: Couldn't open "${resolved.relPath}" — ${msg}`, 8000);
+      new Notice(`VaultGuard Sync: Couldn't open "${resolved.relPath}" — ${msg}`, 8000);
     }
   }
 
@@ -878,7 +878,8 @@ export default class VaultGuardPlugin extends Plugin {
    * what we already encrypted at the application layer.
    */
   private makeAgentBridgePersistenceAdapter(): AgentBridgePersistenceAdapter | null {
-    const PATH = ".obsidian/plugins/vaultguard/agent-leases.envelope";
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    const PATH = `.obsidian/plugins/${pluginId}/agent-leases.envelope`;
     return {
       readEnvelope: async (): Promise<string | null> => {
         if (!this.atRestCipher?.isReady()) return null;
@@ -898,7 +899,7 @@ export default class VaultGuardPlugin extends Plugin {
       writeEnvelope: async (plaintext: string): Promise<void> => {
         if (!this.atRestCipher?.isReady()) {
           throw new Error(
-            "VaultGuard at-rest encryption is not ready; cannot persist agent bridge leases."
+            "VaultGuard Sync at-rest encryption is not ready; cannot persist agent bridge leases."
           );
         }
         const writeBin = this.originalAdapterMethods.writeBinary;
@@ -971,7 +972,7 @@ export default class VaultGuardPlugin extends Plugin {
       if (restored > 0) {
         const server = await this.startAgentBridgeServer();
         new Notice(
-          `VaultGuard: ${restored} persistent agent bridge ${restored === 1 ? "lease is" : "leases are"} active. Endpoint: ${server.endpoint}.`,
+          `VaultGuard Sync: ${restored} persistent agent bridge ${restored === 1 ? "lease is" : "leases are"} active. Endpoint: ${server.endpoint}.`,
           8000
         );
       }
@@ -1090,7 +1091,7 @@ export default class VaultGuardPlugin extends Plugin {
     const operationLabel =
       request.operation === "create" ? "create" : "patch";
     const message =
-      `VaultGuard: Agent "${request.lease.agentName}" wants to ${operationLabel} "${request.path}".\n\n` +
+      `VaultGuard Sync: Agent "${request.lease.agentName}" wants to ${operationLabel} "${request.path}".\n\n` +
       `Scope: ${request.lease.scopes.join(", ")}\n` +
       `Lease expires: ${request.lease.expiresAt}\n\n` +
       `Preview:\n${request.preview}\n\nAllow this write?`;
@@ -1452,7 +1453,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Main plugin menu
     this.addCommand({
       id: "open-menu",
-      name: "Open VaultGuard Menu",
+      name: "Open VaultGuard Sync Menu",
       callback: () => this.showVaultGuardMenu(),
     });
 
@@ -1483,7 +1484,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Direct settings entry point
     this.addCommand({
       id: "open-settings",
-      name: "Open VaultGuard Settings",
+      name: "Open VaultGuard Sync Settings",
       callback: () => this.openVaultGuardSettings(),
     });
 
@@ -1497,7 +1498,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Open VaultGuard Files sidebar
     this.addCommand({
       id: "files-panel",
-      name: "Open VaultGuard Files Panel",
+      name: "Open VaultGuard Sync Files Panel",
       callback: () => this.activateVaultGuardSidebar(),
     });
 
@@ -1525,7 +1526,7 @@ export default class VaultGuardPlugin extends Plugin {
         void this.stopAgentBridgeServer().catch((err) =>
           this.logError("Stopping agent bridge server failed", err)
         );
-        new Notice("VaultGuard: Agent bridge leases revoked.");
+        new Notice("VaultGuard Sync: Agent bridge leases revoked.");
       },
     });
 
@@ -1536,23 +1537,23 @@ export default class VaultGuardPlugin extends Plugin {
       name: "Check for plugin updates",
       callback: async () => {
         if (!this.updateChecker) {
-          new Notice("VaultGuard: update checker is not initialized.");
+          new Notice("VaultGuard Sync: update checker is not initialized.");
           return;
         }
-        new Notice("VaultGuard: checking for updates…");
+        new Notice("VaultGuard Sync: checking for updates…");
         const result = await this.updateChecker.checkNow();
         if (result.latest === null) {
           new Notice(
             this.settings.disableUpdateChecks
-              ? "VaultGuard: update checks are disabled in settings."
-              : "VaultGuard: couldn't reach the release feed. Try again later.",
+              ? "VaultGuard Sync: update checks are disabled in settings."
+              : "VaultGuard Sync: couldn't reach the release feed. Try again later.",
             6000
           );
           return;
         }
         if (!result.isNewer) {
           new Notice(
-            `VaultGuard: you're on the latest version (${this.manifest.version}).`,
+            `VaultGuard Sync: you're on the latest version (${this.manifest.version}).`,
             5000
           );
         }
@@ -1620,7 +1621,7 @@ export default class VaultGuardPlugin extends Plugin {
         // "View Permissions" — available to all authenticated users
         menu.addItem((item) => {
           item
-            .setTitle(`VaultGuard: View ${label} permissions`)
+            .setTitle(`VaultGuard Sync: View ${label} permissions`)
             .setIcon("shield")
             .onClick(() => {
               this.showPathPermissionsModal(path, isFolder);
@@ -1634,7 +1635,7 @@ export default class VaultGuardPlugin extends Plugin {
         if (!isFolder) {
           menu.addItem((item) => {
             item
-              .setTitle("VaultGuard: Copy share link")
+              .setTitle("VaultGuard Sync: Copy share link")
               .setIcon("link")
               .onClick(() => {
                 if (!this.featureEnabled('shareLinks')) {
@@ -1650,7 +1651,7 @@ export default class VaultGuardPlugin extends Plugin {
         if (isAdmin) {
           menu.addItem((item) => {
             item
-              .setTitle(`VaultGuard: Set permissions on ${label}`)
+              .setTitle(`VaultGuard Sync: Set permissions on ${label}`)
               .setIcon("lock")
               .onClick(() => {
                 this.showAddPermissionForPath(path, isFolder);
@@ -1674,7 +1675,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   private async copyShareLinkForPath(path: string): Promise<void> {
     if (!this.session || !this.apiClient || !this.settings.serverVaultId) {
-      new Notice("VaultGuard: Log in and bind this vault before sharing.");
+      new Notice("VaultGuard Sync: Log in and bind this vault before sharing.");
       return;
     }
 
@@ -1683,17 +1684,17 @@ export default class VaultGuardPlugin extends Plugin {
       share = await this.apiClient.createShare({ relPath: path });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      new Notice(`VaultGuard: Couldn't create share link — ${msg}`, 8000);
+      new Notice(`VaultGuard Sync: Couldn't create share link — ${msg}`, 8000);
       return;
     }
 
     try {
       await navigator.clipboard.writeText(share.url);
-      new Notice(`VaultGuard: Share link copied — ${share.url}`, 6000);
+      new Notice(`VaultGuard Sync: Share link copied — ${share.url}`, 6000);
     } catch {
       // Clipboard unavailable (rare in Obsidian, but possible in restricted
       // sandboxes). Surface the URL via Notice so the user can copy by hand.
-      new Notice(`VaultGuard: Share link: ${share.url}`, 12000);
+      new Notice(`VaultGuard Sync: Share link: ${share.url}`, 12000);
     }
   }
 
@@ -1847,7 +1848,7 @@ export default class VaultGuardPlugin extends Plugin {
   }): Promise<void> {
     const slug = (params.org ?? params.slug ?? "").trim().toLowerCase();
     if (!slug) {
-      new Notice("VaultGuard invite link is missing the org slug.");
+      new Notice("VaultGuard Sync invite link is missing the org slug.");
       throw new Error("Missing org slug in invite link.");
     }
 
@@ -1861,19 +1862,19 @@ export default class VaultGuardPlugin extends Plugin {
       }
     }
 
-    new Notice(`VaultGuard: Connecting to "${slug}"...`);
+    new Notice(`VaultGuard Sync: Connecting to "${slug}"...`);
 
     try {
       await this.resolveOrgConfig(slug);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      new Notice(`VaultGuard: Failed to resolve organization "${slug}". ${msg}`);
+      new Notice(`VaultGuard Sync: Failed to resolve organization "${slug}". ${msg}`);
       throw err;
     }
 
     if (this.session) {
       new Notice(
-        `VaultGuard: Already signed in as ${this.session.email}. Logout first to redeem this invite.`
+        `VaultGuard Sync: Already signed in as ${this.session.email}. Logout first to redeem this invite.`
       );
       return;
     }
@@ -1989,7 +1990,7 @@ export default class VaultGuardPlugin extends Plugin {
             if (challengeResult.challengeName === "SOFTWARE_TOKEN_MFA") {
               // Re-authenticate since we need a fresh MFA code
               this.pendingChallengeSession = challengeResult.session ?? null;
-              new Notice("VaultGuard: MFA enabled! Please log in again with your authenticator code.");
+              new Notice("VaultGuard Sync: MFA enabled! Please log in again with your authenticator code.");
               resolve();
               return;
             }
@@ -2004,12 +2005,12 @@ export default class VaultGuardPlugin extends Plugin {
                 result.recoveryCodes,
                 challengeResult.tokens.idToken
               );
-              new Notice("VaultGuard: MFA enabled and logged in successfully.");
+              new Notice("VaultGuard Sync: MFA enabled and logged in successfully.");
             }
             resolve();
           } catch (error) {
             // MFA was set up but challenge completion failed — user can log in with MFA next time
-            new Notice("VaultGuard: MFA enabled! Please log in again with your authenticator code.");
+            new Notice("VaultGuard Sync: MFA enabled! Please log in again with your authenticator code.");
             resolve();
           }
         },
@@ -2053,13 +2054,13 @@ export default class VaultGuardPlugin extends Plugin {
         // user know they should regenerate.
         this.log(`Recovery codes not stored: ${response.error?.message ?? "unknown"}`);
         new Notice(
-          "VaultGuard: Couldn't save recovery codes to the server. Keep the codes you wrote down — you can regenerate from settings later."
+          "VaultGuard Sync: Couldn't save recovery codes to the server. Keep the codes you wrote down — you can regenerate from settings later."
         );
       }
     } catch (err) {
       this.log(`Failed to store recovery codes: ${(err as Error).message}`);
       new Notice(
-        "VaultGuard: Couldn't save recovery codes to the server. Keep the codes you wrote down — you can regenerate from settings later."
+        "VaultGuard Sync: Couldn't save recovery codes to the server. Keep the codes you wrote down — you can regenerate from settings later."
       );
     }
   }
@@ -2114,7 +2115,7 @@ export default class VaultGuardPlugin extends Plugin {
     await this.persistSession(this.session);
     this.startKeyRenewalMonitor();
     this.startHeartbeatMonitor();
-    new Notice(`VaultGuard: Logged in as ${this.session.displayName}`);
+    new Notice(`VaultGuard Sync: Logged in as ${this.session.displayName}`);
 
     // Vault binding gate: every Obsidian local folder must be tied to one
     // server-side vault. Defer sync engine boot — and the "online" status
@@ -2605,7 +2606,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   private normalizeKeyLease(rawLease: Partial<KeyLease>): KeyLease {
     if (!rawLease.key || !rawLease.expiresAt || !rawLease.refreshToken || !rawLease.leaseId) {
-      throw new Error("VaultGuard: Server did not return a usable encryption key lease.");
+      throw new Error("VaultGuard Sync: Server did not return a usable encryption key lease.");
     }
 
     return {
@@ -2639,7 +2640,7 @@ export default class VaultGuardPlugin extends Plugin {
     }>("POST", "/auth/session", undefined, idToken);
 
     if (!response.success || !response.data) {
-      throw new Error(response.error?.message ?? "VaultGuard: Failed to create a server session.");
+      throw new Error(response.error?.message ?? "VaultGuard Sync: Failed to create a server session.");
     }
 
     return response.data;
@@ -2896,11 +2897,11 @@ export default class VaultGuardPlugin extends Plugin {
    */
   async verifyAccountPassword(password: string): Promise<boolean> {
     if (!this.session?.email) {
-      throw new Error("VaultGuard: no active session to verify against.");
+      throw new Error("VaultGuard Sync: no active session to verify against.");
     }
     const config = this.getEffectiveConfig();
     if (!config.cognitoUserPoolId || !config.cognitoClientId) {
-      throw new Error("VaultGuard: Cognito is not configured for this vault.");
+      throw new Error("VaultGuard Sync: Cognito is not configured for this vault.");
     }
     try {
       const result = await cognitoLogin(
@@ -2939,7 +2940,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   async exportAtRestRecoveryCode(): Promise<string> {
     if (!this.atRestCipher) {
-      throw new Error("VaultGuard: at-rest cipher not initialised.");
+      throw new Error("VaultGuard Sync: at-rest cipher not initialised.");
     }
     return this.atRestCipher.exportRecoveryCode();
   }
@@ -2988,7 +2989,7 @@ export default class VaultGuardPlugin extends Plugin {
       this.logError("Could not open VaultGuard settings", error);
     }
 
-    new Notice("VaultGuard: Open Settings → Community plugins → VaultGuard.");
+    new Notice("VaultGuard Sync: Open Settings → Community plugins → VaultGuard Sync.");
   }
 
   private showVaultGuardMenu(evt?: MouseEvent): void {
@@ -3131,7 +3132,7 @@ export default class VaultGuardPlugin extends Plugin {
     const normalizedPath = path ? this.normalizeVaultPath(path) : "";
     const target = normalizedPath ? `"${normalizedPath}"` : "protected files";
     const actionText = this.loginRequiredActionText(action, target);
-    const message = `VaultGuard: Login required to ${actionText}.`;
+    const message = `VaultGuard Sync: Login required to ${actionText}.`;
     const now = Date.now();
 
     if (
@@ -3139,7 +3140,7 @@ export default class VaultGuardPlugin extends Plugin {
       now - this.lastAuthRequiredNoticeAt >= AUTH_REQUIRED_NOTICE_THROTTLE_MS
     ) {
       new Notice(
-        `${message}\nLog in from the VaultGuard shield menu or run "VaultGuard: Login" from the command palette.`,
+        `${message}\nLog in from the VaultGuard Sync shield menu or run "VaultGuard Sync: Login" from the command palette.`,
         9000
       );
       this.lastAuthRequiredNoticeAt = now;
@@ -3499,7 +3500,7 @@ export default class VaultGuardPlugin extends Plugin {
       if (hashStatus !== "verified" && hashStatus !== "unsigned") {
         // Modal already disables the install button in these states; if we
         // somehow reach here, refuse loudly.
-        new Notice(`VaultGuard: Cannot install "${entry.displayName}" — ${hashStatus}.`);
+        new Notice(`VaultGuard Sync: Cannot install "${entry.displayName}" — ${hashStatus}.`);
         continue;
       }
 
@@ -3512,20 +3513,20 @@ export default class VaultGuardPlugin extends Plugin {
         }
         if (typeof pluginManager?.enablePluginAndSave === "function") {
           await pluginManager.enablePluginAndSave(entry.pluginId);
-          new Notice(`VaultGuard: Enabled "${entry.displayName}".`);
+          new Notice(`VaultGuard Sync: Enabled "${entry.displayName}".`);
           await this.emitAuditEvent("plugin.allowlist_install", entry.pluginId, {
             verified: hashStatus === "verified",
             version: entry.version,
           });
         } else {
           new Notice(
-            `VaultGuard: Could not auto-enable "${entry.displayName}" — please enable it manually in Settings → Community plugins.`
+            `VaultGuard Sync: Could not auto-enable "${entry.displayName}" — please enable it manually in Settings → Community plugins.`
           );
         }
       } catch (err) {
         this.logError(`Allowlist: enable "${entry.pluginId}" failed`, err);
         new Notice(
-          `VaultGuard: Failed to enable "${entry.displayName}" — ${err instanceof Error ? err.message : "unknown error"}.`
+          `VaultGuard Sync: Failed to enable "${entry.displayName}" — ${err instanceof Error ? err.message : "unknown error"}.`
         );
       }
     }
@@ -3624,7 +3625,7 @@ export default class VaultGuardPlugin extends Plugin {
           this.rebuildApiClient();
 
           this.log(`Org config resolved for "${this.settings.orgSlug}": API=${this.settings.apiEndpoint}`);
-          new Notice(`VaultGuard: Connected to ${config.orgName || this.settings.orgSlug}`);
+          new Notice(`VaultGuard Sync: Connected to ${config.orgName || this.settings.orgSlug}`);
           return;
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
@@ -3757,7 +3758,7 @@ export default class VaultGuardPlugin extends Plugin {
 
     this.log(`Auto-lock triggered after ${autoLockMinutes} minutes of inactivity.`);
     await this.forceLogout(
-      `VaultGuard: Session locked after ${autoLockMinutes} minutes of inactivity.`
+      `VaultGuard Sync: Session locked after ${autoLockMinutes} minutes of inactivity.`
     );
   }
 
@@ -3765,7 +3766,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Forces logout: invalidates the session, clears credentials,
    * and optionally wipes local cache.
    */
-  async forceLogout(noticeMessage = "VaultGuard: Logged out successfully."): Promise<void> {
+  async forceLogout(noticeMessage = "VaultGuard Sync: Logged out successfully."): Promise<void> {
     try {
       if (this.session) {
         await this.apiRequest("POST", "/auth/logout", {
@@ -3865,7 +3866,7 @@ export default class VaultGuardPlugin extends Plugin {
       );
 
       new Notice(
-        "VaultGuard: Obsidian Sync is enabled. VaultGuard handles all sync and " +
+        "VaultGuard Sync: Obsidian Sync is enabled. VaultGuard Sync handles all sync and " +
         "backup for this vault — please disable Obsidian Sync to prevent " +
         "file conflicts.\n\nSettings → Core plugins → Sync → Disable",
         0 // persistent until dismissed
@@ -3894,7 +3895,7 @@ export default class VaultGuardPlugin extends Plugin {
     // of the human-readable JSON document makes reviews / debugging
     // settings clearer. The plugin folder is already in `isPathExcluded`,
     // so this file never participates in vault sync.
-    const pluginId = this.manifest?.id ?? "vaultguard";
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
     const envelopePath = `.obsidian/plugins/${pluginId}/lak.envelope`;
     const adapter = this.app.vault.adapter;
 
@@ -3938,7 +3939,7 @@ export default class VaultGuardPlugin extends Plugin {
         } else {
           const reason = status.kind === "disabled" ? status.reason : "unknown";
           new Notice(
-            `VaultGuard: local at-rest encryption disabled. ${reason}`,
+            `VaultGuard Sync: local at-rest encryption disabled. ${reason}`,
             10000
           );
         }
@@ -3952,7 +3953,7 @@ export default class VaultGuardPlugin extends Plugin {
       this.log(`AtRestCipher ready (${method}).`);
       if (method === "localstorage-fallback") {
         new Notice(
-          "VaultGuard: at-rest encryption is using the localStorage fallback (OS keychain unavailable). Files in Finder are encrypted, but a full Electron-profile theft can recover the key. See docs/AT-REST-ENCRYPTION.md.",
+          "VaultGuard Sync: at-rest encryption is using the localStorage fallback (OS keychain unavailable). Files in Finder are encrypted, but a full Electron-profile theft can recover the key. See docs/AT-REST-ENCRYPTION.md.",
           10000
         );
       }
@@ -3987,7 +3988,7 @@ export default class VaultGuardPlugin extends Plugin {
       const notice = new Notice("", 0);
       const frag = document.createDocumentFragment();
       const strong = frag.createEl("strong");
-      strong.setText("VaultGuard: at-rest encryption ready. ");
+      strong.setText("VaultGuard Sync: at-rest encryption ready. ");
       frag.appendText(
         `${tally.plaintext} file${tally.plaintext === 1 ? "" : "s"} in this vault still on disk as plaintext. `
       );
@@ -4025,7 +4026,7 @@ export default class VaultGuardPlugin extends Plugin {
     const notice = new Notice("", 0);
     const frag = document.createDocumentFragment();
     const strong = frag.createEl("strong");
-    strong.setText("VaultGuard: cannot read encrypted files on this device. ");
+    strong.setText("VaultGuard Sync: cannot read encrypted files on this device. ");
     frag.appendText(reason + " ");
     const link = frag.createEl("a", {
       text: "Open settings to restore →",
@@ -4049,7 +4050,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async encryptVaultAtRest(): Promise<void> {
     if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.readBinary || !this.originalAdapterMethods.writeBinary) {
-      new Notice("VaultGuard: at-rest cipher not initialised — cannot run migration.");
+      new Notice("VaultGuard Sync: at-rest cipher not initialised — cannot run migration.");
       return;
     }
     const cipher = this.atRestCipher;
@@ -4060,7 +4061,7 @@ export default class VaultGuardPlugin extends Plugin {
     let encrypted = 0;
     let skipped = 0;
     let failed = 0;
-    new Notice(`VaultGuard: encrypting ${files.length} files at rest…`, 3000);
+    new Notice(`VaultGuard Sync: encrypting ${files.length} files at rest…`, 3000);
 
     for (const file of files) {
       if (this.isAtRestExcluded(file.path)) {
@@ -4082,7 +4083,7 @@ export default class VaultGuardPlugin extends Plugin {
       }
     }
     new Notice(
-      `VaultGuard: at-rest encryption pass complete. ${encrypted} encrypted, ${skipped} already-encrypted/excluded, ${failed} failed.`,
+      `VaultGuard Sync: at-rest encryption pass complete. ${encrypted} encrypted, ${skipped} already-encrypted/excluded, ${failed} failed.`,
       8000
     );
   }
@@ -4095,7 +4096,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async decryptVaultAtRest(): Promise<void> {
     if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.readBinary || !this.originalAdapterMethods.writeBinary) {
-      new Notice("VaultGuard: at-rest cipher not initialised — cannot decrypt.");
+      new Notice("VaultGuard Sync: at-rest cipher not initialised — cannot decrypt.");
       return;
     }
     const cipher = this.atRestCipher;
@@ -4106,7 +4107,7 @@ export default class VaultGuardPlugin extends Plugin {
     let decrypted = 0;
     let skipped = 0;
     let failed = 0;
-    new Notice(`VaultGuard: decrypting ${files.length} files at rest…`, 3000);
+    new Notice(`VaultGuard Sync: decrypting ${files.length} files at rest…`, 3000);
 
     for (const file of files) {
       if (this.isAtRestExcluded(file.path)) {
@@ -4128,7 +4129,7 @@ export default class VaultGuardPlugin extends Plugin {
       }
     }
     new Notice(
-      `VaultGuard: at-rest decryption pass complete. ${decrypted} decrypted, ${skipped} already-plaintext/excluded, ${failed} failed.`,
+      `VaultGuard Sync: at-rest decryption pass complete. ${decrypted} decrypted, ${skipped} already-plaintext/excluded, ${failed} failed.`,
       8000
     );
   }
@@ -4277,7 +4278,7 @@ export default class VaultGuardPlugin extends Plugin {
   private async interceptedRead(path: string): Promise<string> {
     if (this.isPathExcluded(path)) {
       if (!this.originalAdapterMethods.read) {
-        throw new Error("VaultGuard: vault adapter read method unavailable.");
+        throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
       }
       return this.originalAdapterMethods.read(path);
     }
@@ -4300,7 +4301,7 @@ export default class VaultGuardPlugin extends Plugin {
       await this.wipeDeniedLocalContent(path);
       this.notifyDeniedLocalWipe(path);
       throw new Error(
-        `VaultGuard: Access denied. Local cached content for "${path}" was wiped.`
+        `VaultGuard Sync: Access denied. Local cached content for "${path}" was wiped.`
       );
     }
 
@@ -4367,7 +4368,7 @@ export default class VaultGuardPlugin extends Plugin {
     if (now - last < 60_000) return;
     this.readOnlyFallbackNoticeAt.set(path, now);
     new Notice(
-      `VaultGuard: You don't have access to "${path}". Local cached content was wiped.`,
+      `VaultGuard Sync: You don't have access to "${path}". Local cached content was wiped.`,
       5000
     );
   }
@@ -4384,7 +4385,7 @@ export default class VaultGuardPlugin extends Plugin {
     if (now - last < 60_000) return;
     this.cloudDecryptFallbackNoticeAt.set(path, now);
     new Notice(
-      `VaultGuard: Couldn't decrypt the cloud copy of "${path}" — showing local copy.`,
+      `VaultGuard Sync: Couldn't decrypt the cloud copy of "${path}" — showing local copy.`,
       6000
     );
   }
@@ -4418,7 +4419,7 @@ export default class VaultGuardPlugin extends Plugin {
     if (permission < PermissionLevel.WRITE) {
       await this.emitAuditEvent("file.write", path, { outcome: "denied" });
       throw new Error(
-        `VaultGuard: Access denied. You do not have write permission for "${path}".`
+        `VaultGuard Sync: Access denied. You do not have write permission for "${path}".`
       );
     }
 
@@ -4500,7 +4501,7 @@ export default class VaultGuardPlugin extends Plugin {
   private async readPlainFromDisk(path: string): Promise<string> {
     if (this.isAtRestExcluded(path) || !this.atRestCipher?.isReady()) {
       if (!this.originalAdapterMethods.read) {
-        throw new Error("VaultGuard: vault adapter read method unavailable.");
+        throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
       }
       return this.originalAdapterMethods.read(path);
     }
@@ -4517,7 +4518,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     if (!this.originalAdapterMethods.read) {
-      throw new Error("VaultGuard: vault adapter read method unavailable.");
+      throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
     }
     return this.originalAdapterMethods.read(path);
   }
@@ -4539,7 +4540,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
     if (!this.atRestCipher?.isReady()) {
       throw new Error(
-        `VaultGuard: refusing to write "${path}" because local at-rest encryption is unavailable.`
+        `VaultGuard Sync: refusing to write "${path}" because local at-rest encryption is unavailable.`
       );
     }
     const ciphertext = await this.atRestCipher.encryptString(data);
@@ -4565,7 +4566,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async readPlainBinaryFromDisk(path: string): Promise<ArrayBuffer> {
     if (!this.originalAdapterMethods.readBinary) {
-      throw new Error("VaultGuard: vault adapter readBinary unavailable.");
+      throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
     }
     if (this.isAtRestExcluded(path) || !this.atRestCipher?.isReady()) {
       return this.originalAdapterMethods.readBinary(path);
@@ -4589,7 +4590,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
     if (!this.atRestCipher?.isReady()) {
       throw new Error(
-        `VaultGuard: refusing to write "${path}" because local at-rest encryption is unavailable.`
+        `VaultGuard Sync: refusing to write "${path}" because local at-rest encryption is unavailable.`
       );
     }
     const ciphertext = await this.atRestCipher.encryptBinary(data);
@@ -4629,7 +4630,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async interceptedReadBinary(path: string): Promise<ArrayBuffer> {
     if (!this.originalAdapterMethods.readBinary) {
-      throw new Error("VaultGuard: vault adapter readBinary unavailable.");
+      throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
     }
     if (this.isPathExcluded(path)) {
       return this.originalAdapterMethods.readBinary(path);
@@ -4645,7 +4646,7 @@ export default class VaultGuardPlugin extends Plugin {
       await this.wipeDeniedLocalContent(path);
       this.notifyDeniedLocalWipe(path);
       throw new Error(
-        `VaultGuard: Access denied. Local cached content for "${path}" was wiped.`
+        `VaultGuard Sync: Access denied. Local cached content for "${path}" was wiped.`
       );
     }
 
@@ -4673,12 +4674,12 @@ export default class VaultGuardPlugin extends Plugin {
     if (permission < PermissionLevel.WRITE) {
       await this.emitAuditEvent("file.write", path, { outcome: "denied" });
       throw new Error(
-        `VaultGuard: Access denied. You do not have write permission for "${path}".`
+        `VaultGuard Sync: Access denied. You do not have write permission for "${path}".`
       );
     }
     await this.emitAuditEvent("file.write", path, { outcome: "denied", reason: "binary-sync-unsupported" });
     throw new Error(
-      `VaultGuard: Binary files are not currently supported for protected sync. "${path}" was not written.`
+      `VaultGuard Sync: Binary files are not currently supported for protected sync. "${path}" was not written.`
     );
   }
 
@@ -4794,7 +4795,7 @@ export default class VaultGuardPlugin extends Plugin {
     if (!(await this.canDeletePath(path))) {
       await this.emitAuditEvent("file.delete", path, { outcome: "denied" });
       throw new Error(
-        `VaultGuard: Access denied. You do not have permission to delete "${path}".`
+        `VaultGuard Sync: Access denied. You do not have permission to delete "${path}".`
       );
     }
 
@@ -4895,7 +4896,7 @@ export default class VaultGuardPlugin extends Plugin {
         outcome: "denied",
       });
       new Notice(
-        `VaultGuard: Renamed locally, but the server copy of "${oldPath}" was not moved — you do not have write permission for "${newPath}".`
+        `VaultGuard Sync: Renamed locally, but the server copy of "${oldPath}" was not moved — you do not have write permission for "${newPath}".`
       );
       return;
     }
@@ -5206,7 +5207,7 @@ export default class VaultGuardPlugin extends Plugin {
       } catch (err) {
         this.logError("Initial reconciliation failed", err);
         new Notice(
-          `VaultGuard: Couldn't reconcile this folder with the server vault: ${
+          `VaultGuard Sync: Couldn't reconcile this folder with the server vault: ${
             err instanceof Error ? err.message : "Unknown error"
           }. Sync paused — open the sidebar to retry.`
         );
@@ -5424,7 +5425,7 @@ export default class VaultGuardPlugin extends Plugin {
       );
     }
 
-    new Notice("VaultGuard: Comparing your folder with the server vault…");
+    new Notice("VaultGuard Sync: Comparing your folder with the server vault…");
 
     // ── Step 1: Build local manifest ─────────────────────────────────────
     const localFiles = this.app.vault.getFiles();
@@ -5535,13 +5536,13 @@ export default class VaultGuardPlugin extends Plugin {
     // ── Step 4: Show preview modal ───────────────────────────────────────
     const decision = await this.askReconciliationPlan(plan);
     if (!decision.proceed) {
-      new Notice("VaultGuard: Binding cancelled — no files were modified.");
+      new Notice("VaultGuard Sync: Binding cancelled — no files were modified.");
       return false;
     }
 
     // ── Step 5: Apply plan ───────────────────────────────────────────────
     new Notice(
-      `VaultGuard: Reconciling — ↓${serverOnly.length} ↑${localOnly.length} ⚠${conflicts.length}`
+      `VaultGuard Sync: Reconciling — ↓${serverOnly.length} ↑${localOnly.length} ⚠${conflicts.length}`
     );
 
     let downloaded = 0;
@@ -5659,10 +5660,10 @@ export default class VaultGuardPlugin extends Plugin {
     const summary = `${summaryParts.join(", ")}.`;
 
     if (fullySucceeded) {
-      new Notice(`VaultGuard: Reconciliation complete. ${summary}`);
+      new Notice(`VaultGuard Sync: Reconciliation complete. ${summary}`);
     } else {
       new Notice(
-        `VaultGuard: Reconciliation finished with errors — ${summary} Open the sidebar to retry.`,
+        `VaultGuard Sync: Reconciliation finished with errors — ${summary} Open the sidebar to retry.`,
         10000
       );
     }
@@ -5699,7 +5700,7 @@ export default class VaultGuardPlugin extends Plugin {
       this.log(`Reconciliation: skipping "${path}" — no write permission.`);
       new Notice(
         options.noWriteNotice ??
-          `VaultGuard: Skipped upload of "${path}" — you do not have write permission. The file stays in this folder but is not synced.`
+          `VaultGuard Sync: Skipped upload of "${path}" — you do not have write permission. The file stays in this folder but is not synced.`
       );
       return "skipped";
     }
@@ -5802,7 +5803,7 @@ export default class VaultGuardPlugin extends Plugin {
         const content = await this.readPlainFromDisk(file.path);
         const outcome = await this.uploadReconciledFile(normalized, content, {
           noWriteNotice:
-            `VaultGuard: Removed local-only "${normalized}" because this server vault ` +
+            `VaultGuard Sync: Removed local-only "${normalized}" because this server vault ` +
             "does not contain it and you do not have write permission to add it.",
         });
         if (outcome === "uploaded") {
@@ -5846,7 +5847,7 @@ export default class VaultGuardPlugin extends Plugin {
       if (skipped > 0) parts.push(`${skipped} skipped (no write permission)`);
       if (failed > 0) parts.push(`${failed} files failed`);
       if (foldersFailed > 0) parts.push(`${foldersFailed} folders failed`);
-      const message = `VaultGuard: Caught up local-only items — ${parts.join(", ")}.`;
+      const message = `VaultGuard Sync: Caught up local-only items — ${parts.join(", ")}.`;
       this.log(message);
     }
 
@@ -5947,7 +5948,7 @@ export default class VaultGuardPlugin extends Plugin {
       if (downloadedFolders > 0) parts.push(`${downloadedFolders} folders created`);
       if (failedFiles > 0) parts.push(`${failedFiles} files failed`);
       if (failedFolders > 0) parts.push(`${failedFolders} folders failed`);
-      this.log(`VaultGuard: Repaired missing remote items — ${parts.join(", ")}.`);
+      this.log(`VaultGuard Sync: Repaired missing remote items — ${parts.join(", ")}.`);
     }
 
     return {
@@ -6084,7 +6085,7 @@ export default class VaultGuardPlugin extends Plugin {
   private folderMarkerPath(folderPath: string): string {
     const normalized = this.normalizeVaultPath(folderPath);
     if (!normalized) {
-      throw new Error("VaultGuard: refused to plant a folder marker at the vault root.");
+      throw new Error("VaultGuard Sync: refused to plant a folder marker at the vault root.");
     }
     return `${normalized}/${FOLDER_MARKER_NAME}`;
   }
@@ -6345,7 +6346,7 @@ export default class VaultGuardPlugin extends Plugin {
       throw new Error("Not connected to a server vault.");
     }
     if (!this.isOnline()) {
-      throw new Error("VaultGuard is offline — connect and try again.");
+      throw new Error("VaultGuard Sync is offline — connect and try again.");
     }
     const patterns = this.settings.excludedPaths ?? [];
     if (patterns.length === 0) {
@@ -6421,38 +6422,38 @@ export default class VaultGuardPlugin extends Plugin {
     if (!this.session) {
       const message = userInitiated
         ? this.showLoginRequiredNotice("sync")
-        : "VaultGuard: Sync skipped — not logged in.";
+        : "VaultGuard Sync: Sync skipped — not logged in.";
       this.log(message);
       return;
     }
     if (!this.isOnline()) {
-      const message = "VaultGuard: Sync skipped — offline.";
+      const message = "VaultGuard Sync: Sync skipped — offline.";
       this.log(message);
       if (userInitiated) new Notice(message);
       return;
     }
     if (!this.keyLease) {
-      const message = "VaultGuard: Sync skipped — encryption key lease unavailable. Try logging in again.";
+      const message = "VaultGuard Sync: Sync skipped — encryption key lease unavailable. Try logging in again.";
       this.log(message);
       if (userInitiated) new Notice(message);
       return;
     }
     if (!this.settings.serverVaultId) {
-      const message = "VaultGuard: Sync skipped — this folder is not bound to a server vault yet.";
+      const message = "VaultGuard Sync: Sync skipped — this folder is not bound to a server vault yet.";
       this.log(message);
       if (userInitiated) new Notice(message);
       return;
     }
 
     if (this.syncState.status === "syncing") {
-      const message = "VaultGuard: A sync is already in progress.";
+      const message = "VaultGuard Sync: A sync is already in progress.";
       this.log(message);
       if (userInitiated) new Notice(message);
       return;
     }
 
     if (userInitiated) {
-      new Notice("VaultGuard: Syncing…");
+      new Notice("VaultGuard Sync: Syncing…");
     }
 
     let totalFilesUploaded = 0;
@@ -6520,7 +6521,7 @@ export default class VaultGuardPlugin extends Plugin {
               `Sync skipped — cursor unchanged (revision ${cursor.revision}, last change ${cursor.lastChangedAt}).`
             );
             if (userInitiated) {
-              new Notice("VaultGuard: Already in sync — nothing to do.");
+              new Notice("VaultGuard Sync: Already in sync — nothing to do.");
             }
             return;
           }
@@ -6664,9 +6665,9 @@ export default class VaultGuardPlugin extends Plugin {
         if (totalRepairFailures > 0) summaryParts.push(`${totalRepairFailures} repair failures`);
         if (deltaCount > 0) summaryParts.push(`${deltaCount} remote changes applied`);
         if (summaryParts.length === 0) {
-          new Notice("VaultGuard: Already in sync — nothing to do.");
+          new Notice("VaultGuard Sync: Already in sync — nothing to do.");
         } else {
-          new Notice(`VaultGuard: Sync complete — ${summaryParts.join(", ")}.`);
+          new Notice(`VaultGuard Sync: Sync complete — ${summaryParts.join(", ")}.`);
         }
       }
     } catch (error) {
@@ -6677,7 +6678,7 @@ export default class VaultGuardPlugin extends Plugin {
 
       if (userInitiated) {
         new Notice(
-          `VaultGuard: Sync failed — ${
+          `VaultGuard Sync: Sync failed — ${
             error instanceof Error ? error.message : "Unknown error"
           }`,
           10000
@@ -6787,7 +6788,7 @@ export default class VaultGuardPlugin extends Plugin {
       default:
         // Leave unresolved for user to handle via UI
         new Notice(
-          `VaultGuard: Sync conflict detected for "${conflict.path}". Use View Permissions to resolve.`
+          `VaultGuard Sync: Sync conflict detected for "${conflict.path}". Use View Permissions to resolve.`
         );
         break;
     }
@@ -6986,13 +6987,13 @@ export default class VaultGuardPlugin extends Plugin {
 
     if (statusCode === 401) {
       // True session expiry — the session is unusable, log the user out.
-      await this.forceLogout(`VaultGuard: ${message}`);
+      await this.forceLogout(`VaultGuard Sync: ${message}`);
       return "logged-out";
     }
 
     if (statusCode === 403) {
       if (this.isUserAccessRevokedMessage(message)) {
-        await this.forceLogout(`VaultGuard: ${message}`);
+        await this.forceLogout(`VaultGuard Sync: ${message}`);
         return "logged-out";
       }
 
@@ -7031,7 +7032,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.lastLimitedAccessNoticeAt = now;
     const vaultLabel = this.settings.serverVaultName?.trim() || "this vault";
     new Notice(
-      `VaultGuard: Limited access to "${vaultLabel}". ${reason} ` +
+      `VaultGuard Sync: Limited access to "${vaultLabel}". ${reason} ` +
         `Cloud sync and encrypted file access are unavailable. ` +
         `Contact your administrator if you expected full access.`,
       8000
@@ -7087,7 +7088,7 @@ export default class VaultGuardPlugin extends Plugin {
   private async handleServerRevocation(reason: string): Promise<void> {
     this.keyLease = null;
     this.permissionCache.clear();
-    await this.forceLogout(`VaultGuard: Access revoked (${reason}). Local session cleared.`);
+    await this.forceLogout(`VaultGuard Sync: Access revoked (${reason}). Local session cleared.`);
   }
 
   /**
@@ -7137,7 +7138,7 @@ export default class VaultGuardPlugin extends Plugin {
           const result = await this.ensureVaultScopedKeyLease();
           if (result === "ok") {
             this.log("Vault-scoped key lease recovered — full access restored.");
-            new Notice("VaultGuard: Full vault access restored.");
+            new Notice("VaultGuard Sync: Full vault access restored.");
             // Permission rules may have widened; clear the cache so the next
             // file open re-evaluates instead of using a stale "denied" entry.
             this.permissionCache.clear();
@@ -7225,14 +7226,14 @@ export default class VaultGuardPlugin extends Plugin {
             return;
           }
           new Notice(
-            "VaultGuard: Encryption key lease expired. Please reconnect to continue accessing files."
+            "VaultGuard Sync: Encryption key lease expired. Please reconnect to continue accessing files."
           );
           return;
         }
 
         // If we can't renew, notify the user
         new Notice(
-          "VaultGuard: Encryption key lease expired. Please reconnect to continue accessing files."
+          "VaultGuard Sync: Encryption key lease expired. Please reconnect to continue accessing files."
         );
       }
     } catch (error) {
@@ -7295,7 +7296,7 @@ export default class VaultGuardPlugin extends Plugin {
   private async encryptContent(content: string): Promise<string> {
     if (!this.keyLease || this.isKeyLeaseExpired()) {
       throw new Error(
-        "VaultGuard: Cannot encrypt - no valid key lease. Please reconnect."
+        "VaultGuard Sync: Cannot encrypt - no valid key lease. Please reconnect."
       );
     }
     this.assertLeaseMatchesBoundVault("encrypt");
@@ -7342,7 +7343,7 @@ export default class VaultGuardPlugin extends Plugin {
   private async decryptContent(encryptedBase64: string): Promise<string> {
     if (!this.keyLease || this.isKeyLeaseExpired()) {
       throw new Error(
-        "VaultGuard: Cannot decrypt - no valid key lease. Please reconnect."
+        "VaultGuard Sync: Cannot decrypt - no valid key lease. Please reconnect."
       );
     }
     this.assertLeaseMatchesBoundVault("decrypt");
@@ -7385,13 +7386,13 @@ export default class VaultGuardPlugin extends Plugin {
     const boundVaultId = this.settings.serverVaultId;
     if (!boundVaultId) {
       throw new Error(
-        `VaultGuard: refusing to ${op} — no server vault is bound to this folder.`
+        `VaultGuard Sync: refusing to ${op} — no server vault is bound to this folder.`
       );
     }
     const leaseVaultId = this.keyLease?.vaultId;
     if (leaseVaultId !== boundVaultId) {
       throw new Error(
-        `VaultGuard: refusing to ${op} — key lease is bound to vault "${leaseVaultId ?? "(none)"}" ` +
+        `VaultGuard Sync: refusing to ${op} — key lease is bound to vault "${leaseVaultId ?? "(none)"}" ` +
         `but this folder is bound to vault "${boundVaultId}". Reload the plugin to recover.`
       );
     }
@@ -7450,7 +7451,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     this.lastConnectionLostNoticeAt = now;
-    new Notice("VaultGuard: Connection lost. Working offline with cached data.");
+    new Notice("VaultGuard Sync: Connection lost. Working offline with cached data.");
   }
 
   /**
@@ -7513,7 +7514,7 @@ export default class VaultGuardPlugin extends Plugin {
         response.error?.statusCode === 403
       ) {
         await this.forceLogout(
-          `VaultGuard: ${response.error.message || "Session expired. Please log in again."}`
+          `VaultGuard Sync: ${response.error.message || "Session expired. Please log in again."}`
         );
       } else {
         this.setConnectionStatus("offline");
@@ -8080,12 +8081,12 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     if (!this.session) {
-      this.statusBarEl.setText("VaultGuard: Not logged in");
+      this.statusBarEl.setText("VaultGuard Sync: Not logged in");
       return;
     }
 
     if (this.permissionWarmupPromise) {
-      this.statusBarEl.setText("VaultGuard ↻ Loading permissions...");
+      this.statusBarEl.setText("VaultGuard Sync ↻ Loading permissions...");
       return;
     }
 
@@ -8100,7 +8101,7 @@ export default class VaultGuardPlugin extends Plugin {
       ? "Connected"
       : "Offline";
 
-    this.statusBarEl.setText(`VaultGuard ${connectionIcon} ${statusText}`);
+    this.statusBarEl.setText(`VaultGuard Sync ${connectionIcon} ${statusText}`);
   }
 
   /**
@@ -8142,7 +8143,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     if (!this.apiClient) {
-      new Notice("VaultGuard: Please configure the API endpoint in settings first.");
+      new Notice("VaultGuard Sync: Please configure the API endpoint in settings first.");
       return;
     }
 
@@ -8184,7 +8185,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     if (!this.apiClient) {
-      new Notice("VaultGuard: Please configure the API endpoint in settings first.");
+      new Notice("VaultGuard Sync: Please configure the API endpoint in settings first.");
       return;
     }
 
@@ -8205,7 +8206,7 @@ export default class VaultGuardPlugin extends Plugin {
   private openAuditLog(): void {
     if (!this.session) return;
     if (!this.apiClient) {
-      new Notice("VaultGuard: not connected to a server.");
+      new Notice("VaultGuard Sync: not connected to a server.");
       return;
     }
     // 4th arg is permissionsUserId; passing it puts AdminModal in
@@ -8249,7 +8250,7 @@ export default class VaultGuardPlugin extends Plugin {
       if (!this.session) {
         this.showLoginRequiredNotice("view permissions");
       } else {
-        new Notice("VaultGuard: Please configure the API endpoint in settings first.");
+        new Notice("VaultGuard Sync: Please configure the API endpoint in settings first.");
       }
       return;
     }
@@ -8286,7 +8287,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private showAddPermissionForPath(path: string, isFolder: boolean): void {
     if (!this.apiClient) {
-      new Notice("VaultGuard: Please configure the API endpoint in settings first.");
+      new Notice("VaultGuard Sync: Please configure the API endpoint in settings first.");
       return;
     }
 
@@ -8324,7 +8325,7 @@ export default class VaultGuardPlugin extends Plugin {
       bytesDownloaded: 0,
       lastError: null,
     };
-    new Notice("VaultGuard: Local cache cleared.");
+    new Notice("VaultGuard Sync: Local cache cleared.");
     this.log("Local cache cleared.");
   }
 
@@ -8740,7 +8741,7 @@ export default class VaultGuardPlugin extends Plugin {
       "No secure session storage available (safeStorage unreachable AND at-rest cipher unavailable) — session will not be persisted to disk."
     );
     new Notice(
-      "VaultGuard: Your platform doesn't expose secure credential storage. " +
+      "VaultGuard Sync: Your platform doesn't expose secure credential storage. " +
       "You'll need to log in each time the plugin loads — we never store " +
       "auth tokens in plaintext.",
       10000

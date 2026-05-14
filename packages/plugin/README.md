@@ -1,7 +1,8 @@
-# VaultGuard for Obsidian
+# VaultGuard Sync for Obsidian
 
-VaultGuard is an Obsidian plugin for permission-aware encrypted sync. This
-public plugin repository contains only the Obsidian client.
+VaultGuard Sync is the Obsidian plugin for permission-aware encrypted sync, part
+of the VaultGuard product family. This public plugin repository contains only
+the Obsidian client.
 
 - **Try Pro free for 14 days (no card):** https://admin.vaultguard.cloud/#/signup
 - **Learn more / managed hosting:** https://vaultguard.cloud
@@ -143,11 +144,11 @@ connection settings automatically.
 2. Place them into your vault at:
 
    ```text
-   <Vault>/.obsidian/plugins/vaultguard/
+   <Vault>/.obsidian/plugins/vaultguard-sync/
    ```
 
 3. Restart Obsidian.
-4. Enable VaultGuard under Settings > Community plugins.
+4. Enable VaultGuard Sync under Settings > Community plugins.
 
 ## Build From Source
 
@@ -166,7 +167,7 @@ npm run -w vaultguard install:plugin -- "/absolute/path/to/YourVault"
 
 ## Self-Hosted Configuration
 
-Open Settings > VaultGuard > Connection, enable manual configuration, then enter:
+Open Settings > VaultGuard Sync > Connection, enable manual configuration, then enter:
 
 - API endpoint
 - Organization ID
@@ -181,15 +182,16 @@ server must implement.
 
 ## Network Use
 
-VaultGuard connects to the API endpoint configured in plugin settings and to the
-configured AWS Cognito User Pool endpoint for authentication. The plugin uses
-Obsidian's `requestUrl` API for all HTTP calls.
+VaultGuard Sync connects to the API endpoint configured in plugin settings and
+to the configured AWS Cognito User Pool endpoint for authentication. The plugin
+uses Obsidian's `requestUrl` API for all HTTP calls.
 
 ## Account, Data, and Privacy
 
-VaultGuard requires an account on the configured backend. In hosted mode, that
-account is provided by the hosted VaultGuard organization. In self-hosted mode,
-the account is provided by your own compatible backend and Cognito User Pool.
+VaultGuard Sync requires an account on the configured backend. In hosted mode,
+that account is provided by the hosted VaultGuard organization. In self-hosted
+mode, the account is provided by your own compatible backend and Cognito User
+Pool.
 
 The plugin sends vault-relative file paths, file metadata, encrypted file
 contents, permission checks, audit events, and authentication tokens to the
@@ -197,10 +199,10 @@ configured backend as part of sync and access control. It does not include
 client-side telemetry, ads, or analytics. Billing and subscription management
 are handled outside the public plugin.
 
-VaultGuard stores plugin settings, vault binding data, and auth session data in
-Obsidian's plugin data store and browser storage so it can restore your session.
-The local at-rest encryption key is wrapped on device; the recovery code is
-shown only to you and is never sent to the backend.
+VaultGuard Sync stores plugin settings, vault binding data, and auth session
+data in Obsidian's plugin data store and browser storage so it can restore your
+session. The local at-rest encryption key is wrapped on device; the recovery
+code is shown only to you and is never sent to the backend.
 
 ## Development
 

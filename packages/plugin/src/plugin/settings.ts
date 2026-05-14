@@ -219,8 +219,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   private renderAtRestSection(containerEl: HTMLElement): void {
     containerEl.createEl("h2", { text: "Local at-rest encryption" });
     const atRestDesc = Platform.isMobileApp
-      ? "Vault files on this device are encrypted on disk with a per-device key kept in this app's secure storage. Without VaultGuard running, the files on disk are ciphertext — useful if your phone backs up app data to iCloud / Google Drive."
-      : "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard running, opening files in Finder shows ciphertext.";
+      ? "Vault files on this device are encrypted on disk with a per-device key kept in this app's secure storage. Without VaultGuard Sync running, the files on disk are ciphertext — useful if your phone backs up app data to iCloud / Google Drive."
+      : "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard Sync running, opening files in Finder shows ciphertext.";
     containerEl.createEl("p", {
       text: atRestDesc,
       cls: "setting-item-description",
@@ -379,7 +379,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             onSubmit: (code) => this.plugin.restoreAtRestFromRecoveryCode(code),
             onRestored: () => {
               new Notice(
-                "VaultGuard: at-rest key restored. Reopening any open notes will now load decrypted content.",
+                "VaultGuard Sync: at-rest key restored. Reopening any open notes will now load decrypted content.",
                 7000
               );
               this.display();
@@ -421,7 +421,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         break;
       case "uninitialized":
         title = "Initializing";
-        body = "VaultGuard is setting up the local at-rest cipher.";
+        body = "VaultGuard Sync is setting up the local at-rest cipher.";
         break;
       case "locked":
         title = "Locked";
@@ -1218,7 +1218,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     containerEl.addClass("vaultguard-settings-tab");
 
     // ── Header ──────────────────────────────────────────────────────────────
-    containerEl.createEl("h1", { text: "VaultGuard" });
+    containerEl.createEl("h1", { text: "VaultGuard Sync" });
     containerEl.createEl("p", {
       text: "Enterprise-grade vault security with permission-aware encrypted cloud sync.",
       cls: "setting-item-description",
@@ -1893,7 +1893,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       containerEl.createEl("p", {
         cls: "setting-item-description",
         text:
-          "Agent bridge is desktop-only. It exposes VaultGuard's tools to local MCP clients (Claudian, Claude Code, Cursor) via a localhost HTTP server, which Obsidian mobile renderers can't host. Manage agent leases from a desktop install of this same vault.",
+          "Agent bridge is desktop-only. It exposes VaultGuard Sync's tools to local MCP clients (Claudian, Claude Code, Cursor) via a localhost HTTP server, which Obsidian mobile renderers can't host. Manage agent leases from a desktop install of this same vault.",
       });
       return;
     }
@@ -1901,7 +1901,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text:
-        "Agent bridge leases let an external agent (Claudian, Claude Code, Cursor, custom MCP client) talk to this vault through VaultGuard tools. Each lease has its own bearer token; revoking or rotating one does not disturb the others. Hidden paths (.obsidian, .trash, .git, ...) are always blocked.",
+        "Agent bridge leases let an external agent (Claudian, Claude Code, Cursor, custom MCP client) talk to this vault through VaultGuard Sync tools. Each lease has its own bearer token; revoking or rotating one does not disturb the others. Hidden paths (.obsidian, .trash, .git, ...) are always blocked.",
     });
 
     const surface = this.plugin.getAgentBridge();
@@ -1937,11 +1937,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               this.plugin.revokeAllAgentBridgeLeases();
               await this.plugin.stopAgentBridgeServer();
               this.latestAgentBridgeReveal = null;
-              new Notice("VaultGuard: all agent bridge leases revoked.");
+              new Notice("VaultGuard Sync: all agent bridge leases revoked.");
               this.display();
             } catch (error) {
               new Notice(
-                `VaultGuard: could not revoke bridge leases - ${this.errorMessage(error)}`,
+                `VaultGuard Sync: could not revoke bridge leases - ${this.errorMessage(error)}`,
                 8000
               );
               button.setDisabled(false).setButtonText("Revoke all leases");
@@ -2013,7 +2013,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                 this.display();
               } catch (error) {
                 new Notice(
-                  `VaultGuard: could not start the bridge server - ${this.errorMessage(error)}`,
+                  `VaultGuard Sync: could not start the bridge server - ${this.errorMessage(error)}`,
                   8000
                 );
                 button.setDisabled(false).setButtonText("Start bridge server");
@@ -2102,12 +2102,12 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       return `Claude Code does not appear to be installed (no ~/.claude/skills/ directory). The skill would land at ${status.skillFilePath} if you install it anyway.`;
     }
     if (status.managedConflict) {
-      return `A SKILL.md exists at ${status.skillFilePath} but wasn't installed by VaultGuard. Overwriting will replace it. Cancel and inspect the file if you didn't expect this.`;
+      return `A SKILL.md exists at ${status.skillFilePath} but wasn't installed by VaultGuard Sync. Overwriting will replace it. Cancel and inspect the file if you didn't expect this.`;
     }
     if (status.installed) {
-      return `Installed at ${status.skillFilePath}. The skill teaches Claude Code (and any agent that loads ~/.claude/skills/) to use VaultGuard's MCP tools instead of Read/Glob/Grep against encrypted vault files. Re-install to pull the latest skill body.`;
+      return `Installed at ${status.skillFilePath}. The skill teaches Claude Code (and any agent that loads ~/.claude/skills/) to use VaultGuard Sync's MCP tools instead of Read/Glob/Grep against encrypted vault files. Re-install to pull the latest skill body.`;
     }
-    return `Writes a SKILL.md to ${status.skillFilePath}. Tells Claude Code to reach for VaultGuard's MCP tools when it sees an encrypted vault, rather than reading ciphertext directly. Contains no tokens or per-user state.`;
+    return `Writes a SKILL.md to ${status.skillFilePath}. Tells Claude Code to reach for VaultGuard Sync's MCP tools when it sees an encrypted vault, rather than reading ciphertext directly. Contains no tokens or per-user state.`;
   }
 
   private async runSkillInstall(
@@ -2126,11 +2126,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             : result.action === "overwrote-conflict"
               ? "overwrote existing file"
               : "updated";
-      new Notice(`VaultGuard: Claude Code skill ${verb} at ${result.filePath}.`, 6000);
+      new Notice(`VaultGuard Sync: Claude Code skill ${verb} at ${result.filePath}.`, 6000);
       this.display();
     } catch (error) {
       new Notice(
-        `VaultGuard: could not install skill - ${this.errorMessage(error)}`,
+        `VaultGuard Sync: could not install skill - ${this.errorMessage(error)}`,
         8000
       );
       button.setDisabled(false).setButtonText(original);
@@ -2142,14 +2142,14 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     try {
       const result = await this.plugin.uninstallAgentBridgeSkill();
       if (result.removed) {
-        new Notice(`VaultGuard: Claude Code skill removed from ${result.filePath}.`, 6000);
+        new Notice(`VaultGuard Sync: Claude Code skill removed from ${result.filePath}.`, 6000);
       } else {
-        new Notice("VaultGuard: no managed skill file to remove.", 4000);
+        new Notice("VaultGuard Sync: no managed skill file to remove.", 4000);
       }
       this.display();
     } catch (error) {
       new Notice(
-        `VaultGuard: could not uninstall skill - ${this.errorMessage(error)}`,
+        `VaultGuard Sync: could not uninstall skill - ${this.errorMessage(error)}`,
         8000
       );
       button.setDisabled(false).setButtonText("Uninstall");
@@ -2267,14 +2267,14 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
       new Notice(
         copiedToClipboard
-          ? "VaultGuard: new MCP config copied. Update the agent using this lease."
-          : "VaultGuard: token rotated. Copy the new config shown in settings.",
+          ? "VaultGuard Sync: new MCP config copied. Update the agent using this lease."
+          : "VaultGuard Sync: token rotated. Copy the new config shown in settings.",
         8000
       );
       this.display();
     } catch (error) {
       new Notice(
-        `VaultGuard: could not rotate bridge token - ${this.errorMessage(error)}`,
+        `VaultGuard Sync: could not rotate bridge token - ${this.errorMessage(error)}`,
         8000
       );
       button.setDisabled(false).setButtonText("Rotate token");
@@ -2289,9 +2289,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     try {
       const revoked = this.plugin.revokeAgentBridgeLease(lease.leaseId);
       if (!revoked) {
-        new Notice("VaultGuard: that bridge lease was already gone.");
+        new Notice("VaultGuard Sync: that bridge lease was already gone.");
       } else {
-        new Notice(`VaultGuard: revoked bridge lease for ${lease.agentName}.`);
+        new Notice(`VaultGuard Sync: revoked bridge lease for ${lease.agentName}.`);
       }
 
       if (this.latestAgentBridgeReveal?.leaseId === lease.leaseId) {
@@ -2305,7 +2305,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       this.display();
     } catch (error) {
       new Notice(
-        `VaultGuard: could not revoke bridge lease - ${this.errorMessage(error)}`,
+        `VaultGuard Sync: could not revoke bridge lease - ${this.errorMessage(error)}`,
         8000
       );
       button.setDisabled(false).setButtonText("Revoke lease");
