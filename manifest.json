@@ -1,9 +1,9 @@
 {
   "id": "vaultguard-sync",
   "name": "VaultGuard Sync",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "minAppVersion": "1.4.0",
-  "description": "End-to-end encrypted sync for Obsidian with per-file permissions and audit logging via an AWS backend. Replaces standard file sync for teams that need compliance-grade vault security. Desktop and mobile; agent bridge is desktop-only.",
+  "description": "End-to-end encrypted sync with per-file permissions and audit logging via an AWS backend. Replaces standard file sync for teams that need compliance-grade vault security. Desktop and mobile; agent bridge is desktop-only.",
   "author": "Peter Sedmak",
   "isDesktopOnly": false
 }
