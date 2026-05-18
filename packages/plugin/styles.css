@@ -4275,7 +4275,6 @@ button .vaultguard-btn-spinner:only-child {
   border-radius: 8px;
   border: 1px solid var(--interactive-accent);
   background-color: var(--background-secondary);
-  background-color: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
   text-align: left;
 }
 .vaultguard-pro-upsell-badge-headline {
