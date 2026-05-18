@@ -1,5 +1,9 @@
 # VaultGuard Sync for Obsidian
 
+> **This is the flat release mirror of the plugin** for Obsidian's community directory.
+> Canonical source (plugin + server, for self-hosters and auditors):
+> https://github.com/peter70700/vaultguard-obsidian/tree/main/packages/plugin
+
 VaultGuard Sync is the Obsidian plugin for permission-aware encrypted sync, part
 of the VaultGuard product family. This public plugin repository contains only
 the Obsidian client.

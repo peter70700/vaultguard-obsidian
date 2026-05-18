@@ -26,5 +26,15 @@ export default defineConfig({
     include: ['tests/**/*.test.ts'],
     setupFiles: ['tests/setup.ts'],
     testTimeout: 15000,
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'html'],
+      thresholds: {
+        lines: 70,
+        branches: 65,
+        functions: 70,
+        statements: 70,
+      },
+    },
   },
 });

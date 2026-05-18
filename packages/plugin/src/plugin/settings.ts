@@ -1883,7 +1883,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * every active lease, rotate one token, or revoke one lease.
    */
   private renderAgentBridgeSection(containerEl: HTMLElement): void {
-    containerEl.createEl("h2", { text: "Agent bridge connections" });
+    containerEl.createEl("h2", { text: "Agent bridge connections (Desktop only.)" });
 
     // Agent bridge needs a local HTTP server (Node `http` module). That's
     // only reachable in desktop Obsidian's renderer. On mobile we surface

@@ -6,6 +6,7 @@
   ],
   "license": "SEE LICENSE IN LICENSE",
   "scripts": {
+    "build": "npm run -w vaultguard build",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "tsc -noEmit -skipLibCheck"

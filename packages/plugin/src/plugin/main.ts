@@ -1530,6 +1530,32 @@ export default class VaultGuardPlugin extends Plugin {
       },
     });
 
+    // Always-present discoverability command so mobile users see a clear
+    // explanation when they search the palette for "agent bridge" instead of
+    // an empty result. On desktop, this opens the lease modal like the
+    // primary command above (it's a synonym entry point).
+    this.addCommand({
+      id: "vaultguard-agent-bridge-info",
+      name: "VaultGuard: Agent bridge (desktop only)",
+      callback: () => {
+        if (Platform.isMobileApp) {
+          new Notice(
+            "Agent bridge requires Obsidian desktop. This feature is unavailable on mobile.",
+            6000
+          );
+          return;
+        }
+        if (!this.session || !this.settings.serverVaultId) {
+          new Notice(
+            "Agent bridge requires Obsidian desktop. Sign in and pick a vault to mint a lease.",
+            6000
+          );
+          return;
+        }
+        this.openAgentBridgeLeaseModal();
+      },
+    });
+
     // Manual update probe — bypasses the 24h throttle. Lets users (and
     // support) confirm the plugin is the latest published version on demand.
     this.addCommand({

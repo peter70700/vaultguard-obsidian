@@ -561,8 +561,7 @@
     "icon path actions"
     ". badges actions";
   align-items: start;
-  column-gap: 8px;
-  row-gap: 5px;
+  gap: 5px 8px;
   padding: 10px 8px;
   cursor: pointer;
   border-radius: 4px;
@@ -1197,7 +1196,7 @@
   max-width: 100%;
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
-  background-color: #fff;
+  background-color: #ffffff;
   padding: 10px;
   box-sizing: border-box;
 }
@@ -2112,22 +2111,22 @@
 /* Level-colored avatar initials */
 .vaultguard-fh-initials-admin {
   background-color: var(--color-purple);
-  color: #fff;
+  color: #ffffff;
 }
 
 .vaultguard-fh-initials-write {
   background-color: var(--color-blue);
-  color: #fff;
+  color: #ffffff;
 }
 
 .vaultguard-fh-initials-read {
   background-color: var(--color-green);
-  color: #fff;
+  color: #ffffff;
 }
 
 .vaultguard-fh-initials-none {
   background-color: var(--text-faint);
-  color: #fff;
+  color: #ffffff;
 }
 
 .vaultguard-fh-chip-label {
@@ -2263,7 +2262,7 @@
   justify-content: center;
   font-size: 0.82em;
   font-weight: 700;
-  color: #fff;
+  color: #ffffff;
   flex-shrink: 0;
   background-color: var(--interactive-accent);
 }
