@@ -31,3 +31,18 @@ terraform.tfstate.backup
 # Environment files
 .env
 .env.*
+
+# Private-only tooling — planning artifacts and AI-assistant configs must
+# never be committed to a public repo. The export pipeline already filters
+# these out; this list is the second line of defense for contributors who
+# clone the public repo and use AI tools locally.
+.planning/
+.claude/
+.codex/
+.cursor/
+.agents/
+.cursorrules
+.github/skills/
+CLAUDE.md
+AGENTS.md
+CODEX.md

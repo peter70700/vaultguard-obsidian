@@ -132,7 +132,7 @@ export async function handler(
     }
   } catch (err) {
     if (err instanceof AuthError) {
-      return formatError(err.statusCode, err.message, requestId);
+      return formatError(err.statusCode, err.message, requestId, err.code);
     }
     if (err instanceof ValidationError) {
       return formatError(err.statusCode, err.message, requestId);

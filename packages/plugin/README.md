@@ -130,9 +130,11 @@ The end-to-end deploy walkthrough lives at [`docs/SELF-HOSTING.md`](docs/SELF-HO
 
 ## Hosted Mode
 
-Hosted organizations can use the same plugin. Enter your organization slug or
-redeem an invite link from your administrator, and the plugin will resolve the
-connection settings automatically.
+Hosted organizations use the same plugin. Click **Continue with VaultGuard
+Cloud** or redeem an invite link from your administrator; the plugin includes
+the public VaultGuard Cloud API and Cognito identifiers and refreshes
+organization-specific settings after sign-in. Entering an organization slug is
+still available for admins who want to pre-resolve a specific org.
 
 ## Install From a Release
 
@@ -171,12 +173,16 @@ npm run -w vaultguard install:plugin -- "/absolute/path/to/YourVault"
 
 ## Self-Hosted Configuration
 
-Open Settings > VaultGuard Sync > Connection, enable manual configuration, then enter:
+Open Settings > VaultGuard Sync > Connection, enable manual configuration, then
+paste your server config URL, for example
+`https://your-server.com/.well-known/vaultguard.json`. The config response fills:
 
 - API endpoint
 - Organization ID
 - Cognito User Pool ID
 - Cognito Client ID
+
+You can still edit those fields manually after applying the config URL.
 
 See [`docs/SELF-HOSTING.md`](docs/SELF-HOSTING.md) for the end-to-end
 Community Edition deploy walkthrough, and
@@ -186,9 +192,13 @@ server must implement.
 
 ## Network Use
 
-VaultGuard Sync connects to the API endpoint configured in plugin settings and
-to the configured AWS Cognito User Pool endpoint for authentication. The plugin
-uses Obsidian's `requestUrl` API for all HTTP calls.
+VaultGuard Sync connects to the effective API endpoint shown in plugin settings
+and to the configured AWS Cognito User Pool endpoint for authentication. Fresh
+installs default to `https://api.vaultguard.cloud`, but the plugin does not make
+Cloud requests on load; network calls begin when you sign in, redeem an invite,
+connect an organization, or restore an existing session. Manual configuration
+bypasses the bundled Cloud fallback. The plugin uses Obsidian's `requestUrl` API
+for all HTTP calls.
 
 ## Account, Data, and Privacy
 

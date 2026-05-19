@@ -1307,6 +1307,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.orgs_settings_get,
     aws_api_gateway_integration.orgs_settings_put,
     aws_api_gateway_integration.orgs_settings_delete,
+    aws_api_gateway_integration.well_known_vaultguard_json_get,
     # Signup
     aws_api_gateway_integration.signup_post,
     aws_api_gateway_integration.signup_options,
@@ -1395,6 +1396,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.orgs_settings_get.id,
       aws_api_gateway_integration.orgs_settings_put.id,
       aws_api_gateway_integration.orgs_settings_delete.id,
+      aws_api_gateway_integration.well_known_vaultguard_json_get.id,
       aws_api_gateway_integration.signup_post.id,
       aws_api_gateway_integration.signup_options.id,
       aws_api_gateway_integration.billing_subscription_get.id,

@@ -16,6 +16,7 @@ locals {
     vaults_members_id          = aws_api_gateway_resource.vaults_members_id.id
     orgs_config                = aws_api_gateway_resource.orgs_config.id
     orgs_settings              = aws_api_gateway_resource.orgs_settings.id
+    well_known_vaultguard_json = aws_api_gateway_resource.well_known_vaultguard_json.id
     auth_login                 = aws_api_gateway_resource.auth_login.id
     auth_session               = aws_api_gateway_resource.auth_session.id
     auth_refresh               = aws_api_gateway_resource.auth_refresh.id

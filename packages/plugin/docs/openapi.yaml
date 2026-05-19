@@ -955,6 +955,37 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OrgConfigResponse' }
 
+  /.well-known/vaultguard.json:
+    get:
+      tags: [Organizations]
+      summary: Public single-org server config discovery (Community Edition only)
+      description: |
+        Returns the public connection config for **single-tenant self-hosted
+        Community Edition deployments**. The response body intentionally
+        omits orgId and orgName (which require authentication to view).
+
+        On multi-tenant deployments — including the managed example.com
+        SaaS — this endpoint is **not served** and returns 404, indistinguishable
+        from a no-org deployment. Use /orgs/{slug}/config for multi-tenant
+        discovery instead.
+
+        The cognitoUserPoolId and cognitoClientId in the response are public
+        Cognito identifiers (not secrets), suitable for embedding in shipped
+        Obsidian plugin code.
+      security: []
+      responses:
+        '200':
+          description: Public connection config for single-tenant Community Edition deployments
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrgConfigResponse' }
+        '404':
+          description: |
+            Either no active organization is configured yet, the deployment
+            hosts multiple organizations, or this is a Cloud (non-Community)
+            deployment. All three cases collapse to the same 404 so the
+            response cannot be used to fingerprint the deployment.
+
   /orgs/{orgId}/settings:
     parameters:
       - in: path

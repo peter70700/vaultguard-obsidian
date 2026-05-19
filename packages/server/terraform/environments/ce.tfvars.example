@@ -23,7 +23,3 @@ session_duration_seconds   = 28800  # 8 hours
 max_file_size_bytes        = 26214400  # 25 MiB
 vaultguard_edition              = "community"
 vaultguard_allow_public_signup  = false
-
-# Optional Google Workspace verification — leave blank if not using.
-google_workspace_verification_token = ""
-google_workspace_dkim_value         = ""

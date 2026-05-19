@@ -49,6 +49,11 @@ variable "stripe_secret_arn" {
   default     = ""
   description = "ARN of the Secrets Manager secret containing Stripe keys. Empty on Community Edition — the billing lambda becomes an inert 404 stub."
 }
+variable "turnstile_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Secrets Manager ARN for Cloudflare Turnstile secret key. Leave empty to disable Turnstile (CE fail-open)."
+}
 variable "vaultguard_edition" {
   type        = string
   description = "Runtime feature edition reported by GET /orgs/{slug}/config and enforced by Pro-only handlers."
@@ -97,14 +102,18 @@ locals {
     VAULT_MEMBERS_TABLE     = var.vault_members_table_name
     VAULT_ACTIVITY_TABLE    = var.vault_activity_table_name
     SHARES_TABLE            = var.shares_table_name
-    KMS_KEY_ID              = var.kms_key_id
-    COGNITO_USER_POOL_ID    = var.cognito_user_pool_id
-    COGNITO_CLIENT_ID       = var.cognito_client_id
-    VAULTGUARD_EDITION      = var.vaultguard_edition
-    SENDER_EMAIL            = var.sender_email
-    ALLOWED_CORS_ORIGIN     = var.domain_name != "" ? "https://admin.${var.domain_name}" : "http://localhost:5173"
-    SHARE_BASE_URL          = var.domain_name != "" ? "https://share.${var.domain_name}" : "http://localhost:5176"
-    NODE_OPTIONS            = "--enable-source-maps"
+    # Every authenticated Lambda reads this in `assertSubscriptionAllowsAccess`
+    # (the SaaS subscription gate). Signup also writes a `pending_checkout`
+    # row here. Promoted to common_env so a new handler can't forget it.
+    SUBSCRIPTIONS_TABLE  = var.subscriptions_table_name
+    KMS_KEY_ID           = var.kms_key_id
+    COGNITO_USER_POOL_ID = var.cognito_user_pool_id
+    COGNITO_CLIENT_ID    = var.cognito_client_id
+    VAULTGUARD_EDITION   = var.vaultguard_edition
+    SENDER_EMAIL         = var.sender_email
+    ALLOWED_CORS_ORIGIN  = var.domain_name != "" ? "https://admin.${var.domain_name}" : "http://localhost:5173"
+    SHARE_BASE_URL       = var.domain_name != "" ? "https://share.${var.domain_name}" : "http://localhost:5176"
+    NODE_OPTIONS         = "--enable-source-maps"
   }
   log_retention = var.is_prod ? 365 : 7
 }
@@ -220,6 +229,15 @@ resource "aws_iam_role_policy_attachment" "auth_logging" {
 }
 
 data "aws_iam_policy_document" "auth_lambda" {
+  # SaaS subscription gate (`assertSubscriptionAllowsAccess` in shared/utils.ts)
+  # reads the org's Subscriptions row on every authenticated request and
+  # rejects pending_checkout / canceled orgs with HTTP 402. Every Lambda that
+  # calls verifyActiveUser needs this grant. (Skipped on EDITION=community,
+  # but the IAM permission itself is harmless to leave attached there.)
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.subscriptions_table_arn]
+  }
   statement {
     actions = [
       "cognito-idp:AdminGetUser",
@@ -351,6 +369,11 @@ resource "aws_iam_role_policy_attachment" "files_logging" {
 }
 
 data "aws_iam_policy_document" "files_lambda" {
+  # SaaS subscription gate — see auth_lambda for the full explainer.
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.subscriptions_table_arn]
+  }
   statement {
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetObjectVersion", "s3:ListBucketVersions"]
     resources = [var.vault_bucket_arn, "${var.vault_bucket_arn}/*"]
@@ -447,6 +470,11 @@ resource "aws_iam_role_policy_attachment" "perms_logging" {
 }
 
 data "aws_iam_policy_document" "permissions_lambda" {
+  # SaaS subscription gate — see auth_lambda for the full explainer.
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.subscriptions_table_arn]
+  }
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"]
     resources = [var.permissions_table_arn, "${var.permissions_table_arn}/index/*"]
@@ -538,6 +566,11 @@ resource "aws_iam_role_policy_attachment" "audit_logging" {
 }
 
 data "aws_iam_policy_document" "audit_lambda" {
+  # SaaS subscription gate — see auth_lambda for the full explainer.
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.subscriptions_table_arn]
+  }
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan"]
     resources = [var.audit_table_arn, "${var.audit_table_arn}/index/*"]
@@ -692,7 +725,6 @@ resource "aws_lambda_function" "billing" {
   environment {
     variables = merge(local.common_env, {
       STRIPE_SECRET_ARN           = var.stripe_secret_arn
-      SUBSCRIPTIONS_TABLE         = var.subscriptions_table_name
       STRIPE_WEBHOOK_EVENTS_TABLE = var.stripe_webhook_events_table_name
       BASE_URL                    = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
     })
@@ -719,6 +751,13 @@ resource "aws_iam_role_policy_attachment" "signup_logging" {
 }
 
 data "aws_iam_policy_document" "signup_lambda" {
+  # SaaS no-free-tier flow: every new org gets a Subscriptions row in
+  # status='pending_checkout' at signup time. Without PutItem here the signup
+  # Lambda 500s with "Member must not be null" on the table-name attribute.
+  statement {
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.subscriptions_table_arn]
+  }
   # Cognito — create users, groups, set passwords
   statement {
     actions = [
@@ -729,6 +768,17 @@ data "aws_iam_policy_document" "signup_lambda" {
       "cognito-idp:CreateGroup",
     ]
     resources = [var.cognito_user_pool_arn]
+  }
+  # Secrets Manager — retrieve Cloudflare Turnstile secret key.
+  # Skipped on Community Edition where turnstile_secret_arn = "" (signup
+  # fails-open and never invokes Secrets Manager). Mirrors the billing
+  # Lambda's Stripe-secret pattern at lines 627-633.
+  dynamic "statement" {
+    for_each = var.turnstile_secret_arn != "" ? [1] : []
+    content {
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.turnstile_secret_arn]
+    }
   }
   # DynamoDB — create org, permissions, audit, default vault + membership
   statement {
@@ -741,9 +791,8 @@ data "aws_iam_policy_document" "signup_lambda" {
       var.vault_members_table_arn, "${var.vault_members_table_arn}/index/*",
     ]
   }
-  # DynamoDB Scan — Community Edition hasAnyOrg() single-tenant gate.
-  # Used only when VAULTGUARD_EDITION=community + VAULTGUARD_ALLOW_PUBLIC_SIGNUP!=true
-  # to decide whether public signup is locked. Scoped to Organizations table.
+  # DynamoDB Scan — Community Edition hasAnyOrg() single-tenant gate and
+  # /.well-known/vaultguard.json single-org discovery. Scoped to Organizations table.
   statement {
     actions   = ["dynamodb:Scan"]
     resources = [var.organizations_table_arn]
@@ -786,6 +835,7 @@ resource "aws_lambda_function" "signup" {
       USER_POOL_ID                   = var.cognito_user_pool_id
       CLIENT_ID                      = var.cognito_client_id
       VAULTGUARD_ALLOW_PUBLIC_SIGNUP = tostring(var.allow_public_signup)
+      TURNSTILE_SECRET_ARN           = var.turnstile_secret_arn
     })
   }
 
@@ -911,9 +961,8 @@ resource "aws_lambda_function" "users" {
 
   environment {
     variables = merge(local.common_env, {
-      USER_POOL_ID        = var.cognito_user_pool_id
-      STRIPE_SECRET_ARN   = var.stripe_secret_arn
-      SUBSCRIPTIONS_TABLE = var.subscriptions_table_name
+      USER_POOL_ID      = var.cognito_user_pool_id
+      STRIPE_SECRET_ARN = var.stripe_secret_arn
     })
   }
 
@@ -938,6 +987,11 @@ resource "aws_iam_role_policy_attachment" "reencryption_logging" {
 }
 
 data "aws_iam_policy_document" "reencryption_lambda" {
+  # SaaS subscription gate — see auth_lambda for the full explainer.
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.subscriptions_table_arn]
+  }
   # S3 — read/write vault files for re-encryption
   statement {
     actions   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
@@ -1133,9 +1187,8 @@ resource "aws_lambda_function" "reconciler" {
 
   environment {
     variables = merge(local.common_env, {
-      SUBSCRIPTIONS_TABLE = var.subscriptions_table_name
-      STRIPE_SECRET_ARN   = var.stripe_secret_arn
-      BASE_URL            = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
+      STRIPE_SECRET_ARN = var.stripe_secret_arn
+      BASE_URL          = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
     })
   }
 
@@ -1180,6 +1233,11 @@ resource "aws_iam_role_policy_attachment" "vaults_logging" {
 }
 
 data "aws_iam_policy_document" "vaults_lambda" {
+  # SaaS subscription gate — see auth_lambda for the full explainer.
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.subscriptions_table_arn]
+  }
   # Vaults table — full CRUD
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"]
@@ -1285,6 +1343,11 @@ resource "aws_iam_role_policy_attachment" "shares_logging" {
 }
 
 data "aws_iam_policy_document" "shares_lambda" {
+  # SaaS subscription gate — see auth_lambda for the full explainer.
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.subscriptions_table_arn]
+  }
   # Shares table — full CRUD + GSI query for listing per-vault.
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]

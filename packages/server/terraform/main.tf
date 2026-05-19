@@ -117,8 +117,15 @@ module "lambda" {
   max_file_size_bytes              = var.max_file_size_bytes
   vaultguard_edition               = var.vaultguard_edition
   allow_public_signup              = var.vaultguard_allow_public_signup
-  sender_email                     = var.sender_email
-  domain_name                      = var.domain_name
+  # Pro/managed SaaS: hardcoded to the prod Turnstile Secrets Manager ARN.
+  # This root module is the Pro production deployment for example.com —
+  # CE consumers depend on `modules/lambda` directly with their own root and
+  # inherit the module default ("") for fail-open behavior. The top-level
+  # `var.turnstile_secret_arn` (default "") lets non-prod stages or test
+  # tfvars override this without editing main.tf.
+  turnstile_secret_arn = var.turnstile_secret_arn != "" ? var.turnstile_secret_arn : ""
+  sender_email         = var.sender_email
+  domain_name          = var.domain_name
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,9 +203,6 @@ module "dns" {
 
   stage       = var.stage
   domain_name = var.domain_name
-
-  google_workspace_verification_token = var.google_workspace_verification_token
-  google_workspace_dkim_value         = var.google_workspace_dkim_value
 }
 
 # Map the API Gateway custom domain to the deployed stage

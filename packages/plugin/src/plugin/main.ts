@@ -12,7 +12,7 @@
  * - Offline support: Graceful degradation with cached keys and queued changes.
  */
 
-import { Notice, Plugin, Platform, TFile, TFolder, TAbstractFile, Menu, normalizePath, addIcon, requestUrl, RequestUrlResponse } from "obsidian";
+import { Notice, Plugin, Platform, TFile, TFolder, TAbstractFile, Menu, normalizePath, addIcon, requestUrl, RequestUrlResponse, EventRef } from "obsidian";
 import pluginStyles from "../../styles.css";
 import { VaultGuardSettingTab, DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
@@ -1269,11 +1269,253 @@ export default class VaultGuardPlugin extends Plugin {
     }
   }
 
+  private clearResolvedConnectionFields(): void {
+    this.settings.orgSlug = "";
+    this.settings.apiEndpoint = "";
+    this.settings.organizationId = "";
+    this.settings.cognitoUserPoolId = "";
+    this.settings.cognitoClientId = "";
+    this.settings.serverEdition = undefined;
+    this.settings.serverFeatures = undefined;
+    this.settings.serverFeaturesResolvedAt = undefined;
+    this.serverEdition = null;
+    this.serverFeatures = null;
+  }
+
+  async resetCloudConnectionDefaults(): Promise<void> {
+    if (this.session) {
+      await this.forceLogout("VaultGuard Sync: Logged out because the connection target changed.");
+    }
+    this.settings.manualConfig = false;
+    this.clearResolvedConnectionFields();
+    await this.saveSettings();
+  }
+
+  async setManualConfigurationMode(manualConfig: boolean): Promise<void> {
+    if ((this.settings.manualConfig ?? false) === manualConfig) {
+      return;
+    }
+
+    if (this.session) {
+      await this.forceLogout("VaultGuard Sync: Logged out because the connection mode changed.");
+    }
+
+    this.settings.manualConfig = manualConfig;
+    this.clearResolvedConnectionFields();
+    await this.saveSettings();
+  }
+
+  getConnectionTargetLabel(): string {
+    const config = this.getEffectiveConfig();
+    const endpoint = config.apiEndpoint || "not configured";
+    const mode = this.settings.manualConfig ? "manual/self-hosted" : "VaultGuard Cloud";
+    const org =
+      this.settings.orgSlug ||
+      this.settings.organizationId ||
+      (this.settings.manualConfig ? "" : "not connected");
+    return org ? `${mode}: ${endpoint} (${org})` : `${mode}: ${endpoint}`;
+  }
+
+  private readConfigString(config: Record<string, unknown>, key: string): string {
+    const value = config[key];
+    return typeof value === "string" ? value.trim() : "";
+  }
+
+  private applyResolvedConnectionConfig(
+    config: Record<string, unknown>,
+    fallbackApiEndpoint: string,
+    fallbackOrgSlug = ""
+  ): void {
+    const cognitoUserPoolId = this.readConfigString(config, "cognitoUserPoolId");
+    const cognitoClientId = this.readConfigString(config, "cognitoClientId");
+    if (!cognitoUserPoolId || !cognitoClientId) {
+      throw new Error("Invalid config response from server");
+    }
+
+    const apiEndpoint = normalizeVaultGuardApiBaseUrl(
+      this.readConfigString(config, "apiEndpoint") || fallbackApiEndpoint
+    );
+    if (!apiEndpoint) {
+      throw new Error("Invalid config response from server: missing API endpoint");
+    }
+
+    const orgSlug = this.readConfigString(config, "orgSlug") || fallbackOrgSlug;
+    const organizationId =
+      this.readConfigString(config, "orgId") ||
+      this.readConfigString(config, "organizationId");
+
+    if (orgSlug) {
+      this.settings.orgSlug = orgSlug;
+    }
+    this.settings.apiEndpoint = apiEndpoint;
+    this.settings.organizationId = organizationId;
+    this.settings.cognitoUserPoolId = cognitoUserPoolId;
+    this.settings.cognitoClientId = cognitoClientId;
+    this.cacheServerCapabilities(config);
+  }
+
+  private assertHttpsOrLocalhostUrl(rawUrl: string, label: string): URL {
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl.trim());
+    } catch {
+      throw new Error(`Enter a valid ${label}.`);
+    }
+
+    const hostname = parsed.hostname.toLowerCase();
+    const isLocalhost =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname === "[::1]";
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLocalhost)) {
+      throw new Error(`${label} must use HTTPS, except localhost during development.`);
+    }
+
+    return parsed;
+  }
+
+  private normalizeManualServerConfigUrl(rawUrl: string): string {
+    const parsed = this.assertHttpsOrLocalhostUrl(rawUrl, "server config URL");
+    return parsed.toString();
+  }
+
   /**
-   * Returns the effective connection config. When manual mode is off,
-   * always returns SaaS defaults — ignoring any user-edited values for
-   * apiEndpoint, cognitoUserPoolId, cognitoClientId. organizationId
-   * is still taken from settings (set during org-slug resolution or login).
+   * Reasonable upper bound for a well-known config document. The legitimate
+   * payload is ~500 bytes; 64 KB leaves ~125x headroom while preventing a
+   * malicious server from exhausting Obsidian's memory with a multi-GB body.
+   */
+  private static readonly MANUAL_CONFIG_MAX_BYTES = 64 * 1024;
+
+  /** Timeout for the manual config fetch — Obsidian's requestUrl has no abort. */
+  private static readonly MANUAL_CONFIG_TIMEOUT_MS = 10_000;
+
+  async applyManualServerConfigUrl(rawUrl: string): Promise<void> {
+    const url = this.normalizeManualServerConfigUrl(rawUrl);
+    const pastedOrigin = new URL(url);
+
+    // WR-04: bound the wait with a manual timeout (requestUrl has no native
+    // abort path) so a stalled or pathological server can't hang the plugin.
+    const response = await Promise.race([
+      requestUrl({ url, method: "GET", throw: false }),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(
+          () => reject(new Error("Server config request timed out after 10 seconds.")),
+          VaultGuardPlugin.MANUAL_CONFIG_TIMEOUT_MS
+        )
+      ),
+    ]);
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`Server returned ${response.status}`);
+    }
+
+    // WR-04: cap response size before doing any further parsing/work.
+    const bodyText = response.text ?? "";
+    if (bodyText.length > VaultGuardPlugin.MANUAL_CONFIG_MAX_BYTES) {
+      throw new Error(
+        "Server config response is unexpectedly large; rejecting to prevent memory exhaustion."
+      );
+    }
+
+    // Strict shape: must be a JSON object literal (not null, not array, not primitive).
+    if (
+      !response.json ||
+      typeof response.json !== "object" ||
+      Array.isArray(response.json)
+    ) {
+      throw new Error("Invalid config response from server: expected a JSON object");
+    }
+
+    const config = response.json as Record<string, unknown>;
+
+    // WR-05 + CR-01: validate the response shape AND enforce that any apiEndpoint
+    // in the body shares the same hostname as the pasted URL. The well-known doc
+    // is by RFC-8615 convention served from the API root, so the pasted URL's
+    // host is the authoritative API host — the response body must not be allowed
+    // to redirect the user to a different (attacker-controlled) host.
+    this.validateWellKnownConfig(config, pastedOrigin);
+
+    if (this.session) {
+      await this.forceLogout("VaultGuard Sync: Logged out because the connection target changed.");
+    }
+
+    this.settings.manualConfig = true;
+    // Use the pasted URL's origin as the apiEndpoint fallback when the body
+    // omits it. When the body provides an apiEndpoint, it has just been
+    // hostname-pinned to the pasted URL by validateWellKnownConfig.
+    this.applyResolvedConnectionConfig(config, pastedOrigin.origin, this.settings.orgSlug);
+    await this.saveSettings();
+    this.rebuildApiClient();
+  }
+
+  /**
+   * Strict validator for a manually-pasted /.well-known/vaultguard.json
+   * response. Rejects the response — does not partial-apply — if any field
+   * fails its format check, or if the body's apiEndpoint points at a host
+   * other than the one the user pasted.
+   */
+  private validateWellKnownConfig(
+    config: Record<string, unknown>,
+    pastedOrigin: URL
+  ): void {
+    const cognitoUserPoolId = this.readConfigString(config, "cognitoUserPoolId");
+    const cognitoClientId = this.readConfigString(config, "cognitoClientId");
+    if (!cognitoUserPoolId || !cognitoClientId) {
+      throw new Error("Invalid config response from server: missing Cognito identifiers");
+    }
+
+    // Cognito User Pool IDs follow `<region>_<random>` where region is a
+    // standard AWS region name. Reject anything that doesn't match — a real
+    // server can never return e.g. an HTML error page parsed as a string here.
+    if (!/^[a-z]{2}-[a-z]+-\d+_[A-Za-z0-9]{6,}$/.test(cognitoUserPoolId)) {
+      throw new Error(
+        "Invalid config response from server: cognitoUserPoolId is not a valid Cognito pool identifier"
+      );
+    }
+
+    // Cognito App Client IDs are 20-26 lowercase alphanumeric characters.
+    if (!/^[a-z0-9]{20,26}$/.test(cognitoClientId)) {
+      throw new Error(
+        "Invalid config response from server: cognitoClientId is not a valid Cognito app client identifier"
+      );
+    }
+
+    // orgSlug (if present) must match the backend's slug regex.
+    const orgSlug = this.readConfigString(config, "orgSlug");
+    if (orgSlug && !/^[a-z0-9][a-z0-9-]{0,46}[a-z0-9]$/.test(orgSlug)) {
+      throw new Error(
+        "Invalid config response from server: orgSlug is not a valid identifier"
+      );
+    }
+
+    // CR-01: any apiEndpoint in the response body must point at the same host
+    // the user pasted. We never honor a body-supplied redirect to a different
+    // host — that would let a malicious .well-known doc silently route the
+    // user's credentials and encrypted vault traffic to attacker infrastructure.
+    const apiEndpoint = this.readConfigString(config, "apiEndpoint");
+    if (apiEndpoint) {
+      let parsed: URL;
+      try {
+        parsed = new URL(apiEndpoint);
+      } catch {
+        throw new Error(
+          "Invalid config response from server: apiEndpoint is not a parseable URL"
+        );
+      }
+      this.assertHttpsOrLocalhostUrl(apiEndpoint, "API endpoint");
+      if (parsed.hostname.toLowerCase() !== pastedOrigin.hostname.toLowerCase()) {
+        throw new Error(
+          `Invalid config response from server: apiEndpoint host (${parsed.hostname}) does not match the pasted URL host (${pastedOrigin.hostname}). To use a separate API host, paste that host's /.well-known/vaultguard.json URL directly.`
+        );
+      }
+    }
+  }
+
+  /**
+   * Returns the effective connection config. Manual mode uses only user-entered
+   * values. Cloud mode starts from bundled SaaS defaults, then lets resolved
+   * org config override them after sign-in, invite redemption, or slug connect.
    */
   getEffectiveConfig(): {
     apiEndpoint: string;
@@ -1776,9 +2018,21 @@ export default class VaultGuardPlugin extends Plugin {
    * @param options.prefillEmail   Email to prefill (used for invite redemption).
    * @param options.firstTimeSetup When true, opens the modal directly in the
    *                               "set your password" form for new invitees.
+   * @param options.requireOrgSlug  When true, the hosted slug field is required
+   *                                before Cognito login. Cloud defaults make
+   *                                this optional for first-run SaaS users.
    */
-  private handleLogin(options?: { prefillEmail?: string; firstTimeSetup?: boolean }): void {
+  private handleLogin(options?: {
+    prefillEmail?: string;
+    firstTimeSetup?: boolean;
+    requireOrgSlug?: boolean;
+  }): void {
     const manualMode = this.settings.manualConfig === true;
+    const hasBundledCloudAuth =
+      Boolean(SAAS_DEFAULTS.cognitoUserPoolId) &&
+      Boolean(SAAS_DEFAULTS.cognitoClientId);
+    const requireOrgSlug =
+      options?.requireOrgSlug ?? (!manualMode && !hasBundledCloudAuth);
 
     const modal = new LoginModal(
       this.app,
@@ -1841,7 +2095,7 @@ export default class VaultGuardPlugin extends Plugin {
       },
       options?.prefillEmail ?? "",
       options?.firstTimeSetup ?? false,
-      !manualMode,
+      requireOrgSlug,
       async (email: string, code: string) => {
         const cfg = this.getEffectiveConfig();
         if (!cfg.apiEndpoint) {
@@ -1860,7 +2114,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   /**
    * Redeem an invite — auto-configure the plugin from a deep link or pasted
-   * URL of the form `obsidian://vaultguard-invite?org=slug&email=user@x.com[&api=...]`.
+   * URL of the form `obsidian://vaultguard-invite?org=slug&email=user@x.com`.
    *
    * Looks up the org's public config (Cognito IDs + API endpoint) by slug,
    * persists settings, then opens the login modal in "set your password" mode.
@@ -1870,6 +2124,8 @@ export default class VaultGuardPlugin extends Plugin {
     slug?: string;
     email?: string;
     api?: string;
+    token?: string;
+    exp?: string;
     [key: string]: string | undefined;
   }): Promise<void> {
     const slug = (params.org ?? params.slug ?? "").trim().toLowerCase();
@@ -1878,9 +2134,12 @@ export default class VaultGuardPlugin extends Plugin {
       throw new Error("Missing org slug in invite link.");
     }
 
-    // Optional self-hosted API override — write before resolveOrgConfig so it
-    // probes the right host first.
     if (params.api) {
+      if (!this.settings.manualConfig) {
+        throw new Error(
+          "Invite links cannot override the VaultGuard Cloud API endpoint. Switch to manual configuration for self-hosted invite links."
+        );
+      }
       const normalizedApi = normalizeVaultGuardApiBaseUrl(params.api);
       if (normalizedApi) {
         this.settings.apiEndpoint = normalizedApi;
@@ -1909,6 +2168,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.handleLogin({
       prefillEmail: email,
       firstTimeSetup: true,
+      requireOrgSlug: false,
     });
   }
 
@@ -2133,6 +2393,14 @@ export default class VaultGuardPlugin extends Plugin {
     const settingsChanged = this.syncSettingsFromTokenPayload(idPayload, sessionRoles);
     if (settingsChanged) {
       await this.saveSettings();
+    }
+
+    if (!this.settings.manualConfig && this.session.organizationId) {
+      try {
+        await this.resolveOrgConfig(this.session.organizationId, { silent: true });
+      } catch (err) {
+        this.logError("Cloud org config refresh after login failed", err);
+      }
     }
 
     this.rebuildApiClient();
@@ -3589,7 +3857,7 @@ export default class VaultGuardPlugin extends Plugin {
    * The org config endpoint is public (no auth required), so we use a well-known
    * SaaS API base URL or the currently configured apiEndpoint to discover it.
    */
-  async resolveOrgConfig(slug: string): Promise<void> {
+  async resolveOrgConfig(slug: string, options: { silent?: boolean } = {}): Promise<void> {
     const slugCandidates = Array.from(
       new Set(
         [slug.trim().toLowerCase(), slug.trim().toLowerCase().replace(/^org-/, "")]
@@ -3597,12 +3865,15 @@ export default class VaultGuardPlugin extends Plugin {
       )
     );
 
-    // Try the currently configured endpoint first, fall back to the SaaS
-    // default (empty string in self-hosted builds, filtered out below).
-    const bases = [
-      this.getEffectiveConfig().apiEndpoint,
-      SAAS_DEFAULTS.fallbackApiUrl,
-    ].filter(Boolean);
+    const fallbackBases = this.settings.manualConfig ? [] : [SAAS_DEFAULTS.fallbackApiUrl];
+    const bases = Array.from(
+      new Set(
+        [
+          this.getEffectiveConfig().apiEndpoint,
+          ...fallbackBases,
+        ].filter(Boolean)
+      )
+    );
 
     // If no base URL at all, the user must enter one manually
     if (bases.length === 0) {
@@ -3632,26 +3903,25 @@ export default class VaultGuardPlugin extends Plugin {
 
           const config = response.json;
 
-          if (!config?.cognitoUserPoolId || !config?.cognitoClientId) {
+          if (!config || typeof config !== "object") {
             throw new Error('Invalid config response from server');
           }
 
-          // Apply the resolved config
-          this.settings.orgSlug = config.orgSlug || slugCandidate;
-          this.settings.apiEndpoint = normalizeVaultGuardApiBaseUrl(
-            config.apiEndpoint || normalizedBase
+          this.applyResolvedConnectionConfig(
+            config as Record<string, unknown>,
+            normalizedBase,
+            slugCandidate
           );
-          this.settings.organizationId = config.orgId || '';
-          this.settings.cognitoUserPoolId = config.cognitoUserPoolId;
-          this.settings.cognitoClientId = config.cognitoClientId;
-          this.cacheServerCapabilities(config as Record<string, unknown>);
           await this.saveSettings();
 
           // Rebuild the API client with new settings
           this.rebuildApiClient();
 
           this.log(`Org config resolved for "${this.settings.orgSlug}": API=${this.settings.apiEndpoint}`);
-          new Notice(`VaultGuard Sync: Connected to ${config.orgName || this.settings.orgSlug}`);
+          if (!options.silent) {
+            const orgName = this.readConfigString(config as Record<string, unknown>, "orgName");
+            new Notice(`VaultGuard Sync: Connected to ${orgName || this.settings.orgSlug}`);
+          }
           return;
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
@@ -3855,13 +4125,26 @@ export default class VaultGuardPlugin extends Plugin {
   // Obsidian Sync Conflict Prevention
   // ─────────────────────────────────────────────────────────────────────────
 
+  /** Persistent Notice shown while Obsidian Sync is enabled; null when not shown. */
+  private obsidianSyncNotice: Notice | null = null;
+
   /**
    * Detects whether Obsidian Sync (the built-in sync plugin) is enabled and
    * warns the user. VaultGuard is the sole sync and backup provider — running
    * both simultaneously causes write races, phantom change propagation,
    * and conflicting conflict-resolution between the two systems.
+   *
+   * Renders once, then keeps the Notice in sync with the live plugin state
+   * via an `internalPlugins.on("change", ...)` listener. Falls back to
+   * polling if the event API is unavailable so the notice still clears after
+   * the user disables Sync.
    */
   private checkForObsidianSync(): void {
+    this.renderObsidianSyncNotice();
+    this.registerObsidianSyncListener();
+  }
+
+  private renderObsidianSyncNotice(): void {
     try {
       // internalPlugins is not part of the public Obsidian API but is stable
       // and the only way to detect that the built-in Sync core plugin is
@@ -3877,28 +4160,56 @@ export default class VaultGuardPlugin extends Plugin {
       const appWithInternals = this.app as unknown as {
         internalPlugins?: InternalPlugins;
       };
-      const internalPlugins = appWithInternals.internalPlugins;
-      if (!internalPlugins) return;
+      const syncPlugin = appWithInternals.internalPlugins?.getPluginById?.("sync");
+      const isSyncEnabled = !!(syncPlugin && (syncPlugin.enabled ?? syncPlugin._loaded ?? false));
 
-      const syncPlugin = internalPlugins.getPluginById?.("sync");
-      if (!syncPlugin) return;
-
-      const isSyncEnabled = syncPlugin.enabled ?? syncPlugin._loaded ?? false;
-      if (!isSyncEnabled) return;
-
-      console.warn(
-        `${LOG_PREFIX} Obsidian Sync is active. VaultGuard handles all sync and backup — ` +
-        "running both will cause file conflicts. Please disable Obsidian Sync."
-      );
-
-      new Notice(
-        "VaultGuard Sync: Obsidian Sync is enabled. VaultGuard Sync handles all sync and " +
-        "backup for this vault — please disable Obsidian Sync to prevent " +
-        "file conflicts.\n\nSettings → Core plugins → Sync → Disable",
-        0 // persistent until dismissed
-      );
+      if (isSyncEnabled && !this.obsidianSyncNotice) {
+        console.warn(
+          `${LOG_PREFIX} Obsidian Sync is active. VaultGuard handles all sync and backup — ` +
+          "running both will cause file conflicts. Please disable Obsidian Sync."
+        );
+        this.obsidianSyncNotice = new Notice(
+          "VaultGuard Sync: Obsidian Sync is enabled. VaultGuard Sync handles all sync and " +
+          "backup for this vault — please disable Obsidian Sync to prevent " +
+          "file conflicts.\n\nSettings → Core plugins → Sync → Disable",
+          0 // persistent until dismissed
+        );
+      } else if (!isSyncEnabled && this.obsidianSyncNotice) {
+        this.obsidianSyncNotice.hide();
+        this.obsidianSyncNotice = null;
+      }
     } catch {
       // Defensive: if the internal API changes, don't block plugin load
+    }
+  }
+
+  private registerObsidianSyncListener(): void {
+    try {
+      interface InternalPluginsEvented {
+        on?(event: string, cb: () => void): EventRef;
+      }
+      const appWithInternals = this.app as unknown as {
+        internalPlugins?: InternalPluginsEvented;
+      };
+      const internalPlugins = appWithInternals.internalPlugins;
+
+      // Primary: react to enable/disable events. `internalPlugins.on("change", ...)`
+      // fires when any core plugin is toggled, so the Notice reconciles the
+      // moment the user disables Sync.
+      const ref = internalPlugins?.on?.("change", () => this.renderObsidianSyncNotice());
+      if (ref) {
+        this.registerEvent(ref);
+        return;
+      }
+
+      // Fallback: poll every 60s if the event API isn't present on this
+      // Obsidian build. registerInterval scopes the timer to plugin lifetime
+      // so it's auto-cleared on unload.
+      this.registerInterval(
+        window.setInterval(() => this.renderObsidianSyncNotice(), 60_000)
+      );
+    } catch {
+      // Defensive: never block plugin load
     }
   }
 

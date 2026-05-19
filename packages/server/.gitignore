@@ -8,3 +8,15 @@ terraform.tfstate.backup
 .terraform.lock.hcl
 *.zip
 .DS_Store
+
+# Private-only tooling — planning + AI configs must never be committed
+.planning/
+.claude/
+.codex/
+.cursor/
+.agents/
+.cursorrules
+.github/skills/
+CLAUDE.md
+AGENTS.md
+CODEX.md

@@ -86,19 +86,13 @@ variable "vaultguard_allow_public_signup" {
   default     = false
 }
 
+variable "turnstile_secret_arn" {
+  description = "Secrets Manager ARN for the Cloudflare Turnstile secret key (JSON shape {\"secretKey\":\"...\"}). Empty on Community Edition disables CAPTCHA (fail-open). The root terraform/main.tf hardcodes the prod ARN at the module invocation; override via tfvars for non-prod stages or leave this default for CE deploys driven from the root."
+  type        = string
+  default     = ""
+}
+
 # ─── Google Workspace (inbound mail) ─────────────────────────────────────────
-# Inbound mail for the domain is handled by Google Workspace. Set these via
-# terraform.tfvars or environment-specific tfvars once the Workspace tenant is
-# provisioned. Outbound transactional mail continues to flow through SES.
-
-variable "google_workspace_verification_token" {
-  description = "Google site-verification token (the value after 'google-site-verification=') from admin.google.com. Empty until the Workspace tenant is being provisioned."
-  type        = string
-  default     = ""
-}
-
-variable "google_workspace_dkim_value" {
-  description = "DKIM public key TXT value generated in Google Workspace Admin (Apps → Gmail → Authenticate email). Empty until the key has been generated."
-  type        = string
-  default     = ""
-}
+# Google Workspace site-verification TXT and DKIM TXT are managed manually
+# in the Route 53 console; they are intentionally NOT modelled as terraform
+# variables so a forgotten tfvars cannot destroy live email records.

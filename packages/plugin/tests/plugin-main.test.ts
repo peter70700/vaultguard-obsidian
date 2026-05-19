@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Menu, Notice, requestUrl } from "obsidian";
 
 import VaultGuardPlugin from "../src/plugin/main";
-import { DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS } from "../src/plugin/settings";
+import { DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "../src/plugin/settings";
 
 const mockNotice = vi.mocked(Notice);
 const mockRequestUrl = vi.mocked(requestUrl);
@@ -630,6 +630,268 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
         serverFeatures: expect.objectContaining({ shareLinks: false, billing: false }),
       })
     );
+  });
+
+  it("uses bundled Cloud defaults in auto mode without persisting them as settings defaults", () => {
+    const plugin = makePlugin();
+    plugin.settings.manualConfig = false;
+    plugin.settings.apiEndpoint = "";
+    plugin.settings.cognitoUserPoolId = "";
+    plugin.settings.cognitoClientId = "";
+
+    expect(plugin.getEffectiveConfig()).toMatchObject({
+      apiEndpoint: SAAS_DEFAULTS.apiEndpoint,
+      cognitoUserPoolId: SAAS_DEFAULTS.cognitoUserPoolId,
+      cognitoClientId: SAAS_DEFAULTS.cognitoClientId,
+    });
+    expect(DEFAULT_SETTINGS.apiEndpoint).toBe("");
+    expect(DEFAULT_SETTINGS.cognitoUserPoolId).toBe("");
+    expect(DEFAULT_SETTINGS.cognitoClientId).toBe("");
+  });
+
+  it("does not fall back to Cloud defaults in manual mode", () => {
+    const plugin = makePlugin();
+    plugin.settings.manualConfig = true;
+    plugin.settings.apiEndpoint = "";
+    plugin.settings.cognitoUserPoolId = "";
+    plugin.settings.cognitoClientId = "";
+
+    expect(plugin.getEffectiveConfig()).toMatchObject({
+      apiEndpoint: "",
+      cognitoUserPoolId: "",
+      cognitoClientId: "",
+    });
+  });
+
+  it("clears stale manual connection fields when switching back to Cloud mode", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    plugin.settings.manualConfig = true;
+    plugin.settings.orgSlug = "self-hosted";
+    plugin.settings.apiEndpoint = "https://self-hosted.example.com";
+    plugin.settings.organizationId = "org-self";
+    plugin.settings.cognitoUserPoolId = "eu-central-1_SELF";
+    plugin.settings.cognitoClientId = "self-client";
+    plugin.settings.serverEdition = "community";
+    plugin.settings.serverFeatures = {
+      shareLinks: false,
+      advancedAudit: false,
+      billing: false,
+      webAdmin: false,
+    };
+
+    await plugin.setManualConfigurationMode(false);
+
+    expect(plugin.settings.manualConfig).not.toBe(true);
+    expect(plugin.settings.orgSlug).toBe("");
+    expect(plugin.settings.apiEndpoint).toBe("");
+    expect(plugin.settings.organizationId).toBe("");
+    expect(plugin.settings.cognitoUserPoolId).toBe("");
+    expect(plugin.settings.cognitoClientId).toBe("");
+    expect(plugin.getEffectiveConfig().apiEndpoint).toBe(SAAS_DEFAULTS.apiEndpoint);
+  });
+
+  it("does not use the Cloud org-config fallback while manual mode is enabled", async () => {
+    const plugin = makePlugin();
+    plugin.settings.manualConfig = true;
+    plugin.settings.apiEndpoint = "";
+
+    await expect(plugin.resolveOrgConfig("acme")).rejects.toThrow("No API endpoint configured");
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+
+  it("applies a self-hosted server config URL in manual mode", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    const body = {
+      orgSlug: "acme",
+      apiEndpoint: "https://acme.example.com",
+      cognitoUserPoolId: "eu-central-1_ACMEpool9",
+      cognitoClientId: "acmeclient0123456789ab",
+      edition: "community",
+      features: {
+        shareLinks: false,
+        advancedAudit: false,
+        billing: false,
+        webAdmin: false,
+      },
+    };
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 200,
+      json: body,
+      text: JSON.stringify(body),
+      headers: {},
+    } as any);
+
+    await plugin.applyManualServerConfigUrl("https://acme.example.com/.well-known/vaultguard.json");
+
+    expect(mockRequestUrl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "https://acme.example.com/.well-known/vaultguard.json",
+        method: "GET",
+      })
+    );
+    expect(plugin.settings.manualConfig).toBe(true);
+    expect(plugin.settings.apiEndpoint).toBe("https://acme.example.com");
+    expect(plugin.settings.cognitoUserPoolId).toBe("eu-central-1_ACMEpool9");
+    expect(plugin.featureEnabled("billing")).toBe(false);
+  });
+
+  it("rejects non-HTTPS self-hosted server config URLs except localhost", async () => {
+    const plugin = makePlugin();
+
+    await expect(
+      plugin.applyManualServerConfigUrl("http://api.acme.example.com/.well-known/vaultguard.json")
+    ).rejects.toThrow("HTTPS");
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+
+  // CR-01 / WR-06: the response body must not be allowed to silently redirect
+  // the user to a different host than the one they pasted. A malicious
+  // .well-known doc on attacker.example.com whose body claims
+  // apiEndpoint=https://api.real-service.com would otherwise capture credentials.
+  it("rejects a server config whose apiEndpoint host differs from the pasted URL host", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    const body = {
+      orgSlug: "acme",
+      apiEndpoint: "https://api.attacker.example.com",
+      cognitoUserPoolId: "eu-central-1_EVILpoolA",
+      cognitoClientId: "evilclient0123456789ab",
+      edition: "community",
+      features: { shareLinks: false, advancedAudit: false, billing: false, webAdmin: false },
+    };
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 200,
+      json: body,
+      text: JSON.stringify(body),
+      headers: {},
+    } as any);
+
+    await expect(
+      plugin.applyManualServerConfigUrl("https://acme.example.com/.well-known/vaultguard.json")
+    ).rejects.toThrow(/apiEndpoint host/);
+    // The plugin must not switch to manual mode or apply the attacker's
+    // Cognito identifiers when rejecting an SSRF response.
+    expect(plugin.settings.manualConfig).not.toBe(true);
+    expect(plugin.settings.cognitoUserPoolId).not.toBe("eu-central-1_EVILpoolA");
+    expect(plugin.settings.cognitoClientId).not.toBe("evilclient0123456789ab");
+    expect(plugin.settings.apiEndpoint).not.toBe("https://api.attacker.example.com");
+  });
+
+  // WR-05: malformed Cognito identifiers (e.g. an HTML error page parsed as JSON
+  // with stringy fields) must be rejected, not partial-applied.
+  it("rejects a server config whose cognitoUserPoolId is not a valid Cognito pool identifier", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    const body = {
+      orgSlug: "acme",
+      cognitoUserPoolId: "<html><body>500 Internal Server Error</body></html>",
+      cognitoClientId: "acmeclient0123456789ab",
+    };
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 200,
+      json: body,
+      text: JSON.stringify(body),
+      headers: {},
+    } as any);
+
+    await expect(
+      plugin.applyManualServerConfigUrl("https://acme.example.com/.well-known/vaultguard.json")
+    ).rejects.toThrow(/cognitoUserPoolId/);
+    expect(plugin.settings.manualConfig).not.toBe(true);
+  });
+
+  it("rejects a server config whose cognitoClientId is not a valid Cognito client identifier", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    const body = {
+      orgSlug: "acme",
+      cognitoUserPoolId: "eu-central-1_ACMEpool9",
+      cognitoClientId: "BAD-CLIENT-ID-WITH-HYPHENS",
+    };
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 200,
+      json: body,
+      text: JSON.stringify(body),
+      headers: {},
+    } as any);
+
+    await expect(
+      plugin.applyManualServerConfigUrl("https://acme.example.com/.well-known/vaultguard.json")
+    ).rejects.toThrow(/cognitoClientId/);
+    expect(plugin.settings.manualConfig).not.toBe(true);
+  });
+
+  // WR-07: non-object response bodies (array, primitive, null) must be rejected.
+  it("rejects a server config whose body is an array, not an object", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 200,
+      json: [],
+      text: "[]",
+      headers: {},
+    } as any);
+
+    await expect(
+      plugin.applyManualServerConfigUrl("https://acme.example.com/.well-known/vaultguard.json")
+    ).rejects.toThrow(/JSON object/);
+    expect(plugin.settings.manualConfig).not.toBe(true);
+  });
+
+  it("rejects a server config whose body is a primitive, not an object", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 200,
+      json: 42,
+      text: "42",
+      headers: {},
+    } as any);
+
+    await expect(
+      plugin.applyManualServerConfigUrl("https://acme.example.com/.well-known/vaultguard.json")
+    ).rejects.toThrow(/JSON object/);
+    expect(plugin.settings.manualConfig).not.toBe(true);
+  });
+
+  // WR-04: a malicious server returning a multi-megabyte body must be rejected
+  // before the plugin spends any further work parsing it.
+  it("rejects a server config response that exceeds the size cap", async () => {
+    const plugin = makePlugin();
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    // 128 KB of padding — twice the 64 KB cap.
+    const oversizedBody = JSON.stringify({
+      orgSlug: "acme",
+      cognitoUserPoolId: "eu-central-1_ACMEpool9",
+      cognitoClientId: "acmeclient0123456789ab",
+      padding: "x".repeat(128 * 1024),
+    });
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 200,
+      json: JSON.parse(oversizedBody),
+      text: oversizedBody,
+      headers: {},
+    } as any);
+
+    await expect(
+      plugin.applyManualServerConfigUrl("https://acme.example.com/.well-known/vaultguard.json")
+    ).rejects.toThrow(/unexpectedly large/);
+    expect(plugin.settings.manualConfig).not.toBe(true);
+  });
+
+  it("rejects invite API overrides unless the user has switched to manual mode", async () => {
+    const plugin = makePlugin();
+
+    await expect(
+      plugin.redeemInvite({
+        org: "acme",
+        email: "invitee@example.com",
+        api: "https://evil.example.com",
+      })
+    ).rejects.toThrow("cannot override");
+    expect(mockRequestUrl).not.toHaveBeenCalled();
   });
 
   it("derives different session bindings for different vault filesystem paths", async () => {

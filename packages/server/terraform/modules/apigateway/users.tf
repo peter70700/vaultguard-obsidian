@@ -44,6 +44,37 @@ resource "aws_api_gateway_integration" "orgs_config_get" {
   uri                     = var.signup_lambda_invoke_arn
 }
 
+# /.well-known/vaultguard.json
+# Single-org self-hosted deployments expose the same public config shape as
+# /orgs/{orgId}/config without requiring a slug.
+resource "aws_api_gateway_resource" "well_known" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_rest_api.vaultguard.root_resource_id
+  path_part   = ".well-known"
+}
+
+resource "aws_api_gateway_resource" "well_known_vaultguard_json" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.well_known.id
+  path_part   = "vaultguard.json"
+}
+
+resource "aws_api_gateway_method" "well_known_vaultguard_json_get" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.well_known_vaultguard_json.id
+  http_method   = "GET"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "well_known_vaultguard_json_get" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.well_known_vaultguard_json.id
+  http_method             = aws_api_gateway_method.well_known_vaultguard_json_get.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.signup_lambda_invoke_arn
+}
+
 resource "aws_api_gateway_resource" "orgs_settings" {
   rest_api_id = aws_api_gateway_rest_api.vaultguard.id
   parent_id   = aws_api_gateway_resource.orgs_id.id

@@ -28,10 +28,16 @@ terraform/*.tfstate.backup
 terraform/*.tfstate.*.backup
 terraform/.terraform.tfstate.lock.info
 terraform/*.tfplan
+terraform/tfplan
 terraform/**/.terraform/
 terraform/**/.build/
 terraform/modules/lambda/.build/
 terraform/environments/*.tfvars
+# Auto-loaded by terraform on every plan/apply. We keep environments/*.tfvars
+# as the canonical source of truth and copy from there; both are gitignored
+# because they contain stage-specific values (admin email, secret ARNs, …).
+terraform/terraform.tfvars
+terraform/*.auto.tfvars
 
 infrastructure/node_modules/
 
@@ -44,3 +50,17 @@ credentials.json
 
 # Cache
 .vaultguard-cache/
+
+# Private-only tooling — planning + AI-assistant configs.
+# Mirrors scripts/templates/public-gitignore.txt; see also
+# scripts/export-validator.mjs::FORBIDDEN_AI_PATHS.
+.planning/
+.claude/
+.codex/
+.cursor/
+.agents/
+.cursorrules
+.github/skills/
+CLAUDE.md
+AGENTS.md
+CODEX.md

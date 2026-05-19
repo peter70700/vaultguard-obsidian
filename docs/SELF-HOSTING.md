@@ -145,10 +145,12 @@ defaults are sensible for a first deployment; you only need to change
 - **`vaultguard_allow_public_signup`** — When `true`, `POST /signup` stays open
   after your first admin organization is created. Set to `false` for a closed
   deployment.
-- **`google_workspace_verification_token` / `google_workspace_dkim_value`** —
-  **Optional**. Leave blank unless you front the domain's inbound mail with
-  Google Workspace. Outbound transactional mail goes through AWS SES whether
-  these are set or not.
+- **Google Workspace DNS records** — the Workspace site-verification TXT and
+  DKIM TXT records are managed manually in the Route 53 console (terraform
+  doesn't model them, so a forgotten `-var-file` cannot destroy a live DKIM
+  key). Add them in Google Admin → Account → Domains and Google Admin → Apps
+  → Google Workspace → Gmail → Authenticate email, then mirror the values
+  into Route 53. Outbound transactional mail goes through AWS SES regardless.
 
 ***
 
@@ -364,19 +366,30 @@ directory and enable the plugin in Obsidian.
 ## Configure the Plugin to Connect to Your Server
 
 Once the plugin is enabled, open **Settings → VaultGuard → Connection** and
-fill in the values from your `terraform output`:
+turn on manual configuration.
+
+For the normal single-tenant Community Edition setup, paste this server config
+URL:
+
+```text
+<api_url output>/.well-known/vaultguard.json
+```
+
+The plugin fetches a public, non-secret JSON document from your server and fills
+the connection fields for you. If you need to enter the advanced fields by hand,
+use:
 
 | Setting              | Value                                                            |
 | -------------------- | ---------------------------------------------------------------- |
 | API endpoint         | `api_url` output (e.g. `https://abc123.execute-api...`)         |
+| Organization ID      | The `orgId` returned by signup, or the value from `/orgs/{slug}/config` |
 | Cognito User Pool ID | `cognito_user_pool_id` output                                    |
 | Cognito Client ID    | `cognito_client_id` output                                       |
-| Region               | The AWS region you deployed into (e.g. `eu-central-1`)           |
 
-Click **Save** and then **Log in** with the admin email + password you set in
-the previous step. On a successful login, the plugin will pick up your
-organization, fetch its feature config, and (because `vaultguard_edition` is
-`"community"`) hide the Pro-only UI surfaces.
+Then click **Log in** with the admin email + password you set in the previous
+step. On a successful login, the plugin will pick up your organization, fetch
+its feature config, and (because `vaultguard_edition` is `"community"`) hide the
+Pro-only UI surfaces.
 
 ***
 

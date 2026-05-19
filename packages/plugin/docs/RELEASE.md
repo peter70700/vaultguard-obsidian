@@ -11,8 +11,8 @@ The same plugin supports both connection models:
 
 | Mode | Included in plugin release | Setup path |
 |------|----------------------------|------------|
-| Hosted SaaS | Yes | User enters an organization slug or redeems an `obsidian://vaultguard-invite` link. The plugin resolves API and Cognito config from the hosted org config endpoint. |
-| Self-hosted | Yes | User turns on manual configuration and enters the API endpoint, organization ID, Cognito User Pool ID, and Cognito Client ID from their deployment outputs. |
+| Hosted SaaS | Yes | User clicks **Continue with VaultGuard Cloud** or redeems an `obsidian://vaultguard-invite` link. The plugin ships the public Cloud API/Cognito identifiers and refreshes org-specific config after sign-in. |
+| Self-hosted | Yes | User turns on manual configuration and applies a server config URL, or enters the API endpoint, organization ID, Cognito User Pool ID, and Cognito Client ID from their deployment outputs. |
 
 Do not create separate plugin binaries for SaaS and self-hosted unless the
 backend API contract diverges. Endpoint differences belong in settings, invite
@@ -26,6 +26,7 @@ Terraform/Lambda infrastructure, or customer-specific deployment material.
 
 The plugin release includes:
 
+- Hosted Cloud login without requiring an org slug.
 - Hosted org-slug auto-configuration.
 - Invite-link redemption for first-time users.
 - Manual self-hosted configuration.

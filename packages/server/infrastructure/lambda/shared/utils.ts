@@ -24,6 +24,7 @@ import {
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { randomBytes, randomUUID } from 'crypto';
+import { EDITION } from './edition';
 
 // ─── Environment Configuration ───────────────────────────────────────────────
 
@@ -50,6 +51,7 @@ const ORGANIZATIONS_TABLE = process.env.ORGANIZATIONS_TABLE!;
 const VAULTS_TABLE = process.env.VAULTS_TABLE!;
 const VAULT_MEMBERS_TABLE = process.env.VAULT_MEMBERS_TABLE!;
 const VAULT_ACTIVITY_TABLE = process.env.VAULT_ACTIVITY_TABLE!;
+const SUBSCRIPTIONS_TABLE = process.env.SUBSCRIPTIONS_TABLE!;
 const ORG_SETTINGS_CACHE_TTL_MS = 60_000;
 const VAULT_ACTIVITY_TTL_DAYS = 14;
 
@@ -340,12 +342,57 @@ export async function verifyToken(event: APIGatewayProxyEvent): Promise<UserCont
  * fails closed through the revoked-key table while session invalidation stays
  * backward compatible.
  */
-export async function verifyActiveUser(event: APIGatewayProxyEvent): Promise<UserContext> {
+/**
+ * Verifies the caller and asserts the org has an active SaaS subscription.
+ *
+ * Pass `{ allowPendingCheckout: true }` from billing endpoints so a freshly
+ * signed-up org can reach `/billing/checkout` even though its subscription
+ * status is still `pending_checkout`. Every other endpoint should use the
+ * default — that's what enforces "no usage without a card on file."
+ *
+ * On `EDITION === 'community'` the subscription gate is a no-op (self-hosters
+ * don't have Stripe in the loop).
+ */
+export async function verifyActiveUser(
+  event: APIGatewayProxyEvent,
+  options: { allowPendingCheckout?: boolean } = {}
+): Promise<UserContext> {
   const user = await verifyToken(event);
   requireOrgId(user);
   await assertUserNotRevoked(user);
   await assertSessionActiveIfPresent(event, user);
+  if (!options.allowPendingCheckout) {
+    await assertSubscriptionAllowsAccess(user);
+  }
   return user;
+}
+
+const ALLOWED_SUBSCRIPTION_STATUSES = new Set(['trialing', 'active', 'past_due']);
+
+/**
+ * Throws `AuthError(402)` when the org's subscription is missing or in a
+ * non-paying state (`pending_checkout`, `canceled`, `unpaid`, …). The error
+ * carries `code: 'checkout_required'` so the admin panel can route the user
+ * to /#/billing without prompting a re-login.
+ *
+ * Community Edition installs have no Stripe — skip the check entirely there.
+ */
+async function assertSubscriptionAllowsAccess(user: UserContext): Promise<void> {
+  if (EDITION !== 'pro') return;
+  const result = await docClient.send(
+    new GetCommand({
+      TableName: SUBSCRIPTIONS_TABLE,
+      Key: { orgId: user.orgId },
+    })
+  );
+  const status = result.Item?.status as string | undefined;
+  if (status && ALLOWED_SUBSCRIPTION_STATUSES.has(status)) return;
+
+  throw new AuthError(
+    'A Pro subscription is required. Complete checkout to continue.',
+    402,
+    'checkout_required'
+  );
 }
 
 export async function assertUserNotRevoked(user: UserContext): Promise<void> {
@@ -803,11 +850,15 @@ async function getAuditExpiryTtl(orgId: string | undefined, timestamp: string): 
  */
 export class AuthError extends Error {
   public statusCode: number;
+  /** Optional machine-readable marker (e.g. `checkout_required`) so callers
+   *  can route on the failure rather than just showing a toast. */
+  public code?: string;
 
-  constructor(message: string, statusCode: number = 401) {
+  constructor(message: string, statusCode: number = 401, code?: string) {
     super(message);
     this.name = 'AuthError';
     this.statusCode = statusCode;
+    this.code = code;
   }
 }
 
@@ -867,16 +918,18 @@ function SECURITY_HEADERS(requestId?: string): Record<string, string> {
 export function formatError(
   statusCode: number,
   message: string,
-  requestId?: string
+  requestId?: string,
+  code?: string
 ): APIGatewayProxyResult {
   const errorName = getErrorName(statusCode);
 
-  const body: ErrorResponse = {
+  const body: ErrorResponse & { code?: string } = {
     statusCode,
     error: errorName,
     message,
     requestId,
   };
+  if (code) body.code = code;
 
   return {
     statusCode,
@@ -912,6 +965,7 @@ function getErrorName(statusCode: number): string {
   const map: Record<number, string> = {
     400: 'Bad Request',
     401: 'Unauthorized',
+    402: 'Payment Required',
     403: 'Forbidden',
     404: 'Not Found',
     409: 'Conflict',
@@ -1088,8 +1142,11 @@ export function sanitizeFilePath(filePath: string): string {
 }
 
 // ─── Plan Limits (single source of truth) ───────────────────────────────────
+// SaaS has no free tier: every org is Pro (or Enterprise) from signup, with a
+// 14-day Stripe trial that requires a card on file. See docs/TERMINOLOGY.md
+// and infrastructure/lambda/signup/handler.ts for the pending_checkout state.
 
-export type PlanTier = 'free' | 'pro' | 'enterprise';
+export type PlanTier = 'pro' | 'enterprise';
 
 export interface PlanLimits {
   maxUsers: number;
@@ -1097,7 +1154,6 @@ export interface PlanLimits {
 }
 
 export const PLAN_LIMITS: Record<PlanTier, PlanLimits> = {
-  free:       { maxUsers: 5,      maxStorageBytes: 1 * 1024 * 1024 * 1024 },         // 1 GB
   pro:        { maxUsers: 100,    maxStorageBytes: 100 * 1024 * 1024 * 1024 },        // 100 GB
   enterprise: { maxUsers: -1,     maxStorageBytes: -1 },                               // unlimited
 };
@@ -1869,5 +1925,6 @@ export {
   VAULTS_TABLE,
   VAULT_MEMBERS_TABLE,
   VAULT_ACTIVITY_TABLE,
+  SUBSCRIPTIONS_TABLE,
   REGION,
 };

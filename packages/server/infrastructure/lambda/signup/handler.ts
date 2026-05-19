@@ -7,6 +7,7 @@
  * Endpoints:
  * - POST /signup           — Create org + admin user (public, no auth)
  * - GET  /orgs/{slug}/config — Public config for plugin auto-discovery
+ * - GET  /.well-known/vaultguard.json — Public config for single-org self-hosts
  */
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
@@ -18,6 +19,7 @@ import {
   AdminGetUserCommand,
   CreateGroupCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import {
   docClient,
   logAudit,
@@ -36,6 +38,7 @@ import {
   PERMISSIONS_TABLE,
   VAULTS_TABLE,
   VAULT_MEMBERS_TABLE,
+  SUBSCRIPTIONS_TABLE,
   PLAN_LIMITS,
   VaultRecord,
   VaultMemberRecord,
@@ -48,8 +51,93 @@ import { sendEmail } from '../email/handler';
 const REGION = process.env.AWS_REGION || 'eu-central-1';
 const USER_POOL_ID = process.env.USER_POOL_ID!;
 const CLIENT_ID = process.env.CLIENT_ID!;
+const TURNSTILE_SECRET_ARN = process.env.TURNSTILE_SECRET_ARN || '';
 
 const cognitoClient = new CognitoIdentityProviderClient({ region: REGION });
+
+// ─── Cloudflare Turnstile (cold-start cache) ────────────────────────────────
+// Mirrors the Stripe Secrets Manager pattern in billing/handler.ts:51-73.
+// When TURNSTILE_SECRET_ARN is empty (Community Edition / self-host without
+// Cloudflare), the secret resolver returns "" and verification is skipped.
+
+const smClient = new SecretsManagerClient({});
+let cachedTurnstileSecret: string | null = null;
+
+async function getTurnstileSecret(): Promise<string> {
+  if (cachedTurnstileSecret !== null) return cachedTurnstileSecret;
+  if (TURNSTILE_SECRET_ARN === '') {
+    // CE signal — do NOT cache so a redeploy that sets the ARN takes effect
+    // on the next cold start without code changes.
+    return '';
+  }
+
+  const result = await smClient.send(
+    new GetSecretValueCommand({ SecretId: TURNSTILE_SECRET_ARN })
+  );
+  if (!result.SecretString) {
+    throw new Error('Turnstile secret payload is empty');
+  }
+
+  let parsed: { secretKey?: string };
+  try {
+    parsed = JSON.parse(result.SecretString) as { secretKey?: string };
+  } catch (err) {
+    throw new Error(
+      `Failed to parse Turnstile secret JSON: ${(err as Error).message}`
+    );
+  }
+  if (!parsed.secretKey) {
+    throw new Error('Turnstile secret JSON is missing "secretKey" field');
+  }
+  cachedTurnstileSecret = parsed.secretKey;
+  return cachedTurnstileSecret;
+}
+
+async function verifyTurnstile(
+  token: string,
+  remoteip: string | undefined
+): Promise<boolean> {
+  try {
+    const secret = await getTurnstileSecret();
+    if (!secret) return false;
+
+    const params = new URLSearchParams();
+    params.append('secret', secret);
+    params.append('response', token);
+    if (remoteip) params.append('remoteip', remoteip);
+
+    const response = await fetch(
+      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      }
+    );
+    if (!response.ok) return false;
+
+    const data = (await response.json()) as { success?: boolean };
+    return data?.success === true;
+  } catch (err) {
+    console.error('[signup] Turnstile siteverify call failed', err);
+    return false;
+  }
+}
+
+/**
+ * Returns a 400 error response with the `turnstile_failed` marker code so the
+ * admin-panel can distinguish CAPTCHA failures from generic validation errors
+ * (and reset the widget). Reuses the same response shape as formatError().
+ */
+function formatTurnstileError(
+  message: string,
+  requestId: string
+): APIGatewayProxyResult {
+  const base = formatError(400, message, requestId);
+  const body = JSON.parse(base.body);
+  body.code = 'turnstile_failed';
+  return { ...base, body: JSON.stringify(body) };
+}
 
 /** Derive the API base URL from the incoming request context. */
 function getApiUrl(event: APIGatewayProxyEvent): string {
@@ -75,6 +163,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       case method === 'GET' && (resource === '/orgs/{slug}/config' || resource === '/orgs/{orgId}/config'):
         return await handleOrgConfig(event, requestId);
 
+      case method === 'GET' && resource === '/.well-known/vaultguard.json':
+        return await handleWellKnownConfig(event, requestId);
+
       default:
         return formatError(404, `Route not found: ${method} ${resource}`, requestId);
     }
@@ -82,8 +173,8 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     console.error('[SIGNUP_HANDLER_ERROR]', (err as Error).message);
 
     if (err && typeof err === 'object' && 'statusCode' in err) {
-      const typed = err as { statusCode: number; message: string };
-      return formatError(typed.statusCode, typed.message, requestId);
+      const typed = err as { statusCode: number; message: string; code?: string };
+      return formatError(typed.statusCode, typed.message, requestId, typed.code);
     }
 
     return formatError(500, 'Internal server error', requestId);
@@ -129,6 +220,32 @@ async function handleSignup(
   }
 
   const body = parseBody(event);
+
+  // Turnstile CAPTCHA verification.
+  //   Pro / managed SaaS: TURNSTILE_SECRET_ARN is set → token required + verified.
+  //   Community Edition: TURNSTILE_SECRET_ARN is empty → skip (fail-open). Self-hosters
+  //   gate signup with VAULTGUARD_ALLOW_PUBLIC_SIGNUP=true instead (see handler.ts:117-126).
+  const turnstileToken = typeof body.turnstileToken === 'string' ? body.turnstileToken : '';
+  const turnstileSecret = await getTurnstileSecret();
+  if (turnstileSecret === '') {
+    console.warn(
+      '[signup] Turnstile not configured (TURNSTILE_SECRET_ARN empty) — skipping verification. ' +
+        'This is normal for Community Edition; set TURNSTILE_SECRET_ARN to enable CAPTCHA.'
+    );
+  } else {
+    if (!turnstileToken) {
+      return formatTurnstileError('CAPTCHA challenge required.', requestId);
+    }
+    const remoteip = event.requestContext?.identity?.sourceIp;
+    const ok = await verifyTurnstile(turnstileToken, remoteip);
+    if (!ok) {
+      return formatTurnstileError(
+        'CAPTCHA verification failed. Please try again.',
+        requestId
+      );
+    }
+  }
+
   validateRequiredFields(body, ['orgName', 'orgSlug', 'email', 'password', 'displayName']);
 
   const orgName = (body.orgName as string).trim();
@@ -162,7 +279,12 @@ async function handleSignup(
 
   const orgId = generateId();
   const now = new Date().toISOString();
-  const tier = 'free';
+  // SaaS is Pro-only: every new org starts on the Pro plan with a
+  // `pending_checkout` subscription (no free tier). The 14-day trial only
+  // begins once the user completes Stripe Checkout — until then the
+  // subscription gate in shared/utils.ts blocks every non-billing endpoint
+  // with HTTP 402 + code:'checkout_required'.
+  const tier = 'pro';
   const limits = PLAN_LIMITS[tier];
 
   // Step 2: Create Cognito user
@@ -294,6 +416,29 @@ async function handleSignup(
     new PutCommand({
       TableName: ORGANIZATIONS_TABLE,
       Item: orgRecord,
+    })
+  );
+
+  // Step 5b: Write a `pending_checkout` Subscriptions row so the new org is
+  // visible to the billing surface (so it can complete checkout) but BLOCKED
+  // by `assertSubscriptionAllowsAccess` from every other endpoint. On Stripe
+  // checkout success the webhook overwrites this row with the real
+  // `trialing`/`active` state. Community Edition deployments skip the gate
+  // (`assertSubscriptionAllowsAccess` returns early when EDITION !== 'pro'),
+  // so this row is harmless on self-hosts even though SUBSCRIPTIONS_TABLE
+  // exists in their schema.
+  await docClient.send(
+    new PutCommand({
+      TableName: SUBSCRIPTIONS_TABLE,
+      Item: {
+        orgId,
+        plan: tier,
+        status: 'pending_checkout',
+        cancelAtPeriodEnd: false,
+        quantity: 1,
+        createdAt: now,
+        updatedAt: now,
+      },
     })
   );
 
@@ -452,6 +597,100 @@ async function handleOrgConfig(
   return formatSuccess(200, buildOrgConfig(org.slug as string, org.orgId as string, org.name as string, getApiUrl(event)), requestId);
 }
 
+// ─── GET /.well-known/vaultguard.json ────────────────────────────────────────
+
+/**
+ * Public, unauthenticated endpoint for self-hosted single-tenant deployments.
+ * Returns the minimal connection config the plugin needs to bootstrap without
+ * the user knowing their org slug.
+ *
+ * Security posture (per pre-commit review WR-01 / WR-02):
+ *
+ * - The endpoint is **only** served on Community Edition single-tenant
+ *   deployments. On Cloud (multi-tenant) it returns 404 indistinguishable
+ *   from the no-org case, so an outsider scanning example.com cannot
+ *   fingerprint which edition runs a given installation. Cloud uses
+ *   /orgs/{slug}/config for discovery.
+ * - Response body intentionally omits `orgId` and `orgName` — neither is
+ *   needed before login and `orgName` is admin-set free text that could
+ *   contain the legal entity name. The plugin fetches these post-auth.
+ * - `Cache-Control: public, max-age=300` lets CloudFront/intermediaries
+ *   absorb repeat requests, reducing the per-request DynamoDB Scan cost.
+ *
+ * The Cognito User Pool ID and App Client ID in the response ARE public by
+ * design — Cognito treats them as OAuth client identifiers, not secrets,
+ * and any unauthenticated client must present them during sign-in. See the
+ * matching note in `src/config/saas-defaults.ts`.
+ */
+async function handleWellKnownConfig(
+  event: APIGatewayProxyEvent,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  // Cloud/multi-tenant deployments never serve this endpoint. The single-org
+  // discovery semantic doesn't apply there, and a 200/409 response would
+  // fingerprint the edition to unauthenticated callers.
+  if (EDITION !== 'community') {
+    return formatError(404, 'Not found.', requestId);
+  }
+
+  const org = await getSingleActiveOrg();
+  // Collapse "no org" and "multiple orgs" into the same 404 response so an
+  // unauthenticated scanner cannot tell a fresh single-org install apart
+  // from a multi-org one.
+  if (!org || org === 'multiple') {
+    return formatError(404, 'Not found.', requestId);
+  }
+
+  const body = buildWellKnownConfig(org.slug as string, getApiUrl(event));
+  return {
+    statusCode: 200,
+    headers: {
+      ...wellKnownSecurityHeaders(requestId),
+      'Cache-Control': 'public, max-age=300',
+    },
+    body: JSON.stringify(body),
+  };
+}
+
+/**
+ * Minimal config shape for the unauthenticated /.well-known/vaultguard.json
+ * response. Deliberately omits `orgId` and `orgName` (which `buildOrgConfig`
+ * includes) — those require an authenticated caller.
+ */
+function buildWellKnownConfig(
+  slug: string,
+  apiUrl?: string
+): Record<string, unknown> {
+  return {
+    apiEndpoint: apiUrl || '',
+    cognitoUserPoolId: USER_POOL_ID,
+    cognitoClientId: CLIENT_ID,
+    cognitoRegion: REGION,
+    orgSlug: slug,
+    edition: EDITION,
+    features: FEATURES,
+  };
+}
+
+/**
+ * Same standard security headers as formatSuccess, but expressed as a plain
+ * object so the well-known handler can override Cache-Control. Mirrors
+ * SECURITY_HEADERS in shared/utils.ts.
+ */
+function wellKnownSecurityHeaders(requestId: string): Record<string, string> {
+  const allowedOrigin = process.env.ALLOWED_CORS_ORIGIN || 'https://admin.example.com';
+  return {
+    'Content-Type': 'application/json',
+    'X-Request-Id': requestId,
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Access-Control-Allow-Origin': allowedOrigin,
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-VaultGuard-Session-Id',
+  };
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function buildOrgConfig(
@@ -496,6 +735,67 @@ async function hasAnyOrg(): Promise<boolean> {
     })
   );
   return (result.Items?.length ?? 0) > 0;
+}
+
+// Module-level cache for the /.well-known/vaultguard.json result. Since the
+// endpoint is unauthenticated and public, the underlying DynamoDB Scan is a
+// cost-amplification target — caching the (0|1|multiple) verdict for a short
+// window absorbs repeat callers without weakening freshness for the legitimate
+// "self-hoster just provisioned, plugin polling" path.
+//
+// 60-second TTL is the right size: orgs are not created frequently, and the
+// 5-minute Cache-Control on the well-known response means CloudFront and
+// browser caches handle most traffic; only cache misses reach Lambda.
+let cachedSingleActiveOrg: {
+  value: Record<string, unknown> | 'multiple' | null;
+  expiresAt: number;
+} | null = null;
+const SINGLE_ACTIVE_ORG_TTL_MS = 60_000;
+
+async function getSingleActiveOrg(): Promise<Record<string, unknown> | 'multiple' | null> {
+  const now = Date.now();
+  if (cachedSingleActiveOrg && cachedSingleActiveOrg.expiresAt > now) {
+    return cachedSingleActiveOrg.value;
+  }
+
+  // Server-side FilterExpression prevents Scan from returning soft-deleted /
+  // suspended rows. Combined with the early-exit pagination below, this keeps
+  // the Lambda's RCU consumption bounded even on tables with many historical
+  // org rows.
+  let activeOrg: Record<string, unknown> | null = null;
+  let lastEvaluatedKey: Record<string, unknown> | undefined;
+
+  do {
+    const result = await docClient.send(
+      new ScanCommand({
+        TableName: ORGANIZATIONS_TABLE,
+        ProjectionExpression: 'slug, orgId, #status',
+        FilterExpression: '#status = :active',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+        },
+        ExpressionAttributeValues: {
+          ':active': 'active',
+        },
+        ExclusiveStartKey: lastEvaluatedKey,
+      })
+    );
+
+    for (const item of (result.Items ?? []) as Record<string, unknown>[]) {
+      if (!activeOrg) {
+        activeOrg = item;
+      } else {
+        // Two active orgs found — short-circuit, no need to scan further.
+        cachedSingleActiveOrg = { value: 'multiple', expiresAt: now + SINGLE_ACTIVE_ORG_TTL_MS };
+        return 'multiple';
+      }
+    }
+    lastEvaluatedKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (lastEvaluatedKey);
+
+  const value = activeOrg;
+  cachedSingleActiveOrg = { value, expiresAt: now + SINGLE_ACTIVE_ORG_TTL_MS };
+  return value;
 }
 
 async function getOrgByOrgId(orgId: string): Promise<Record<string, unknown> | null> {

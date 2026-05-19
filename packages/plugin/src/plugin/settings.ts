@@ -57,10 +57,10 @@ export const DEFAULT_EXCLUDED_PATHS = [
 export const DEFAULT_SETTINGS: VaultGuardSettings = {
   orgSlug: "",
   serverVaultId: "",
-  apiEndpoint: SAAS_DEFAULTS.apiEndpoint,
+  apiEndpoint: "",
   organizationId: "",
-  cognitoUserPoolId: SAAS_DEFAULTS.cognitoUserPoolId,
-  cognitoClientId: SAAS_DEFAULTS.cognitoClientId,
+  cognitoUserPoolId: "",
+  cognitoClientId: "",
   syncInterval: 30,
   cacheEncryptionStrength: "standard",
   offlineKeyLeaseDuration: 24,
@@ -1226,6 +1226,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     // ── Account ─────────────────────────────────────────────────────────────
     const session = this.plugin.getSession();
+    const isManualMode = this.plugin.settings.manualConfig ?? false;
     if (session) {
       containerEl.createEl("h2", { text: "Account" });
 
@@ -1302,10 +1303,14 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
       new Setting(containerEl)
         .setName("Not logged in")
-        .setDesc("Log in to start syncing your vault.")
+        .setDesc(
+          isManualMode
+            ? "Sign in with your self-hosted VaultGuard server."
+            : "Sign in with your VaultGuard Cloud account."
+        )
         .addButton((button) =>
           button
-            .setButtonText("Login")
+            .setButtonText(isManualMode ? "Login" : "Continue with VaultGuard Cloud")
             .setCta()
             .onClick(() => {
               this.plugin.triggerLogin();
@@ -1318,7 +1323,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // ── Connection Settings ─────────────────────────────────────────────────
     containerEl.createEl("h2", { text: "Connection" });
 
-    const isManualMode = this.plugin.settings.manualConfig ?? false;
+    new Setting(containerEl)
+      .setName("Connected to")
+      .setDesc(this.plugin.getConnectionTargetLabel());
 
     // Mode toggle
     new Setting(containerEl)
@@ -1326,20 +1333,60 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .setDesc(
         isManualMode
           ? "Using manual configuration for self-hosted deployments."
-          : "Auto-configure by entering your organization slug."
+          : "Using VaultGuard Cloud defaults. Organization details are discovered after sign-in or invite redemption."
       )
       .addToggle((toggle) =>
         toggle
           .setTooltip("Toggle between auto and manual configuration")
           .setValue(isManualMode)
           .onChange(async (value) => {
-            this.plugin.settings.manualConfig = value;
-            await this.plugin.saveSettings();
-            this.display();
+            try {
+              await this.plugin.setManualConfigurationMode(value);
+              this.display();
+            } catch (err) {
+              this.showStatus(
+                containerEl,
+                `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+                true
+              );
+            }
           })
       );
 
     if (!isManualMode) {
+      new Setting(containerEl)
+        .setName("VaultGuard Cloud")
+        .setDesc("Uses the bundled api.example.com and Cognito configuration.")
+        .addButton((button) =>
+          button
+            .setButtonText("Continue")
+            .setCta()
+            .onClick(() => {
+              this.plugin.triggerLogin();
+            })
+        )
+        .addButton((button) =>
+          button
+            .setButtonText("Reset")
+            .setTooltip("Clear locally cached connection fields and use the bundled Cloud defaults")
+            .onClick(async () => {
+              button.setDisabled(true);
+              try {
+                await this.plugin.resetCloudConnectionDefaults();
+                this.showStatus(containerEl, "VaultGuard Cloud defaults restored.", false);
+                this.display();
+              } catch (err) {
+                this.showStatus(
+                  containerEl,
+                  `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+                  true
+                );
+              } finally {
+                button.setDisabled(false);
+              }
+            })
+        );
+
       // ── Auto mode: org slug ──────────────────────────────────────────────
       const orgSlugSetting = new Setting(containerEl)
         .setName("Organization slug")
@@ -1446,6 +1493,50 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           })
       );
     } else {
+      const serverConfigSetting = new Setting(containerEl)
+        .setName("Server config URL")
+        .setDesc(
+          "Paste your self-hosted server's public config URL, for example https://your-server.com/.well-known/vaultguard.json."
+        );
+
+      let serverConfigInput: HTMLInputElement | null = null;
+      serverConfigSetting.addText((text) => {
+        text
+          .setPlaceholder("https://your-server.com/.well-known/vaultguard.json")
+          .setValue("");
+        serverConfigInput = text.inputEl;
+      });
+
+      serverConfigSetting.addButton((button) =>
+        button
+          .setButtonText("Apply")
+          .setCta()
+          .onClick(async () => {
+            const raw = serverConfigInput?.value.trim() ?? "";
+            if (!raw) {
+              this.showStatus(containerEl, "Paste a server config URL first.", true);
+              return;
+            }
+            button.setButtonText("Applying...");
+            button.setDisabled(true);
+            try {
+              await this.plugin.applyManualServerConfigUrl(raw);
+              if (serverConfigInput) serverConfigInput.value = "";
+              this.showStatus(containerEl, "Self-hosted server configuration applied.", false);
+              this.display();
+            } catch (err) {
+              this.showStatus(
+                containerEl,
+                `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+                true
+              );
+            } finally {
+              button.setButtonText("Apply");
+              button.setDisabled(false);
+            }
+          })
+      );
+
       // ── Manual mode: direct field entry ──────────────────────────────────
       new Setting(containerEl)
         .setName("API endpoint")
@@ -2397,12 +2488,18 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 }
 
 /**
- * Parses an invite link of any of these shapes into `{ org, email, api }`:
+ * Parses an invite link of any of these shapes into `{ org, email, api, token, exp }`:
  *   - `obsidian://vaultguard-invite?org=acme&email=user@x.com`
- *   - `obsidian://vaultguard-invite?slug=acme&email=user@x.com&api=https://...`
+ *   - `obsidian://vaultguard-invite?slug=acme&email=user@x.com&token=...`
  *   - bare query string: `org=acme&email=user@x.com`
  */
-function parseInviteLink(raw: string): { org?: string; email?: string; api?: string } {
+function parseInviteLink(raw: string): {
+  org?: string;
+  email?: string;
+  api?: string;
+  token?: string;
+  exp?: string;
+} {
   const trimmed = raw.trim();
   if (!trimmed) return {};
 
@@ -2430,10 +2527,14 @@ function parseInviteLink(raw: string): { org?: string; email?: string; api?: str
   const org = (params.get("org") ?? params.get("slug") ?? "").trim().toLowerCase();
   const email = (params.get("email") ?? "").trim();
   const api = (params.get("api") ?? "").trim();
+  const token = (params.get("token") ?? "").trim();
+  const exp = (params.get("exp") ?? "").trim();
 
   return {
     ...(org ? { org } : {}),
     ...(email ? { email } : {}),
     ...(api ? { api } : {}),
+    ...(token ? { token } : {}),
+    ...(exp ? { exp } : {}),
   };
 }

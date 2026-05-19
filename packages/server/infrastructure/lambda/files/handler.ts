@@ -292,8 +292,8 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     }
   } catch (err: unknown) {
     if (err && typeof err === 'object' && 'statusCode' in err) {
-      const typed = err as { statusCode: number; message: string };
-      return formatError(typed.statusCode, typed.message, requestId);
+      const typed = err as { statusCode: number; message: string; code?: string };
+      return formatError(typed.statusCode, typed.message, requestId, typed.code);
     }
 
     console.error('[FILES_HANDLER_ERROR]', (err as Error).message);
