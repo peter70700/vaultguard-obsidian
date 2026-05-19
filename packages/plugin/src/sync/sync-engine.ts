@@ -116,6 +116,7 @@ export class SyncEngine {
     const key = this.keyManager.getKey();
     if (!key) {
       this.setState(SyncEngineState.OFFLINE);
+      console.log("[VaultGuard] Sync skipped: no key lease (sync() early return — keyManager.getKey() returned null)");
       return this.buildStatus('No valid encryption key available');
     }
 
@@ -301,7 +302,10 @@ export class SyncEngine {
     mergedContent?: string
   ): Promise<void> {
     const key = this.keyManager.getKey();
-    if (!key) throw new Error('No valid key for conflict resolution');
+    if (!key) {
+      console.log("[VaultGuard] Sync skipped: no key lease (handleConflicts() — keyManager.getKey() returned null)");
+      throw new Error('No valid key for conflict resolution');
+    }
 
     const resolution = await this.conflictResolver.resolve(
       path,

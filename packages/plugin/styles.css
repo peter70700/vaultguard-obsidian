@@ -2445,6 +2445,118 @@
   cursor: wait;
 }
 
+/* ─── Mobile layout (≤600px) ──────────────────────────────────────────────
+   The header fights for room in a single horizontal row on phones:
+   badge + separator + count + up to 4 named chips + Manage button. With
+   nowrap + overflow:hidden the chips get clipped mid-name and the action
+   button can be pushed off-screen. On mobile we collapse chips to colored
+   avatar dots (initials still carry identity, background carries level),
+   hide the redundant separator and button text, and tighten spacing.
+
+   The popover is positioned inline by positionPopover() at a fixed 260px
+   width, which is awkward on narrow viewports — we override with
+   !important to turn it into a bottom-anchored sheet. */
+@media (max-width: 600px) {
+  .vaultguard-fh-inner {
+    padding: 4px 10px;
+    gap: 6px;
+  }
+
+  .vaultguard-fh-separator {
+    display: none;
+  }
+
+  .vaultguard-fh-shared-count {
+    gap: 2px;
+  }
+
+  .vaultguard-fh-shared-count-icon svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  /* Collapse chips to icon-only avatar dots. The colored initials circle
+     already encodes both identity (initials) and access level (color), so
+     the chip wrapper itself becomes pure padding around the avatar. */
+  .vaultguard-fh-chip {
+    padding: 0;
+    background-color: transparent;
+    border: none;
+    max-width: none;
+  }
+
+  .vaultguard-fh-chip:hover,
+  .vaultguard-fh-chip-clickable:hover {
+    background-color: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    transform: none;
+  }
+
+  .vaultguard-fh-chip-label,
+  .vaultguard-fh-chip-level {
+    display: none;
+  }
+
+  /* Bump avatar size slightly to keep it a comfortable tap target now
+     that the chip wrapper is gone. */
+  .vaultguard-fh-chip-initials,
+  .vaultguard-fh-chip-icon {
+    width: 22px;
+    height: 22px;
+  }
+
+  .vaultguard-fh-chip-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background-color: var(--background-modifier-hover);
+  }
+
+  .vaultguard-fh-avatar-group {
+    gap: 2px;
+  }
+
+  .vaultguard-fh-overflow {
+    padding: 2px 6px;
+  }
+
+  /* Icon-only action button. The button has two children — an icon span
+     (.vaultguard-fh-btn-icon) and a plain text span. Hide the text span
+     only, by targeting direct children that aren't the icon. */
+  .vaultguard-fh-btn {
+    padding: 5px;
+    gap: 0;
+  }
+
+  .vaultguard-fh-btn > span:not(.vaultguard-fh-btn-icon) {
+    display: none;
+  }
+
+  .vaultguard-fh-btn-icon svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  /* Bottom-sheet popover. positionPopover() in file-permission-header.ts
+     writes inline top/left/width on every open — !important is the only
+     way to override without touching TS. */
+  .vaultguard-fh-popover {
+    left: 8px !important;
+    right: 8px !important;
+    width: auto !important;
+    top: auto !important;
+    bottom: 8px !important;
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+
+  .vaultguard-fh-popover-inner {
+    padding: 16px;
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    File Permission Panel — dropdown for managing per-file access
    ═══════════════════════════════════════════════════════════════════════════ */

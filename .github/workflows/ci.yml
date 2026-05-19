@@ -13,7 +13,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  forbidden-artifacts:
+    # Standalone, intentionally independent of build-test-lint. On the public
+    # monorepo (where this workflow file is copied via export) it fails the
+    # push when a Terraform state / plan / dev-tfvars file lands in the tree.
+    #
+    # Skipped on this private source repo for the same reason build-test-lint
+    # is: the private repo's runners never come online (pre-existing quota /
+    # availability issue — jobs queue, get a runner ID, then exit with no
+    # step logs). Defence-in-depth on the private side comes from
+    # scripts/git-hooks/pre-commit (auto-installed via npm prepare) and the
+    # post-copy validator in scripts/export-public-server-repo.mjs.
+    if: github.repository != 'peter70700/vaultguard-obsidian-plugin'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refuse Terraform state/plan/dev-tfvars in tree
+        run: |
+          set -euo pipefail
+          forbidden_regex='^terraform/(.*\.tfstate(\.[^/]+)?$|tfplan$|.*\.tfplan$|terraform\.tfvars$|.*\.auto\.tfvars$|\.terraform/|\.terraform\.tfstate\.lock\.info$)'
+          violations="$(git ls-files | grep -E "$forbidden_regex" || true)"
+          if [[ -n "$violations" ]]; then
+            echo "::error::Tracked Terraform state/plan/dev-tfvars artifacts found:"
+            printf '%s\n' $violations | while read -r f; do echo "::error file=$f::forbidden artifact tracked in git"; done
+            exit 1
+          fi
+          echo "OK: no forbidden Terraform artifacts in tree."
+
   build-test-lint:
+    # The job body targets the public monorepo's packages/{plugin,server}/
+    # layout. This file is the single source of truth (CONTEXT.md D-40) and
+    # is copied verbatim into the monorepo via export-public-monorepo.mjs.
+    #
+    # On THIS private repo the layout is flat (root package.json, src/,
+    # infrastructure/) — the monorepo paths don't exist, so running these
+    # steps here would always fail. The `if:` guard skips the job entirely
+    # when the workflow runs on the private source repo, leaving the
+    # forbidden-artifacts guard above as the only CI on this repo.
+    if: github.repository != 'peter70700/vaultguard-obsidian-plugin'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

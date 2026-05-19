@@ -1980,13 +1980,25 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async restoreSession(): Promise<void> {
     let storedSession = this.loadSessionFromStore();
+    if (storedSession) {
+      this.log("Session restored via safe-storage path");
+    }
     if (!storedSession) {
       // safeStorage path returned nothing — either there's no session at all
       // or it was sealed via the AtRestCipher (mobile / safeStorage-less).
       storedSession = await this.loadAtRestSessionFromStore();
+      if (storedSession) {
+        this.log("Session restored via at-rest-cipher path");
+      }
     }
     if (!storedSession) {
       this.log("No stored session found.");
+      if (Platform.isMobileApp) {
+        new Notice(
+          "VaultGuard diag: no stored session — login required",
+          5000
+        );
+      }
       return;
     }
 
@@ -2009,6 +2021,16 @@ export default class VaultGuardPlugin extends Plugin {
     this.initializeApiClientFromSession(storedSession);
     this.log(`Session restored for user: ${storedSession.displayName}`);
     this.updateStatusBar();
+
+    if (Platform.isMobileApp) {
+      const userIdShort = (storedSession.userId ?? "").slice(0, 6) || "—";
+      const rawVaultId = this.settings.serverVaultId ?? "";
+      const vaultIdShort = rawVaultId.length > 0 ? rawVaultId.slice(0, 6) : "—";
+      new Notice(
+        `VaultGuard diag: session restored (user=${userIdShort}, vault=${vaultIdShort})`,
+        5000
+      );
+    }
   }
 
   /**
@@ -4288,7 +4310,14 @@ export default class VaultGuardPlugin extends Plugin {
       }
       const method = status.kind === "unlocked" ? status.method : "unknown";
       this.log(`AtRestCipher ready (${method}).`);
-      if (method === "localstorage-fallback") {
+      if (Platform.isMobileApp) {
+        const ready = status.kind === "unlocked";
+        new Notice(
+          `VaultGuard diag: at-rest method=${method}, ready=${ready}`,
+          5000
+        );
+      }
+      if (method === "localstorage-fallback" && !Platform.isMobileApp) {
         new Notice(
           "VaultGuard Sync: at-rest encryption is using the localStorage fallback (OS keychain unavailable). Files in Finder are encrypted, but a full Electron-profile theft can recover the key. See docs/AT-REST-ENCRYPTION.md.",
           10000
@@ -7316,6 +7345,7 @@ export default class VaultGuardPlugin extends Plugin {
       this.keyLease = this.normalizeKeyLease(response.data.keyLease);
       this.applyOrgSettings(response.data.orgSettings ?? this.orgSettings);
       this.vaultLeaseDenied = false;
+      this.log("Vault-scoped key lease: ok");
       return "ok";
     }
 
@@ -7324,12 +7354,14 @@ export default class VaultGuardPlugin extends Plugin {
 
     if (statusCode === 401) {
       // True session expiry — the session is unusable, log the user out.
+      this.log(`Vault-scoped key lease: logged-out (status=${statusCode}, message=${message})`);
       await this.forceLogout(`VaultGuard Sync: ${message}`);
       return "logged-out";
     }
 
     if (statusCode === 403) {
       if (this.isUserAccessRevokedMessage(message)) {
+        this.log(`Vault-scoped key lease: logged-out (status=${statusCode}, message=${message})`);
         await this.forceLogout(`VaultGuard Sync: ${message}`);
         return "logged-out";
       }
@@ -7341,7 +7373,7 @@ export default class VaultGuardPlugin extends Plugin {
       // `keyLease` and degrade to "local only" cleanly.
       this.keyLease = null;
       this.vaultLeaseDenied = true;
-      this.log(`Vault-scoped key lease denied (limited access): ${message}`);
+      this.log(`Vault-scoped key lease denied (limited access): status=${statusCode}, message=${message}`);
       this.notifyLimitedAccess(message);
       return "limited";
     }

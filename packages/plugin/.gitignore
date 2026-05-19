@@ -14,6 +14,9 @@ node_modules/
 *.swo
 *~
 
+# Claude Code agent worktrees (internal scratch dir, never tracked)
+.claude/worktrees/
+
 # OS
 .DS_Store
 Thumbs.db
