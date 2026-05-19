@@ -2445,6 +2445,124 @@
   cursor: wait;
 }
 
+/* ─── Mobile phone clearance (Obsidian-specific) ──────────────────────────
+   Two real problems the @media query below cannot solve on its own:
+
+   1. iOS notch / Dynamic Island. Obsidian does NOT auto-pad .view-content
+      for safe-area-inset-top, so an element injected at viewContent.firstChild
+      (which is exactly what file-permission-header.ts:114 does) lands behind
+      the status bar on notched devices.
+
+   2. Floating navigation (Settings → Appearance → Floating navigation,
+      default-on since mobile v1.11.7, Feb 2026). The floating back/menu
+      buttons render ABOVE .view-content with no automatic clearance — they
+      overlap our badge + chips. When the setting is OFF, the native
+      .view-header sibling provides spacing; when ON, nothing does.
+
+   Reference: chrisgurney/obsidian-note-toolbar src/Styles/body.css L104-141.
+   Scoped to .is-phone (not .is-mobile) — iPads render desktop-style and
+   don't need this clearance. */
+body.is-phone .vaultguard-file-header {
+  padding-top: var(--safe-area-inset-top, env(safe-area-inset-top, 0px));
+}
+
+body.is-phone.is-floating-nav .vaultguard-file-header {
+  margin-top: var(--navbar-height, 48px);
+}
+
+/* ─── Mobile layout: .is-phone branch ──────────────────────────────────────
+   Mirror of the @media (max-width: 600px) block below, but scoped to
+   Obsidian's body.is-phone class. Belt-and-suspenders: real phones may
+   report a CSS viewport >600px (split-screen, large devices, zoom level
+   tweaks), in which case the media query wouldn't fire on its own. */
+body.is-phone .vaultguard-fh-inner {
+  padding: 4px 10px;
+  gap: 6px;
+}
+
+body.is-phone .vaultguard-fh-separator {
+  display: none;
+}
+
+body.is-phone .vaultguard-fh-shared-count {
+  gap: 2px;
+}
+
+body.is-phone .vaultguard-fh-shared-count-icon svg {
+  width: 11px;
+  height: 11px;
+}
+
+body.is-phone .vaultguard-fh-chip {
+  padding: 0;
+  background-color: transparent;
+  border: none;
+  max-width: none;
+}
+
+body.is-phone .vaultguard-fh-chip:hover,
+body.is-phone .vaultguard-fh-chip-clickable:hover {
+  background-color: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+body.is-phone .vaultguard-fh-chip-label,
+body.is-phone .vaultguard-fh-chip-level {
+  display: none;
+}
+
+body.is-phone .vaultguard-fh-chip-initials,
+body.is-phone .vaultguard-fh-chip-icon {
+  width: 22px;
+  height: 22px;
+}
+
+body.is-phone .vaultguard-fh-chip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background-color: var(--background-modifier-hover);
+}
+
+body.is-phone .vaultguard-fh-avatar-group {
+  gap: 2px;
+}
+
+body.is-phone .vaultguard-fh-overflow {
+  padding: 2px 6px;
+}
+
+body.is-phone .vaultguard-fh-btn {
+  padding: 5px;
+  gap: 0;
+}
+
+body.is-phone .vaultguard-fh-btn > span:not(.vaultguard-fh-btn-icon) {
+  display: none;
+}
+
+body.is-phone .vaultguard-fh-btn-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+body.is-phone .vaultguard-fh-popover {
+  left: 8px !important;
+  right: 8px !important;
+  width: auto !important;
+  top: auto !important;
+  bottom: 8px !important;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+body.is-phone .vaultguard-fh-popover-inner {
+  padding: 16px;
+}
+
 /* ─── Mobile layout (≤600px) ──────────────────────────────────────────────
    The header fights for room in a single horizontal row on phones:
    badge + separator + count + up to 4 named chips + Manage button. With

@@ -420,6 +420,17 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private cloudDecryptFallbackNoticeAt: Map<string, number> = new Map();
 
+  /** Resolves when `initAtRestCipher()` finishes its first attempt. Reads
+   * issued before init completes (e.g. early `onload()` adapter reads on
+   * mobile, where session restore awaits the cipher) await this with a
+   * 10s timeout before deciding to fail closed on VG1-prefixed bytes. */
+  private cipherInitPromise: Promise<boolean> | null = null;
+
+  /** Per-path 60s debounce for the corrupted-write Notice that fires when
+   * an `interceptedWrite` / `interceptedWriteBinary` call would have
+   * persisted bytes whose plaintext starts with the VG1 magic header. */
+  private corruptedWriteNoticeAt: Map<string, number> = new Map();
+
   /** Cache of file permissions to avoid repeated API calls */
   private permissionCache: Map<string, PermissionLevel> = new Map();
 
@@ -508,6 +519,15 @@ export default class VaultGuardPlugin extends Plugin {
     // Create API client (tokens are set later during session restore or login)
     this.rebuildApiClient();
 
+    // Install the adapter intercept BEFORE any awaited startup work. Reads that
+    // Obsidian fires during plugin load (workspace restore, initial indexer)
+    // would otherwise go through the un-intercepted adapter and could return
+    // raw VG1 ciphertext as a UTF-8 string, which the editor would then
+    // re-save through the encryption path and permanently corrupt the file.
+    // Early reads route through readPlainFromDisk, which fails closed via
+    // `cipherInitPromise` until init settles.
+    this.interceptVaultAdapter();
+
     // Bring up the local at-rest cipher BEFORE restoring the session. On
     // mobile (no Electron `safeStorage`), session blobs are sealed with the
     // LAK rather than the OS keystore, so we need the cipher ready to
@@ -539,8 +559,8 @@ export default class VaultGuardPlugin extends Plugin {
     // a focus-triggered sync collapses that to ~immediate when it matters.
     this.registerFocusSyncHandlers();
 
-    // Intercept vault adapter methods for permission enforcement
-    this.interceptVaultAdapter();
+    // (moved earlier — interceptVaultAdapter() now runs before initAtRestCipher()
+    //  so adapter reads issued during plugin startup route through the guarded path.)
 
     // Prepare the explicit LLM bridge. It remains inert until the user mints
     // a scoped lease; no server or token is created during normal plugin load.
@@ -4285,7 +4305,12 @@ export default class VaultGuardPlugin extends Plugin {
 
     this.atRestCipher = new AtRestCipher(storage);
     try {
-      const ok = await this.atRestCipher.init();
+      const initPromise = this.atRestCipher.init();
+      this.cipherInitPromise = initPromise;
+      const ok = await initPromise.catch(() => false);
+      if (this.cipherInitPromise === initPromise) {
+        this.cipherInitPromise = null;
+      }
       const status = this.atRestCipher.getStatus();
       if (!ok) {
         if (status.kind === "needs-recovery") {
@@ -4757,12 +4782,78 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Returns true if `data` starts with the VG1 magic header. Catches
+   * corrupted-read cascades where ciphertext bytes were returned as a
+   * UTF-8 string and now arrive at the write path.
+   */
+  private looksLikeCiphertext(data: string): boolean {
+    return (
+      data.length >= 4 &&
+      data.charCodeAt(0) === 0x56 &&
+      data.charCodeAt(1) === 0x47 &&
+      data.charCodeAt(2) === 0x31 &&
+      data.charCodeAt(3) === 0x00
+    );
+  }
+
+  /**
+   * Binary counterpart of `looksLikeCiphertext`. Prefers the cipher's
+   * own header check when available (full length + version validation),
+   * falls back to a manual 4-byte magic + version-byte test otherwise.
+   */
+  private looksLikeCiphertextBytes(data: ArrayBuffer | Uint8Array): boolean {
+    if (this.atRestCipher) {
+      return this.atRestCipher.isEncrypted(data);
+    }
+    const view = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (view.length < 5) return false;
+    return (
+      view[0] === 0x56 &&
+      view[1] === 0x47 &&
+      view[2] === 0x31 &&
+      view[3] === 0x00 &&
+      view[4] === 0x01
+    );
+  }
+
+  /**
+   * Per-path-debounced Notice for a blocked corrupted write. Tells the
+   * user explicitly to close the file WITHOUT saving — saving again
+   * would just re-trigger the same block.
+   */
+  private notifyCorruptedWrite(path: string): void {
+    const now = Date.now();
+    const last = this.corruptedWriteNoticeAt.get(path) ?? 0;
+    if (now - last < 60_000) return;
+    this.corruptedWriteNoticeAt.set(path, now);
+    new Notice(
+      `VaultGuard Sync: refusing to save "${path}" — it looks like the editor has VaultGuard ciphertext as its content (likely a corrupted-read cascade). The write was BLOCKED to protect the file. Close the file WITHOUT saving and reload it.`,
+      10000
+    );
+  }
+
+  /**
    * Permission-checked and encryption-aware file write operation.
    * @param path - Normalized vault-relative file path
    * @param data - File content to write
    * @throws Error if the user lacks WRITE permission
    */
   private async interceptedWrite(path: string, data: string): Promise<void> {
+    if (this.looksLikeCiphertext(data)) {
+      this.notifyCorruptedWrite(path);
+      this.logError(
+        `Refusing to write ciphertext-as-plaintext to ${path}`,
+        new Error("blocked: VG1 magic in plaintext write")
+      );
+      void this.emitAuditEvent("file.write", path, {
+        outcome: "denied",
+        reason: "ciphertext-as-plaintext-write-blocked",
+      });
+      throw new Error(
+        `VaultGuard Sync: refusing to write "${path}" — content looks like at-rest ciphertext (corrupted-read cascade). File preserved.`
+      );
+    }
+
     if (this.applyingRemoteWrite) {
       await this.writePlainToDisk(path, data);
       return;
@@ -4865,7 +4956,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private async readPlainFromDisk(path: string): Promise<string> {
-    if (this.isAtRestExcluded(path) || !this.atRestCipher?.isReady()) {
+    if (this.isAtRestExcluded(path)) {
       if (!this.originalAdapterMethods.read) {
         throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
       }
@@ -4873,20 +4964,60 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     // Prefer readBinary so we can detect the magic header bytes precisely.
-    // Fall back to read() on older adapters that lack readBinary.
     if (this.originalAdapterMethods.readBinary) {
       const bytes = await this.originalAdapterMethods.readBinary(path);
-      if (this.atRestCipher.isEncrypted(bytes)) {
+      if (this.atRestCipher?.isEncrypted(bytes)) {
+        if (!this.atRestCipher.isReady()) {
+          await this.waitForCipherInit(10_000);
+        }
+        if (!this.atRestCipher.isReady()) {
+          throw new Error(
+            `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
+          );
+        }
         return this.atRestCipher.decryptString(bytes);
       }
       // Legacy plaintext (or external write). Decode as UTF-8.
       return new TextDecoder().decode(bytes);
     }
 
+    // Legacy adapter without readBinary (rare; legacy mobile). Re-encode the
+    // first 4 chars and check for the VG1 magic — if it matches, this is
+    // ciphertext we must NOT return as a string.
     if (!this.originalAdapterMethods.read) {
       throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
     }
-    return this.originalAdapterMethods.read(path);
+    const text = await this.originalAdapterMethods.read(path);
+    if (text.length >= 4) {
+      const head = new TextEncoder().encode(text.slice(0, 4));
+      if (
+        head.length >= 4 &&
+        head[0] === 0x56 &&
+        head[1] === 0x47 &&
+        head[2] === 0x31 &&
+        head[3] === 0x00
+      ) {
+        throw new Error(
+          `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
+        );
+      }
+    }
+    return text;
+  }
+
+  /**
+   * Wait up to `timeoutMs` for the at-rest cipher's init promise to settle.
+   * Returns true if init completed (regardless of success); false on timeout.
+   * No-op if `cipherInitPromise` is already null.
+   */
+  private async waitForCipherInit(timeoutMs: number): Promise<boolean> {
+    const p = this.cipherInitPromise;
+    if (!p) return false;
+    const timeout = new Promise<boolean>((resolve) =>
+      setTimeout(() => resolve(false), timeoutMs)
+    );
+    await Promise.race([p.then(() => true).catch(() => true), timeout]);
+    return true;
   }
 
   /**
@@ -4899,6 +5030,11 @@ export default class VaultGuardPlugin extends Plugin {
    * guarantee after keychain/reset failures.
    */
   private async writePlainToDisk(path: string, data: string): Promise<void> {
+    if (this.looksLikeCiphertext(data)) {
+      throw new Error(
+        `VaultGuard Sync: writePlainToDisk refused for "${path}" — content has VG1 magic header (corrupted-read cascade).`
+      );
+    }
     if (this.isAtRestExcluded(path)) {
       if (!this.originalAdapterMethods.write) return;
       await this.originalAdapterMethods.write(path, data);
@@ -4934,11 +5070,19 @@ export default class VaultGuardPlugin extends Plugin {
     if (!this.originalAdapterMethods.readBinary) {
       throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
     }
-    if (this.isAtRestExcluded(path) || !this.atRestCipher?.isReady()) {
+    if (this.isAtRestExcluded(path)) {
       return this.originalAdapterMethods.readBinary(path);
     }
     const bytes = await this.originalAdapterMethods.readBinary(path);
-    if (this.atRestCipher.isEncrypted(bytes)) {
+    if (this.atRestCipher?.isEncrypted(bytes)) {
+      if (!this.atRestCipher.isReady()) {
+        await this.waitForCipherInit(10_000);
+      }
+      if (!this.atRestCipher.isReady()) {
+        throw new Error(
+          `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
+        );
+      }
       return this.atRestCipher.decryptBinary(bytes);
     }
     return bytes;
@@ -4949,6 +5093,11 @@ export default class VaultGuardPlugin extends Plugin {
    * storage. Mirror of `writePlainToDisk` for binary attachments.
    */
   private async writePlainBinaryToDisk(path: string, data: ArrayBuffer): Promise<void> {
+    if (this.looksLikeCiphertextBytes(data)) {
+      throw new Error(
+        `VaultGuard Sync: writePlainBinaryToDisk refused for "${path}" — content has VG1 magic header (corrupted-read cascade).`
+      );
+    }
     if (this.isAtRestExcluded(path)) {
       if (!this.originalAdapterMethods.writeBinary) return;
       await this.originalAdapterMethods.writeBinary(path, data);
@@ -5028,6 +5177,20 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async interceptedWriteBinary(path: string, data: ArrayBuffer): Promise<void> {
     if (!this.originalAdapterMethods.writeBinary) return;
+    if (this.looksLikeCiphertextBytes(data)) {
+      this.notifyCorruptedWrite(path);
+      this.logError(
+        `Refusing to write ciphertext-as-plaintext binary to ${path}`,
+        new Error("blocked: VG1 magic in plaintext binary write")
+      );
+      void this.emitAuditEvent("file.write", path, {
+        outcome: "denied",
+        reason: "ciphertext-as-plaintext-write-blocked",
+      });
+      throw new Error(
+        `VaultGuard Sync: refusing to write "${path}" — content looks like at-rest ciphertext (corrupted-read cascade). File preserved.`
+      );
+    }
     if (this.applyingRemoteWrite || this.isPathExcluded(path)) {
       await this.writePlainBinaryToDisk(path, data);
       return;
