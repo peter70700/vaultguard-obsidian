@@ -87,4 +87,4 @@ jobs:
         run: npx tsc -p packages/server/infrastructure/tsconfig.json --noEmit
 
       - name: Test (Vitest)
-        run: npm run -w vaultguard test
+        run: npm run -w vaultguard-sync test

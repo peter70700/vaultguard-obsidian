@@ -749,10 +749,55 @@ function getPathSpecificity(pattern: string): number {
 // ─── Audit Logging ───────────────────────────────────────────────────────────
 
 /**
+ * Extracts the optional agent-attribution headers `X-VG-Agent-Name` and
+ * `X-VG-Lease-Id` from an API Gateway event. Used by `logAudit` to tag
+ * audit rows produced by agent-bridge-originated requests with the
+ * calling agent's identity.
+ *
+ * Header lookup is case-insensitive (API Gateway preserves caller casing
+ * but the spec is case-insensitive). Each value is stripped of
+ * CR/LF/control chars (defense-in-depth against header smuggling — the
+ * client also sanitizes in `sanitizeAgentField`) and capped at 128 chars
+ * so an oversized lease ID can't bloat every audit row.
+ *
+ * Returns an object with only the keys present; absent or empty-after-
+ * sanitization values are omitted so callers can spread the result
+ * without leaking `agentName: undefined` keys into the saved metadata.
+ */
+function extractAgentHeaders(
+  event?: APIGatewayProxyEvent
+): { agentName?: string; leaseId?: string } {
+  if (!event?.headers) return {};
+  const lookup = (name: string): string | undefined => {
+    const target = name.toLowerCase();
+    for (const [k, v] of Object.entries(event.headers)) {
+      if (k.toLowerCase() === target && typeof v === 'string') {
+        // eslint-disable-next-line no-control-regex
+        const cleaned = v.replace(/[\r\n\x00-\x1f\x7f]/g, '').trim().slice(0, 128);
+        return cleaned || undefined;
+      }
+    }
+    return undefined;
+  };
+  const result: { agentName?: string; leaseId?: string } = {};
+  const agentName = lookup('X-VG-Agent-Name');
+  if (agentName) result.agentName = agentName;
+  const leaseId = lookup('X-VG-Lease-Id');
+  if (leaseId) result.leaseId = leaseId;
+  return result;
+}
+
+/**
  * Writes an audit log entry to the AuditLog DynamoDB table.
  * All handler operations must call this to maintain a complete audit trail.
  *
  * @param entry - The audit entry to log (id and timestamp auto-generated if missing)
+ * @param event - Optional API Gateway event. When supplied, `X-VG-Agent-Name`
+ *   and `X-VG-Lease-Id` headers (if present) are merged into the row's
+ *   metadata so agent-bridge-originated operations are attributable.
+ *   Header-derived values win over caller-supplied metadata of the same
+ *   name (defense — headers are authenticated by the Cognito authorizer
+ *   while caller metadata is not).
  *
  * @example
  * ```ts
@@ -762,11 +807,12 @@ function getPathSpecificity(pattern: string): number {
  *   resourcePath: '/engineering/spec.md',
  *   outcome: 'success',
  *   metadata: { fileSize: 2048 },
- * });
+ * }, event);
  * ```
  */
 export async function logAudit(
-  entry: Omit<AuditEntry, 'id' | 'timestamp'> & { id?: string; timestamp?: string }
+  entry: Omit<AuditEntry, 'id' | 'timestamp'> & { id?: string; timestamp?: string },
+  event?: APIGatewayProxyEvent
 ): Promise<void> {
   const id = entry.id || generateId();
   const timestamp = entry.timestamp || new Date().toISOString();
@@ -775,6 +821,14 @@ export async function logAudit(
   const vaultId = entry.vaultId
     || extractVaultIdFromMetadata(entry.metadata)
     || extractVaultIdFromResourcePath(entry.resourcePath);
+
+  // Header-derived agent attribution wins over caller metadata (see fn doc).
+  const agentHeaders = extractAgentHeaders(event);
+  const metadata = {
+    ...(entry.metadata ?? {}),
+    ...(agentHeaders.agentName ? { agentName: agentHeaders.agentName } : {}),
+    ...(agentHeaders.leaseId ? { leaseId: agentHeaders.leaseId } : {}),
+  };
 
   const auditEntry: Record<string, unknown> = {
     // DynamoDB composite key: pk = orgId#date, sk = timestamp#eventId
@@ -788,7 +842,7 @@ export async function logAudit(
     action: entry.action,
     resourcePath: entry.resourcePath,
     outcome: entry.outcome,
-    metadata: entry.metadata,
+    metadata,
     ipAddress: entry.ipAddress,
     userAgent: entry.userAgent,
     // GSI attributes

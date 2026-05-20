@@ -147,6 +147,16 @@ interface AgentBridgeDeps {
     resourcePath: string | null,
     metadata: Record<string, unknown>
   ): void | Promise<void>;
+  // Wraps `fn` so that any HTTP requests it makes carry agent-attribution
+  // headers (X-VG-Agent-Name / X-VG-Lease-Id). Wired in main.ts to
+  // `apiClient.withAgentContext`. The bridge calls this around every
+  // `executeTool` dispatch so the resulting file/permission audit rows on
+  // the backend pick up the calling agent's identity automatically.
+  withAgentContext: <T>(
+    agentName: string,
+    leaseId: string,
+    fn: () => Promise<T>
+  ) => Promise<T>;
   // Optional — only present when at-rest encryption is ready. The bridge
   // gates persistent leases on this; when absent, persistent-mode lease
   // creation fails closed with a clear error rather than silently
@@ -1502,7 +1512,20 @@ export class VaultGuardAgentBridge {
       auditMeta.contentLength = args.content.length;
     }
     try {
-      const result = await this.executeTool(tool, lease.leaseId, args);
+      // Wrap dispatch so every downstream API call (files.read, files.write,
+      // etc.) carries X-VG-Agent-Name / X-VG-Lease-Id and the resulting
+      // backend audit rows are attributed to this lease. Wrapping at the
+      // dispatch boundary (rather than inside each individual tool method)
+      // means new tools added later inherit attribution automatically.
+      // The audit emit calls themselves are intentionally OUTSIDE the
+      // wrapper — they hit the dedicated bridge.* endpoint which already
+      // carries `agentName` / `leaseId` in its body, so adding the headers
+      // would be redundant.
+      const result = await this.deps.withAgentContext(
+        lease.agentName,
+        lease.leaseId,
+        () => this.executeTool(tool, lease.leaseId, args)
+      );
       void this.deps.emitAudit("bridge.tool_invoked", auditMeta.path as string ?? null, {
         ...auditMeta,
         outcome: "success",

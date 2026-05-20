@@ -16,6 +16,7 @@
  * - GET  /vaults/{vaultId}/audit/alerts        — Get security alerts for a vault
  * - POST /vaults/{vaultId}/audit/export        — Export audit logs as CSV
  * - POST /vaults/{vaultId}/audit/report        — Legacy alias for CSV export
+ * - POST /vaults/{vaultId}/audit/bridge        — Agent-bridge lifecycle event emit (any member, bridge.* actions only)
  */
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
@@ -69,6 +70,28 @@ const ANOMALY_THRESHOLD_DISTINCT_PATHS = parseInt(process.env.ANOMALY_THRESHOLD_
 const OFF_HOURS_START_HOUR_UTC = parseInt(process.env.OFF_HOURS_START_HOUR_UTC || '20', 10);
 const OFF_HOURS_END_HOUR_UTC = parseInt(process.env.OFF_HOURS_END_HOUR_UTC || '6', 10);
 const ALLOWED_CORS_ORIGIN = process.env.ALLOWED_CORS_ORIGIN || 'https://admin.example.com';
+
+// ─── Bridge audit endpoint limits ────────────────────────────────────────────
+//
+// Strict allowlist of `bridge.*` actions accepted by POST /audit/bridge.
+// Keeping this small is what stops the endpoint from being abused to forge
+// non-bridge audit rows (e.g. `files.read`, `auth.login`) on behalf of
+// other users. New bridge lifecycle actions must be added here AND mirrored
+// in `BridgeAuditAction` on the plugin side (src/plugin/agent-bridge.ts).
+const BRIDGE_AUDIT_ACTION_ALLOWLIST: ReadonlySet<string> = new Set([
+  'bridge.lease_created',
+  'bridge.lease_revoked',
+  'bridge.lease_token_rotated',
+  'bridge.session_bound',
+  'bridge.session_unbound',
+  'bridge.tool_invoked',
+]);
+
+// Bridge-audit payload cap. 4 KB is large enough for a tool_invoked row
+// (lease id + agent name + tool name + path + a handful of stats) while
+// being too small to ship raw file content or diff bodies — those would
+// leak plaintext into an immutable audit log on a runaway agent.
+const BRIDGE_AUDIT_MAX_BODY_BYTES = 4096;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -134,7 +157,12 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return formatError(400, 'vaultId path parameter is required for audit routes', requestId);
     }
 
-    await requireAuditVaultAdmin(event, user, vaultId, resource);
+    // The bridge route is intentionally NOT admin-gated: any vault member
+    // can emit lifecycle events for their own bridge sessions. All other
+    // audit routes (logs, alerts, exports, etc.) remain admin-only.
+    if (resource !== '/vaults/{vaultId}/audit/bridge') {
+      await requireAuditVaultAdmin(event, user, vaultId, resource);
+    }
 
     switch (true) {
       case method === 'GET' && (resource === '/vaults/{vaultId}/audit/logs' || resource === '/vaults/{vaultId}/audit'):
@@ -151,6 +179,11 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       case method === 'POST' && (resource === '/vaults/{vaultId}/audit/export' || resource === '/vaults/{vaultId}/audit/report'):
         return await handleExport(event, user, vaultId, requestId);
+
+      case method === 'POST' && resource === '/vaults/{vaultId}/audit/bridge':
+        // NOTE: bridge events ship in BOTH editions (no FEATURES.advancedAudit
+        // gate). Keep this route OUT of isAdvancedAuditRoute below.
+        return await handleBridgeAudit(event, user, vaultId, requestId);
 
       default:
         return formatError(404, `Route not found: ${method} ${resource}`, requestId);
@@ -623,6 +656,122 @@ async function handleExport(
     },
     body: csv,
   };
+}
+
+// ─── POST /vaults/{vaultId}/audit/bridge ─────────────────────────────────────
+
+/**
+ * Records a single agent-bridge lifecycle event (lease created, session
+ * bound, tool invoked, etc.) to the audit log. Unlike the other audit
+ * routes, this one is open to any vault member — the bound user is the
+ * only legitimate emitter for their own bridge — and is gated only by
+ * `requireVaultMember`. A strict action allowlist (`bridge.*` only)
+ * prevents the endpoint from being used to forge file/auth/permission
+ * rows.
+ *
+ * Available on both Pro and Community editions (no FEATURES gate) so the
+ * agent bridge surface is auditable on every deploy.
+ */
+async function handleBridgeAudit(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vaultId: string,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  // Size check FIRST so a runaway agent can't tie up the Lambda parsing
+  // megabyte-sized JSON bodies.
+  const raw = event.body ?? '';
+  if (raw.length > BRIDGE_AUDIT_MAX_BODY_BYTES) {
+    return formatError(
+      413,
+      `Bridge audit payload exceeds ${BRIDGE_AUDIT_MAX_BODY_BYTES} bytes`,
+      requestId
+    );
+  }
+
+  // Member-only check. requireVaultMember (no role arg) accepts any
+  // viewer/editor/admin — bridge events are emitted by the user themselves.
+  await requireVaultMember(user, vaultId);
+
+  const body = parseBody(event) as {
+    action?: unknown;
+    resourcePath?: unknown;
+    metadata?: unknown;
+  };
+
+  const action = typeof body.action === 'string' ? body.action.trim() : '';
+  if (!action) {
+    return formatError(400, 'action is required', requestId);
+  }
+  if (!BRIDGE_AUDIT_ACTION_ALLOWLIST.has(action)) {
+    return formatError(
+      400,
+      `action must be one of: ${Array.from(BRIDGE_AUDIT_ACTION_ALLOWLIST).join(', ')}`,
+      requestId
+    );
+  }
+
+  const resourcePath =
+    typeof body.resourcePath === 'string' ? body.resourcePath.slice(0, 1024) : null;
+  const metadata = sanitizeBridgeMetadata(body.metadata);
+
+  await logAudit(
+    {
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: user.orgId,
+      vaultId,
+      action,
+      // AuditEntry.resourcePath is required (string, not optional).
+      // Bridge events may legitimately have no resource (e.g. lease_created),
+      // in which case we store an empty string rather than leaving the
+      // field absent so the GSI / filter expressions stay consistent with
+      // the rest of the audit log.
+      resourcePath: resourcePath ?? '',
+      outcome: 'success',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      // Spread caller metadata first, then re-assert vaultId so the row's
+      // vaultId index attribute is always populated regardless of what
+      // the agent sent. Header-driven agentName/leaseId are merged
+      // inside logAudit (via the `event` arg below) and WIN over any
+      // caller-supplied agentName/leaseId in `metadata`.
+      metadata: { ...metadata, vaultId },
+    },
+    event
+  );
+
+  return formatSuccess(200, { logged: true }, requestId);
+}
+
+/**
+ * Shallow-sanitizes the caller-supplied metadata bag attached to a bridge
+ * audit event. Caps are intentionally aggressive so the audit log can't
+ * be used as a side-channel for shipping plaintext file content via a
+ * runaway agent: at most 32 keys, 64 chars per key name, 1 KB per
+ * string value, and any object/array value is JSON-stringified then
+ * truncated to 1 KB.
+ */
+function sanitizeBridgeMetadata(input: unknown): Record<string, unknown> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const out: Record<string, unknown> = {};
+  let count = 0;
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    if (count >= 32) break;
+    if (typeof k !== 'string' || k.length > 64) continue;
+    if (v === null || ['string', 'number', 'boolean'].includes(typeof v)) {
+      out[k] = typeof v === 'string' ? v.slice(0, 1024) : v;
+    } else {
+      try {
+        const s = JSON.stringify(v).slice(0, 1024);
+        out[k] = JSON.parse(s);
+      } catch {
+        out[k] = String(v).slice(0, 1024);
+      }
+    }
+    count++;
+  }
+  return out;
 }
 
 // ─── Anomaly Detection ───────────────────────────────────────────────────────

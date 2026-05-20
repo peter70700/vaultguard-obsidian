@@ -921,6 +921,33 @@ resource "aws_api_gateway_integration" "audit_export_post" {
   uri                     = var.audit_lambda_invoke_arn
 }
 
+resource "aws_api_gateway_resource" "audit_bridge" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.audit.id
+  path_part   = "bridge"
+}
+
+resource "aws_api_gateway_method" "audit_bridge_post" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.audit_bridge.id
+  http_method   = "POST"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+
+  request_parameters = {
+    "method.request.path.vaultId" = true
+  }
+}
+
+resource "aws_api_gateway_integration" "audit_bridge_post" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.audit_bridge.id
+  http_method             = aws_api_gateway_method.audit_bridge_post.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.audit_lambda_invoke_arn
+}
+
 resource "aws_api_gateway_resource" "audit_report" {
   rest_api_id = aws_api_gateway_rest_api.vaultguard.id
   parent_id   = aws_api_gateway_resource.audit.id
@@ -1302,6 +1329,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.audit_file_path_get,
     aws_api_gateway_integration.audit_export_post,
     aws_api_gateway_integration.audit_report_post,
+    aws_api_gateway_integration.audit_bridge_post,
     # Orgs
     aws_api_gateway_integration.orgs_config_get,
     aws_api_gateway_integration.orgs_settings_get,
@@ -1392,6 +1420,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.audit_file_path_get.id,
       aws_api_gateway_integration.audit_export_post.id,
       aws_api_gateway_integration.audit_report_post.id,
+      aws_api_gateway_integration.audit_bridge_post.id,
       aws_api_gateway_integration.orgs_config_get.id,
       aws_api_gateway_integration.orgs_settings_get.id,
       aws_api_gateway_integration.orgs_settings_put.id,

@@ -886,6 +886,16 @@ export default class VaultGuardPlugin extends Plugin {
       log: (message) => this.log(message),
       emitAudit: (action, resourcePath, metadata) =>
         this.emitAuditEvent(action, resourcePath, metadata),
+      // Forwards to the API client's instance-scoped agent-context stack so
+      // every downstream HTTP request issued during `fn` carries
+      // X-VG-Agent-Name / X-VG-Lease-Id and the backend's `logAudit`
+      // helper merges them into the audit row's metadata. If the API
+      // client is absent (early-startup race), we still run `fn` so the
+      // bridge stays functional — the only loss is the attribution tag.
+      withAgentContext: (agentName, leaseId, fn) =>
+        this.apiClient
+          ? this.apiClient.withAgentContext(agentName, leaseId, fn)
+          : fn(),
       persistence: this.makeAgentBridgePersistenceAdapter(),
     });
   }
@@ -8420,10 +8430,30 @@ export default class VaultGuardPlugin extends Plugin {
     resourcePath: string | null,
     metadata: Record<string, unknown> = {}
   ): Promise<void> {
-    // The deployed backend already writes audit events for auth, file, sync,
-    // and permission operations. Avoid duplicating those calls to endpoints
-    // that are not part of the current public API surface.
-    this.log(`Audit event handled server-side: ${action} ${resourcePath ?? ""}`.trim());
+    // Bridge-lifecycle events (lease created/revoked/rotated, session
+    // bound/unbound, tool invoked) are first-class audit rows posted to
+    // the dedicated `audit/bridge` endpoint. File/auth/permission events
+    // (anything not starting with "bridge.") are already recorded by the
+    // backend on the corresponding Lambda call — emitting them here would
+    // double-count, so we keep those as debug logs only.
+    if (!action.startsWith("bridge.")) {
+      this.log(`Audit event handled server-side: ${action} ${resourcePath ?? ""}`.trim());
+      return;
+    }
+
+    if (!this.apiClient || !this.settings.serverVaultId) {
+      this.log(`Audit event skipped (no client/vault): ${action}`);
+      return;
+    }
+
+    try {
+      await this.apiClient.postBridgeAudit(action, resourcePath, metadata);
+    } catch (err) {
+      // Audit emission is fire-and-forget — never break the caller.
+      this.log(
+        `Audit emission failed for ${action}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────

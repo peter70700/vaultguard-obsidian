@@ -46,6 +46,7 @@ locals {
     audit_file_path            = aws_api_gateway_resource.audit_file_path.id
     audit_export               = aws_api_gateway_resource.audit_export.id
     audit_report               = aws_api_gateway_resource.audit_report.id
+    audit_bridge               = aws_api_gateway_resource.audit_bridge.id
     billing_subscription       = aws_api_gateway_resource.billing_subscription.id
     billing_checkout           = aws_api_gateway_resource.billing_checkout.id
     billing_portal             = aws_api_gateway_resource.billing_portal.id
@@ -114,7 +115,7 @@ resource "aws_api_gateway_integration_response" "cors_options" {
   status_code = aws_api_gateway_method_response.cors_options[each.key].status_code
 
   response_parameters = {
-    "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id'"
+    "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id,X-VG-Agent-Name,X-VG-Lease-Id'"
     "method.response.header.Access-Control-Allow-Methods" = "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
     "method.response.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
   }

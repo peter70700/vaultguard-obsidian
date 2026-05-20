@@ -324,6 +324,22 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
   return bytes.buffer;
 }
 
+// ─── Agent-bridge context helpers ──────────────────────────────────────────
+//
+// Defense-in-depth sanitizer for the agent-name / lease-id HTTP headers.
+// CR/LF would let a hostile caller inject extra response headers (header
+// smuggling); control chars confuse intermediaries. Server also sanitizes
+// in `extractAgentHeaders` (infrastructure/lambda/shared/utils.ts). We
+// cap at 128 chars so an oversized lease ID can't bloat every request.
+
+// eslint-disable-next-line no-control-regex
+const AGENT_FIELD_FORBIDDEN_RE = /[\r\n\x00-\x1f\x7f]/g;
+const AGENT_FIELD_MAX_LENGTH = 128;
+
+function sanitizeAgentField(value: string): string {
+  return (value ?? "").replace(AGENT_FIELD_FORBIDDEN_RE, "").slice(0, AGENT_FIELD_MAX_LENGTH);
+}
+
 // ─── API Client ─────────────────────────────────────────────────────────────
 
 export class VaultGuardApiClient {
@@ -336,6 +352,14 @@ export class VaultGuardApiClient {
   private refreshPromise: Promise<AuthTokens | null> | null = null;
   private resolvedBaseUrl: string | null = null;
   private baseUrlResolutionPromise: Promise<string> | null = null;
+  // LIFO stack of agent contexts. Pushed by `withAgentContext` on entry,
+  // popped on exit (in a `finally` so it's exception-safe). When non-empty,
+  // `getAuthHeaders` reads the top entry and appends X-VG-Agent-Name /
+  // X-VG-Lease-Id to outbound requests so the server can attribute audit
+  // rows to the calling agent. Instance-scoped (not AsyncLocalStorage)
+  // because Obsidian's renderer doesn't ship ALS on globalThis and the
+  // agent-bridge dispatch is strictly serial per executeTool invocation.
+  private agentContextStack: Array<{ agentName: string; leaseId: string }> = [];
 
   constructor(config: Partial<VaultGuardApiConfig>) {
     this.config = {
@@ -761,6 +785,57 @@ export class VaultGuardApiClient {
     });
   }
 
+  // ─── Agent-Bridge Audit ────────────────────────────────────────────
+  //
+  // The agent-bridge layer wraps every tool invocation in `withAgentContext`
+  // so that the standard file/permission audit rows produced by downstream
+  // API calls carry the calling agent's identity (via X-VG-Agent-Name and
+  // X-VG-Lease-Id headers). For *bridge-lifecycle* events (lease created,
+  // session bound, tool invoked, etc.) the plugin posts directly to the
+  // dedicated `audit/bridge` endpoint via `postBridgeAudit` below. The
+  // server enforces an action allowlist — only `bridge.*` actions are
+  // accepted — so this surface can't be used to forge file/auth audit rows.
+
+  /**
+   * Runs `fn` with the given agent context pushed onto the LIFO stack.
+   * While the stack is non-empty, all outbound requests (auth-bearing or
+   * not) carry `X-VG-Agent-Name` and `X-VG-Lease-Id` headers. The stack
+   * is restored on exit via a `finally` so thrown errors don't leak the
+   * context into a subsequent unrelated request.
+   */
+  async withAgentContext<T>(
+    agentName: string,
+    leaseId: string,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    this.agentContextStack.push({
+      agentName: sanitizeAgentField(agentName),
+      leaseId: sanitizeAgentField(leaseId),
+    });
+    try {
+      return await fn();
+    } finally {
+      this.agentContextStack.pop();
+    }
+  }
+
+  /**
+   * Emits a single bridge-lifecycle audit row to the backend. Used by the
+   * plugin's `emitAuditEvent` helper for events that don't naturally
+   * trigger a downstream API call (e.g. `bridge.lease_created`,
+   * `bridge.session_bound`). Throws if no vault is bound — callers
+   * (`emitAuditEvent` in main.ts) swallow the error so audit emission
+   * stays fire-and-forget.
+   */
+  async postBridgeAudit(
+    action: string,
+    resourcePath: string | null,
+    metadata: Record<string, unknown> = {}
+  ): Promise<void> {
+    const body = { action, resourcePath, metadata };
+    await this.request<void>("POST", `${this.vaultBase()}/audit/bridge`, body);
+  }
+
   // ─── Organization Settings ─────────────────────────────────────────
 
   async getOrgSettings(): Promise<OrgSettingsResponse> {
@@ -894,6 +969,15 @@ export class VaultGuardApiClient {
     const sessionId = this.config.getSessionId?.();
     if (sessionId) {
       headers["X-VaultGuard-Session-Id"] = sessionId;
+    }
+    // Agent-bridge attribution: if an agent context is active on the LIFO
+    // stack, tag this outbound request with the agent name + lease id so
+    // the server-side `logAudit` helper can merge them into the audit row's
+    // metadata. Sanitization happens at push time in `withAgentContext`.
+    const top = this.agentContextStack[this.agentContextStack.length - 1];
+    if (top) {
+      headers["X-VG-Agent-Name"] = top.agentName;
+      headers["X-VG-Lease-Id"] = top.leaseId;
     }
     return headers;
   }
