@@ -682,7 +682,11 @@ export class FilePermissionHeader {
 
     const exactUserRule = this.findExactUserRuleForFile(rules, userId, file);
 
-    if (this.ctx.isAdmin) {
+    // Admins/owners cannot restrict themselves — the server bypasses deny rules for
+    // org-admin/vault-admin/owner (see infrastructure/lambda/shared/utils.ts:528-530),
+    // so offering the editable dropdown for the admin's own row would silently write
+    // an orphan deny rule with no effect. Fold self-rows into the static-badge branch.
+    if (this.ctx.isAdmin && userId !== this.ctx.currentUserId) {
       const levelSelect = levelRow.createEl("select", {
         cls: "vaultguard-fh-popover-level-select",
       });

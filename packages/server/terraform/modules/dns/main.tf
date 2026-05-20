@@ -168,12 +168,18 @@ resource "aws_route53_record" "api" {
 # SES is NOT in the MX set: outbound from SES doesn't need an MX, and adding
 # SES as a low-priority fallback would silently drop mail (no SES receipt rule
 # is configured) whenever Google has a hiccup.
+#
+# IMPORTANT: no trailing dot on `SMTP.GOOGLE.COM`. Route53 stores MX targets
+# without the trailing dot (it's added back when serving DNS responses), so
+# `.` here causes perpetual no-op drift on every `terraform plan` against the
+# terraform-provider-aws's normalization quirk. Verified live with
+# `aws route53 list-resource-record-sets` returning the un-dotted form.
 resource "aws_route53_record" "mx" {
   zone_id = data.aws_route53_zone.main.zone_id
   name    = var.domain_name
   type    = "MX"
   ttl     = 3600
-  records = ["1 SMTP.GOOGLE.COM."]
+  records = ["1 SMTP.GOOGLE.COM"]
 }
 
 # Google Workspace site-verification TXT and DKIM TXT are managed manually

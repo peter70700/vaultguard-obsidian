@@ -2563,7 +2563,7 @@ body.is-phone .vaultguard-fh-popover-inner {
   padding: 16px;
 }
 
-/* ─── Mobile layout (≤600px) ──────────────────────────────────────────────
+/* ─── Mobile touch layout (≤600px) ─────────────────────────────────────────
    The header fights for room in a single horizontal row on phones:
    badge + separator + count + up to 4 named chips + Manage button. With
    nowrap + overflow:hidden the chips get clipped mid-name and the action
@@ -2573,8 +2573,11 @@ body.is-phone .vaultguard-fh-popover-inner {
 
    The popover is positioned inline by positionPopover() at a fixed 260px
    width, which is awkward on narrow viewports — we override with
-   !important to turn it into a bottom-anchored sheet. */
-@media (max-width: 600px) {
+   !important to turn it into a bottom-anchored sheet.
+
+   Keep this fallback touch-only. On macOS desktop, a narrow Obsidian window
+   can also be <=600px wide, but it should keep the desktop header layout. */
+@media (max-width: 600px) and (hover: none) and (pointer: coarse) {
   .vaultguard-fh-inner {
     padding: 4px 10px;
     gap: 6px;

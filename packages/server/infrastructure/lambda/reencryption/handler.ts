@@ -26,7 +26,7 @@ import {
   GenerateDataKeyCommand,
   DecryptCommand,
 } from '@aws-sdk/client-kms';
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'crypto';
 import {
   docClient,
   verifyActiveUser,
@@ -100,6 +100,12 @@ interface PreparedScopeKey {
   plaintextKey: Buffer;
   encryptedDataKey: string;
   previousItem?: Record<string, unknown>;
+  /**
+   * Freshly generated UUID v4 (per-rotation) that stays with this DEK for life
+   * (ACTIVE → ROTATED#<ts>). Phase 7 cross-DEK restore looks up historical DEKs
+   * via the `keyId-index` GSI on `user_keys` using this id.
+   */
+  newKeyId: string;
 }
 
 // ─── Main Handler ────────────────────────────────────────────────────────────
@@ -312,7 +318,15 @@ async function executeReEncryptionJob(
       for (const s3Key of plan.s3Keys) {
         try {
           const vaultPath = '/' + s3Key.replace(prefix, '');
-          await reEncryptFile(s3Key, vaultPath, orgId, plan.vaultId, plan.oldKey, plan.newKey.plaintextKey);
+          await reEncryptFile(
+            s3Key,
+            vaultPath,
+            orgId,
+            plan.vaultId,
+            plan.oldKey.key,
+            plan.newKey.plaintextKey,
+            plan.newKey.newKeyId,
+          );
           processedPlanKeys.push(s3Key);
           processedFiles++;
         } catch (err) {
@@ -332,7 +346,18 @@ async function executeReEncryptionJob(
         for (const s3Key of processedPlanKeys) {
           try {
             const vaultPath = '/' + s3Key.replace(prefix, '');
-            await reEncryptFile(s3Key, vaultPath, orgId, plan.vaultId, plan.newKey.plaintextKey, plan.oldKey);
+            // Rollback: re-encrypt back to the OLD key, so the object's
+            // `vaultguard-key-id` Metadata should reflect the OLD keyId
+            // (the DEK the file is now wrapped with after rollback).
+            await reEncryptFile(
+              s3Key,
+              vaultPath,
+              orgId,
+              plan.vaultId,
+              plan.newKey.plaintextKey,
+              plan.oldKey.key,
+              plan.oldKey.keyId,
+            );
             processedFiles--;
           } catch (rollbackErr) {
             const errMsg = `${s3Key}: rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`;
@@ -350,7 +375,7 @@ async function executeReEncryptionJob(
       dek.plaintextKey.fill(0);
     }
     for (const plan of plans) {
-      plan.oldKey.fill(0);
+      plan.oldKey.key.fill(0);
       plan.newKey.plaintextKey.fill(0);
     }
 
@@ -540,7 +565,7 @@ function getScopeSpecificity(scope: string): number {
  * Decrypt a VaultGuard-format encrypted payload.
  * Format: [IV (12 bytes)][Ciphertext][Auth Tag (16 bytes)]
  */
-function aesDecrypt(payload: Buffer, key: Buffer): Buffer {
+export function aesDecrypt(payload: Buffer, key: Buffer): Buffer {
   if (payload.length < IV_LENGTH + AUTH_TAG_LENGTH) {
     throw new Error(`Payload too short for decryption: ${payload.length} bytes`);
   }
@@ -560,7 +585,7 @@ function aesDecrypt(payload: Buffer, key: Buffer): Buffer {
  * Encrypt plaintext into VaultGuard format with a new random IV.
  * Returns: [IV (12 bytes)][Ciphertext][Auth Tag (16 bytes)]
  */
-function aesEncrypt(plaintext: Buffer, key: Buffer): Buffer {
+export function aesEncrypt(plaintext: Buffer, key: Buffer): Buffer {
   const iv = randomBytes(IV_LENGTH);
   const cipher = createCipheriv(AES_ALGORITHM, key, iv);
 
@@ -593,7 +618,8 @@ async function reEncryptFile(
   orgId: string,
   vaultId: string,
   oldKey: Buffer,
-  newKey: Buffer
+  newKey: Buffer,
+  newKeyId: string,
 ): Promise<void> {
   // Download encrypted file
   const getResponse = await s3Client.send(
@@ -629,11 +655,21 @@ async function reEncryptFile(
       Body: reEncrypted,
       ContentType: getResponse.ContentType || 'application/octet-stream',
       Metadata: {
+        // SPREAD FIRST: inherit any unrelated S3 metadata from the pre-rotation
+        // GET (e.g. `modified-by`, `modified-at`) so the re-encrypted object
+        // retains its provenance.
         ...getResponse.Metadata,
         'x-vaultguard-reencrypted': 'true',
         'x-vaultguard-reencryption-time': new Date().toISOString(),
         'x-vaultguard-vault-id': vaultId,
         'x-vaultguard-key-scope': '/**',
+        // OVERRIDE AFTER THE SPREAD: the pre-rotation Metadata MAY have carried
+        // a stale `vaultguard-key-id` (the OLD DEK's keyId). Phase 7's restore
+        // endpoint matches noncurrent versions to DEKs by this attribute, so it
+        // MUST reflect the DEK the file is now wrapped with (the NEW one). The
+        // explicit assignment AFTER the spread guarantees override semantics.
+        // See: 06-02-PLAN.md "spread-then-override invariant", T-06-02-02.
+        'vaultguard-key-id': newKeyId,
       },
     })
   );
@@ -664,7 +700,11 @@ function scopeKeyPk(orgId: string, scope: string, vaultId?: string): string {
   return `ORG#${orgId}#SCOPE#${scopePart}`;
 }
 
-function scopeKmsContext(orgId: string, scope: string, vaultId?: string): Record<string, string> {
+// Exported so Phase 7's restore endpoint and the Plan 06-03 EncryptionContext
+// preservation test can reconstruct the KMS EncryptionContext from a
+// GSI-projected user_keys row (orgId + scope + vaultId). Pure function with
+// no I/O — safe to widen surface.
+export function scopeKmsContext(orgId: string, scope: string, vaultId?: string): Record<string, string> {
   return {
     orgId,
     ...(vaultId ? { vaultId } : {}),
@@ -735,7 +775,11 @@ async function getAffectedVaultScopes(
   );
 }
 
-async function getActiveScopeDataKey(orgId: string, vaultId: string | undefined, scope: string): Promise<Buffer | null> {
+export async function getActiveScopeDataKey(
+  orgId: string,
+  vaultId: string | undefined,
+  scope: string
+): Promise<{ key: Buffer; keyId: string } | null> {
   const result = await docClient.send(
     new GetCommand({
       TableName: USER_KEYS_TABLE,
@@ -743,7 +787,9 @@ async function getActiveScopeDataKey(orgId: string, vaultId: string | undefined,
     })
   );
 
-  const item = result.Item as { encryptedDataKey?: string; status?: string } | undefined;
+  const item = result.Item as
+    | { encryptedDataKey?: string; status?: string; keyId?: string }
+    | undefined;
   if (!item?.encryptedDataKey || item.status !== 'active') {
     return null;
   }
@@ -759,7 +805,13 @@ async function getActiveScopeDataKey(orgId: string, vaultId: string | undefined,
     throw new Error(`KMS Decrypt did not return key material for vault ${vaultId || '(legacy)'}`);
   }
 
-  return Buffer.from(decryptResponse.Plaintext);
+  // Backwards-compat: rows written before Phase 6 don't yet have `keyId`.
+  // Use `'legacy'` sentinel; the backfill script populates real UUIDs.
+  // Phase 7's restore endpoint will fall back to current-ACTIVE-DEK + warning
+  // audit when the keyId on an S3 object is `'legacy'` or absent.
+  const keyId = typeof item.keyId === 'string' && item.keyId.length > 0 ? item.keyId : 'legacy';
+
+  return { key: Buffer.from(decryptResponse.Plaintext), keyId };
 }
 
 async function resolveOldScopeKey(
@@ -767,7 +819,7 @@ async function resolveOldScopeKey(
   vaultId: string,
   scope: string,
   oldDeks: RecoveredDek[]
-): Promise<Buffer> {
+): Promise<{ key: Buffer; keyId: string }> {
   const activeVaultKey = await getActiveScopeDataKey(orgId, vaultId, scope);
   if (activeVaultKey) return activeVaultKey;
 
@@ -777,7 +829,10 @@ async function resolveOldScopeKey(
   const recovered = oldDeks.find((dek) => dek.vaultId === vaultId && dek.scope === scope)
     ?? oldDeks.find((dek) => !dek.vaultId && dek.scope === scope);
   if (recovered) {
-    return Buffer.from(recovered.plaintextKey);
+    // RecoveredDek is pre-keyId (it comes from a revoked lease, not from user_keys);
+    // tag with 'legacy' so downstream metadata writers know there's no canonical
+    // keyId to record for this DEK. Phase 7 will treat 'legacy' as a fallback signal.
+    return { key: Buffer.from(recovered.plaintextKey), keyId: 'legacy' };
   }
 
   throw new Error(`No decryptable active key for vault ${vaultId} scope ${scope}`);
@@ -808,11 +863,16 @@ async function prepareRotatedScopeDataKey(
     throw new Error('KMS GenerateDataKey did not return usable key material');
   }
 
+  // Fresh UUID v4 per rotation. Stays with this DEK for life — through ACTIVE
+  // state and into ROTATED# state. Phase 7 looks this up via the keyId-index GSI.
+  const newKeyId = randomUUID();
+
   const encryptedDataKey = Buffer.from(dataKeyResponse.CiphertextBlob).toString('base64');
   return {
     plaintextKey: Buffer.from(dataKeyResponse.Plaintext),
     encryptedDataKey,
     previousItem: currentResult.Item as Record<string, unknown> | undefined,
+    newKeyId,
   };
 }
 
@@ -827,18 +887,31 @@ async function commitRotatedScopeDataKey(
   const now = new Date().toISOString();
 
   if (prepared.previousItem) {
-    await docClient.send(
-      new PutCommand({
-        TableName: USER_KEYS_TABLE,
-        Item: {
-          ...prepared.previousItem,
-          sk: `ROTATED#${now}`,
-          status: 'rotated',
-          rotatedAt: now,
-          rotatedBy,
-        },
-      })
-    );
+    try {
+      await docClient.send(
+        new PutCommand({
+          TableName: USER_KEYS_TABLE,
+          Item: {
+            // Spread preserves the prior entry's `keyId` (post-backfill) for free —
+            // ROTATED# rows carry the OLD keyId; only the new ACTIVE row gets newKeyId.
+            ...prepared.previousItem,
+            sk: `ROTATED#${now}`,
+            status: 'rotated',
+            rotatedAt: now,
+            rotatedBy,
+          },
+        })
+      );
+    } catch (err) {
+      // INVARIANT (T-06-01-01): if the prior DEK cannot be preserved as ROTATED#,
+      // ABORT the rotation. The new ACTIVE write does NOT run; the existing
+      // ACTIVE row remains valid and decryptable. Without this guard, a
+      // ROTATED# write failure followed by a successful ACTIVE write would
+      // leave noncurrent S3 versions un-decryptable forever.
+      throw new Error(
+        `Failed to preserve prior DEK as ROTATED#${now}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
   await docClient.send(
@@ -851,6 +924,7 @@ async function commitRotatedScopeDataKey(
         vaultId,
         scope,
         encryptedDataKey: prepared.encryptedDataKey,
+        keyId: prepared.newKeyId,
         status: 'active',
         createdAt: now,
         lastUsedAt: now,

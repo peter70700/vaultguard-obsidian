@@ -673,6 +673,57 @@ resource "aws_api_gateway_integration" "files_path_delete" {
   uri                     = var.files_lambda_invoke_arn
 }
 
+# POST /vaults/{vaultId}/files/{filePath+} — multipurpose POST on the greedy file-path resource.
+# Currently dispatched server-side by the Lambda based on `event.path` suffix:
+#   - ends with `/restore-delete` → un-delete a soft-deleted file (Phase 5 / UND-01)
+# API Gateway does NOT allow child resources under a greedy `{filePath+}` path variable,
+# so we add the static suffix matching in the Lambda dispatcher (mirroring how `/history`
+# is handled via `isHistoryResource = isFilePathResource && path.endsWith('/history')`).
+resource "aws_api_gateway_method" "files_path_post" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.files_path.id
+  http_method   = "POST"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+
+  request_parameters = { "method.request.path.filePath" = true }
+}
+
+resource "aws_api_gateway_integration" "files_path_post" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.files_path.id
+  http_method             = aws_api_gateway_method.files_path_post.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.files_lambda_invoke_arn
+}
+
+# GET /vaults/{vaultId}/files/deleted — list files whose current head is a delete marker
+# Flat sibling under aws_api_gateway_resource.files; static `deleted` segment is resolved
+# by API Gateway before the greedy {filePath+} sibling.
+resource "aws_api_gateway_resource" "files_deleted" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.files.id
+  path_part   = "deleted"
+}
+
+resource "aws_api_gateway_method" "files_deleted_get" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.files_deleted.id
+  http_method   = "GET"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+}
+
+resource "aws_api_gateway_integration" "files_deleted_get" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.files_deleted.id
+  http_method             = aws_api_gateway_method.files_deleted_get.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.files_lambda_invoke_arn
+}
+
 # ─── Permissions Endpoints ───────────────────────────────────────────────────
 #
 # Permission rules live under `/vaults/{vaultId}/permissions/...` — every rule
@@ -1314,6 +1365,8 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.files_path_get,
     aws_api_gateway_integration.files_path_put,
     aws_api_gateway_integration.files_path_delete,
+    aws_api_gateway_integration.files_path_post,
+    aws_api_gateway_integration.files_deleted_get,
     # Permissions
     aws_api_gateway_integration.permissions_get,
     aws_api_gateway_integration.permissions_post,
@@ -1407,6 +1460,8 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.files_path_get.id,
       aws_api_gateway_integration.files_path_put.id,
       aws_api_gateway_integration.files_path_delete.id,
+      aws_api_gateway_integration.files_path_post.id,
+      aws_api_gateway_integration.files_deleted_get.id,
       aws_api_gateway_integration.permissions_get.id,
       aws_api_gateway_integration.permissions_post.id,
       aws_api_gateway_integration.permissions_delete.id,

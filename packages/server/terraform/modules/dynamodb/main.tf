@@ -325,6 +325,14 @@ resource "aws_dynamodb_table" "user_keys" {
     name = "status"
     type = "S"
   }
+  # Phase 6 (DEK-02, DEK-03): stable per-DEK identifier that travels with the
+  # key from ACTIVE → ROTATED# and lives on S3 objects as
+  # `x-amz-meta-vaultguard-key-id`. Used by Phase 7 cross-DEK restore to look
+  # up the historical DEK that wrapped a noncurrent S3 version.
+  attribute {
+    name = "keyId"
+    type = "S"
+  }
 
   # GSI: Find all active keys across an org (for bulk rotation)
   global_secondary_index {
@@ -333,6 +341,15 @@ resource "aws_dynamodb_table" "user_keys" {
     range_key          = "status"
     projection_type    = "INCLUDE"
     non_key_attributes = ["pk", "sk", "createdAt", "lastUsedAt"]
+  }
+
+  # GSI: Look up a DEK by its keyId (Phase 7 cross-DEK restore + S3-metadata-
+  # tagged objects). Projection ALL so the Phase 7 lookup gets `orgId`,
+  # `scope`, `vaultId`, `encryptedDataKey` for the KMS EncryptionContext.
+  global_secondary_index {
+    name            = "keyId-index"
+    hash_key        = "keyId"
+    projection_type = "ALL"
   }
 
   tags = { Name = "VaultGuard-${var.stage}-UserKeys" }

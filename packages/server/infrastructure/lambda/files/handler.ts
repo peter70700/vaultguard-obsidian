@@ -28,6 +28,13 @@ import {
   ListObjectVersionsCommand,
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
+import { KMSClient, DecryptCommand } from '@aws-sdk/client-kms';
+import {
+  aesDecrypt,
+  aesEncrypt,
+  getActiveScopeDataKey,
+  scopeKmsContext,
+} from '../reencryption/handler';
 import {
   docClient,
   verifyActiveUser,
@@ -57,6 +64,7 @@ import {
   VaultRecord,
   VaultActivityRecord,
   AuthError,
+  GetCommand,
   PutCommand,
   QueryCommand,
 } from '../shared/utils';
@@ -69,6 +77,81 @@ const REGION = process.env.AWS_REGION || 'eu-west-1';
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || '10485760', 10); // 10MB default
 const DEFAULT_OVERVIEW_LIMIT = 5000;
 const MAX_OVERVIEW_LIMIT = 10000;
+
+// Phase 6 (Plan 06-02): the `user_keys` table holds per-`(orgId, scope, vaultId)`
+// DEK metadata. This handler does NOT decrypt DEKs (that's the reencryption Lambda's
+// job) — it only reads the `keyId` attribute to annotate S3 objects + audit rows so
+// Phase 7's cross-DEK restore endpoint can match noncurrent versions to their DEKs.
+const USER_KEYS_TABLE = process.env.USER_KEYS_TABLE || 'UserKeysTable';
+
+// ─── Active DEK keyId lookup (Plan 06-02) ────────────────────────────────────
+//
+// These three helpers mirror the equivalent definitions in
+// `infrastructure/lambda/reencryption/handler.ts` (the canonical home of
+// `scopeKeyPk` / `encodedScope`). They're inline-copied here to avoid pulling
+// reencryption-specific symbols into the files handler. If a third caller
+// appears (Phase 7 restore endpoint is a likely candidate), extract into
+// `shared/utils.ts` instead.
+
+function encodedScope(scope: string): string {
+  return Buffer.from(scope, 'utf8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function scopeKeyPk(orgId: string, scope: string, vaultId?: string): string {
+  const scopePart = encodedScope(scope);
+  if (vaultId) {
+    return `ORG#${orgId}#VAULT#${vaultId}#SCOPE#${scopePart}`;
+  }
+  return `ORG#${orgId}#SCOPE#${scopePart}`;
+}
+
+/**
+ * Returns the active DEK's `keyId` for a vault, or `null` if no active row
+ * exists yet (pre-backfill / first-ever write).
+ *
+ * Pre-backfill rows that exist but lack the `keyId` attribute return the
+ * `'legacy'` sentinel — matching the same fallback semantics used by
+ * `getActiveScopeDataKey` in the reencryption handler. Phase 7's restore
+ * endpoint treats `'legacy'` as a "fall back to current-ACTIVE DEK + emit
+ * warning audit" signal.
+ *
+ * Implementation note: this is a single DDB Get on `user_keys` with NO KMS
+ * Decrypt call — we only need the metadata id here, not the plaintext key
+ * material. The reencryption handler's `getActiveScopeDataKey` does the
+ * heavier round-trip when actual decryption is required.
+ *
+ * Defensive try/catch: T-06-02-05 mitigation — a DDB hiccup must not block
+ * the user-visible write. On any failure we log and return null so the write
+ * proceeds without keyId tagging.
+ */
+async function getActiveKeyIdForVault(
+  orgId: string,
+  vaultId: string
+): Promise<string | null> {
+  try {
+    const result = await docClient.send(
+      new GetCommand({
+        TableName: USER_KEYS_TABLE,
+        Key: { pk: scopeKeyPk(orgId, '/**', vaultId), sk: 'ACTIVE' },
+      })
+    );
+    const item = result.Item as { keyId?: string; status?: string } | undefined;
+    if (!item || item.status !== 'active') return null;
+    if (typeof item.keyId === 'string' && item.keyId.length > 0) {
+      return item.keyId;
+    }
+    // Row exists but is pre-backfill — surface the 'legacy' sentinel so
+    // downstream metadata writers know there's no canonical keyId.
+    return 'legacy';
+  } catch (err) {
+    console.error('[VaultGuard] getActiveKeyIdForVault failed:', err);
+    return null;
+  }
+}
 
 /**
  * Sentinel filename the plugin writes into every server-side folder so that
@@ -153,6 +236,13 @@ function vaultS3Prefix(orgId: string, vaultId: string): string {
 }
 
 const s3Client = new S3Client({ region: REGION });
+
+// Phase 7 (Plan 07-01): KMS client for cross-DEK restore. The restore endpoint
+// reaches into the keyId-index GSI for a historical user_keys row, then asks
+// KMS to unwrap that row's envelope with the row's EncryptionContext (orgId +
+// scope + vaultId). Mirroring the s3Client singleton pattern keeps the cold
+// start fast and avoids per-request client construction.
+const kmsClient = new KMSClient({ region: REGION });
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -261,6 +351,23 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     const actualPath = event.path || '';
     const isHistoryResource = isFilePathResource && actualPath.endsWith('/history');
     const isOverviewResource = resource === '/vaults/{vaultId}/overview' || actualPath.endsWith('/overview');
+    // The greedy `{filePath+}` resource also matches the `/restore-delete` suffix.
+    // The dispatch order below ensures the restore arm wins over the generic
+    // read/write/delete arms for the same resource string. Donor: isHistoryResource.
+    const isRestoreDeleteResource = isFilePathResource && actualPath.endsWith('/restore-delete');
+    // Phase 7 (Plan 07-01): cross-DEK version restore. The regex anchor `$`
+    // matches `/restore` but NOT `/restore-delete` (which doesn't end at
+    // `/restore`); the dispatch order below places this arm BEFORE the generic
+    // file-path arms but AFTER `isRestoreDeleteResource` for belt-and-suspenders
+    // mutual exclusivity.
+    const isRestoreVersionResource = isFilePathResource && /\/restore$/.test(actualPath);
+    // Static sibling of `{filePath+}` — `GET /vaults/{vaultId}/files/deleted`
+    // is its own API Gateway resource, but older/dev API Gateway deployments may
+    // still hand it through the greedy filePath route. Treat the concrete URL as
+    // authoritative so the Lambda remains compatible with either resource shape.
+    const isDeletedListResource =
+      resource === '/vaults/{vaultId}/files/deleted' ||
+      actualPath.replace(/\/+$/, '').endsWith('/files/deleted');
 
     switch (true) {
       case method === 'GET' && resource === '/vaults/{vaultId}/files':
@@ -268,6 +375,15 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       case method === 'GET' && isOverviewResource:
         return await handleVaultOverview(event, user, vault, requestId);
+
+      case method === 'GET' && isDeletedListResource:
+        return await handleListDeleted(event, user, vault, requestId);
+
+      case method === 'POST' && isRestoreDeleteResource:
+        return await handleRestoreDelete(event, user, vault, requestId);
+
+      case method === 'POST' && isRestoreVersionResource:
+        return await handleRestoreVersion(event, user, vault, requestId);
 
       case method === 'GET' && isHistoryResource:
         return await handleGetHistory(event, user, vault, requestId);
@@ -852,6 +968,10 @@ async function handleWriteFile(
     }
   }
 
+  // Phase 6 (Plan 06-02): annotate the object with the DEK keyId so Phase 7's
+  // cross-DEK restore endpoint can match noncurrent versions back to their DEK.
+  const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
+
   // Write to S3
   const putResponse = await s3Client.send(
     new PutObjectCommand({
@@ -862,6 +982,7 @@ async function handleWriteFile(
       Metadata: {
         'modified-by': user.userId,
         'modified-at': new Date().toISOString(),
+        ...(activeKeyId ? { 'vaultguard-key-id': activeKeyId } : {}),
       },
     })
   );
@@ -899,6 +1020,7 @@ async function handleWriteFile(
       size: contentBuffer.length,
       versionId: putResponse.VersionId,
       contentType,
+      ...(activeKeyId ? { keyId: activeKeyId } : {}),
     },
   });
 
@@ -972,6 +1094,10 @@ async function handleDeleteFile(
     throw err;
   }
 
+  // Phase 6 (Plan 06-02): record the keyId active at delete time so the audit
+  // log has chain-of-custody for which DEK protected the now-hidden version.
+  const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
+
   // Soft delete (S3 versioning creates a delete marker)
   const deleteResponse = await s3Client.send(
     new DeleteObjectCommand({
@@ -1012,6 +1138,7 @@ async function handleDeleteFile(
       deleteMarkerVersionId: deleteResponse.VersionId,
       softDelete: true,
       freedBytes: fileSize,
+      ...(activeKeyId ? { keyId: activeKeyId } : {}),
     },
   });
 
@@ -1130,6 +1257,624 @@ async function handleGetHistory(
       versions,
       count: versions.length,
     },
+    requestId
+  );
+}
+
+// ─── POST /vaults/{vaultId}/files/{path}/restore-delete ─────────────────────
+
+/**
+ * Restores a soft-deleted file by removing the current S3 delete marker.
+ *
+ * S3 versioning semantics: a delete marker IS a version. Removing the
+ * `IsLatest === true` delete marker via `DeleteObjectCommand({ VersionId })`
+ * re-promotes the prior non-marker version as the new head — no ciphertext
+ * is touched, no DEK lookup happens, no re-encryption is needed (the prior
+ * version is already encrypted with the current DEK because the delete
+ * itself was not a re-encryption boundary).
+ *
+ * Permission gate (per Phase 5 / UND-02):
+ *   1. verifyActiveUser — already done by the top-level dispatcher
+ *   2. requireVaultMember(user, vaultId, 'admin') — admin role required
+ *   3. evaluatePermission('write', '/' + relPath) — per-path ACL check
+ *
+ * Audit:
+ *   - success: action 'files.restore.softDelete' with metadata
+ *     { removedDeleteMarkerVersionId, restoredVersionId }
+ *   - denied:  action 'files.restore.softDelete.denied' with outcome 'denied'
+ *
+ * Responses:
+ *   - 200 { path, versionId, restoredFrom } on success
+ *   - 404 if the current head is not a delete marker (file not soft-deleted)
+ *   - 409 if every version is a delete marker (pathological state)
+ *   - 403 on permission denial (audited)
+ *   - AuthError statusCode for non-member / non-admin (typically 401/403/404)
+ */
+async function handleRestoreDelete(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  // The greedy `{filePath+}` path parameter ends in `/restore-delete` — strip
+  // the suffix to recover the actual file path.
+  const rawPath = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
+  if (!rawPath.endsWith('/restore-delete')) {
+    return formatError(404, 'Invalid restore-delete path', requestId);
+  }
+  const filePath = sanitizeFilePath(rawPath.slice(0, -'/restore-delete'.length));
+  if (!filePath) {
+    return formatError(400, 'Missing file path', requestId);
+  }
+  if (isClientLocalOnlyPath(filePath)) {
+    return formatError(404, `File not found: ${filePath}`, requestId);
+  }
+
+  // Upgrade the dispatcher's viewer-level membership check to 'admin' for
+  // this destructive recovery operation. Org admins bypass the role check
+  // inside requireVaultMember (see shared/utils.ts:1704). On failure we
+  // emit a files.restore.softDelete.denied audit row before propagating
+  // the typed error to the top-level dispatcher (T-05-03 mitigation).
+  try {
+    await requireVaultMember(user, vault.vaultId, 'admin');
+  } catch (err: unknown) {
+    await logAudit({
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      action: 'files.restore.softDelete.denied',
+      resourcePath: '/' + filePath,
+      outcome: 'denied',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: { reason: 'role_check_failed' },
+    }, event);
+    throw err;
+  }
+
+  // Per-path ACL check — write action, since restore re-promotes content at
+  // the path and a denied 'write' rule should block restore the same way it
+  // blocks an overwrite.
+  const permResult = await evaluatePermission(
+    user.userId,
+    user.roles,
+    'write',
+    '/' + filePath,
+    user.orgId,
+    vault.vaultId
+  );
+  if (!permResult.allowed) {
+    await logAudit({
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      action: 'files.restore.softDelete.denied',
+      resourcePath: '/' + filePath,
+      outcome: 'denied',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: { matchedRule: permResult.matchedRule?.id },
+    }, event);
+    return formatError(403, 'Access denied: insufficient permissions to restore this file', requestId);
+  }
+
+  const key = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+
+  // Find the current delete marker via ListObjectVersionsCommand. The Prefix
+  // returns anything starting with `key`, so we filter to exact-key matches
+  // (e.g. a sibling file whose key starts with the same characters).
+  const listRes = await s3Client.send(
+    new ListObjectVersionsCommand({
+      Bucket: S3_BUCKET,
+      Prefix: key,
+      MaxKeys: 100,
+    })
+  );
+
+  const markers = (listRes.DeleteMarkers ?? []).filter((m) => m.Key === key);
+  const versions = (listRes.Versions ?? []).filter((v) => v.Key === key);
+
+  const currentMarker = markers.find((m) => m.IsLatest === true);
+  if (!currentMarker || !currentMarker.VersionId) {
+    return formatError(404, 'File is not soft-deleted', requestId);
+  }
+
+  // Pathological-state defense (PATTERNS open Q7): if every version is a
+  // delete marker (no recoverable content version exists), bail out with 409
+  // before touching anything. In normal S3 use this can't happen — the
+  // first PUT must have been a non-marker version — but a corrupted history
+  // or hand-edited bucket could land us here.
+  const priorNonMarker = versions
+    .filter((v) => v.VersionId && v.VersionId !== currentMarker.VersionId)
+    .sort((a, b) => {
+      const aT = a.LastModified instanceof Date ? a.LastModified.getTime() : 0;
+      const bT = b.LastModified instanceof Date ? b.LastModified.getTime() : 0;
+      return bT - aT;
+    })[0];
+  if (!priorNonMarker || !priorNonMarker.VersionId) {
+    return formatError(409, 'No recoverable prior version', requestId);
+  }
+
+  // Remove the delete marker. S3 automatically promotes the most-recent
+  // non-marker version as the new head.
+  await s3Client.send(
+    new DeleteObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      VersionId: currentMarker.VersionId,
+    })
+  );
+
+  // Removing the delete marker makes the prior object active again. Mirror the
+  // normal write path so active-storage accounting and warm sync cursors notice
+  // the restored file without waiting for a cold full scan.
+  const restoredSizeBytes = priorNonMarker.Size ?? 0;
+  if (restoredSizeBytes > 0) {
+    const orgResult = await getActiveOrg(user.orgId);
+    if (orgResult.org) {
+      await updateOrgStorageUsage(orgResult.org.slug, restoredSizeBytes);
+    }
+  }
+
+  await recordVaultActivity({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'created',
+    path: '/' + filePath,
+    actorUserId: user.userId,
+  });
+
+  // Phase 6 (Plan 06-02): chain-of-custody record of which DEK is active when
+  // the file is re-promoted. Future Phase 7 cross-DEK restore reads this to
+  // correlate restored versions to historical keys.
+  const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
+
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'files.restore.softDelete',
+    resourcePath: '/' + filePath,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: {
+      removedDeleteMarkerVersionId: currentMarker.VersionId,
+      restoredVersionId: priorNonMarker.VersionId,
+      restoredSizeBytes,
+      ...(activeKeyId ? { keyId: activeKeyId } : {}),
+    },
+  }, event);
+
+  return formatSuccess(
+    200,
+    {
+      path: filePath,
+      versionId: priorNonMarker.VersionId,
+      restoredFrom: currentMarker.VersionId,
+    },
+    requestId
+  );
+}
+
+// ─── POST /vaults/{vaultId}/files/{path+}/restore ───────────────────────────
+
+/**
+ * Synthesize an event whose `filePath` + `path` end in `/restore-delete` so
+ * `handleRestoreDelete`'s path-suffix check succeeds when we delegate to it
+ * from `handleRestoreVersion`. The original `/restore`-shaped event would
+ * fail the `endsWith('/restore-delete')` guard inside that handler.
+ *
+ * We deliberately copy-then-overwrite (rather than mutate the caller's event)
+ * so the audit emission's `event` reference still reflects the original API
+ * Gateway path the user actually invoked.
+ */
+function deleteMarkerEvent(event: APIGatewayProxyEvent, filePath: string): APIGatewayProxyEvent {
+  const restoreDeleteSuffix = `${filePath}/restore-delete`;
+  const newPath = `/vaults/${event.pathParameters?.vaultId ?? ''}/files/${restoreDeleteSuffix}`;
+  return {
+    ...event,
+    path: newPath,
+    pathParameters: {
+      ...(event.pathParameters ?? {}),
+      filePath: restoreDeleteSuffix,
+      path: restoreDeleteSuffix,
+    },
+  };
+}
+
+/**
+ * Cross-DEK version restore — Phase 7, Plan 07-01.
+ *
+ * Restores a noncurrent S3 versionId as the new head. The historical version
+ * may have been encrypted with a DEK that's no longer active (after one or more
+ * rotations), so this handler runs the 13-step cross-DEK crypto flow locked in
+ * `.planning/phases/07-cross-dek-version-restore-admin-ui/07-CONTEXT.md`:
+ *
+ *   1. GetObjectCommand({ VersionId }) — fetch the historical ciphertext.
+ *   2. Read `Metadata['vaultguard-key-id']`. Missing or 'legacy' → 410 Gone.
+ *   3. Query `user_keys` via `keyId-index` GSI for the source keyId.
+ *      Retry up to 2× with 200ms backoff (DDB GSI eventual consistency).
+ *   4. KMS Decrypt with `scopeKmsContext(orgId, scope, vaultId)` — KMS refuses
+ *      with InvalidCiphertextException if the context doesn't match what was
+ *      used at GenerateDataKey time (T-07-02). Authoritative.
+ *   5. AES-decrypt the historical ciphertext with the unwrapped DEK.
+ *   6. Fetch the current ACTIVE DEK via `getActiveScopeDataKey('/**')`.
+ *   7. AES-encrypt the plaintext with the current DEK.
+ *   8. `plaintext.fill(0)` — best-effort wipe.
+ *   9. PutObjectCommand with new Metadata including 'vaultguard-key-id' (new),
+ *      'restored-from-version', 'modified-by', 'modified-at'.
+ *  10. Audit `files.restore.version` with sourceVersionId, sourceKeyId,
+ *      targetVersionId, targetKeyId.
+ *  11. Response: { versionId, restoredFrom: { versionId, keyId }, targetKeyId }
+ *      — pure metadata, no plaintext (T-07-07 mitigation).
+ *
+ * Routing rules:
+ *  - If the source versionId is a delete marker (S3 returns 405 MethodNotAllowed
+ *    for GET on a delete-marker version), route to `handleRestoreDelete` so the
+ *    client has a single affordance for both restore types.
+ *  - Source not found → 404. Bad body → 400. Permission denied → 403/404 +
+ *    `files.restore.version.denied` audit.
+ *
+ * Permission gate identical to `handleRestoreDelete` (UND-02 / T-07-01):
+ *   requireVaultMember(user, vaultId, 'admin')
+ *   → evaluatePermission('write', '/' + relPath, ...)
+ *
+ * 410 Gone messages are uniformly generic (T-07-03): missing keyId metadata,
+ * 'legacy' sentinel, and empty GSI after retries all return the same string so
+ * callers can't probe for which DEK existed when.
+ */
+async function handleRestoreVersion(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  // The greedy `{filePath+}` path parameter ends in `/restore` — strip the
+  // suffix to recover the actual file path.
+  const rawPath = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
+  if (!rawPath.endsWith('/restore')) {
+    return formatError(404, 'Invalid restore path', requestId);
+  }
+  const filePath = sanitizeFilePath(rawPath.slice(0, -'/restore'.length));
+  if (!filePath) {
+    return formatError(400, 'Missing file path', requestId);
+  }
+  if (isClientLocalOnlyPath(filePath)) {
+    return formatError(404, `File not found: ${filePath}`, requestId);
+  }
+
+  // Body validation (before permission gate is fine — the permission gate is
+  // free of side effects until requireVaultMember runs, and getting a 400 for
+  // a malformed body before the role check matches the rest of this handler).
+  const body = parseBody(event);
+  const sourceVersionId = body?.versionId;
+  if (!sourceVersionId || typeof sourceVersionId !== 'string') {
+    return formatError(400, 'Missing or invalid body field: versionId', requestId);
+  }
+
+  // Upgrade the dispatcher's viewer-level membership to 'admin' for this
+  // destructive recovery operation. Org admins bypass the role check inside
+  // requireVaultMember. On failure we emit a `.denied` audit row before
+  // propagating the typed error to the top-level dispatcher (T-07-01, T-07-05).
+  try {
+    await requireVaultMember(user, vault.vaultId, 'admin');
+  } catch (err: unknown) {
+    await logAudit(
+      {
+        userId: user.userId,
+        userEmail: user.email,
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        action: 'files.restore.version.denied',
+        resourcePath: '/' + filePath,
+        outcome: 'denied',
+        ipAddress: getClientIp(event),
+        userAgent: getUserAgent(event),
+        metadata: { reason: 'role_check_failed' },
+      },
+      event
+    );
+    throw err;
+  }
+
+  // Per-path ACL check — write action, since restore re-promotes content at
+  // the path. A denied 'write' rule should block restore the same way it
+  // blocks an overwrite.
+  const permResult = await evaluatePermission(
+    user.userId,
+    user.roles,
+    'write',
+    '/' + filePath,
+    user.orgId,
+    vault.vaultId
+  );
+  if (!permResult.allowed) {
+    await logAudit(
+      {
+        userId: user.userId,
+        userEmail: user.email,
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        action: 'files.restore.version.denied',
+        resourcePath: '/' + filePath,
+        outcome: 'denied',
+        ipAddress: getClientIp(event),
+        userAgent: getUserAgent(event),
+        metadata: { matchedRule: permResult.matchedRule?.id },
+      },
+      event
+    );
+    return formatError(403, 'Access denied: insufficient permissions to restore this file', requestId);
+  }
+
+  const bucket = S3_BUCKET;
+  const key = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+
+  // STEP 1 — GET the historical ciphertext by VersionId.
+  type S3GetResp = {
+    Metadata?: Record<string, string>;
+    ContentType?: string;
+    Body?: { transformToByteArray: () => Promise<Uint8Array> };
+    DeleteMarker?: boolean;
+  };
+  let getResp: S3GetResp;
+  try {
+    getResp = (await s3Client.send(
+      new GetObjectCommand({ Bucket: bucket, Key: key, VersionId: sourceVersionId })
+    )) as unknown as S3GetResp;
+  } catch (err: unknown) {
+    const e = err as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number }; DeleteMarker?: boolean };
+    const code = e?.name || e?.Code || '';
+    const status = e?.$metadata?.httpStatusCode;
+    // STEP 1b — delete-marker source: S3 returns 405 MethodNotAllowed for GET
+    // on a delete-marker versionId. Route to handleRestoreDelete — single
+    // client affordance covers both flavours of restore.
+    if (code === 'MethodNotAllowed' || status === 405 || e?.DeleteMarker === true) {
+      return await handleRestoreDelete(deleteMarkerEvent(event, filePath), user, vault, requestId);
+    }
+    if (code === 'NoSuchVersion' || code === 'NoSuchKey' || code === 'NotFound' || status === 404) {
+      return formatError(404, 'Source version not found', requestId);
+    }
+    throw err;
+  }
+
+  // Some S3 responses to a delete-marker GET don't throw — they return with
+  // `DeleteMarker: true`. Route the same way as the 405 branch.
+  if ((getResp as { DeleteMarker?: boolean })?.DeleteMarker === true) {
+    return await handleRestoreDelete(deleteMarkerEvent(event, filePath), user, vault, requestId);
+  }
+
+  // STEP 2 — read keyId Metadata (SDK lowercases all metadata keys).
+  const sourceKeyId = getResp.Metadata?.['vaultguard-key-id'];
+  if (!sourceKeyId) {
+    return formatError(410, 'Historical key material is no longer available', requestId);
+  }
+
+  // STEP 3 — 'legacy' sentinel → 410.
+  if (sourceKeyId === 'legacy') {
+    return formatError(410, 'Historical key material is no longer available', requestId);
+  }
+
+  // STEP 4 — Query `keyId-index` GSI with retry/backoff for DDB GSI eventual
+  // consistency (T-07-04 mitigation). 3 total attempts × 200ms backoff bounds
+  // worst-case latency at ~600ms added.
+  type DekItem = {
+    orgId?: string;
+    vaultId?: string;
+    scope?: string;
+    encryptedDataKey?: string;
+  };
+  let dekItem: DekItem | null = null;
+  const ATTEMPTS = 3;
+  const BACKOFF_MS = 200;
+  for (let i = 0; i < ATTEMPTS; i++) {
+    const q = await docClient.send(
+      new QueryCommand({
+        TableName: USER_KEYS_TABLE,
+        IndexName: 'keyId-index',
+        KeyConditionExpression: 'keyId = :kid',
+        ExpressionAttributeValues: { ':kid': sourceKeyId },
+        Limit: 1,
+      })
+    );
+    if (q.Items && q.Items.length > 0) {
+      dekItem = q.Items[0] as DekItem;
+      break;
+    }
+    if (i < ATTEMPTS - 1) {
+      await new Promise((r) => setTimeout(r, BACKOFF_MS));
+    }
+  }
+
+  // STEP 5 — still empty after retries → 410. Same generic message as the
+  // missing-metadata and 'legacy' branches above (T-07-03 mitigation).
+  if (!dekItem || !dekItem.encryptedDataKey) {
+    return formatError(410, 'Historical key material is no longer available', requestId);
+  }
+
+  // STEP 6 — KMS Decrypt the historical envelope. The EncryptionContext is
+  // reconstructed from the GSI row's (orgId, scope, vaultId) — KMS refuses
+  // with InvalidCiphertextException BEFORE producing plaintext if these don't
+  // match what was used at GenerateDataKey time (T-07-02 mitigation).
+  const decryptResp = await kmsClient.send(
+    new DecryptCommand({
+      CiphertextBlob: Buffer.from(dekItem.encryptedDataKey, 'base64'),
+      EncryptionContext: scopeKmsContext(
+        dekItem.orgId || user.orgId,
+        dekItem.scope || '/**',
+        dekItem.vaultId || vault.vaultId
+      ),
+    })
+  );
+  if (!decryptResp.Plaintext) {
+    throw new Error('KMS Decrypt returned no plaintext for historical DEK');
+  }
+  const oldDek = Buffer.from(decryptResp.Plaintext);
+
+  // STEP 7 — AES-decrypt the historical ciphertext.
+  const ciphertextBody = await getResp.Body!.transformToByteArray();
+  const plaintext = aesDecrypt(Buffer.from(ciphertextBody), oldDek);
+
+  // STEP 8 — fetch the current ACTIVE DEK for the vault.
+  const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
+  if (!active) {
+    throw new Error('No active DEK for vault — cannot complete restore');
+  }
+  const { key: currentDek, keyId: currentKeyId } = active;
+
+  // STEP 9 — AES-encrypt with the current DEK.
+  const newCiphertext = aesEncrypt(plaintext, currentDek);
+
+  // STEP 10 — best-effort plaintext wipe. Matches `reEncryptFile`'s pattern.
+  plaintext.fill(0);
+
+  // STEP 11 — PUT as the new head with audit-tagged Metadata.
+  const putResp = await s3Client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: newCiphertext,
+      ContentType: getResp.ContentType || 'application/octet-stream',
+      Metadata: {
+        'modified-by': user.userId,
+        'modified-at': new Date().toISOString(),
+        'vaultguard-key-id': currentKeyId,
+        'restored-from-version': sourceVersionId,
+      },
+    })
+  );
+
+  // STEP 12 — capture the new head versionId.
+  const targetVersionId = (putResp as { VersionId?: string }).VersionId || '';
+
+  // STEP 13 — emit the success audit row (T-07-05 chain-of-custody).
+  await logAudit(
+    {
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      action: 'files.restore.version',
+      resourcePath: '/' + filePath,
+      outcome: 'success',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: {
+        sourceVersionId,
+        sourceKeyId,
+        targetVersionId,
+        targetKeyId: currentKeyId,
+      },
+    },
+    event
+  );
+
+  // Response is pure metadata — never include plaintext (T-07-07).
+  return formatSuccess(
+    200,
+    {
+      versionId: targetVersionId,
+      restoredFrom: { versionId: sourceVersionId, keyId: sourceKeyId },
+      targetKeyId: currentKeyId,
+    },
+    requestId
+  );
+}
+
+// ─── GET /vaults/{vaultId}/files/deleted ────────────────────────────────────
+
+/**
+ * Lists files whose current S3 head is a delete marker (i.e. soft-deleted).
+ *
+ * Per-row permission filtering mirrors handleListFiles: the caller only
+ * sees deleted paths they can `read`. Returns path + delete-marker
+ * versionId + ISO-formatted deletion timestamp. `previousSize` is
+ * intentionally omitted from the v1 response (would require N extra S3
+ * calls per file — PATTERNS open Q6).
+ */
+async function handleListDeleted(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  // Upgrade to admin — the deleted-files affordance is admin-only so it
+  // matches the restore endpoint's permission gate. Non-admins should not
+  // even learn that soft-deleted files exist.
+  await requireVaultMember(user, vault.vaultId, 'admin');
+
+  const prefix = vaultS3Prefix(user.orgId, vault.vaultId);
+
+  interface DeletedFileEntry {
+    path: string;
+    deleteMarkerVersionId: string;
+    deletedAt: string;
+  }
+
+  const files: DeletedFileEntry[] = [];
+  let keyMarker: string | undefined;
+  let versionIdMarker: string | undefined;
+  let safetyIterations = 0;
+
+  do {
+    const res = await s3Client.send(
+      new ListObjectVersionsCommand({
+        Bucket: S3_BUCKET,
+        Prefix: prefix,
+        MaxKeys: 1000,
+        KeyMarker: keyMarker,
+        VersionIdMarker: versionIdMarker,
+      })
+    );
+
+    for (const marker of res.DeleteMarkers ?? []) {
+      if (marker.IsLatest !== true || !marker.Key || !marker.VersionId || !marker.LastModified) continue;
+      const relPath = marker.Key.slice(prefix.length);
+      if (!relPath) continue;
+      if (isClientLocalOnlyPath(relPath)) continue;
+      if (isFolderMarkerPath(relPath)) continue;
+
+      // Per-row permission filter — only include paths the caller can read.
+      const perm = await evaluatePermission(
+        user.userId,
+        user.roles,
+        'read',
+        '/' + relPath,
+        user.orgId,
+        vault.vaultId
+      );
+      if (!perm.allowed) continue;
+
+      const deletedAt =
+        marker.LastModified instanceof Date
+          ? marker.LastModified.toISOString()
+          : String(marker.LastModified);
+
+      files.push({
+        path: relPath,
+        deleteMarkerVersionId: marker.VersionId,
+        deletedAt,
+      });
+    }
+
+    keyMarker = res.IsTruncated ? res.NextKeyMarker : undefined;
+    versionIdMarker = res.IsTruncated ? res.NextVersionIdMarker : undefined;
+
+    safetyIterations += 1;
+    if (safetyIterations > 100) {
+      // Defensive — a vault with > 100,000 versions returned per call is
+      // pathological; bail out rather than spin indefinitely.
+      break;
+    }
+  } while (keyMarker);
+
+  return formatSuccess(
+    200,
+    { files },
     requestId
   );
 }
