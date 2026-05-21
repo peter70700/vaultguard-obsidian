@@ -1339,6 +1339,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
   it("creates parent folders before applying a remote file", async () => {
     const plugin = makePlugin();
     plugin.settings.serverVaultId = "vault-abc";
+    plugin.keyLease = makeKeyLease();
 
     const existingPaths = new Set<string>();
     const createFolder = vi.fn(async (path: string) => {
@@ -1444,6 +1445,72 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(create).toHaveBeenCalledWith("test1/remote.md", "remote body");
     expect(write).not.toHaveBeenCalled();
     expect(modify).not.toHaveBeenCalled();
+  });
+
+  it("bootstraps accessible server files as placeholders when the vault-wide key lease is denied (Phase 8 limited-access)", async () => {
+    // Phase 8 (plan 08-03) changed limited-access reconciliation: instead of
+    // calling ?decrypt=true per file to materialize plaintext immediately, we
+    // write 36-byte VG1 placeholders via writePlainToDisk(path, '') and add
+    // each path to placeholderPaths. The first interceptedRead per file then
+    // hydrates via the new /files-decrypted endpoint.
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.keyLease = null;
+    plugin.vaultLeaseDenied = true;
+    plugin.placeholderPaths = new Set<string>();
+    plugin.connectionState.status = "online";
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    // Modal must NOT be shown in limited-access mode.
+    plugin.askReconciliationPlan = vi.fn();
+
+    plugin.app = {
+      vault: {
+        adapter: {
+          exists: vi.fn(async () => false),
+        },
+        getFiles: vi.fn(() => []),
+        getRoot: vi.fn(() => ({ children: [] })),
+      },
+    };
+    plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+    plugin.ensureLocalFolderPath = vi.fn().mockResolvedValue(true);
+    plugin.writePlainToDisk = vi.fn().mockResolvedValue(undefined);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.decryptContent = vi.fn();
+    plugin.apiRequest = vi.fn(async (method: string, endpoint: string) => {
+      if (method === "POST" && endpoint === "/vaults/vault-abc/files/sync") {
+        return {
+          success: true,
+          data: {
+            deltas: [
+              { path: "/docs/welcome.md", action: "created", checksum: "etag", size: 12 },
+            ],
+            syncTimestamp: "2026-05-21T12:00:00.000Z",
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${endpoint}`);
+    });
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    // The modal must NOT be shown in limited-access mode.
+    expect(plugin.askReconciliationPlan).not.toHaveBeenCalled();
+    // No per-file ?decrypt=true fetch — placeholders only.
+    expect(plugin.apiRequest).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("?decrypt=true")
+    );
+    // No client-side decrypt — there is no lease.
+    expect(plugin.decryptContent).not.toHaveBeenCalled();
+    // Placeholder write + set membership.
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith("docs/welcome.md", "");
+    expect(plugin.placeholderPaths.has("docs/welcome.md")).toBe(true);
+    expect(plugin.settings.bindingReconciledVaultId).toBe("vault-abc");
   });
 
   it("routes vault settings helpers through the bound vault API", async () => {
@@ -1923,5 +1990,237 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(manifest).not.toHaveProperty("/secret/private.md");
     expect(manifest["/notes/.vaultguard-folder"]).toBe("");
     expect(manifest["/empty/.vaultguard-folder"]).toBe("");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 8 (plan 08-03): Limited-access placeholder flow + sweep
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("VaultGuardPlugin limited-access placeholder flow", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    mockRequestUrl.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  function makeLimitedPlugin() {
+    const plugin = makePlugin();
+    // Default to limited-access state for most tests in this block.
+    plugin.vaultLeaseDenied = true;
+    plugin.placeholderPaths = new Set<string>();
+    plugin.session = makeSession();
+    plugin.permissionCache = new Map<string, number>();
+    // interceptedRead deps — make all the gates a pass-through.
+    plugin.isPathExcluded = vi.fn(() => false);
+    plugin.awaitPermissionReadiness = vi.fn().mockResolvedValue(undefined);
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(3); // READ-or-better
+    plugin.emitAuditEvent = vi.fn().mockResolvedValue(undefined);
+    plugin.wipeDeniedLocalContent = vi.fn().mockResolvedValue(undefined);
+    plugin.writePlainToDisk = vi.fn().mockResolvedValue(undefined);
+    plugin.readPlainFromDisk = vi.fn().mockResolvedValue("");
+    plugin.notifyDeniedLocalWipe = vi.fn();
+    plugin.notifyCloudDecryptFallback = vi.fn();
+    plugin.isOnline = vi.fn(() => true);
+    plugin.isNetworkError = vi.fn(() => false);
+    plugin.setConnectionStatus = vi.fn();
+    // base64 -> utf8 helper used by the hydration path.
+    plugin.decodeBase64Utf8 = vi.fn((b64: string) =>
+      Buffer.from(b64, "base64").toString("utf8")
+    );
+    plugin.normalizeVaultPath = vi.fn((p: string) => p.replace(/^\/+/, ""));
+    return plugin;
+  }
+
+  it("interceptedRead in limited-access mode with placeholder hit fetches via readFileDecrypted and writes plaintext", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.placeholderPaths.add("notes/welcome.md");
+    plugin.readFileDecrypted = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        path: "/notes/welcome.md",
+        content: Buffer.from("hello world", "utf8").toString("base64"),
+        encoding: "base64",
+        decrypted: true,
+      },
+      error: null,
+      requestId: "req-1",
+    });
+
+    const result = await plugin.interceptedRead("notes/welcome.md");
+
+    expect(result).toBe("hello world");
+    expect(plugin.readFileDecrypted).toHaveBeenCalledWith("notes/welcome.md");
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith(
+      "notes/welcome.md",
+      "hello world"
+    );
+    expect(plugin.placeholderPaths.has("notes/welcome.md")).toBe(false);
+  });
+
+  it("interceptedRead on 404 calls wipeDeniedLocalContent and removes from placeholderPaths", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.placeholderPaths.add("secret/locked.md");
+    plugin.readFileDecrypted = vi.fn().mockResolvedValue({
+      success: false,
+      data: null,
+      error: { statusCode: 404, message: "File not found" },
+      requestId: "req-2",
+    });
+
+    await expect(plugin.interceptedRead("secret/locked.md")).rejects.toThrow(
+      /Access denied to "secret\/locked\.md"/
+    );
+
+    expect(plugin.wipeDeniedLocalContent).toHaveBeenCalledWith("secret/locked.md");
+    expect(plugin.placeholderPaths.has("secret/locked.md")).toBe(false);
+  });
+
+  it("performInitialReconciliation in limited-access mode writes placeholders for serverOnly paths AND does not show the modal", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.connectionState.status = "online";
+    plugin.isOnline = vi.fn(() => true);
+
+    // Existing methods used inside performInitialReconciliation.
+    plugin.computeHash = vi.fn(async (s: string) => "h-" + s);
+    plugin.app.vault.getFiles = vi.fn(() => []);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+    plugin.ensureLocalFolderPath = vi.fn().mockResolvedValue(true);
+    plugin.isFolderMarkerPath = vi.fn((p: string) => p.endsWith(".vaultguard-folder"));
+    plugin.askReconciliationPlan = vi.fn(); // Must NOT be called
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        deltas: [
+          { path: "/permitted/a.md", action: "created", lastModified: "x", checksum: "c1", size: 1 },
+          { path: "/permitted/b.md", action: "created", lastModified: "x", checksum: "c2", size: 1 },
+        ],
+        syncTimestamp: "2026-05-21T00:00:00.000Z",
+      },
+      error: null,
+      requestId: "req-recon",
+    });
+
+    const ok = await plugin.performInitialReconciliation();
+
+    expect(ok).toBe(true);
+    expect(plugin.askReconciliationPlan).not.toHaveBeenCalled();
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith("permitted/a.md", "");
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith("permitted/b.md", "");
+    expect(plugin.placeholderPaths.has("permitted/a.md")).toBe(true);
+    expect(plugin.placeholderPaths.has("permitted/b.md")).toBe(true);
+  });
+
+  it("placeholderPaths is cleared when checkKeyLeaseRenewal recovers from limited -> ok", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.placeholderPaths.add("a.md");
+    plugin.placeholderPaths.add("b.md");
+    plugin.keyLease = null;
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.ensureVaultScopedKeyLease = vi.fn().mockImplementation(async () => {
+      plugin.vaultLeaseDenied = false;
+      plugin.keyLease = makeKeyLease();
+      return "ok";
+    });
+    plugin.readOnlyGuard = { refreshAll: vi.fn() };
+    plugin.fileExplorerDecorations = { invalidate: vi.fn() };
+    plugin.filePermissionHeader = { invalidateCache: vi.fn(), update: vi.fn() };
+
+    await plugin.checkKeyLeaseRenewal();
+
+    expect(plugin.placeholderPaths.size).toBe(0);
+    expect(plugin.permissionCache.size).toBe(0);
+  });
+
+  it("placeholderPaths is not persisted to data.json (saveData payload never contains the set)", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.placeholderPaths.add("a.md");
+    plugin.placeholderPaths.add("b.md");
+    const saveSpy = vi.fn().mockResolvedValue(undefined);
+    plugin.saveData = saveSpy;
+
+    await plugin.saveSettings();
+
+    expect(saveSpy).toHaveBeenCalled();
+    for (const call of saveSpy.mock.calls) {
+      const payload = call[0];
+      expect(JSON.stringify(payload)).not.toContain("placeholderPaths");
+    }
+  });
+
+  it("secondary heuristic: empty decrypted plaintext + vaultLeaseDenied triggers a fetch (legacy placeholder fallback)", async () => {
+    const plugin = makeLimitedPlugin();
+    // Path NOT in placeholderPaths (legacy on-disk file written by older
+    // plugin version before placeholderPaths existed). Use the offline
+    // fallback branch to specifically exercise the secondary heuristic; the
+    // primary online branch would fire readFileDecrypted via the normal
+    // fetchRemoteFileContent path otherwise.
+    plugin.isOnline = vi.fn(() => false);
+    plugin.readPlainFromDisk = vi.fn().mockResolvedValue("");
+    plugin.readFileDecrypted = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        path: "/legacy/old.md",
+        content: Buffer.from("hydrated", "utf8").toString("base64"),
+        encoding: "base64",
+        decrypted: true,
+      },
+      error: null,
+      requestId: "req-fallback",
+    });
+
+    const result = await plugin.interceptedRead("legacy/old.md");
+
+    expect(result).toBe("hydrated");
+    expect(plugin.readFileDecrypted).toHaveBeenCalledWith("legacy/old.md");
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith("legacy/old.md", "hydrated");
+  });
+
+  it("sweepPlaceholderPaths only adds 36-byte files whose first 4 bytes are VG1 magic", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.originalAdapterMethods.list = vi
+      .fn()
+      .mockResolvedValueOnce({ files: ["a.md", "b.md", "c.md"], folders: [] });
+    plugin.app.vault.adapter.stat = vi
+      .fn()
+      .mockResolvedValueOnce({ size: 36, type: "file" }) // a.md
+      .mockResolvedValueOnce({ size: 36, type: "file" }) // b.md
+      .mockResolvedValueOnce({ size: 100, type: "file" }); // c.md
+    const vg1 = new Uint8Array([0x56, 0x47, 0x31, 0x00, ...new Array(32).fill(0)]).buffer;
+    const notVg1 = new Uint8Array([0xff, 0xff, 0xff, 0xff, ...new Array(32).fill(0)]).buffer;
+    plugin.originalAdapterMethods.readBinary = vi
+      .fn()
+      .mockResolvedValueOnce(vg1)
+      .mockResolvedValueOnce(notVg1);
+
+    await plugin.sweepPlaceholderPaths();
+
+    expect(plugin.placeholderPaths.has("a.md")).toBe(true);
+    expect(plugin.placeholderPaths.has("b.md")).toBe(false);
+    expect(plugin.placeholderPaths.has("c.md")).toBe(false);
+  });
+
+  it("sweepPlaceholderPaths aborts at MAX_SWEEP_ENTRIES (5000) and emits one console.warn", async () => {
+    const plugin = makeLimitedPlugin();
+    // Manufacture 5500 file paths to exceed the cap.
+    const files = Array.from({ length: 5500 }, (_, i) => `f${i}.md`);
+    plugin.originalAdapterMethods.list = vi
+      .fn()
+      .mockResolvedValueOnce({ files, folders: [] });
+    plugin.app.vault.adapter.stat = vi
+      .fn()
+      .mockResolvedValue({ size: 100, type: "file" }); // none are 36-byte
+    plugin.originalAdapterMethods.readBinary = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await plugin.sweepPlaceholderPaths();
+
+    expect(warnSpy).toHaveBeenCalled();
+    const firstCallMsg = String(warnSpy.mock.calls[0][0]);
+    expect(firstCallMsg).toContain("sweepPlaceholderPaths");
+    warnSpy.mockRestore();
   });
 });

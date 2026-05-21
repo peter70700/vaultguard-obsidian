@@ -222,6 +222,34 @@ async function canSeeFolderMarker(
 }
 
 /**
+ * Phase 8 (Plan 08-01): sibling-resource matcher for the per-file server-side
+ * decrypt endpoint. Distinct from the generic `/files/{path+}` resource so
+ * audit, CloudWatch, and IAM policies can be targeted independently. Both
+ * `{filePath+}` and `{path+}` proxy variants are accepted so the matcher is
+ * resilient to API Gateway resource-name drift.
+ */
+const isReadDecryptedResource = (resource: string): boolean =>
+  resource === '/vaults/{vaultId}/files-decrypted/{filePath+}' ||
+  resource === '/vaults/{vaultId}/files-decrypted/{path+}';
+
+async function decryptCurrentVaultBlobForRead(
+  ciphertext: Buffer,
+  user: UserContext,
+  vault: VaultRecord
+): Promise<{ plaintext: Buffer; keyId: string }> {
+  const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
+  if (!active) {
+    throw new AuthError('Vault key unavailable for server-side decrypt.', 409);
+  }
+
+  try {
+    return { plaintext: aesDecrypt(ciphertext, active.key), keyId: active.keyId };
+  } finally {
+    active.key.fill(0);
+  }
+}
+
+/**
  * Returns the vault-scoped S3 prefix: `vault/{orgId}/{vaultId}/`.
  *
  * BOTH parameters are required. This is the canonical guard rail for tenant
@@ -387,6 +415,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       case method === 'GET' && isHistoryResource:
         return await handleGetHistory(event, user, vault, requestId);
+
+      case method === 'GET' && isReadDecryptedResource(resource):
+        return await handleReadDecrypted(event, user, vault, requestId);
 
       case method === 'GET' && isFilePathResource:
         return await handleReadFile(event, user, vault, requestId);
@@ -830,7 +861,10 @@ async function handleReadFile(
     );
 
     const bodyBytes = await s3Response.Body?.transformToByteArray();
-    const content = bodyBytes ? Buffer.from(bodyBytes).toString('base64') : '';
+    const encryptedBody = bodyBytes ? Buffer.from(bodyBytes) : Buffer.alloc(0);
+    const responseBody = encryptedBody;
+
+    const content = responseBody.toString('base64');
 
     await logAudit({
       userId: user.userId,
@@ -868,6 +902,131 @@ async function handleReadFile(
     }
     throw err;
   }
+}
+
+// ─── GET /vaults/{vaultId}/files-decrypted/{path} ──────────────────────────
+
+/**
+ * Phase 8 (Plan 08-01): per-file server-side decrypt endpoint.
+ *
+ * Routed via `isReadDecryptedResource(resource)` in the top-level handler
+ * dispatch. Sibling resource of `GET /vaults/{vaultId}/files/{path+}` used by
+ * limited-access clients (users with any read-deny rule) who cannot receive a
+ * vault-wide `/**` key lease but can still read individually permitted files.
+ *
+ * Trust pattern mirrors `handleResolveShare` (`infrastructure/lambda/shares/handler.ts`):
+ *   1. `requireVaultMember(user, vaultId, 'viewer')` already ran at top-level dispatch.
+ *   2. Per-file `evaluatePermission('read', '/' + relPath)` runs before any KMS/S3 work.
+ *   3. Any deny path returns 404 (NOT 403) so token can't probe for existence (D-02).
+ *   4. NoSuchKey from S3 also returns 404, indistinguishable from a permission deny.
+ *   5. Success and deny each emit a distinct audit action so admins can spot probing.
+ *
+ * Plaintext bytes are zeroed in a `finally` after the base64 encode; the scope DEK is
+ * zeroed inside `decryptCurrentVaultBlobForRead` (T-08-02, T-08-06).
+ */
+async function handleReadDecrypted(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  const rawPath = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
+  const filePath = sanitizeFilePath(rawPath);
+  if (!filePath || isClientLocalOnlyPath(filePath)) {
+    // 404 (not 403/400) — see D-02. Plugin-internal paths must never be served
+    // through this endpoint.
+    return formatError(404, 'File not found', requestId);
+  }
+
+  // Per-file permission gate — 404 on deny (D-02). Audit BEFORE returning per T-08-05.
+  const permResult = await evaluatePermission(
+    user.userId,
+    user.roles,
+    'read',
+    '/' + filePath,
+    user.orgId,
+    vault.vaultId
+  );
+  if (!permResult.allowed) {
+    await logAudit({
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      action: 'files.readDecrypted.denied',
+      resourcePath: '/' + filePath,
+      outcome: 'denied',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: { matchedRule: permResult.matchedRule?.id ?? null },
+    });
+    return formatError(404, 'File not found', requestId);
+  }
+
+  // Fetch ciphertext from S3.
+  let s3Response;
+  try {
+    s3Response = await s3Client.send(
+      new GetObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+      })
+    );
+  } catch (err: unknown) {
+    if (err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'NoSuchKey') {
+      // Indistinguishable from permission deny per D-02.
+      return formatError(404, 'File not found', requestId);
+    }
+    throw err;
+  }
+
+  const bodyBytes = await s3Response.Body?.transformToByteArray();
+  const ciphertext = bodyBytes ? Buffer.from(bodyBytes) : Buffer.alloc(0);
+
+  // Reuse the existing scope-DEK unwrap helper (Phase 6/7 plumbing) — KMS Decrypt
+  // with EncryptionContext is the tampering defense (T-08-03). Helper zeros the
+  // DEK in its own finally; we zero the plaintext buffer below (T-08-06).
+  const { plaintext, keyId } = await decryptCurrentVaultBlobForRead(ciphertext, user, vault);
+
+  let content: string;
+  try {
+    content = plaintext.toString('base64');
+  } finally {
+    plaintext.fill(0);
+  }
+
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'files.readDecrypted',
+    resourcePath: '/' + filePath,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: {
+      size: s3Response.ContentLength,
+      versionId: s3Response.VersionId,
+      keyId,
+    },
+  });
+
+  return formatSuccess(
+    200,
+    {
+      path: '/' + filePath,
+      content,
+      encoding: 'base64',
+      decrypted: true,
+      encrypted: false,
+      contentType: s3Response.ContentType || 'application/octet-stream',
+      size: s3Response.ContentLength,
+      lastModified: s3Response.LastModified?.toISOString(),
+      versionId: s3Response.VersionId,
+    },
+    requestId
+  );
 }
 
 // ─── PUT /vaults/{vaultId}/files/{path} ─────────────────────────────────────

@@ -117,6 +117,29 @@ const CONNECTION_LOST_NOTICE_THROTTLE_MS = 30 * 1000;
 const LOG_PREFIX = "[VaultGuard]";
 
 /**
+ * Hard cap on entries scanned by the limited-access placeholder sweep
+ * (sweepPlaceholderPaths). Vaults larger than this should not be the
+ * bootstrap target for v1 of limited-access mode; revisit with telemetry.
+ */
+const MAX_SWEEP_ENTRIES = 5000;
+
+/**
+ * Plugin id -> list of historical plugin ids whose lak.envelope may still be
+ * on disk and should be migrated INTO this id's folder before the at-rest
+ * cipher initializes. Generic shape so a future rename appends cleanly.
+ *
+ * Why: commit 9495041 (2026-05-14) renamed manifest.id from `vaultguard` to
+ * `vaultguard-sync`. The envelope path is derived from manifest.id, so on
+ * upgrade init() saw no envelope at the new path and generated a fresh LAK
+ * while every on-disk VG1 file was still ciphertext under the OLD LAK,
+ * silently bricking decryption for any user who fell back to the disk LAK
+ * (e.g. a stranded user with read-deny rules and no /** key lease).
+ */
+const PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION: Record<string, string[]> = {
+  "vaultguard-sync": ["vaultguard"],
+};
+
+/**
  * Sentinel filename uploaded into every server-side folder so the empty-folder
  * case isn't lost across the round-trip. S3 has no native concept of an empty
  * directory — without this marker, a folder with no files in it disappears
@@ -154,6 +177,12 @@ interface ProtectedSessionEnvelope {
 type AccessTokenRefreshResult =
   | { ok: true }
   | { ok: false; message: string; error?: unknown };
+
+interface RemoteFileContentResponse {
+  content: string;
+  encoding?: string;
+  decrypted?: boolean;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main Plugin Class
@@ -262,13 +291,24 @@ export default class VaultGuardPlugin extends Plugin {
    * overlapping `/**` or lacks read access on the root probe path). The
    * session itself is still valid — only the vault-wide DEK is unavailable.
    *
-   * UI surfaces this as "Limited access" and sync / cloud reads gracefully
-   * skip while the user can still browse local cached content.
+   * UI surfaces this as "Limited access". Downloads can still use the
+   * permission-checked server-side decrypt path, but uploads stay disabled
+   * until a client-side encryption lease is available.
    */
   private vaultLeaseDenied = false;
 
   /** Debounces the "Limited access" Notice so it isn't shown more than once per minute. */
   private lastLimitedAccessNoticeAt = 0;
+
+  /**
+   * Paths known to hold 36-byte VG1 placeholders pending hydration via the
+   * server-side decrypt endpoint. In-memory only per D-09 (never persisted
+   * to data.json). Populated by performInitialReconciliation in limited-
+   * access mode and by a session-restore sweep over 36-byte VG1 files
+   * (see sweepPlaceholderPaths). Consulted by interceptedRead as the
+   * primary disambiguator vs the empty-plaintext fallback heuristic (D-13).
+   */
+  placeholderPaths: Set<string> = new Set();
 
   /** Current synchronization state */
   private syncState: SyncState = {
@@ -2492,10 +2532,10 @@ export default class VaultGuardPlugin extends Plugin {
       }
 
       // 403 path ("limited"): session is intact, keyLease is null. Sync and
-      // cloud reads guard on keyLease and degrade to local-only access; the
-      // user already saw a Notice. We still flip online because the API is
-      // reachable and other endpoints (sidebar, audit, share-link mgmt)
-      // continue to work without a DEK.
+      // cloud reads can still download permission-allowed files through the
+      // server-side decrypt path; encrypted uploads stay paused. We still
+      // flip online because the API is reachable and other endpoints
+      // (sidebar, audit, share-link mgmt) continue to work without a DEK.
       this.setConnectionStatus("online");
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed (non-blocking)", err);
@@ -3087,6 +3127,13 @@ export default class VaultGuardPlugin extends Plugin {
         // "limited" (403) is fine — session still valid, keyLease still null,
         // sync engine + interceptedRead already null-guard on keyLease and
         // gracefully fall back to the local at-rest copy.
+      }
+      // Phase-8: if we ended up in limited-access mode, rebuild the in-memory
+      // placeholderPaths set from on-disk 36-byte VG1 envelopes so reads of
+      // previously-reconciled files still go through the hydration path after
+      // a plugin reload (placeholderPaths is in-memory only per D-09).
+      if (this.vaultLeaseDenied) {
+        await this.sweepPlaceholderPaths();
       }
     }
 
@@ -4288,6 +4335,52 @@ export default class VaultGuardPlugin extends Plugin {
     const envelopePath = `.obsidian/plugins/${pluginId}/lak.envelope`;
     const adapter = this.app.vault.adapter;
 
+    // One-time envelope migration after a plugin-id rename. If no envelope
+    // exists at the current path but one DOES exist under a historical
+    // plugin id, copy it across before AtRestCipher.init() runs so the
+    // existing unwrap path picks it up and on-disk VG1 files remain
+    // decryptable. See PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION and commit
+    // 9495041 (2026-05-14, vaultguard -> vaultguard-sync).
+    let envelopeMigrationFailureReason: string | null = null;
+    try {
+      const currentExists = await adapter.exists(envelopePath);
+      if (!currentExists) {
+        const priorIds = PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION[pluginId] ?? [];
+        for (const priorId of priorIds) {
+          const priorPath = `.obsidian/plugins/${priorId}/lak.envelope`;
+          try {
+            if (!(await adapter.exists(priorPath))) continue;
+            const priorBlob = await adapter.read(priorPath);
+            if (!priorBlob || priorBlob.trim().length === 0) continue;
+            try {
+              await adapter.write(envelopePath, priorBlob);
+              this.log(`[at-rest] Migrated LAK envelope from ${priorId} -> ${pluginId}`);
+              // Source envelope intentionally NOT removed: a second Obsidian
+              // window, a second install, or a rollback to the prior plugin
+              // id all benefit from the original staying put.
+              break;
+            } catch (writeErr) {
+              envelopeMigrationFailureReason =
+                `Found an at-rest envelope under the previous plugin id (${priorId}) but could not copy it into the current plugin folder (${pluginId}): ${
+                  writeErr instanceof Error ? writeErr.message : String(writeErr)
+                }. Your encrypted files have NOT been overwritten — close Obsidian, copy ".obsidian/plugins/${priorId}/lak.envelope" to ".obsidian/plugins/${pluginId}/lak.envelope" manually, and reopen.`;
+              break;
+            }
+          } catch (readErr) {
+            // A prior-id folder exists but reading the envelope failed.
+            // Treat as "no sibling found" and continue scanning the rest of
+            // the prior id list — do not block init.
+            this.logError(`[at-rest] Probing prior envelope at ${priorPath} failed`, readErr);
+          }
+        }
+      }
+    } catch (err) {
+      // adapter.exists threw for the current path — extremely unusual.
+      // Don't block init; fall through to AtRestStorage which has its own
+      // try/catch around adapter.read.
+      this.logError(`[at-rest] Probing current envelope at ${envelopePath} failed`, err);
+    }
+
     const storage: AtRestStorage = {
       loadWrappedLak: async () => {
         try {
@@ -4314,6 +4407,23 @@ export default class VaultGuardPlugin extends Plugin {
     };
 
     this.atRestCipher = new AtRestCipher(storage);
+
+    // If the envelope migration found a sibling but failed to copy it,
+    // short-circuit BEFORE running init(). Running init() now would see no
+    // envelope and silently generate a fresh LAK, which is the exact failure
+    // mode this migration block exists to prevent.
+    if (envelopeMigrationFailureReason !== null) {
+      const reason = envelopeMigrationFailureReason;
+      this.app.workspace.onLayoutReady(() =>
+        this.showAtRestRecoveryBanner(reason)
+      );
+      this.logError(
+        "AtRestCipher init aborted: envelope migration failed",
+        new Error(reason)
+      );
+      return;
+    }
+
     try {
       const initPromise = this.atRestCipher.init();
       this.cipherInitPromise = initPromise;
@@ -4706,17 +4816,38 @@ export default class VaultGuardPlugin extends Plugin {
       );
     }
 
+    // Phase-8 limited-access primary branch (OD-4): if this path is a known
+    // 36-byte VG1 placeholder, hydrate via the server-side decrypt endpoint
+    // and replace the on-disk placeholder with LAK-encrypted plaintext.
+    if (this.vaultLeaseDenied && this.placeholderPaths.has(path)) {
+      const response = await this.readFileDecrypted(path);
+      if (response.success && response.data?.decrypted === true) {
+        const plaintext = this.decodeBase64Utf8(response.data.content);
+        await this.writePlainToDisk(path, plaintext);
+        this.placeholderPaths.delete(path);
+        await this.emitAuditEvent("file.read", path);
+        return plaintext;
+      }
+      if (response.error?.statusCode === 404) {
+        // D-16: previously-permitted, now-denied — cleanup + propagate
+        await this.wipeDeniedLocalContent(path);
+        this.placeholderPaths.delete(path);
+        throw new Error(`VaultGuard Sync: Access denied to "${path}".`);
+      }
+      // Other errors (5xx, network) — fall through to existing logic which
+      // already debounces a "decrypt failed" Notice.
+    }
+
     try {
-      // If online, fetch from server with decryption
-      if (this.isOnline() && this.keyLease) {
-        const response = await this.apiRequest<{ content: string }>(
-          "GET",
-          this.vaultPath(`/files/${encodeURIComponent(path)}`)
-        );
+      // If online, fetch the newest server copy. Full-access sessions decrypt
+      // locally with their lease; limited-access sessions ask the backend to
+      // decrypt only this permission-checked file.
+      if (this.isOnline()) {
+        const response = await this.fetchRemoteFileContent(path);
 
         if (response.success && response.data) {
           try {
-            const decrypted = await this.decryptContent(response.data.content);
+            const decrypted = await this.decodeRemoteFileContent(path, response.data);
             await this.emitAuditEvent("file.read", path);
             return decrypted;
           } catch (decryptErr) {
@@ -4746,6 +4877,39 @@ export default class VaultGuardPlugin extends Plugin {
 
       // Fallback to local cached version if offline
       const localContent = await this.readPlainFromDisk(path);
+
+      // Phase-8 secondary disambiguator (D-13): legacy on-disk placeholders
+      // written by older plugin versions before placeholderPaths existed. If
+      // decrypted plaintext is empty AND we're in limited-access mode, treat
+      // as a (legacy) placeholder and try to hydrate. Best-effort; the
+      // primary path is placeholderPaths.has(path) above. The vaultLeaseDenied
+      // guard prevents this from firing on legitimately-empty notes in full-
+      // access sessions (T-08-19).
+      if (localContent === "" && this.vaultLeaseDenied) {
+        try {
+          const response = await this.readFileDecrypted(path);
+          if (response.success && response.data?.decrypted === true) {
+            const plaintext = this.decodeBase64Utf8(response.data.content);
+            await this.writePlainToDisk(path, plaintext);
+            this.placeholderPaths.delete(path);
+            await this.emitAuditEvent("file.read", path);
+            return plaintext;
+          }
+          if (response.error?.statusCode === 404) {
+            await this.wipeDeniedLocalContent(path);
+            this.placeholderPaths.delete(path);
+            throw new Error(`VaultGuard Sync: Access denied to "${path}".`);
+          }
+        } catch (err) {
+          if (this.isNetworkError(err)) {
+            // Offline — return the empty local content; we'll retry next read.
+          } else {
+            throw err;
+          }
+        }
+        // Fall through on other errors — return the empty local content.
+      }
+
       await this.emitAuditEvent("file.read", path, { source: "cache" });
       return localContent;
     } catch (error) {
@@ -5958,9 +6122,9 @@ export default class VaultGuardPlugin extends Plugin {
    * and the regular sync engine may proceed; false if the user cancelled.
    */
   private async performInitialReconciliation(): Promise<boolean> {
-    if (!this.session || !this.isOnline() || !this.keyLease) {
+    if (!this.session || !this.isOnline()) {
       throw new Error(
-        "Reconciliation requires an authenticated, online session with a valid key lease."
+        "Reconciliation requires an authenticated, online session."
       );
     }
 
@@ -6041,23 +6205,50 @@ export default class VaultGuardPlugin extends Plugin {
       }
     }
 
+    // Phase-8 limited-access branch (BLOCKER-2 Q2 RESOLVED): skip the async-ack
+    // modal entirely — there is nothing for the user to acknowledge in this mode.
+    // localOnly uploads silently fail (no lease → no encrypt); conflicts can't
+    // be diffed (no plaintext at scale); serverOnly is written non-interactively
+    // as 36-byte VG1 placeholders so Obsidian's file explorer renders the tree.
+    // localOnly and conflicts handling defer to a follow-up phase (A4).
+    if (this.vaultLeaseDenied) {
+      for (const path of serverOnly) {
+        const normalized = this.normalizeVaultPath(path);
+        if (this.isPathExcluded(normalized)) continue;
+        if (this.isFolderMarkerPath(normalized)) continue;
+        await this.ensureParentFoldersForPath(normalized);
+        await this.writePlainToDisk(normalized, ""); // 36-byte VG1 placeholder
+        this.placeholderPaths.add(normalized);
+      }
+      // Mirror server-only folders too so the tree is visible.
+      for (const folderPath of serverFolderPaths) {
+        if (!folderPath) continue;
+        try {
+          await this.ensureLocalFolderPath(folderPath);
+        } catch (err) {
+          this.logError(`Reconciliation (limited): mkdir for "${folderPath}" failed`, err);
+        }
+      }
+      // Persist completion so this binding isn't re-reconciled on every restart.
+      this.settings.bindingReconciledVaultId = this.settings.serverVaultId;
+      this.syncState.lastSync = inventory.data.syncTimestamp;
+      this.settings.lastSyncTimestamp = inventory.data.syncTimestamp;
+      await this.saveSettings();
+      new Notice(
+        `VaultGuard Sync: Limited-access reconciliation — ${serverOnly.length} files visible. ` +
+          `Open one to fetch its content from the server.`,
+        6000
+      );
+      return true;
+    }
+
     // For paths on both sides, fetch + decrypt the server copy and hash to
     // determine real conflicts (the server's reported `checksum` is the S3
     // ETag of the encrypted blob — never equal to a plaintext SHA-256).
     const sameContent = new Set<string>();
     for (const item of localManifestBoth) {
       try {
-        const fileResp = await this.apiRequest<{ content: string }>(
-          "GET",
-          this.vaultPath(`/files/${encodeURIComponent(this.normalizeVaultPath(item.path))}`)
-        );
-        if (!fileResp.success || !fileResp.data) {
-          // If the user can't read the server copy, treat it as a conflict —
-          // they shouldn't be able to silently overwrite content they can't see.
-          conflicts.push(item.path);
-          continue;
-        }
-        const remoteContent = await this.decryptContent(fileResp.data.content);
+        const remoteContent = await this.readRemotePlaintext(item.path);
         const remoteHash = await this.computeHash(remoteContent);
         if (remoteHash === item.localHash) {
           sameContent.add(item.path);
@@ -6234,6 +6425,14 @@ export default class VaultGuardPlugin extends Plugin {
     content: string,
     options: { noWriteNotice?: string } = {}
   ): Promise<"uploaded" | "skipped"> {
+    if (!this.hasValidKeyLease()) {
+      this.log(`Reconciliation: skipping "${path}" — no encryption key lease available.`);
+      new Notice(
+        `VaultGuard Sync: Skipped upload of "${path}" — limited access sessions can download accessible files, but need a key lease to encrypt uploads.`
+      );
+      return "skipped";
+    }
+
     const permission = await this.getEffectivePermission(path);
     if (permission < PermissionLevel.WRITE) {
       this.log(`Reconciliation: skipping "${path}" — no write permission.`);
@@ -6289,7 +6488,7 @@ export default class VaultGuardPlugin extends Plugin {
     failedFiles: number;
     failedFolders: number;
   } | null> {
-    if (!this.session || !this.settings.serverVaultId || !this.keyLease) return null;
+    if (!this.session || !this.settings.serverVaultId || !this.hasValidKeyLease()) return null;
     if (!this.originalAdapterMethods.read) return null;
 
     let inventory: { path: string; action: string }[] | null = null;
@@ -6413,7 +6612,7 @@ export default class VaultGuardPlugin extends Plugin {
     failedFiles: number;
     failedFolders: number;
   } | null> {
-    if (!this.session || !this.settings.serverVaultId || !this.keyLease) return null;
+    if (!this.session || !this.settings.serverVaultId) return null;
     if (!this.originalAdapterMethods.write) return null;
 
     const response = await this.apiRequest<{
@@ -6971,12 +7170,6 @@ export default class VaultGuardPlugin extends Plugin {
       if (userInitiated) new Notice(message);
       return;
     }
-    if (!this.keyLease) {
-      const message = "VaultGuard Sync: Sync skipped — encryption key lease unavailable. Try logging in again.";
-      this.log(message);
-      if (userInitiated) new Notice(message);
-      return;
-    }
     if (!this.settings.serverVaultId) {
       const message = "VaultGuard Sync: Sync skipped — this folder is not bound to a server vault yet.";
       this.log(message);
@@ -6995,6 +7188,14 @@ export default class VaultGuardPlugin extends Plugin {
       new Notice("VaultGuard Sync: Syncing…");
     }
 
+    const canUploadEncryptedContent = this.hasValidKeyLease();
+    if (!canUploadEncryptedContent) {
+      this.log("Sync running in limited access mode — downloads only; encrypted uploads are paused until a key lease is available.");
+      if (userInitiated) {
+        new Notice("VaultGuard Sync: Limited access — downloading accessible server changes only.");
+      }
+    }
+
     let totalFilesUploaded = 0;
     let totalFoldersUploaded = 0;
     let totalFilesRemoved = 0;
@@ -7009,23 +7210,29 @@ export default class VaultGuardPlugin extends Plugin {
 
       // Phase 1: Upload queued offline operations
       const offlineQueueSizeBefore = this.offlineQueue.length;
-      await this.flushOfflineQueue();
-      const flushedSomething = offlineQueueSizeBefore > 0;
+      if (canUploadEncryptedContent) {
+        await this.flushOfflineQueue();
+      } else if (offlineQueueSizeBefore > 0) {
+        this.log(
+          `Sync: ${offlineQueueSizeBefore} queued operation(s) kept pending because no encryption key lease is available.`
+        );
+      }
+      const flushedSomething = canUploadEncryptedContent && offlineQueueSizeBefore > 0;
 
       // Phase 1b: Catch up local-only files + folders. Auto-runs once per
       // plugin process to self-heal vaults whose first reconciliation never
       // landed; user-initiated syncs always force a re-run so subsequent
       // clicks aren't silent no-ops after the flag has been set.
       let catchupChanges = 0;
-      if (forceCatchup || !this.localOnlyCatchupCompleted) {
+      if (canUploadEncryptedContent && (forceCatchup || !this.localOnlyCatchupCompleted)) {
         const result = await this.uploadLocalOnlyFiles();
         if (result) {
           totalFilesUploaded += result.uploadedFiles;
           totalFoldersUploaded += result.uploadedFolders;
           totalFilesRemoved += result.removedLocalFiles;
           catchupChanges = result.uploadedFiles + result.uploadedFolders + result.removedLocalFiles;
+          this.localOnlyCatchupCompleted = true;
         }
-        this.localOnlyCatchupCompleted = true;
       }
 
       // Phase 1c: Cursor short-circuit. Cheapest possible "is there anything
@@ -7244,11 +7451,10 @@ export default class VaultGuardPlugin extends Plugin {
       this.log(`Sync: skipping excluded path "${normalizedPath}".`);
       return;
     }
-    // Fetch and decrypt file content
-    const response = await this.apiRequest<{ content: string }>(
-      "GET",
-      this.vaultPath(`/files/${encodeURIComponent(normalizedPath)}`)
-    );
+    // Fetch and decrypt file content. Limited-access sessions lack the
+    // client-side DEK, so `fetchRemoteFileContent` asks the server for a
+    // permission-checked plaintext envelope instead.
+    const response = await this.fetchRemoteFileContent(normalizedPath);
 
     if (!response.success || !response.data) {
       throw new Error(response.error?.message ?? `Failed to read ${normalizedPath} from the server.`);
@@ -7258,13 +7464,13 @@ export default class VaultGuardPlugin extends Plugin {
 
     let decrypted: string;
     try {
-      decrypted = await this.decryptContent(response.data.content);
+      decrypted = await this.decodeRemoteFileContent(normalizedPath, response.data);
     } catch (decryptErr) {
       // Skip the file rather than aborting the whole sync pass — a single
       // undecryptable cloud blob (wrong-DEK upload, partial rotation) used
       // to crash sync wholesale. Local copy stays as it was.
       this.logError(
-        `Sync: skipping "${normalizedPath}" — cloud copy could not be decrypted with the current key lease.`,
+        `Sync: skipping "${normalizedPath}" — cloud copy could not be decrypted.`,
         decryptErr
       );
       this.notifyCloudDecryptFallback(normalizedPath);
@@ -7369,6 +7575,90 @@ export default class VaultGuardPlugin extends Plugin {
       this.logError("Sync cursor fetch failed", err);
       return null;
     }
+  }
+
+  private hasValidKeyLease(): boolean {
+    return !!this.keyLease && !this.isKeyLeaseExpired();
+  }
+
+  /**
+   * Fetch a file's plaintext via the server-side decrypt endpoint
+   * (GET /vaults/{vaultId}/files-decrypted/{path}). Used by the limited-
+   * access read path (Phase 8) when the caller cannot receive a vault-wide
+   * `/**` key lease. The server gates the route with requireVaultMember +
+   * evaluatePermission; 404 on deny (per docs/SHARE-LINKS.md trust pattern).
+   */
+  private async readFileDecrypted(relPath: string): Promise<ApiResponse<RemoteFileContentResponse>> {
+    const normalizedPath = this.normalizeVaultPath(relPath);
+    const encoded = normalizedPath
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+    return this.apiRequest<RemoteFileContentResponse>(
+      "GET",
+      this.vaultPath(`/files-decrypted/${encoded}`)
+    );
+  }
+
+  private async fetchRemoteFileContent(path: string): Promise<ApiResponse<RemoteFileContentResponse>> {
+    const normalizedPath = this.normalizeVaultPath(path);
+    const serverDecrypt = !this.hasValidKeyLease();
+    if (serverDecrypt) {
+      // Limited-access (no /** lease) — server-side decrypt sibling endpoint
+      // (Phase 8, plan 08-01). The legacy decrypt-query URL is removed from
+      // this caller; plan 08-04 deletes the Lambda branch.
+      return this.readFileDecrypted(normalizedPath);
+    }
+    // Full-access — fetch ciphertext, plugin decrypts via its own DEK.
+    return this.apiRequest<RemoteFileContentResponse>(
+      "GET",
+      this.vaultPath(`/files/${encodeURIComponent(normalizedPath)}`)
+    );
+  }
+
+  private decodeBase64Utf8(base64: string): string {
+    return new TextDecoder().decode(this.base64ToBytes(base64));
+  }
+
+  private remoteDecryptError(path: string, error: unknown): Error {
+    const message = error instanceof Error ? error.message : String(error);
+    const wrapped = new Error(
+      `VaultGuard Sync: could not decrypt server copy of "${path}": ${message}`
+    );
+    wrapped.name = "VaultGuardRemoteDecryptError";
+    return wrapped;
+  }
+
+  private async decodeRemoteFileContent(
+    path: string,
+    data: RemoteFileContentResponse
+  ): Promise<string> {
+    const normalizedPath = this.normalizeVaultPath(path);
+    if (data.decrypted === true) {
+      return this.decodeBase64Utf8(data.content);
+    }
+
+    if (!this.hasValidKeyLease()) {
+      throw this.remoteDecryptError(
+        normalizedPath,
+        new Error("server returned encrypted bytes and no valid key lease is available")
+      );
+    }
+
+    try {
+      return await this.decryptContent(data.content);
+    } catch (error) {
+      throw this.remoteDecryptError(normalizedPath, error);
+    }
+  }
+
+  private async readRemotePlaintext(path: string): Promise<string> {
+    const normalizedPath = this.normalizeVaultPath(path);
+    const response = await this.fetchRemoteFileContent(normalizedPath);
+    if (!response.success || !response.data) {
+      throw new Error(response.error?.message ?? `Failed to read ${normalizedPath} from the server.`);
+    }
+    return this.decodeRemoteFileContent(normalizedPath, response.data);
   }
 
   /**
@@ -7483,8 +7773,8 @@ export default class VaultGuardPlugin extends Plugin {
    *                   `/**` scope is denied: deny rules overlap, or no read
    *                   permission on the root probe path). Session is kept
    *                   intact, `keyLease` is cleared, and a debounced Notice
-   *                   informs the user. Sync, cloud reads, and encryption
-   *                   already guard on `keyLease` so they degrade gracefully.
+   *                   informs the user. Downloads use the server-side
+   *                   decrypt fallback; encrypted uploads remain paused.
    * - `"logged-out"` — backend returned 401 (true session expiry / invalid
    *                   token). `forceLogout` was called; caller must abort.
    * - throws        — for any other error (network failure, 5xx, 4xx other
@@ -7541,9 +7831,9 @@ export default class VaultGuardPlugin extends Plugin {
 
       // Permission denial on `/**` scope — the user authenticated fine, they
       // just can't be given a vault-wide DEK. Keep the session intact and
-      // surface the limitation so the user understands why files won't
-      // sync. Sync, encrypt, and cloud-read paths already null-guard on
-      // `keyLease` and degrade to "local only" cleanly.
+      // surface the limitation. Download paths can still request
+      // permission-checked server-side decrypts; upload/encrypt paths keep
+      // guarding on `keyLease`.
       this.keyLease = null;
       this.vaultLeaseDenied = true;
       this.log(`Vault-scoped key lease denied (limited access): status=${statusCode}, message=${message}`);
@@ -7560,6 +7850,70 @@ export default class VaultGuardPlugin extends Plugin {
       normalized.startsWith("access has been revoked") ||
       normalized.startsWith("session has been revoked")
     );
+  }
+
+  /**
+   * One-shot self-healing walk over the on-disk vault. Adds every file whose
+   * size is exactly 36 bytes AND whose first 4 bytes equal the VG1 magic
+   * header [0x56, 0x47, 0x31, 0x00] to placeholderPaths. Handles mid-session
+   * plugin reloads where placeholderPaths was lost from memory but on-disk
+   * placeholders remain (D-09 keeps the set in-memory only).
+   *
+   * Bounded by MAX_SWEEP_ENTRIES (5000). Walks via originalAdapterMethods.list
+   * (the raw, ciphertext-aware listing) because we are deliberately inspecting
+   * the on-disk envelope shape, NOT reading plaintext. The 4-byte magic-header
+   * read via originalAdapterMethods.readBinary is a documented exception to
+   * the at-rest rule (CLAUDE.md Local At-Rest Rule): we are inspecting
+   * ciphertext envelope bytes, not surfacing plaintext to disk.
+   */
+  private async sweepPlaceholderPaths(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const rawList = this.originalAdapterMethods.list;
+    const rawReadBinary = this.originalAdapterMethods.readBinary;
+    if (!rawList || !rawReadBinary) return;
+    let scanned = 0;
+    let aborted = false;
+    const queue: string[] = ["/"];
+    while (queue.length > 0 && !aborted) {
+      const dir = queue.shift()!;
+      let listing: { files: string[]; folders: string[] };
+      try {
+        listing = await rawList(dir);
+      } catch {
+        continue;
+      }
+      for (const subdir of listing.folders) {
+        if (this.isPathExcluded(subdir)) continue;
+        queue.push(subdir);
+      }
+      for (const filePath of listing.files) {
+        scanned++;
+        if (scanned > MAX_SWEEP_ENTRIES) {
+          aborted = true;
+          break;
+        }
+        if (this.isPathExcluded(filePath)) continue;
+        try {
+          const stat = await adapter.stat(filePath);
+          if (!stat || stat.size !== 36) continue;
+          // Magic-byte verification (RESEARCH Q3 RESOLVED — not size-only).
+          // Read first 4 bytes via the RAW binary method since we are
+          // inspecting the ciphertext envelope, not the plaintext payload.
+          const buf = await rawReadBinary(filePath);
+          const view = new Uint8Array(buf, 0, 4);
+          if (view[0] === 0x56 && view[1] === 0x47 && view[2] === 0x31 && view[3] === 0x00) {
+            this.placeholderPaths.add(filePath);
+          }
+        } catch {
+          // ignore individual file errors
+        }
+      }
+    }
+    if (aborted) {
+      console.warn(
+        `[VaultGuard] sweepPlaceholderPaths: aborting at ${MAX_SWEEP_ENTRIES} entries; placeholderPaths.size=${this.placeholderPaths.size}`
+      );
+    }
   }
 
   /**
@@ -7684,6 +8038,12 @@ export default class VaultGuardPlugin extends Plugin {
             // Permission rules may have widened; clear the cache so the next
             // file open re-evaluates instead of using a stale "denied" entry.
             this.permissionCache.clear();
+            // Phase-8: clear the in-memory placeholder set so subsequent reads
+            // go through the normal readPlainFromDisk path (the on-disk VG1
+            // bytes are still placeholders until the next reconcile writes
+            // real content; that's the existing sync engine's job once the
+            // lease is back).
+            this.placeholderPaths.clear();
             this.readOnlyGuard?.refreshAll();
             this.fileExplorerDecorations?.invalidate();
             this.filePermissionHeader?.invalidateCache();

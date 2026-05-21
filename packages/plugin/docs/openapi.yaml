@@ -30,9 +30,13 @@ info:
     - **Error shape.** Failed responses return JSON matching
       `#/components/schemas/ApiError`.
     - **Encryption envelope.** File bodies are transported base64-encoded
-      inside a JSON `{ "content": "<base64>" }` field. The plugin
-      handles encryption locally; the server treats payloads as opaque
-      bytes.
+      inside a JSON `{ "content": "<base64>" }` field. Normal uploads and
+      full-access downloads are encrypted/decrypted locally by the plugin.
+      Limited-access clients (members with read-deny rules who cannot
+      receive a vault-wide `/**` key lease) use the sibling endpoint
+      `GET /vaults/{vaultId}/files-decrypted/{path}`; the reference server
+      decrypts only the already permission-checked file and returns base64
+      plaintext.
 
     ## What is *not* documented here
 
@@ -441,7 +445,13 @@ paths:
         description: Vault-relative file path, URL-encoded as a single segment.
     get:
       tags: [Files]
-      summary: Fetch a single file's content (base64-encoded, opaque to server)
+      summary: Fetch a single file's ciphertext
+      description: |
+        Returns the raw VG1 ciphertext bytes for a single file (base64-encoded
+        for transport). Clients with a vault-wide `/**` key lease decrypt
+        locally. Limited-access clients (read-deny members) must use the
+        sibling endpoint `GET /vaults/{vaultId}/files-decrypted/{path}` for
+        server-side decrypt.
       responses:
         '200':
           description: File content envelope
@@ -451,7 +461,8 @@ paths:
                 type: object
                 required: [content]
                 properties:
-                  content: { type: string, format: byte, description: Base64-encoded file bytes (may be ciphertext). }
+                  content: { type: string, format: byte, description: Base64-encoded VG1 ciphertext bytes. }
+                  encoding: { type: string, enum: [base64] }
         '404':
           $ref: '#/components/responses/NotFound'
     put:
@@ -480,6 +491,58 @@ paths:
       summary: Delete a file
       responses:
         '204': { description: Deleted }
+
+  /vaults/{vaultId}/files-decrypted/{path}:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+      - in: path
+        name: path
+        required: true
+        schema: { type: string }
+        description: Vault-relative file path, URL-encoded as a single segment.
+    get:
+      tags: [Files]
+      summary: Read a file's decrypted plaintext (limited-access bootstrap)
+      operationId: readFileDecrypted
+      description: |
+        Returns the plaintext bytes for a single file, server-side decrypted
+        via the vault scope-DEK. Designed for clients that cannot receive a
+        vault-wide `/**` key lease — e.g. members with read-deny rules whose
+        lease requests are rejected by `assertScopeHasNoReadDenyRules`.
+
+        Permission gating: `requireVaultMember(viewer)` AND per-file
+        `evaluatePermission('read', '/' + path)` MUST both pass. Permission
+        denial returns HTTP 404 (not 403) so an unauthorised caller cannot
+        probe for file existence — matches the share-link rule pattern.
+      responses:
+        '200':
+          description: Decrypted plaintext envelope
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, content, encoding, decrypted, encrypted, contentType, size]
+                properties:
+                  path:         { type: string }
+                  content:      { type: string, format: byte, description: Base64-encoded plaintext bytes. }
+                  encoding:     { type: string, enum: [base64] }
+                  decrypted:    { type: boolean, enum: [true] }
+                  encrypted:    { type: boolean, enum: [false] }
+                  contentType:  { type: string }
+                  size:         { type: integer }
+                  lastModified: { type: string, format: date-time }
+                  versionId:    { type: string, nullable: true }
+        '401':
+          description: Missing or invalid bearer token
+        '404':
+          description: |
+            File not found OR caller does not have read permission OR cross-vault
+            forgery attempt. Distinguishability is removed by design (D-02) so the
+            endpoint cannot be used to probe for file existence.
+        '409':
+          description: Vault key unavailable for server-side decrypt
+        '500':
+          description: Internal error during S3 fetch or KMS unwrap
 
   /vaults/{vaultId}/files/{path}/history:
     parameters:
