@@ -659,6 +659,30 @@ export class VaultGuardApiClient {
     };
   }
 
+  /**
+   * Batched variant of `getPathAccess`. Pass up to 100 paths in one request;
+   * the server returns one summary per unique path in the same order as
+   * input. Used by the file-explorer decorator so the sidebar dots/avatars
+   * stay aligned with the file header's source of truth.
+   */
+  async getBatchPathAccess(paths: string[]): Promise<PathAccessSummary[]> {
+    if (!Array.isArray(paths) || paths.length === 0) return [];
+    const normalized = paths
+      .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+      .map((p) => (p.startsWith("/") ? p : `/${p}`));
+    if (normalized.length === 0) return [];
+    const response = await this.request<{ summaries: PathAccessSummary[] }>(
+      "POST",
+      `${this.vaultBase()}/permissions/access/batch`,
+      { paths: normalized }
+    );
+    return (response.summaries ?? []).map((summary) => ({
+      path: summary.path,
+      currentUserLevel: summary.currentUserLevel ?? "none",
+      principals: summary.principals ?? [],
+    }));
+  }
+
   // ─── Share Link Operations (vault-scoped) ───────────────────────────
   //
   // Mint, list, resolve, or revoke opaque deep-link tokens that route a

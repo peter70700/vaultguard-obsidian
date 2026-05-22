@@ -14,6 +14,7 @@
  * - DELETE /vaults/{vaultId}/permissions/{id} — Delete rule (vault-admin)
  * - POST   /vaults/{vaultId}/permissions/check — Check if user can perform action on path (any vault member, self only)
  * - POST   /vaults/{vaultId}/permissions/access — Effective per-file access summary (any member with read)
+ * - POST   /vaults/{vaultId}/permissions/access/batch — Batch access summaries (any member, capped paths)
  */
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
@@ -43,6 +44,7 @@ import {
   recordVaultActivity,
   UserContext,
   VaultRecord,
+  VaultMemberRecord,
   PermissionRule,
   PermissionAction,
   AuthError,
@@ -133,6 +135,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       case method === 'POST' && resource === '/vaults/{vaultId}/permissions/access':
         return await handlePathAccess(event, user, vault, requestId);
+
+      case method === 'POST' && resource === '/vaults/{vaultId}/permissions/access/batch':
+        return await handleBatchPathAccess(event, user, vault, requestId);
 
       default:
         return formatError(404, `Route not found: ${method} ${resource}`, requestId);
@@ -926,7 +931,134 @@ async function handlePathAccess(
 
   const path = normalizePermissionPath(String(body.path));
   const directory = await buildOrgIdentityMap(vault.orgId);
+  const members = await listVaultMembers(vault.vaultId);
 
+  const summary = await computePathAccessSummary(
+    path,
+    user,
+    vault,
+    directory,
+    members
+  );
+
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'permissions.access',
+    resourcePath: path,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: {
+      principalCount: summary.principals.length,
+      visiblePrincipalCount: summary.principals.filter(
+        (principal) => principal.level !== 'none'
+      ).length,
+    },
+  });
+
+  return formatSuccess(200, summary, requestId);
+}
+
+// ─── POST /vaults/{vaultId}/permissions/access/batch ────────────────────────
+
+const BATCH_PATH_LIMIT = 100;
+
+/**
+ * Returns backend-computed access summaries for many paths in one request.
+ *
+ * Used by the plugin's file-explorer decorator so the sidebar dot/avatar
+ * stack stay perfectly aligned with the file header. The handler reuses the
+ * single-path evaluator per path, but folds the Cognito directory + member
+ * lookup into one query each — that's where the per-path overhead would
+ * otherwise dominate.
+ *
+ * The route returns summaries in the same order as the input. Duplicate
+ * paths are deduplicated server-side; the caller's response array stays
+ * keyed by `path` so duplicates still resolve via lookup.
+ */
+async function handleBatchPathAccess(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  const body = parseBody(event);
+  validateRequiredFields(body, ['paths']);
+
+  if (!Array.isArray(body.paths)) {
+    return formatError(400, 'paths must be an array of strings', requestId);
+  }
+
+  const rawPaths = body.paths
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => normalizePermissionPath(value));
+
+  if (rawPaths.length === 0) {
+    return formatSuccess(200, { summaries: [] }, requestId);
+  }
+
+  if (rawPaths.length > BATCH_PATH_LIMIT) {
+    return formatError(
+      400,
+      `Too many paths: limit is ${BATCH_PATH_LIMIT} per batch (got ${rawPaths.length})`,
+      requestId
+    );
+  }
+
+  // Deduplicate but preserve input ordering — the client may rely on it.
+  const uniquePaths: string[] = [];
+  const seen = new Set<string>();
+  for (const path of rawPaths) {
+    if (seen.has(path)) continue;
+    seen.add(path);
+    uniquePaths.push(path);
+  }
+
+  const directory = await buildOrgIdentityMap(vault.orgId);
+  const members = await listVaultMembers(vault.vaultId);
+
+  const summaries = await Promise.all(
+    uniquePaths.map((path) =>
+      computePathAccessSummary(path, user, vault, directory, members)
+    )
+  );
+
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'permissions.access.batch',
+    resourcePath: `/vaults/${vault.vaultId}/permissions/access/batch`,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: {
+      requestedPathCount: rawPaths.length,
+      uniquePathCount: uniquePaths.length,
+      memberCount: members.length,
+    },
+  });
+
+  return formatSuccess(200, { summaries }, requestId);
+}
+
+/**
+ * Shared per-path evaluator used by both the single-path and batch endpoints.
+ * The caller is responsible for fetching `directory` (Cognito identity map)
+ * and `members` (vault member list) once and passing them in — these lookups
+ * dominate the cost of a batch request, so they must not run per path.
+ */
+async function computePathAccessSummary(
+  path: string,
+  user: UserContext,
+  vault: VaultRecord,
+  directory: Map<string, PrincipalIdentity>,
+  members: VaultMemberRecord[]
+): Promise<PathAccessSummary> {
   const callerRoles = await resolvePermissionRolesForTarget(user.userId, user, vault);
   const callerAliases = await aliasesForAccessTarget(
     user.userId,
@@ -944,20 +1076,20 @@ async function handlePathAccess(
   );
 
   // Do not reveal the membership/principal list for a path the caller cannot
-  // read. The current user's own status is still returned so the header can
+  // read. The current user's own status is still returned so the UI can
   // show a stable "No Access" state instead of inventing a local answer.
   if (callerLevel === 'none') {
-    return formatSuccess(200, {
-      path,
-      currentUserLevel: callerLevel,
-      principals: [],
-    }, requestId);
+    return { path, currentUserLevel: callerLevel, principals: [] };
   }
 
-  const members = await listVaultMembers(vault.vaultId);
   const principals: PathAccessPrincipal[] = [];
   for (const member of members) {
-    const aliases = await aliasesForAccessTarget(member.userId, user, vault.orgId, directory);
+    const aliases = await aliasesForAccessTarget(
+      member.userId,
+      user,
+      vault.orgId,
+      directory
+    );
     const level = await resolvePathAccessLevel(
       member.userId,
       [member.role],
@@ -985,27 +1117,13 @@ async function handlePathAccess(
     });
   }
 
-  await logAudit({
-    userId: user.userId,
-    userEmail: user.email,
-    orgId: user.orgId,
-    vaultId: vault.vaultId,
-    action: 'permissions.access',
-    resourcePath: path,
-    outcome: 'success',
-    ipAddress: getClientIp(event),
-    userAgent: getUserAgent(event),
-    metadata: {
-      principalCount: principals.length,
-      visiblePrincipalCount: principals.filter((principal) => principal.level !== 'none').length,
-    },
-  });
+  return { path, currentUserLevel: callerLevel, principals };
+}
 
-  return formatSuccess(200, {
-    path,
-    currentUserLevel: callerLevel,
-    principals,
-  }, requestId);
+interface PathAccessSummary {
+  path: string;
+  currentUserLevel: PathAccessLevel;
+  principals: PathAccessPrincipal[];
 }
 
 // ─── Helper Functions ────────────────────────────────────────────────────────

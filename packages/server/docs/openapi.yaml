@@ -690,6 +690,44 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/PathAccessSummary' }
 
+  /vaults/{vaultId}/permissions/access/batch:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    post:
+      tags: [Permissions]
+      summary: Batch resolve effective access for many paths
+      description: |
+        Server-computed batch variant of `/permissions/access`. Used by the
+        plugin's file-explorer decorator so the sidebar dots and avatar
+        stacks stay aligned with the file header. Cap of 100 paths per
+        request. Duplicate paths are deduplicated server-side.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paths]
+              properties:
+                paths:
+                  type: array
+                  items: { type: string }
+                  maxItems: 100
+      responses:
+        '200':
+          description: Batch of effective access summaries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [summaries]
+                properties:
+                  summaries:
+                    type: array
+                    items: { $ref: '#/components/schemas/PathAccessSummary' }
+        '400':
+          description: Invalid request (empty paths, non-array, or exceeds 100-path limit)
+
   # ─── Share Links ─────────────────────────────────────────────────────────
   #
   # Opaque deep-link tokens that route a teammate to a specific file. Each

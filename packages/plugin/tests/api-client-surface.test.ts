@@ -154,6 +154,12 @@ describe("VaultGuardApiClient surface", () => {
         currentUserLevel: "read",
         principals: [{ userId: "user-1", level: "read" }],
       }))
+      .mockResolvedValueOnce(jsonResponse(200, {
+        summaries: [
+          { path: "/docs/a.md", currentUserLevel: "read", principals: [] },
+          { path: "/docs/b.md", currentUserLevel: "none", principals: [] },
+        ],
+      }))
       .mockResolvedValueOnce(
         jsonResponse(200, [
           {
@@ -192,6 +198,7 @@ describe("VaultGuardApiClient surface", () => {
     await client.deletePermission("rule-1");
     await client.getUserPermissions("user-1");
     await client.getPathAccess("docs/a.md");
+    await client.getBatchPathAccess(["docs/a.md", "docs/b.md"]);
     await client.listUsers();
     await client.listRoles();
     await client.inviteUser({
@@ -214,6 +221,7 @@ describe("VaultGuardApiClient surface", () => {
       ["DELETE", "https://api.vaultguard.test/vaults/vault-abc/permissions/rule-1"],
       ["GET", "https://api.vaultguard.test/vaults/vault-abc/permissions/user/user-1"],
       ["POST", "https://api.vaultguard.test/vaults/vault-abc/permissions/access"],
+      ["POST", "https://api.vaultguard.test/vaults/vault-abc/permissions/access/batch"],
       ["GET", "https://api.vaultguard.test/users"],
       ["GET", "https://api.vaultguard.test/users/roles"],
       ["POST", "https://api.vaultguard.test/users/invite"],
@@ -226,7 +234,10 @@ describe("VaultGuardApiClient surface", () => {
     expect(JSON.parse(mockRequestUrl.mock.calls[5]![0].body as string)).toEqual({
       path: "/docs/a.md",
     });
-    expect(JSON.parse(mockRequestUrl.mock.calls[8]![0].body as string)).toEqual({
+    expect(JSON.parse(mockRequestUrl.mock.calls[6]![0].body as string)).toEqual({
+      paths: ["/docs/a.md", "/docs/b.md"],
+    });
+    expect(JSON.parse(mockRequestUrl.mock.calls[9]![0].body as string)).toEqual({
       email: "user@example.com",
       role: "viewer",
       sendWelcomeEmail: true,

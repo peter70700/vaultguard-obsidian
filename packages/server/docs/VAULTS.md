@@ -173,6 +173,7 @@ PUT    /vaults/{vaultId}/permissions/{id}                 → update rule (vault
 DELETE /vaults/{vaultId}/permissions/{id}                 → delete rule (vault-admin)
 POST   /vaults/{vaultId}/permissions/check                → check action on path (any member, self only unless admin)
 POST   /vaults/{vaultId}/permissions/access               → effective per-file access list (any member with read on path)
+POST   /vaults/{vaultId}/permissions/access/batch         → batch access summaries for many paths (any member; cap 100)
 ```
 
 ### Audit (vault-scoped)

@@ -1413,6 +1413,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.permissions_id_put,
     aws_api_gateway_integration.permissions_check_post,
     aws_api_gateway_integration.permissions_access_post,
+    aws_api_gateway_integration.permissions_access_batch_post,
     # Audit
     aws_api_gateway_integration.audit_get,
     aws_api_gateway_integration.audit_logs_get,
@@ -1509,6 +1510,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.permissions_id_put.id,
       aws_api_gateway_integration.permissions_check_post.id,
       aws_api_gateway_integration.permissions_access_post.id,
+      aws_api_gateway_integration.permissions_access_batch_post.id,
       aws_api_gateway_integration.audit_get.id,
       aws_api_gateway_integration.audit_logs_get.id,
       aws_api_gateway_integration.audit_alerts_get.id,

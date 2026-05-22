@@ -39,41 +39,42 @@ locals {
     # Note: /files/{filePath+}/restore-delete is served via the files_path resource
     # itself (suffix dispatch in the Lambda), so its OPTIONS preflight is covered by
     # the files_path CORS entry above. Greedy {filePath+} can't have child resources.
-    files_deleted          = aws_api_gateway_resource.files_deleted.id
-    files_decrypted        = aws_api_gateway_resource.files_decrypted.id
-    files_decrypted_path   = aws_api_gateway_resource.files_decrypted_path.id
-    permissions            = aws_api_gateway_resource.permissions.id
-    permissions_id         = aws_api_gateway_resource.permissions_id.id
-    permissions_check      = aws_api_gateway_resource.permissions_check.id
-    permissions_access     = aws_api_gateway_resource.permissions_access.id
-    audit                  = aws_api_gateway_resource.audit.id
-    audit_logs             = aws_api_gateway_resource.audit_logs.id
-    audit_alerts           = aws_api_gateway_resource.audit_alerts.id
-    audit_user_id          = aws_api_gateway_resource.audit_user_id.id
-    audit_file_path        = aws_api_gateway_resource.audit_file_path.id
-    audit_export           = aws_api_gateway_resource.audit_export.id
-    audit_report           = aws_api_gateway_resource.audit_report.id
-    audit_bridge           = aws_api_gateway_resource.audit_bridge.id
-    billing_subscription   = aws_api_gateway_resource.billing_subscription.id
-    billing_checkout       = aws_api_gateway_resource.billing_checkout.id
-    billing_portal         = aws_api_gateway_resource.billing_portal.id
-    billing_webhook        = aws_api_gateway_resource.billing_webhook.id
-    users                  = aws_api_gateway_resource.users.id
-    users_invite           = aws_api_gateway_resource.users_invite.id
-    users_roles            = aws_api_gateway_resource.users_roles.id
-    users_id               = aws_api_gateway_resource.users_id.id
-    users_id_role          = aws_api_gateway_resource.users_id_role.id
-    users_id_profile       = aws_api_gateway_resource.users_id_profile.id
-    users_id_revoke        = aws_api_gateway_resource.users_id_revoke.id
-    users_id_reactivate    = aws_api_gateway_resource.users_id_reactivate.id
-    users_id_resend_invite = aws_api_gateway_resource.users_id_resend_invite.id
-    users_id_activity      = aws_api_gateway_resource.users_id_activity.id
-    users_id_reset_mfa     = aws_api_gateway_resource.users_id_reset_mfa.id
-    permissions_user_id    = aws_api_gateway_resource.permissions_user_id.id
-    reencryption_trigger   = aws_api_gateway_resource.reencryption_trigger.id
-    reencryption_job_id    = aws_api_gateway_resource.reencryption_job_id.id
-    shares                 = aws_api_gateway_resource.shares.id
-    shares_id              = aws_api_gateway_resource.shares_id.id
+    files_deleted            = aws_api_gateway_resource.files_deleted.id
+    files_decrypted          = aws_api_gateway_resource.files_decrypted.id
+    files_decrypted_path     = aws_api_gateway_resource.files_decrypted_path.id
+    permissions              = aws_api_gateway_resource.permissions.id
+    permissions_id           = aws_api_gateway_resource.permissions_id.id
+    permissions_check        = aws_api_gateway_resource.permissions_check.id
+    permissions_access       = aws_api_gateway_resource.permissions_access.id
+    permissions_access_batch = aws_api_gateway_resource.permissions_access_batch.id
+    audit                    = aws_api_gateway_resource.audit.id
+    audit_logs               = aws_api_gateway_resource.audit_logs.id
+    audit_alerts             = aws_api_gateway_resource.audit_alerts.id
+    audit_user_id            = aws_api_gateway_resource.audit_user_id.id
+    audit_file_path          = aws_api_gateway_resource.audit_file_path.id
+    audit_export             = aws_api_gateway_resource.audit_export.id
+    audit_report             = aws_api_gateway_resource.audit_report.id
+    audit_bridge             = aws_api_gateway_resource.audit_bridge.id
+    billing_subscription     = aws_api_gateway_resource.billing_subscription.id
+    billing_checkout         = aws_api_gateway_resource.billing_checkout.id
+    billing_portal           = aws_api_gateway_resource.billing_portal.id
+    billing_webhook          = aws_api_gateway_resource.billing_webhook.id
+    users                    = aws_api_gateway_resource.users.id
+    users_invite             = aws_api_gateway_resource.users_invite.id
+    users_roles              = aws_api_gateway_resource.users_roles.id
+    users_id                 = aws_api_gateway_resource.users_id.id
+    users_id_role            = aws_api_gateway_resource.users_id_role.id
+    users_id_profile         = aws_api_gateway_resource.users_id_profile.id
+    users_id_revoke          = aws_api_gateway_resource.users_id_revoke.id
+    users_id_reactivate      = aws_api_gateway_resource.users_id_reactivate.id
+    users_id_resend_invite   = aws_api_gateway_resource.users_id_resend_invite.id
+    users_id_activity        = aws_api_gateway_resource.users_id_activity.id
+    users_id_reset_mfa       = aws_api_gateway_resource.users_id_reset_mfa.id
+    permissions_user_id      = aws_api_gateway_resource.permissions_user_id.id
+    reencryption_trigger     = aws_api_gateway_resource.reencryption_trigger.id
+    reencryption_job_id      = aws_api_gateway_resource.reencryption_job_id.id
+    shares                   = aws_api_gateway_resource.shares.id
+    shares_id                = aws_api_gateway_resource.shares_id.id
     # Note: signup already has OPTIONS defined in main.tf
   }
 }

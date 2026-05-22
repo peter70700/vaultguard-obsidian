@@ -3,12 +3,19 @@
  * and mini avatar stacks onto the native Obsidian file explorer via DOM manipulation.
  *
  * Uses a debounced MutationObserver to detect when the file explorer re-renders
- * and re-applies decorations. Permission data is fetched once in bulk and cached
- * to avoid excessive API calls.
+ * and re-applies decorations. Permission data is fetched from the backend in
+ * batches and cached so the sidebar dots/avatars stay perfectly aligned with
+ * the file header's source of truth (the Lambda permission evaluator).
  */
 
 import { App, setIcon } from "obsidian";
-import { VaultGuardApiClient, PermissionRule, UserListEntry } from "../api/client";
+import {
+  VaultGuardApiClient,
+  PathAccessPrincipal,
+  PathAccessSummary,
+  PermissionAccessLevel,
+  UserListEntry,
+} from "../api/client";
 import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
 
 // ─── Constants ─────────────────────────────────────────────────────────────
@@ -18,13 +25,15 @@ const HIDDEN_CLS = "vaultguard-fe-hidden";
 const CACHE_TTL_MS = 120_000; // 2 minutes
 const DEBOUNCE_MS = 300; // debounce observer-triggered repaints
 const ATTACH_RETRY_MS = 1_000; // file explorer can mount after plugin load
+const BATCH_PATH_LIMIT = 100; // matches backend cap
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
 interface DecorationCacheEntry {
-  level: string;
+  level: PermissionAccessLevel;
   sharedWith: number;
-  principals: Array<{ id: string; label: string; level: string; type: "user" | "role" }>;
+  principals: Array<{ id: string; label: string; level: PermissionAccessLevel; type: "user" | "role" }>;
+  fetchedAt: number;
 }
 
 export interface FileExplorerDecorationsConfig {
@@ -39,17 +48,16 @@ export interface FileExplorerDecorationsConfig {
 export class FileExplorerDecorations {
   private config: FileExplorerDecorationsConfig;
   private cache: Map<string, DecorationCacheEntry> = new Map();
-  private allRules: PermissionRule[] | null = null;
-  private allRulesFetchedAt = 0;
+  private inFlightPaths: Map<string, Promise<void>> = new Map();
   private observer: MutationObserver | null = null;
   private observedContainer: HTMLElement | null = null;
   private enabled = false;
   private isDecorating = false; // guard against observer re-entry
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private attachRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  private fetchPromise: Promise<void> | null = null;
   private userMap: Map<string, UserListEntry> = new Map();
   private usersLoaded = false;
+  private usersLoadPromise: Promise<void> | null = null;
 
   constructor(config: FileExplorerDecorationsConfig) {
     this.config = config;
@@ -85,9 +93,8 @@ export class FileExplorerDecorations {
    * Force re-decoration of all visible items (e.g. after permission change).
    */
   refresh(): void {
-    this.allRules = null;
-    this.allRulesFetchedAt = 0;
     this.cache.clear();
+    this.inFlightPaths.clear();
     if (this.enabled) {
       this.scheduleDecorate();
     }
@@ -101,15 +108,16 @@ export class FileExplorerDecorations {
   invalidate(path?: string): void {
     if (path) {
       this.cache.delete(path);
+      this.inFlightPaths.delete(path);
     } else {
-      this.allRules = null;
-      this.allRulesFetchedAt = 0;
       this.cache.clear();
+      this.inFlightPaths.clear();
       // Clear the user directory too — a permission grant may target a user
       // who was just invited and isn't in the cached map. Without this,
       // their chip would render as their UUID until the next session.
       this.userMap = new Map();
       this.usersLoaded = false;
+      this.usersLoadPromise = null;
     }
     if (this.enabled) {
       this.scheduleDecorate();
@@ -129,9 +137,8 @@ export class FileExplorerDecorations {
     if (updates.currentUserRole !== undefined) {
       this.config.currentUserRole = updates.currentUserRole;
     }
-    this.allRules = null;
-    this.allRulesFetchedAt = 0;
     this.cache.clear();
+    this.inFlightPaths.clear();
     if (this.enabled) {
       this.scheduleDecorate();
     }
@@ -143,7 +150,7 @@ export class FileExplorerDecorations {
   destroy(): void {
     this.disable();
     this.cache.clear();
-    this.allRules = null;
+    this.inFlightPaths.clear();
   }
 
   // ─── DOM Observation ──────────────────────────────────────────────────
@@ -240,27 +247,44 @@ export class FileExplorerDecorations {
     // the left sidebar is toggled. Keep the observer attached to the live leaf.
     this.observeFileExplorer();
 
-    // Ensure we have rules loaded (single bulk fetch, not per-file)
-    await this.ensureRulesLoaded();
+    // Snapshot visible items + paths so we know what to fetch.
+    const items = Array.from(
+      container.querySelectorAll<HTMLElement>(".nav-file-title, .nav-folder-title")
+    );
+    const itemPaths: Array<{ item: HTMLElement; path: string; isFile: boolean }> = [];
+    const pathsToFetch: string[] = [];
+    const seenPaths = new Set<string>();
+
+    for (const item of items) {
+      const path = this.getItemPath(item);
+      if (!path) continue;
+      const isFile = item.classList.contains("nav-file-title");
+      itemPaths.push({ item, path, isFile });
+      if (!seenPaths.has(path) && this.needsFetch(path)) {
+        seenPaths.add(path);
+        pathsToFetch.push(path);
+      }
+    }
+
+    // Kick off backend fetches (user directory + path access summaries).
+    // The first paint may run before fetches return — items without cached
+    // data render in their "loading" state (no decoration). The MutationObserver
+    // would normally re-trigger us on every mutation; the in-flight guard
+    // below keeps us from stampeding the server with duplicate requests.
+    await this.loadUsersIfNeeded();
+    if (pathsToFetch.length > 0) {
+      await this.fetchAccessForPaths(pathsToFetch);
+    }
 
     // Guard: set flag so observer ignores our own DOM mutations
     this.isDecorating = true;
     try {
-      const items = Array.from(
-        container.querySelectorAll<HTMLElement>(".nav-file-title, .nav-folder-title")
-      );
-
       // First pass: resolve every path's effective level so we can decide
       // folder visibility based on whether any descendant grants access.
-      const resolved: Array<{ item: HTMLElement; path: string; entry: DecorationCacheEntry; isFile: boolean }> = [];
       const accessiblePaths = new Set<string>();
-      for (const item of items) {
-        const path = this.getItemPath(item);
-        if (!path) continue;
-        const entry = this.getOrBuildCacheEntry(path);
-        const isFile = item.classList.contains("nav-file-title");
-        resolved.push({ item, path, entry, isFile });
-        if (entry.level !== "none") accessiblePaths.add(path);
+      for (const { path } of itemPaths) {
+        const entry = this.cache.get(path);
+        if (entry && entry.level !== "none") accessiblePaths.add(path);
       }
 
       const hasAccessibleDescendant = (folderPath: string): boolean => {
@@ -271,7 +295,20 @@ export class FileExplorerDecorations {
         return false;
       };
 
-      for (const { item, path, entry, isFile } of resolved) {
+      for (const { item, path, isFile } of itemPaths) {
+        const entry = this.cache.get(path);
+
+        // If we have no cached entry (fetch failed, or stale and refresh
+        // pending), leave the row unhidden and skip decoration — never hide
+        // a row based on a guess. The Obsidian file explorer treats absent
+        // decorations as "no info" rather than "no access", which is the
+        // safer default for a permission UI.
+        if (!entry) {
+          item.classList.remove(HIDDEN_CLS);
+          this.removeDecoration(item);
+          continue;
+        }
+
         // Files: hide when the user has no access. Folders: hide only when
         // the user has no access AND no descendant grants access — otherwise
         // we'd hide a folder containing accessible children.
@@ -279,12 +316,6 @@ export class FileExplorerDecorations {
           entry.level === "none" && (isFile || !hasAccessibleDescendant(path));
         item.classList.toggle(HIDDEN_CLS, shouldHide);
 
-        // Always re-apply. The previous `cache.has(path)` skip was a no-op
-        // because the first pass above populated the cache for every item
-        // before we got here, so already-decorated rows (especially the
-        // folder row, which Obsidian reuses) never re-rendered after a
-        // permission change. `applyDecoration` removes any existing
-        // decoration node first, so this is idempotent and flicker-free.
         this.applyDecoration(item, entry);
       }
     } finally {
@@ -292,10 +323,16 @@ export class FileExplorerDecorations {
     }
   }
 
+  private needsFetch(path: string): boolean {
+    if (this.inFlightPaths.has(path)) return false;
+    const cached = this.cache.get(path);
+    if (!cached) return true;
+    return Date.now() - cached.fetchedAt >= CACHE_TTL_MS;
+  }
+
   private applyDecoration(item: HTMLElement, data: DecorationCacheEntry): void {
     // Remove existing decoration if present
-    const existing = item.querySelector(`.${DECORATION_CLS}`);
-    if (existing) existing.remove();
+    this.removeDecoration(item);
 
     const decoration = createDiv({ cls: DECORATION_CLS });
 
@@ -327,7 +364,7 @@ export class FileExplorerDecorations {
         } else if (principal.id === "*") {
           setIcon(avatar, "globe");
         } else {
-          avatar.setText(this.initials(principal.id));
+          avatar.setText(this.initials(principal.id, principal.label));
         }
         avatar.title = `${principal.label} (${this.formatLevel(principal.level)})`;
       }
@@ -341,6 +378,11 @@ export class FileExplorerDecorations {
     }
 
     item.appendChild(decoration);
+  }
+
+  private removeDecoration(item: HTMLElement): void {
+    const existing = item.querySelector(`.${DECORATION_CLS}`);
+    if (existing) existing.remove();
   }
 
   private removeAllDecorations(): void {
@@ -370,269 +412,140 @@ export class FileExplorerDecorations {
     return owner?.dataset.path ?? null;
   }
 
-  // ─── Data Fetching (bulk, not per-file) ───────────────────────────────
+  // ─── Data Fetching (backend source of truth) ──────────────────────────
 
-  private async ensureRulesLoaded(): Promise<void> {
-    const isStale = Date.now() - this.allRulesFetchedAt >= CACHE_TTL_MS;
-    if (this.allRules && !isStale) return;
-
-    // Deduplicate concurrent fetches
-    if (this.fetchPromise) {
-      await this.fetchPromise;
-      return;
+  /**
+   * Fetches access summaries for the given paths via the batch endpoint and
+   * stores them in the cache. Splits requests into chunks of `BATCH_PATH_LIMIT`
+   * to respect the backend cap. Concurrent requests for the same path are
+   * deduplicated via `inFlightPaths`.
+   */
+  private async fetchAccessForPaths(paths: string[]): Promise<void> {
+    // Dedupe paths that already have an in-flight fetch.
+    const pending: string[] = [];
+    const inFlightForThisCall: Array<Promise<void>> = [];
+    for (const path of paths) {
+      const existing = this.inFlightPaths.get(path);
+      if (existing) {
+        inFlightForThisCall.push(existing);
+      } else {
+        pending.push(path);
+      }
     }
 
-    this.fetchPromise = this.fetchAllRules();
-    try {
-      await this.fetchPromise;
-    } finally {
-      this.fetchPromise = null;
+    // Chunk + fire requests; record one promise per path so concurrent
+    // decorate passes can coalesce on it.
+    for (let i = 0; i < pending.length; i += BATCH_PATH_LIMIT) {
+      const chunk = pending.slice(i, i + BATCH_PATH_LIMIT);
+      const requestPromise = this.fetchBatchChunk(chunk);
+      for (const path of chunk) {
+        this.inFlightPaths.set(path, requestPromise);
+      }
+      inFlightForThisCall.push(requestPromise);
+      // Detach the cleanup so the in-flight entry clears whether or not
+      // the request succeeded.
+      requestPromise.finally(() => {
+        for (const path of chunk) {
+          if (this.inFlightPaths.get(path) === requestPromise) {
+            this.inFlightPaths.delete(path);
+          }
+        }
+      });
+    }
+
+    if (inFlightForThisCall.length > 0) {
+      await Promise.allSettled(inFlightForThisCall);
     }
   }
 
-  private async fetchAllRules(): Promise<void> {
+  private async fetchBatchChunk(paths: string[]): Promise<void> {
     try {
-      const [rules] = await Promise.all([
-        this.config.apiClient.getPermissions(),
-        this.loadUsersIfNeeded(),
-      ]);
-      this.allRules = rules;
-      this.allRulesFetchedAt = Date.now();
-      this.cache.clear(); // rebuild from fresh rules
-    } catch {
-      // On error, keep stale data if available
-      if (!this.allRules) {
-        this.allRules = [];
-        this.allRulesFetchedAt = Date.now();
+      const summaries = await this.config.apiClient.getBatchPathAccess(paths);
+      const byPath = new Map(summaries.map((s) => [this.normalizePath(s.path), s]));
+      const now = Date.now();
+      for (const path of paths) {
+        const normalized = this.normalizePath(path);
+        const summary = byPath.get(normalized);
+        if (summary) {
+          this.cache.set(path, this.summaryToCacheEntry(summary, now));
+        } else {
+          // Backend returned nothing for this path — treat as "no access"
+          // so the row is hidden. This matches the explicit "currentUserLevel:
+          // 'none'" branch the handler takes when the caller can't read the path.
+          this.cache.set(path, {
+            level: "none",
+            sharedWith: 0,
+            principals: [],
+            fetchedAt: now,
+          });
+        }
       }
+    } catch {
+      // On error, don't poison the cache. The next decorate pass will retry
+      // the path because needsFetch() sees no cached entry.
     }
+  }
+
+  private normalizePath(path: string): string {
+    const trimmed = path.trim().replace(/\/+/g, "/");
+    return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  }
+
+  private summaryToCacheEntry(
+    summary: PathAccessSummary,
+    fetchedAt: number
+  ): DecorationCacheEntry {
+    const principals = summary.principals
+      .filter((p) => p.userId !== this.config.currentUserId)
+      .filter((p) => p.level !== "none")
+      .map((p) => ({
+        id: p.userId,
+        label: this.principalLabel(p),
+        level: p.level,
+        type: "user" as const,
+      }))
+      .sort((a, b) => this.levelRank(b.level) - this.levelRank(a.level));
+
+    return {
+      level: summary.currentUserLevel,
+      sharedWith: principals.length,
+      principals,
+      fetchedAt,
+    };
+  }
+
+  private principalLabel(principal: PathAccessPrincipal): string {
+    if (principal.displayName) return principal.displayName;
+    if (principal.email) return principal.email;
+    const user = this.userMap.get(principal.userId);
+    if (user) return getAccessUserDisplayName(user);
+    return principal.userId;
   }
 
   private async loadUsersIfNeeded(): Promise<void> {
     if (this.usersLoaded) return;
-    try {
-      const users = await this.config.apiClient.listUsers();
-      this.userMap = buildAccessUserMap(users);
-      this.usersLoaded = true;
-    } catch {
-      // Silently fail — degrades to showing user IDs
+    if (this.usersLoadPromise) {
+      await this.usersLoadPromise;
+      return;
     }
-  }
-
-  private resolveUserLabel(userId: string): string {
-    if (userId === "*") return "Everyone";
-    const user = this.userMap.get(userId);
-    return user ? getAccessUserDisplayName(user) : userId;
-  }
-
-  private getOrBuildCacheEntry(path: string): DecorationCacheEntry {
-    const cached = this.cache.get(path);
-    if (cached) return cached;
-
-    const rules = this.allRules ?? [];
-    const matchingRules = rules.filter((r) => this.ruleMatchesPath(r.pathPattern, path));
-    const entry = this.rulesToCacheEntry(matchingRules);
-    this.cache.set(path, entry);
-    return entry;
-  }
-
-  private rulesToCacheEntry(rules: PermissionRule[]): DecorationCacheEntry {
-    const myLevel = this.resolveMyLevel(rules);
-
-    // Per-principal state — the same conflict-resolution shape used by the
-    // header. Without specificity + denied tracking, a deny rule for a user
-    // who also has an allow rule was simply skipped, leaving the avatar in
-    // the sidebar even after admin revoked their access.
-    interface PrincipalState {
-      id: string;
-      label: string;
-      level: string;
-      type: "user" | "role";
-      specificity: number;
-      denied: boolean;
-    }
-
-    const principals = new Map<string, PrincipalState>();
-
-    const shouldReplace = (
-      current: PrincipalState | undefined,
-      nextLevel: string,
-      specificity: number,
-      denied: boolean
-    ): boolean => {
-      if (!current) return true;
-      if (specificity > current.specificity) return true;
-      if (specificity < current.specificity) return false;
-      if (denied && !current.denied) return true;
-      if (!denied && current.denied) return false;
-      return this.levelRank(nextLevel) > this.levelRank(current.level);
-    };
-
-    for (const rule of rules) {
-      const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
-      const specificity = this.patternSpecificity(rule.pathPattern);
-      const denied = rule.effect === "deny";
-
-      if (rule.role) {
-        const key = `role:${rule.role}`;
-        if (!shouldReplace(principals.get(key), level, specificity, denied)) continue;
-        principals.set(key, {
-          id: rule.role,
-          label: rule.role,
-          level,
-          type: "role",
-          specificity,
-          denied,
-        });
-        continue;
+    this.usersLoadPromise = (async () => {
+      try {
+        const users = await this.config.apiClient.listUsers();
+        this.userMap = buildAccessUserMap(users);
+        this.usersLoaded = true;
+      } catch {
+        // Silently fail — backend principal labels still come through; this
+        // is only a fallback for initials.
+      } finally {
+        this.usersLoadPromise = null;
       }
-
-      if (rule.userId === this.config.currentUserId) continue;
-      const key = `user:${rule.userId}`;
-      if (!shouldReplace(principals.get(key), level, specificity, denied)) continue;
-      principals.set(key, {
-        id: rule.userId,
-        label: this.resolveUserLabel(rule.userId),
-        level,
-        type: "user",
-        specificity,
-        denied,
-      });
-    }
-
-    // Drop anyone whose effective access resolved to "none" (revoked /
-    // explicitly denied). Strip the conflict-resolution metadata before
-    // returning so the cache entry shape stays minimal.
-    const sortedPrincipals = [...principals.values()]
-      .filter((principal) => principal.level !== "none")
-      .map(({ id, label, level, type }) => ({ id, label, level, type }))
-      .sort((a, b) => this.levelRank(b.level) - this.levelRank(a.level));
-
-    return {
-      level: myLevel,
-      sharedWith: sortedPrincipals.length,
-      principals: sortedPrincipals,
-    };
-  }
-
-  // ─── Rule Matching ────────────────────────────────────────────────────
-
-  private ruleMatchesPath(pattern: string, path: string): boolean {
-    const normalizedPattern = pattern.replace(/^\/+/, "").replace(/\/+$/, "");
-    const normalizedPath = path.replace(/^\/+/, "").replace(/\/+$/, "");
-
-    if (normalizedPath === normalizedPattern) return true;
-
-    if (!normalizedPattern.includes("*") && normalizedPath.startsWith(normalizedPattern + "/")) {
-      return true;
-    }
-
-    if (normalizedPattern === "*" || normalizedPattern === "**") return true;
-
-    if (normalizedPattern.includes("*")) {
-      return this.matchGlob(normalizedPath, normalizedPattern);
-    }
-
-    return false;
-  }
-
-  private matchGlob(path: string, pattern: string): boolean {
-    let regexStr = "^";
-    let i = 0;
-
-    while (i < pattern.length) {
-      const char = pattern[i];
-      if (char === "*") {
-        if (pattern[i + 1] === "*") {
-          if (pattern[i + 2] === "/") {
-            regexStr += "(?:.+/)?";
-            i += 3;
-          } else {
-            regexStr += ".*";
-            i += 2;
-          }
-        } else {
-          regexStr += "[^/]*";
-          i++;
-        }
-      } else if (".+^${}()|[]\\".includes(char)) {
-        regexStr += "\\" + char;
-        i++;
-      } else {
-        regexStr += char;
-        i++;
-      }
-    }
-
-    regexStr += "$";
-
-    try {
-      return new RegExp(regexStr).test(path);
-    } catch {
-      return false;
-    }
+    })();
+    await this.usersLoadPromise;
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────
 
-  private resolveMyLevel(rules: PermissionRule[]): string {
-    const role = this.config.currentUserRole;
-    if (role === "admin" || role === "owner") return "admin";
-
-    let bestLevel = "none";
-    let bestSpecificity = -1;
-
-    for (const rule of rules) {
-      const applies =
-        rule.userId === this.config.currentUserId ||
-        rule.userId === "*" ||
-        (rule.role && role === rule.role);
-
-      if (!applies) continue;
-
-      const specificity = this.patternSpecificity(rule.pathPattern);
-      if (specificity > bestSpecificity) {
-        bestSpecificity = specificity;
-        bestLevel = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
-      } else if (specificity === bestSpecificity) {
-        const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
-        if (this.levelRank(level) > this.levelRank(bestLevel)) {
-          bestLevel = level;
-        }
-      }
-    }
-
-    if (bestLevel === "none" && bestSpecificity === -1) {
-      return this.defaultLevelForRole();
-    }
-
-    return bestLevel;
-  }
-
-  private defaultLevelForRole(): string {
-    const role = this.config.currentUserRole;
-    if (role === "admin" || role === "owner") return "admin";
-    if (role === "editor") return "write";
-    return "read";
-  }
-
-  private ruleLevelString(rule: PermissionRule): string {
-    if (rule.actions.includes("admin")) return "admin";
-    if (rule.actions.includes("write") || rule.actions.includes("delete")) return "write";
-    if (rule.actions.includes("read")) return "read";
-    return "none";
-  }
-
-  private patternSpecificity(pattern: string): number {
-    let score = 0;
-    score += (pattern.match(/\//g) || []).length * 10;
-    if (!pattern.includes("*")) score += 100;
-    if (pattern.includes("**")) score -= 50;
-    score += pattern.length;
-    return score;
-  }
-
-  private levelRank(level: string): number {
+  private levelRank(level: PermissionAccessLevel): number {
     switch (level) {
       case "admin": return 3;
       case "write": return 2;
@@ -641,7 +554,7 @@ export class FileExplorerDecorations {
     }
   }
 
-  private formatLevel(level: string): string {
+  private formatLevel(level: PermissionAccessLevel): string {
     switch (level) {
       case "admin": return "Admin";
       case "write": return "Write";
@@ -650,11 +563,14 @@ export class FileExplorerDecorations {
     }
   }
 
-  private initials(userId: string): string {
+  private initials(userId: string, label: string): string {
     if (userId === "*") return "*";
     const user = this.userMap.get(userId);
     if (user) return getAccessUserNameInitials(user);
-    const parts = userId.split(/[\s@._-]+/).filter(Boolean);
+    // Prefer initials derived from the human label (display name / email)
+    // before falling back to the UUID — UUIDs make for unreadable chips.
+    const source = label && label !== userId ? label : userId;
+    const parts = source.split(/[\s@._-]+/).filter(Boolean);
     return parts
       .slice(0, 2)
       .map((p) => p[0]?.toUpperCase() ?? "")
