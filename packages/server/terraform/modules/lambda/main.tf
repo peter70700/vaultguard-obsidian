@@ -412,6 +412,12 @@ data "aws_iam_policy_document" "files_lambda" {
     resources = [var.sessions_table_arn, "${var.sessions_table_arn}/index/*"]
   }
   statement {
+    actions = ["dynamodb:GetItem", "dynamodb:Query"]
+    resources = [
+      var.user_keys_table_arn, "${var.user_keys_table_arn}/index/*",
+    ]
+  }
+  statement {
     actions   = ["dynamodb:GetItem"]
     resources = [var.revoked_keys_table_arn]
   }
@@ -1268,6 +1274,12 @@ data "aws_iam_policy_document" "vaults_lambda" {
   statement {
     actions   = ["dynamodb:Query", "dynamodb:UpdateItem"]
     resources = [var.leases_table_arn, "${var.leases_table_arn}/index/*"]
+  }
+  # Vault activity log — member role changes alter effective permissions for
+  # the whole vault, so append a permission_changed cursor event.
+  statement {
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.vault_activity_table_arn]
   }
   # Audit logging
   statement {

@@ -2818,12 +2818,6 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
-    const defaultLevel = this.deriveDefaultPermissionLevel();
-    if (defaultLevel !== null) {
-      this.vaultDefaultPermission = defaultLevel;
-      this.permissionCache.set("", defaultLevel);
-    }
-
     let rules: PermissionRule[] = [];
     try {
       rules = await this.apiClient.getPermissions();
@@ -2832,8 +2826,26 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
-    for (const rule of rules) {
-      if (!this.ruleAppliesToCurrentUser(rule)) continue;
+    const applicableRules = rules.filter(
+      (rule) => this.ruleAppliesToCurrentUser(rule) && !this.ruleIsExpired(rule)
+    );
+    const hasDynamicRules = applicableRules.some((rule) =>
+      this.isGlobPattern(rule.pathPattern)
+    );
+
+    const defaultLevel = this.deriveDefaultPermissionLevel();
+    if (defaultLevel !== null) {
+      this.vaultDefaultPermission = defaultLevel;
+      // A root default is only safe when every applicable rule can be
+      // represented by the literal ancestor cache below. Glob rules need the
+      // backend's matcher; otherwise a cached viewer READ would bypass
+      // `/secret/**` denies or miss `/editable/**` write grants.
+      if (!hasDynamicRules) {
+        this.permissionCache.set("", defaultLevel);
+      }
+    }
+
+    for (const rule of applicableRules) {
       // Glob patterns can't be exact-matched in the path-walk cache —
       // leave them to the per-file network probe.
       if (this.isGlobPattern(rule.pathPattern)) continue;
@@ -2841,10 +2853,15 @@ export default class VaultGuardPlugin extends Plugin {
       const level = this.ruleToPermissionLevel(rule);
       const cacheKey = this.normalizeVaultPath(rule.pathPattern);
 
-      // Deny rules and explicit grants both win over the default. If two
-      // rules cover the same exact path, take the higher level so explicit
-      // grants don't get clobbered by an inherited deny we already saw.
+      // Deny wins over allow at the same literal path, matching the backend
+      // evaluator. Allows can still combine upward by level when no deny is
+      // present for that exact cache key.
       const existing = this.permissionCache.get(cacheKey);
+      if (rule.effect === "deny") {
+        this.permissionCache.set(cacheKey, PermissionLevel.NONE);
+        continue;
+      }
+      if (existing === PermissionLevel.NONE) continue;
       if (existing !== undefined && existing >= level) continue;
       this.permissionCache.set(cacheKey, level);
     }
@@ -2895,6 +2912,10 @@ export default class VaultGuardPlugin extends Plugin {
       return PermissionLevel.READ;
     }
     return PermissionLevel.NONE;
+  }
+
+  private ruleIsExpired(rule: PermissionRule): boolean {
+    return typeof rule.expiresAt === "string" && rule.expiresAt <= new Date().toISOString();
   }
 
   private isGlobPattern(pattern: string): boolean {

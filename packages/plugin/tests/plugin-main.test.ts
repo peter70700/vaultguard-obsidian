@@ -4,6 +4,7 @@ import { Menu, Notice, requestUrl } from "obsidian";
 
 import VaultGuardPlugin from "../src/plugin/main";
 import { DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "../src/plugin/settings";
+import { PermissionLevel } from "../src/types";
 
 const mockNotice = vi.mocked(Notice);
 const mockRequestUrl = vi.mocked(requestUrl);
@@ -1683,6 +1684,134 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       currentUserId: "user-1",
       currentUserRole: "viewer",
     });
+  });
+
+  it("does not let a warmed vault-default cache bypass glob deny rules", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
+    plugin.vaultMemberRole = "viewer";
+    plugin.connectionState.status = "online";
+    plugin.apiClient = {
+      getPermissions: vi.fn().mockResolvedValue([
+        {
+          id: "deny-secret",
+          vaultId: "vault-abc",
+          userId: "*",
+          role: null,
+          pathPattern: "/secret/**",
+          actions: ["read", "list"],
+          effect: "deny",
+          priority: 100,
+          createdAt: "2026-05-01T00:00:00.000Z",
+          updatedAt: "2026-05-01T00:00:00.000Z",
+          createdBy: "admin-1",
+        },
+      ]),
+    };
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: { allowed: false },
+      error: null,
+      requestId: "req-perm",
+    });
+
+    await plugin.runPermissionWarmup();
+
+    expect(plugin.permissionCache.has("")).toBe(false);
+    const level = await plugin.getEffectivePermission("secret/plan.md");
+
+    expect(level).toBe(PermissionLevel.NONE);
+    expect(plugin.apiRequest).toHaveBeenCalledWith(
+      "POST",
+      "/vaults/vault-abc/permissions/check",
+      expect.objectContaining({ action: "read", path: "/secret/plan.md" })
+    );
+  });
+
+  it("asks the server for glob write grants instead of stopping at the viewer default", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
+    plugin.vaultMemberRole = "viewer";
+    plugin.connectionState.status = "online";
+    plugin.apiClient = {
+      getPermissions: vi.fn().mockResolvedValue([
+        {
+          id: "allow-editable",
+          vaultId: "vault-abc",
+          userId: "user-1",
+          role: null,
+          pathPattern: "/editable/**",
+          actions: ["read", "write", "list"],
+          effect: "allow",
+          priority: 100,
+          createdAt: "2026-05-01T00:00:00.000Z",
+          updatedAt: "2026-05-01T00:00:00.000Z",
+          createdBy: "admin-1",
+        },
+      ]),
+    };
+    plugin.apiRequest = vi.fn(async (_method: string, _path: string, body: { action: string }) => ({
+      success: true,
+      data: { allowed: body.action === "write" || body.action === "read" },
+      error: null,
+      requestId: "req-perm",
+    }));
+
+    await plugin.runPermissionWarmup();
+
+    expect(plugin.permissionCache.has("")).toBe(false);
+    const level = await plugin.getEffectivePermission("editable/draft.md");
+
+    expect(level).toBe(PermissionLevel.WRITE);
+    expect(plugin.apiRequest).toHaveBeenCalledWith(
+      "POST",
+      "/vaults/vault-abc/permissions/check",
+      expect.objectContaining({ action: "write", path: "/editable/draft.md" })
+    );
+  });
+
+  it("keeps literal deny rules authoritative over literal allows in the warm cache", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
+    plugin.vaultMemberRole = "viewer";
+    plugin.apiClient = {
+      getPermissions: vi.fn().mockResolvedValue([
+        {
+          id: "allow-doc",
+          vaultId: "vault-abc",
+          userId: "user-1",
+          role: null,
+          pathPattern: "/docs/locked.md",
+          actions: ["read"],
+          effect: "allow",
+          priority: 10,
+          createdAt: "2026-05-01T00:00:00.000Z",
+          updatedAt: "2026-05-01T00:00:00.000Z",
+          createdBy: "admin-1",
+        },
+        {
+          id: "deny-doc",
+          vaultId: "vault-abc",
+          userId: "user-1",
+          role: null,
+          pathPattern: "/docs/locked.md",
+          actions: ["read"],
+          effect: "deny",
+          priority: 1,
+          createdAt: "2026-05-01T00:00:00.000Z",
+          updatedAt: "2026-05-01T00:00:00.000Z",
+          createdBy: "admin-1",
+        },
+      ]),
+    };
+    plugin.apiRequest = vi.fn();
+
+    await plugin.runPermissionWarmup();
+    const level = await plugin.getEffectivePermission("docs/locked.md");
+
+    expect(level).toBe(PermissionLevel.NONE);
+    expect(plugin.permissionCache.get("docs/locked.md")).toBe(PermissionLevel.NONE);
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
   });
 
   it("clears only the current vault session on logout", async () => {

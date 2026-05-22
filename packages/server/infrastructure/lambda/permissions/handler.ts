@@ -7,7 +7,7 @@
  * permissions with inheritance, time-bound grants, and conflict resolution.
  *
  * Endpoints (all under /vaults/{vaultId}):
- * - GET    /permissions                — List rules in this vault (vault member)
+ * - GET    /permissions                — List rules in this vault (vault-admin or org-admin)
  * - GET    /vaults/{vaultId}/permissions/user/{userId} — Effective permissions for a user (self or vault-admin)
  * - POST   /permissions                — Create rule (vault-admin or org-admin)
  * - PUT    /vaults/{vaultId}/permissions/{id} — Update rule (vault-admin)
@@ -144,7 +144,11 @@ async function handleListPermissions(
   vault: VaultRecord,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  // Vault membership was already verified at the routing layer.
+  // Permission rules can reveal hidden path names and target principals, so
+  // full rule listing is admin-only. Non-admin plugin clients should use the
+  // per-path `/permissions/check` route instead of pulling the rule table.
+  await requireVaultMember(user, vault.vaultId, 'admin');
+
   const limit = Math.min(parseInt(event.queryStringParameters?.limit || '50', 10), 500);
   const pathFilter = event.queryStringParameters?.pathFilter;
   const effectFilter = event.queryStringParameters?.effectFilter;
@@ -247,8 +251,24 @@ async function handleGetUserPermissions(
     return formatError(403, 'You can only view your own permissions', requestId);
   }
 
-  // Fetch all rules applicable to this user inside this vault.
-  const userRules = await fetchAllUserRules(targetUserId, vault.orgId, vault.vaultId);
+  // Fetch all rules applicable to this user inside this vault, including
+  // role-based rules derived from the target's vault membership. Without
+  // the role-index pass, the "effective permissions" view omitted grants or
+  // denies attached to viewer/editor/admin roles even though enforcement used
+  // them.
+  const targetMembership = await getVaultMembership(vault.vaultId, targetUserId);
+  const targetRoles =
+    targetMembership
+      ? [targetMembership.role]
+      : targetUserId === user.userId
+        ? user.roles
+        : [];
+  const userRules = await fetchAllUserRules(
+    targetUserId,
+    vault.orgId,
+    vault.vaultId,
+    targetRoles
+  );
 
   // Group by path pattern for a readable summary
   const effectivePermissions = consolidatePermissions(userRules);
@@ -341,7 +361,12 @@ async function handleCreatePermission(
   }
 
   // Reject duplicate: same principal + same exact path already has a rule
-  const existingUserRules = await fetchAllUserRules(userId, vault.orgId, vault.vaultId);
+  const existingUserRules = await fetchAllUserRules(
+    userId,
+    vault.orgId,
+    vault.vaultId,
+    role ? [role] : []
+  );
   const duplicate = existingUserRules.find((rule) => {
     const samePath = rule.pathPattern === pathPattern;
     const samePrincipal = role
@@ -849,9 +874,19 @@ async function handleCheckPermission(
 async function fetchAllUserRules(
   userId: string,
   orgId: string,
-  vaultId: string
+  vaultId: string,
+  roles: string[] = []
 ): Promise<PermissionRule[]> {
   const results: PermissionRule[] = [];
+  const seen = new Set<string>();
+  const pushRules = (items: unknown[] | undefined) => {
+    for (const rule of (items ?? []) as PermissionRule[]) {
+      const key = rule.id || `${rule.userId}:${rule.role ?? ''}:${rule.pathPattern}:${rule.effect}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push(rule);
+    }
+  };
 
   // User-specific rules (scoped to org + vault)
   const userResult = await docClient.send(
@@ -863,7 +898,22 @@ async function fetchAllUserRules(
       ExpressionAttributeValues: { ':uid': userId, ':orgId': orgId, ':vaultId': vaultId },
     })
   );
-  if (userResult.Items) results.push(...(userResult.Items as PermissionRule[]));
+  pushRules(userResult.Items);
+
+  // Role-based rules (scoped to org + vault)
+  for (const role of roles) {
+    const roleResult = await docClient.send(
+      new QueryCommand({
+        TableName: PERMISSIONS_TABLE,
+        IndexName: 'role-index',
+        KeyConditionExpression: '#role = :role',
+        ExpressionAttributeNames: { '#role': 'role' },
+        FilterExpression: 'orgId = :orgId AND vaultId = :vaultId',
+        ExpressionAttributeValues: { ':role': role, ':orgId': orgId, ':vaultId': vaultId },
+      })
+    );
+    pushRules(roleResult.Items);
+  }
 
   // Wildcard rules (scoped to org + vault)
   const wildcardResult = await docClient.send(
@@ -875,7 +925,7 @@ async function fetchAllUserRules(
       ExpressionAttributeValues: { ':uid': '*', ':orgId': orgId, ':vaultId': vaultId },
     })
   );
-  if (wildcardResult.Items) results.push(...(wildcardResult.Items as PermissionRule[]));
+  pushRules(wildcardResult.Items);
 
   return results;
 }
@@ -940,7 +990,12 @@ async function findConflictingRules(
   orgId: string,
   vaultId: string
 ): Promise<PermissionRule[]> {
-  const existingRules = await fetchAllUserRules(userId, orgId, vaultId);
+  const existingRules = await fetchAllUserRules(
+    userId,
+    orgId,
+    vaultId,
+    role ? [role] : []
+  );
 
   return existingRules.filter((rule) => {
     // Check if paths overlap

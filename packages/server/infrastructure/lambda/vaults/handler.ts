@@ -46,6 +46,7 @@ import {
   generateId,
   AuthError,
   ValidationError,
+  recordVaultActivity,
   PutCommand,
   DeleteCommand,
   UpdateCommand,
@@ -605,6 +606,30 @@ async function handleUpdateMember(
     new Date().toISOString()
   );
 
+  let revokedLeases = 0;
+  if (existing.role !== role) {
+    // A role change can narrow file permissions while an old vault-scoped
+    // DEK lease is still alive. Revoke those leases immediately so demotion
+    // takes effect on both the authorization and cryptographic planes.
+    revokedLeases = await revokeUserVaultLeases(
+      targetUserId,
+      vaultId,
+      vault.orgId,
+      user.userId
+    );
+
+    // Signal member clients to clear local permission caches and re-evaluate
+    // their file set. The default member rule is `/**`, so the whole vault can
+    // be affected by a role change.
+    await recordVaultActivity({
+      orgId: vault.orgId,
+      vaultId,
+      action: 'permission_changed',
+      path: '/**',
+      actorUserId: user.userId,
+    });
+  }
+
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
@@ -614,7 +639,7 @@ async function handleUpdateMember(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { vaultId, targetUserId, oldRole: existing.role, newRole: role },
+    metadata: { vaultId, targetUserId, oldRole: existing.role, newRole: role, revokedLeases },
   });
 
   return formatSuccess(200, { membership: { ...existing, role } }, requestId);

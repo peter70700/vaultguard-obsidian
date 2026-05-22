@@ -1404,6 +1404,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.files_path_delete,
     aws_api_gateway_integration.files_path_post,
     aws_api_gateway_integration.files_deleted_get,
+    aws_api_gateway_integration.files_decrypted_path_get,
     # Permissions
     aws_api_gateway_integration.permissions_get,
     aws_api_gateway_integration.permissions_post,
@@ -1499,6 +1500,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.files_path_delete.id,
       aws_api_gateway_integration.files_path_post.id,
       aws_api_gateway_integration.files_deleted_get.id,
+      aws_api_gateway_integration.files_decrypted_path_get.id,
       aws_api_gateway_integration.permissions_get.id,
       aws_api_gateway_integration.permissions_post.id,
       aws_api_gateway_integration.permissions_delete.id,

@@ -428,7 +428,52 @@ async function handleRefresh(
     await expireLease(existingLease.leaseId);
     throw new AuthError('Legacy lease has no vault binding; request a vault-scoped lease.', 410);
   }
-  await requireVaultMember(user, existingLease.vaultId, 'viewer');
+  const renewalScope = existingLease.scope || '/**';
+  const renewalVaultId = existingLease.vaultId;
+  await requireVaultMember(user, renewalVaultId, 'viewer');
+
+  // Re-run the same scope permission checks used for initial lease issuance.
+  // Otherwise an existing broad `/**` lease could be renewed after an admin
+  // adds a deny rule, keeping local decryption alive past the permission cut.
+  try {
+    await assertScopeHasNoReadDenyRules(user, renewalVaultId, renewalScope, event, requestId);
+  } catch (err) {
+    if (err instanceof AuthError) {
+      await expireLease(existingLease.leaseId);
+    }
+    throw err;
+  }
+
+  const permissionProbePath = scopeToPermissionProbePath(renewalScope);
+  const permission = await evaluatePermission(
+    user.userId,
+    user.roles,
+    'read',
+    permissionProbePath,
+    user.orgId,
+    renewalVaultId
+  );
+  if (!permission.allowed) {
+    await logAudit({
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: user.orgId,
+      vaultId: renewalVaultId,
+      action: 'auth.refresh.denied',
+      resourcePath: `/vaults/${renewalVaultId}/auth/refresh`,
+      outcome: 'denied',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: {
+        vaultId: renewalVaultId,
+        scope: renewalScope,
+        reason: 'insufficient_scope_permission',
+        matchedRule: permission.matchedRule?.id,
+      },
+    });
+    await expireLease(existingLease.leaseId);
+    throw new AuthError('Access denied: insufficient permissions for requested key scope', 403);
+  }
 
   await expireLease(existingLease.leaseId);
 
@@ -451,8 +496,8 @@ async function handleRefresh(
     user.userId,
     sessionId,
     user.orgId,
-    existingLease.scope || '/**',
-    existingLease.vaultId
+    renewalScope,
+    renewalVaultId
   );
 
   await logAudit({
