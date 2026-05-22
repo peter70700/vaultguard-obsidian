@@ -45,6 +45,7 @@ locals {
     permissions            = aws_api_gateway_resource.permissions.id
     permissions_id         = aws_api_gateway_resource.permissions_id.id
     permissions_check      = aws_api_gateway_resource.permissions_check.id
+    permissions_access     = aws_api_gateway_resource.permissions_access.id
     audit                  = aws_api_gateway_resource.audit.id
     audit_logs             = aws_api_gateway_resource.audit_logs.id
     audit_alerts           = aws_api_gateway_resource.audit_alerts.id

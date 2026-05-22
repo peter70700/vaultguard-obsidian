@@ -1692,7 +1692,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     plugin.vaultMemberRole = "viewer";
     plugin.connectionState.status = "online";
     plugin.apiClient = {
-      getPermissions: vi.fn().mockResolvedValue([
+      getUserPermissions: vi.fn().mockResolvedValue([
         {
           id: "deny-secret",
           vaultId: "vault-abc",
@@ -1734,7 +1734,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     plugin.vaultMemberRole = "viewer";
     plugin.connectionState.status = "online";
     plugin.apiClient = {
-      getPermissions: vi.fn().mockResolvedValue([
+      getUserPermissions: vi.fn().mockResolvedValue([
         {
           id: "allow-editable",
           vaultId: "vault-abc",
@@ -1775,7 +1775,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
     plugin.vaultMemberRole = "viewer";
     plugin.apiClient = {
-      getPermissions: vi.fn().mockResolvedValue([
+      getUserPermissions: vi.fn().mockResolvedValue([
         {
           id: "allow-doc",
           vaultId: "vault-abc",

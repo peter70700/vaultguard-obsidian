@@ -2820,7 +2820,9 @@ export default class VaultGuardPlugin extends Plugin {
 
     let rules: PermissionRule[] = [];
     try {
-      rules = await this.apiClient.getPermissions();
+      rules = this.isEffectiveAdmin()
+        ? await this.apiClient.getPermissions()
+        : await this.apiClient.getUserPermissions(this.session.userId);
     } catch (err) {
       this.log(`Permission warm-up: rules fetch failed: ${(err as Error).message}`);
       return;
@@ -2900,9 +2902,10 @@ export default class VaultGuardPlugin extends Plugin {
       return true;
     }
     if (rule.role) {
-      const userRoles = this.session.roles?.length
-        ? this.session.roles
-        : [this.session.role];
+      const userRoles = [
+        ...(this.vaultMemberRole ? [this.vaultMemberRole] : []),
+        ...(this.session.roles?.length ? this.session.roles : [this.session.role]),
+      ];
       return userRoles.includes(rule.role);
     }
     return false;

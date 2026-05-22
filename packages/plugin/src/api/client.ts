@@ -66,6 +66,22 @@ export interface PermissionRule {
   createdBy: string;
 }
 
+export type PermissionAccessLevel = "none" | "read" | "write" | "admin";
+
+export interface PathAccessPrincipal {
+  userId: string;
+  email?: string;
+  displayName?: string;
+  role?: string;
+  level: PermissionAccessLevel;
+}
+
+export interface PathAccessSummary {
+  path: string;
+  currentUserLevel: PermissionAccessLevel;
+  principals: PathAccessPrincipal[];
+}
+
 /**
  * A share-link record minted by a vault member. The token itself carries
  * no authority — resolving it to a path still requires vault membership
@@ -630,6 +646,17 @@ export class VaultGuardApiClient {
   async getUserPermissions(userId: string): Promise<PermissionRule[]> {
     const response = await this.request<{ rules: PermissionRule[] }>("GET", `${this.vaultBase()}/permissions/user/${encodeURIComponent(userId)}`);
     return response.rules ?? [];
+  }
+
+  async getPathAccess(path: string): Promise<PathAccessSummary> {
+    const response = await this.request<PathAccessSummary>("POST", `${this.vaultBase()}/permissions/access`, {
+      path: path.startsWith("/") ? path : `/${path}`,
+    });
+    return {
+      path: response.path,
+      currentUserLevel: response.currentUserLevel ?? "none",
+      principals: response.principals ?? [],
+    };
   }
 
   // ─── Share Link Operations (vault-scoped) ───────────────────────────

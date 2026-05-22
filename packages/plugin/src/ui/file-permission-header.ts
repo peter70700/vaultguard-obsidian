@@ -8,7 +8,14 @@
  */
 
 import { App, MarkdownView, TFile, setIcon } from "obsidian";
-import { VaultGuardApiClient, PermissionRule, UserListEntry, VaultMemberRecord } from "../api/client";
+import {
+  PathAccessPrincipal,
+  PathAccessSummary,
+  VaultGuardApiClient,
+  PermissionRule,
+  UserListEntry,
+  VaultMemberRecord,
+} from "../api/client";
 import { PermissionLevel } from "../types";
 import { FilePermissionPanel } from "./file-permission-panel";
 import { setButtonLoading, setControlBusy } from "./loading-button";
@@ -50,8 +57,14 @@ interface HeaderContext {
 
 interface RuleCacheEntry {
   rules?: PermissionRule[];
+  access?: PathAccessSummary | null;
   fetchedAt: number;
-  inFlight?: Promise<PermissionRule[]>;
+  inFlight?: Promise<HeaderData>;
+}
+
+interface HeaderData {
+  rules: PermissionRule[];
+  access: PathAccessSummary | null;
 }
 
 type AccessLevel = "unknown" | "none" | "read" | "write" | "admin";
@@ -70,6 +83,7 @@ type AccessPrincipalState = AccessPrincipal & {
 interface AccessListOptions {
   includeVaultMemberDefaults?: boolean;
   currentUserLevel?: AccessLevel;
+  accessPrincipals?: AccessPrincipal[];
 }
 
 export class FilePermissionHeader {
@@ -138,7 +152,7 @@ export class FilePermissionHeader {
 
     const cached = this.ruleCache.get(file.path);
     if (cached?.rules) {
-      this.renderHeader(headerEl, file, cached.rules);
+      this.renderHeader(headerEl, file, cached.rules, this.optionsFromAccess(cached.access));
       this.activePanel?.setRules(cached.rules);
     } else {
       this.renderSkeleton(headerEl, file);
@@ -156,11 +170,11 @@ export class FilePermissionHeader {
     if (showRefreshing) this.setRefreshing(headerEl, true);
 
     try {
-      const rules = await this.fetchRulesForPath(file.path, options.force === true);
+      const data = await this.fetchHeaderDataForPath(file.path, options.force === true);
       // Check the element is still mounted (user may have switched files)
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
-      this.renderHeader(headerEl, file, rules);
-      this.activePanel?.setRules(rules);
+      this.renderHeader(headerEl, file, data.rules, this.optionsFromAccess(data.access));
+      this.activePanel?.setRules(data.rules);
     } catch {
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
       const currentUserLevel = await this.fetchCurrentUserLevel(file.path);
@@ -301,7 +315,7 @@ export class FilePermissionHeader {
         if (cached?.rules) {
           const view = this.ctx.app.workspace.getActiveViewOfType(MarkdownView);
           if (view?.file?.path === this.activePath) {
-            this.renderHeader(this.activeHeader, view.file, cached.rules);
+            this.renderHeader(this.activeHeader, view.file, cached.rules, this.optionsFromAccess(cached.access));
           }
         }
       }
@@ -337,7 +351,7 @@ export class FilePermissionHeader {
         if (cached?.rules) {
           const view = this.ctx.app.workspace.getActiveViewOfType(MarkdownView);
           if (view?.file?.path === this.activePath) {
-            this.renderHeader(this.activeHeader, view.file, cached.rules);
+            this.renderHeader(this.activeHeader, view.file, cached.rules, this.optionsFromAccess(cached.access));
           }
         }
       }
@@ -430,30 +444,44 @@ export class FilePermissionHeader {
   // ─── Data ──────────────────────────────────────────────────────────
 
   private async fetchRulesForPath(path: string, force = false): Promise<PermissionRule[]> {
+    const data = await this.fetchHeaderDataForPath(path, force);
+    return data.rules;
+  }
+
+  private async fetchHeaderDataForPath(path: string, force = false): Promise<HeaderData> {
     const cached = this.ruleCache.get(path);
-    if (!force && cached?.rules && !this.isCacheStale(cached)) {
-      return cached.rules;
+    if (!force && cached?.rules && cached.access !== undefined && !this.isCacheStale(cached)) {
+      return { rules: cached.rules, access: cached.access ?? null };
     }
 
     if (cached?.inFlight) {
       return cached.inFlight;
     }
 
+    const rulesRequest = this.ctx.isAdmin
+      ? this.ctx.apiClient.getPermissions().catch(() => [] as PermissionRule[])
+      : Promise.resolve([] as PermissionRule[]);
+    const accessRequest = this.ctx.apiClient.getPathAccess(path).catch(() => null);
+
     const request = Promise.all([
-      this.ctx.apiClient.getPermissions(),
+      rulesRequest,
+      accessRequest,
       this.loadVaultMembersIfNeeded(),
     ])
-      .then(([rules]) => {
+      .then(([rules, access]) => {
         const matchingRules = rules.filter((rule) =>
           this.ruleMatchesPath(rule.pathPattern, path)
         );
-        this.ruleCache.set(path, { rules: matchingRules, fetchedAt: Date.now() });
-        return matchingRules;
+        if (access) {
+          this.mergePathAccessIntoDirectory(access.principals);
+        }
+        this.ruleCache.set(path, { rules: matchingRules, access, fetchedAt: Date.now() });
+        return { rules: matchingRules, access };
       })
       .catch((error) => {
-        const fallback = this.ruleCache.get(path)?.rules ?? cached?.rules;
-        if (fallback) {
-          return fallback;
+        const fallback = this.ruleCache.get(path) ?? cached;
+        if (fallback?.rules) {
+          return { rules: fallback.rules, access: fallback.access ?? null };
         }
         throw error;
       })
@@ -463,11 +491,13 @@ export class FilePermissionHeader {
           if (current.rules) {
             this.ruleCache.set(path, {
               rules: current.rules,
+              access: current.access,
               fetchedAt: current.fetchedAt,
             });
           } else if (cached?.rules) {
             this.ruleCache.set(path, {
               rules: cached.rules,
+              access: cached.access,
               fetchedAt: cached.fetchedAt,
             });
           } else {
@@ -478,11 +508,71 @@ export class FilePermissionHeader {
 
     this.ruleCache.set(path, {
       rules: cached?.rules,
+      access: cached?.access,
       fetchedAt: cached?.fetchedAt ?? 0,
       inFlight: request,
     });
 
     return request;
+  }
+
+  private mergePathAccessIntoDirectory(principals: PathAccessPrincipal[]): void {
+    if (principals.length === 0) return;
+
+    const knownIds = new Set(this.users.map((user) => user.id));
+    const additions: UserListEntry[] = [];
+    for (const principal of principals) {
+      if (knownIds.has(principal.userId)) continue;
+      if (!principal.displayName && !principal.email) continue;
+      additions.push({
+        id: principal.userId,
+        email: principal.email ?? "",
+        displayName: principal.displayName ?? "",
+        name: principal.displayName ?? "",
+        role: this.mapVaultRoleToUserRole((principal.role ?? "viewer") as VaultMemberRecord["role"]),
+        status: "active",
+        lastActive: "",
+        createdAt: "",
+        mfaEnabled: false,
+        deviceCount: 0,
+        type: "user",
+      });
+      knownIds.add(principal.userId);
+    }
+
+    if (additions.length === 0) return;
+    this.users = sortAccessUsers([...this.users, ...additions]);
+    this.userMap = buildAccessUserMap(this.users);
+  }
+
+  private optionsFromAccess(access: PathAccessSummary | null | undefined): AccessListOptions {
+    if (!access) return {};
+    return {
+      currentUserLevel: access.currentUserLevel,
+      accessPrincipals: this.pathAccessToPrincipals(access.principals),
+    };
+  }
+
+  private pathAccessToPrincipals(principals: PathAccessPrincipal[]): AccessPrincipal[] {
+    return principals
+      .filter((principal) => principal.level !== "none")
+      .map((principal) => {
+        const label =
+          principal.displayName ||
+          principal.email ||
+          this.resolveUserLabel(principal.userId);
+        return {
+          id: principal.userId,
+          label,
+          level: principal.level,
+          type: "user" as const,
+        };
+      })
+      .sort((a, b) => {
+        const levelDiff = this.levelRank(b.level) - this.levelRank(a.level);
+        if (levelDiff !== 0) return levelDiff;
+        return a.label.localeCompare(b.label);
+      });
   }
 
   private isCacheStale(entry: RuleCacheEntry): boolean {
@@ -573,7 +663,7 @@ export class FilePermissionHeader {
     rules: PermissionRule[],
     options: AccessListOptions = {}
   ): void {
-    const sorted = this.buildVisibleAccessPrincipals(rules, options);
+    const sorted = options.accessPrincipals ?? this.buildVisibleAccessPrincipals(rules, options);
 
     const MAX_SHOWN = 4;
     const shown = sorted.slice(0, MAX_SHOWN);

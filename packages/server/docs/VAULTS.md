@@ -166,12 +166,13 @@ wrapped keys, checksums, ETags, version IDs, or any decrypted content.
 ### Permissions (vault-scoped)
 
 ```
-GET    /vaults/{vaultId}/permissions                      → list rules in vault (any member)
+GET    /vaults/{vaultId}/permissions                      → list raw rules in vault (vault-admin)
 GET    /vaults/{vaultId}/permissions/user/{userId}        → effective perms for a user (self or vault-admin)
 POST   /vaults/{vaultId}/permissions                      → create rule (vault-admin)
 PUT    /vaults/{vaultId}/permissions/{id}                 → update rule (vault-admin)
 DELETE /vaults/{vaultId}/permissions/{id}                 → delete rule (vault-admin)
 POST   /vaults/{vaultId}/permissions/check                → check action on path (any member, self only unless admin)
+POST   /vaults/{vaultId}/permissions/access               → effective per-file access list (any member with read on path)
 ```
 
 ### Audit (vault-scoped)

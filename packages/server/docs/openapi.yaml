@@ -576,7 +576,8 @@ paths:
       - $ref: '#/components/parameters/VaultId'
     get:
       tags: [Permissions]
-      summary: List permission rules in a vault
+      summary: List raw permission rules in a vault
+      description: Vault-admin only. Plugin views for non-admin members should use `POST /permissions/access` for per-file visibility.
       parameters:
         - in: query
           name: pathFilter
@@ -662,6 +663,32 @@ paths:
                   rules:
                     type: array
                     items: { $ref: '#/components/schemas/PermissionRule' }
+
+  /vaults/{vaultId}/permissions/access:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    post:
+      tags: [Permissions]
+      summary: Resolve effective access for every vault member on one path
+      description: |
+        Server-computed source of truth for the per-file permission header.
+        Returns the caller's level even when denied; the principal list is
+        returned only when the caller has read access to the path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string }
+      responses:
+        '200':
+          description: Effective access summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PathAccessSummary' }
 
   # ─── Share Links ─────────────────────────────────────────────────────────
   #
@@ -1317,6 +1344,32 @@ components:
           format: date-time
           description: Optional ISO timestamp after which the rule is ignored.
         createdBy: { type: string }
+
+    PathAccessPrincipal:
+      type: object
+      required: [userId, level]
+      properties:
+        userId: { type: string }
+        email: { type: string, format: email }
+        displayName: { type: string }
+        role:
+          type: string
+          enum: [viewer, editor, admin]
+        level:
+          type: string
+          enum: [none, read, write, admin]
+
+    PathAccessSummary:
+      type: object
+      required: [path, currentUserLevel, principals]
+      properties:
+        path: { type: string }
+        currentUserLevel:
+          type: string
+          enum: [none, read, write, admin]
+        principals:
+          type: array
+          items: { $ref: '#/components/schemas/PathAccessPrincipal' }
 
     ShareRecord:
       type: object

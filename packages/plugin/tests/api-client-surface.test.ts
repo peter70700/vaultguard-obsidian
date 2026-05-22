@@ -149,6 +149,11 @@ describe("VaultGuardApiClient surface", () => {
       .mockResolvedValueOnce(jsonResponse(200, { rule: { ...rule, priority: 2 } }))
       .mockResolvedValueOnce(emptyResponse())
       .mockResolvedValueOnce(jsonResponse(200, { rules: [rule] }))
+      .mockResolvedValueOnce(jsonResponse(200, {
+        path: "/docs/a.md",
+        currentUserLevel: "read",
+        principals: [{ userId: "user-1", level: "read" }],
+      }))
       .mockResolvedValueOnce(
         jsonResponse(200, [
           {
@@ -186,6 +191,7 @@ describe("VaultGuardApiClient surface", () => {
     await client.updatePermission("rule-1", { priority: 2 });
     await client.deletePermission("rule-1");
     await client.getUserPermissions("user-1");
+    await client.getPathAccess("docs/a.md");
     await client.listUsers();
     await client.listRoles();
     await client.inviteUser({
@@ -207,6 +213,7 @@ describe("VaultGuardApiClient surface", () => {
       ["PUT", "https://api.vaultguard.test/vaults/vault-abc/permissions/rule-1"],
       ["DELETE", "https://api.vaultguard.test/vaults/vault-abc/permissions/rule-1"],
       ["GET", "https://api.vaultguard.test/vaults/vault-abc/permissions/user/user-1"],
+      ["POST", "https://api.vaultguard.test/vaults/vault-abc/permissions/access"],
       ["GET", "https://api.vaultguard.test/users"],
       ["GET", "https://api.vaultguard.test/users/roles"],
       ["POST", "https://api.vaultguard.test/users/invite"],
@@ -216,7 +223,10 @@ describe("VaultGuardApiClient surface", () => {
       ["POST", "https://api.vaultguard.test/users/user-1/resend-invite"],
       ["GET", "https://api.vaultguard.test/users/user-1/activity?limit=25"],
     ]);
-    expect(JSON.parse(mockRequestUrl.mock.calls[7]![0].body as string)).toEqual({
+    expect(JSON.parse(mockRequestUrl.mock.calls[5]![0].body as string)).toEqual({
+      path: "/docs/a.md",
+    });
+    expect(JSON.parse(mockRequestUrl.mock.calls[8]![0].body as string)).toEqual({
       email: "user@example.com",
       role: "viewer",
       sendWelcomeEmail: true,

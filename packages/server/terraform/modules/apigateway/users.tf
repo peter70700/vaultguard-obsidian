@@ -456,6 +456,30 @@ resource "aws_api_gateway_integration" "permissions_check_post" {
   uri                     = var.perms_lambda_invoke_arn
 }
 
+# POST /vaults/{vaultId}/permissions/access — effective access summary for a path
+resource "aws_api_gateway_resource" "permissions_access" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.permissions.id
+  path_part   = "access"
+}
+
+resource "aws_api_gateway_method" "permissions_access_post" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.permissions_access.id
+  http_method   = "POST"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+}
+
+resource "aws_api_gateway_integration" "permissions_access_post" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.permissions_access.id
+  http_method             = aws_api_gateway_method.permissions_access_post.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.perms_lambda_invoke_arn
+}
+
 # /vaults/{vaultId}/permissions/{id} — PUT update, DELETE
 resource "aws_api_gateway_method" "permissions_id_put" {
   rest_api_id   = aws_api_gateway_rest_api.vaultguard.id

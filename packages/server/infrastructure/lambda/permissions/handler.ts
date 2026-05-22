@@ -13,6 +13,7 @@
  * - PUT    /vaults/{vaultId}/permissions/{id} — Update rule (vault-admin)
  * - DELETE /vaults/{vaultId}/permissions/{id} — Delete rule (vault-admin)
  * - POST   /vaults/{vaultId}/permissions/check — Check if user can perform action on path (any vault member, self only)
+ * - POST   /vaults/{vaultId}/permissions/access — Effective per-file access summary (any member with read)
  */
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
@@ -29,6 +30,7 @@ import {
   requireVaultMember,
   pathMatchesPattern,
   getVaultMembership,
+  listVaultMembers,
   logAudit,
   formatError,
   formatSuccess,
@@ -71,6 +73,17 @@ const cognitoClient = new CognitoIdentityProviderClient({ region: COGNITO_REGION
 interface PrincipalIdentity {
   userId: string;
   email: string;
+  displayName?: string;
+}
+
+type PathAccessLevel = 'none' | 'read' | 'write' | 'admin';
+
+interface PathAccessPrincipal {
+  userId: string;
+  email?: string;
+  displayName?: string;
+  role?: string;
+  level: PathAccessLevel;
 }
 
 // ─── Main Handler ────────────────────────────────────────────────────────────
@@ -117,6 +130,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       case method === 'POST' && resource === '/vaults/{vaultId}/permissions/check':
         return await handleCheckPermission(event, user, vault, requestId);
+
+      case method === 'POST' && resource === '/vaults/{vaultId}/permissions/access':
+        return await handlePathAccess(event, user, vault, requestId);
 
       default:
         return formatError(404, `Route not found: ${method} ${resource}`, requestId);
@@ -819,18 +835,13 @@ async function handleCheckPermission(
   // Roles are derived server-side from verified identity — body.roles is
   // ignored. evaluatePermission would otherwise treat caller-supplied
   // admin-like roles as bypasses, allowing a non-admin caller to make their
-  // own check return `allowed: true` regardless of real entitlement. For
-  // self-checks we trust the JWT claims; for admin cross-user checks we
-  // resolve the target user's vault membership role from DynamoDB and skip
-  // any org-level role inheritance (only an org admin issuing the check
-  // gets the org-admin bypass — and only for themselves).
-  let resolvedRoles: string[];
-  if (targetUserId === user.userId) {
-    resolvedRoles = user.roles;
-  } else {
-    const membership = await getVaultMembership(vault.vaultId, targetUserId);
-    resolvedRoles = membership ? [membership.role] : [];
-  }
+  // own check return `allowed: true` regardless of real entitlement.
+  //
+  // For both self-checks and admin cross-user checks, use the target user's
+  // vault membership role. This keeps "what I see for myself" identical to
+  // "what an admin sees when checking me" and prevents org-level roles from
+  // accidentally masquerading as vault roles.
+  const resolvedRoles = await resolvePermissionRolesForTarget(targetUserId, user, vault);
 
   // Evaluate permission within this vault.
   const targetAliases = await aliasesForTargetUser(targetUserId, user, vault.orgId);
@@ -894,6 +905,109 @@ async function handleCheckPermission(
   );
 }
 
+// ─── POST /vaults/{vaultId}/permissions/access ──────────────────────────────
+
+/**
+ * Returns the backend-computed access list for a single file path.
+ *
+ * This is the one source of truth used by the plugin header. The client no
+ * longer reconstructs other users' effective access from raw rules, because
+ * raw-rule merging can diverge from the Lambda evaluator when membership
+ * defaults, legacy email principals, denies, and role rules overlap.
+ */
+async function handlePathAccess(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  const body = parseBody(event);
+  validateRequiredFields(body, ['path']);
+
+  const path = normalizePermissionPath(String(body.path));
+  const directory = await buildOrgIdentityMap(vault.orgId);
+
+  const callerRoles = await resolvePermissionRolesForTarget(user.userId, user, vault);
+  const callerAliases = await aliasesForAccessTarget(
+    user.userId,
+    user,
+    vault.orgId,
+    directory,
+    user.email ? [user.email] : []
+  );
+  const callerLevel = await resolvePathAccessLevel(
+    user.userId,
+    callerRoles,
+    path,
+    vault,
+    callerAliases
+  );
+
+  // Do not reveal the membership/principal list for a path the caller cannot
+  // read. The current user's own status is still returned so the header can
+  // show a stable "No Access" state instead of inventing a local answer.
+  if (callerLevel === 'none') {
+    return formatSuccess(200, {
+      path,
+      currentUserLevel: callerLevel,
+      principals: [],
+    }, requestId);
+  }
+
+  const members = await listVaultMembers(vault.vaultId);
+  const principals: PathAccessPrincipal[] = [];
+  for (const member of members) {
+    const aliases = await aliasesForAccessTarget(member.userId, user, vault.orgId, directory);
+    const level = await resolvePathAccessLevel(
+      member.userId,
+      [member.role],
+      path,
+      vault,
+      aliases
+    );
+    const identity = directory.get(member.userId);
+    principals.push({
+      userId: member.userId,
+      ...(identity?.email ? { email: identity.email } : {}),
+      ...(identity?.displayName ? { displayName: identity.displayName } : {}),
+      role: member.role,
+      level,
+    });
+  }
+
+  if (!principals.some((principal) => principal.userId === user.userId)) {
+    principals.push({
+      userId: user.userId,
+      email: user.email,
+      displayName: user.email,
+      role: isAdmin(user) ? 'admin' : undefined,
+      level: callerLevel,
+    });
+  }
+
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'permissions.access',
+    resourcePath: path,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: {
+      principalCount: principals.length,
+      visiblePrincipalCount: principals.filter((principal) => principal.level !== 'none').length,
+    },
+  });
+
+  return formatSuccess(200, {
+    path,
+    currentUserLevel: callerLevel,
+    principals,
+  }, requestId);
+}
+
 // ─── Helper Functions ────────────────────────────────────────────────────────
 
 function escapeCognitoFilterValue(value: string): string {
@@ -906,6 +1020,53 @@ function attrsToRecord(
   return Object.fromEntries(
     (attrs ?? []).map((attr) => [attr.Name ?? '', attr.Value ?? ''])
   );
+}
+
+function displayNameFromAttrs(attrs: Record<string, string>, fallback: string): string {
+  const explicitName = attrs.name?.trim() || '';
+  const givenName = attrs.given_name || '';
+  const familyName = attrs.family_name || '';
+  const composed = [givenName, familyName].filter(Boolean).join(' ').trim();
+  return explicitName || composed || attrs.email || fallback;
+}
+
+async function buildOrgIdentityMap(orgId: string): Promise<Map<string, PrincipalIdentity>> {
+  const map = new Map<string, PrincipalIdentity>();
+  if (!USER_POOL_ID || !orgId) return map;
+
+  try {
+    let paginationToken: string | undefined;
+    do {
+      const result = await cognitoClient.send(
+        new ListUsersCommand({
+          UserPoolId: USER_POOL_ID,
+          Limit: 60,
+          PaginationToken: paginationToken,
+        })
+      );
+
+      for (const user of result.Users ?? []) {
+        const attrs = attrsToRecord(user.Attributes);
+        if (attrs['custom:org'] !== orgId) continue;
+        const userId = attrs.sub || user.Username || '';
+        if (!userId) continue;
+        map.set(userId, {
+          userId,
+          email: attrs.email || '',
+          displayName: displayNameFromAttrs(attrs, userId),
+        });
+      }
+
+      paginationToken = result.PaginationToken;
+    } while (paginationToken);
+  } catch (error) {
+    console.warn('[PERMISSIONS] Org identity lookup failed', {
+      orgId,
+      message: (error as Error).message,
+    });
+  }
+
+  return map;
 }
 
 function identityBelongsToOrg(identity: PrincipalIdentity, attrs: Record<string, string>, orgId: string): boolean {
@@ -925,6 +1086,7 @@ async function resolvePrincipalIdentity(value: string, orgId: string): Promise<P
       const identity = {
         userId: attrs.sub || result.Username || principal,
         email: attrs.email || principal,
+        displayName: displayNameFromAttrs(attrs, principal),
       };
       return identityBelongsToOrg(identity, attrs, orgId) ? identity : null;
     }
@@ -942,6 +1104,7 @@ async function resolvePrincipalIdentity(value: string, orgId: string): Promise<P
     const identity = {
       userId: attrs.sub || user.Username || principal,
       email: attrs.email || '',
+      displayName: displayNameFromAttrs(attrs, principal),
     };
     return identityBelongsToOrg(identity, attrs, orgId) ? identity : null;
   } catch (error) {
@@ -952,6 +1115,89 @@ async function resolvePrincipalIdentity(value: string, orgId: string): Promise<P
     });
     return null;
   }
+}
+
+function normalizePermissionPath(path: string): string {
+  const normalized = path.trim().replace(/\/+/g, '/');
+  return normalized.startsWith('/') ? normalized : `/${normalized}`;
+}
+
+async function resolvePermissionRolesForTarget(
+  targetUserId: string,
+  caller: UserContext,
+  vault: VaultRecord
+): Promise<string[]> {
+  if (targetUserId === caller.userId && isAdmin(caller)) {
+    return caller.roles;
+  }
+
+  const membership = await getVaultMembership(vault.vaultId, targetUserId);
+  if (membership) {
+    return [membership.role];
+  }
+
+  return targetUserId === caller.userId ? caller.roles : [];
+}
+
+function aliasesFromDirectory(
+  userId: string,
+  directory: Map<string, PrincipalIdentity>,
+  extras: string[] = []
+): string[] {
+  const identity = directory.get(userId);
+  return principalLookupValues(userId, [
+    ...(identity?.email ? [identity.email] : []),
+    ...extras,
+  ]).filter((value) => value !== userId);
+}
+
+async function aliasesForAccessTarget(
+  userId: string,
+  caller: UserContext,
+  orgId: string,
+  directory: Map<string, PrincipalIdentity>,
+  extras: string[] = []
+): Promise<string[]> {
+  const aliases = aliasesFromDirectory(userId, directory, extras);
+  if (aliases.length > 0) return aliases;
+  if (userId === caller.userId && caller.email) {
+    return aliasesFromDirectory(userId, directory, [caller.email, ...extras]);
+  }
+
+  const identity = await resolvePrincipalIdentity(userId, orgId);
+  return principalLookupValues(userId, [
+    ...(identity?.email ? [identity.email] : []),
+    ...extras,
+  ]).filter((value) => value !== userId);
+}
+
+async function resolvePathAccessLevel(
+  userId: string,
+  roles: string[],
+  path: string,
+  vault: VaultRecord,
+  aliases: string[] = []
+): Promise<PathAccessLevel> {
+  const checks: Array<{ action: PermissionAction; level: PathAccessLevel }> = [
+    { action: 'admin', level: 'admin' },
+    { action: 'write', level: 'write' },
+    { action: 'read', level: 'read' },
+  ];
+
+  for (const check of checks) {
+    const result = await evaluatePermission(
+      userId,
+      roles,
+      check.action,
+      path,
+      vault.orgId,
+      vault.vaultId,
+      { userAliases: aliases }
+    );
+    if (result.allowed) return check.level;
+  }
+
+  return 'none';
 }
 
 async function canonicalizeRuleUserId(userId: string, orgId: string): Promise<string | null> {
