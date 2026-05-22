@@ -17,6 +17,11 @@
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import {
+  AdminGetUserCommand,
+  CognitoIdentityProviderClient,
+  ListUsersCommand,
+} from '@aws-sdk/client-cognito-identity-provider';
+import {
   docClient,
   verifyActiveUser,
   evaluatePermission,
@@ -59,6 +64,14 @@ const VALID_EFFECTS = ['allow', 'deny'] as const;
 
 /** Constant sort key for permission rule items. */
 const RULE_SK = 'RULE';
+const USER_POOL_ID = process.env.USER_POOL_ID!;
+const COGNITO_REGION = process.env.AWS_REGION || 'eu-west-1';
+const cognitoClient = new CognitoIdentityProviderClient({ region: COGNITO_REGION });
+
+interface PrincipalIdentity {
+  userId: string;
+  email: string;
+}
 
 // ─── Main Handler ────────────────────────────────────────────────────────────
 
@@ -263,11 +276,13 @@ async function handleGetUserPermissions(
       : targetUserId === user.userId
         ? user.roles
         : [];
+  const targetAliases = await aliasesForTargetUser(targetUserId, user, vault.orgId);
   const userRules = await fetchAllUserRules(
     targetUserId,
     vault.orgId,
     vault.vaultId,
-    targetRoles
+    targetRoles,
+    targetAliases
   );
 
   // Group by path pattern for a readable summary
@@ -329,7 +344,7 @@ async function handleCreatePermission(
   validateRequiredFields(body, ['pathPattern', 'actions', 'effect']);
 
   // Validate inputs
-  const userId = (body.userId as string) || '*';
+  let userId = (body.userId as string) || '*';
   const role = (body.role as string) || null;
   const pathPattern = body.pathPattern as string;
   const actions = body.actions as string[];
@@ -358,6 +373,14 @@ async function handleCreatePermission(
   // Validate path pattern
   if (!pathPattern.startsWith('/')) {
     return formatError(400, 'pathPattern must start with /', requestId);
+  }
+
+  if (!role) {
+    const canonicalUserId = await canonicalizeRuleUserId(userId, vault.orgId);
+    if (!canonicalUserId) {
+      return formatError(400, `Unknown user in this organization: ${userId}`, requestId);
+    }
+    userId = canonicalUserId;
   }
 
   // Reject duplicate: same principal + same exact path already has a rule
@@ -552,7 +575,13 @@ async function handleUpdatePermission(
   }
 
   if (body.priority !== undefined) updates.priority = body.priority;
-  if (body.userId !== undefined) updates.userId = body.userId;
+  if (body.userId !== undefined) {
+    const canonicalUserId = await canonicalizeRuleUserId(body.userId as string, vault.orgId);
+    if (!canonicalUserId) {
+      return formatError(400, `Unknown user in this organization: ${body.userId}`, requestId);
+    }
+    updates.userId = canonicalUserId;
+  }
   if (body.role !== undefined) updates.role = body.role;
   if (body.expiresAt !== undefined) {
     updates.expiresAt = typeof body.expiresAt === 'string' ? body.expiresAt : null;
@@ -804,13 +833,15 @@ async function handleCheckPermission(
   }
 
   // Evaluate permission within this vault.
+  const targetAliases = await aliasesForTargetUser(targetUserId, user, vault.orgId);
   const result = await evaluatePermission(
     targetUserId,
     resolvedRoles,
     action as PermissionAction,
     path,
     vault.orgId,
-    vault.vaultId
+    vault.vaultId,
+    { userAliases: targetAliases }
   );
 
   await logAudit({
@@ -865,6 +896,97 @@ async function handleCheckPermission(
 
 // ─── Helper Functions ────────────────────────────────────────────────────────
 
+function escapeCognitoFilterValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function attrsToRecord(
+  attrs: Array<{ Name?: string; Value?: string }> | undefined
+): Record<string, string> {
+  return Object.fromEntries(
+    (attrs ?? []).map((attr) => [attr.Name ?? '', attr.Value ?? ''])
+  );
+}
+
+function identityBelongsToOrg(identity: PrincipalIdentity, attrs: Record<string, string>, orgId: string): boolean {
+  return Boolean(identity.userId) && attrs['custom:org'] === orgId;
+}
+
+async function resolvePrincipalIdentity(value: string, orgId: string): Promise<PrincipalIdentity | null> {
+  const principal = value.trim();
+  if (!principal || principal === '*' || !USER_POOL_ID) return null;
+
+  try {
+    if (principal.includes('@')) {
+      const result = await cognitoClient.send(
+        new AdminGetUserCommand({ UserPoolId: USER_POOL_ID, Username: principal })
+      );
+      const attrs = attrsToRecord(result.UserAttributes);
+      const identity = {
+        userId: attrs.sub || result.Username || principal,
+        email: attrs.email || principal,
+      };
+      return identityBelongsToOrg(identity, attrs, orgId) ? identity : null;
+    }
+
+    const result = await cognitoClient.send(
+      new ListUsersCommand({
+        UserPoolId: USER_POOL_ID,
+        Filter: `sub = "${escapeCognitoFilterValue(principal)}"`,
+        Limit: 1,
+      })
+    );
+    const user = result.Users?.[0];
+    if (!user) return null;
+    const attrs = attrsToRecord(user.Attributes);
+    const identity = {
+      userId: attrs.sub || user.Username || principal,
+      email: attrs.email || '',
+    };
+    return identityBelongsToOrg(identity, attrs, orgId) ? identity : null;
+  } catch (error) {
+    console.warn('[PERMISSIONS] Principal identity lookup failed', {
+      principal,
+      orgId,
+      message: (error as Error).message,
+    });
+    return null;
+  }
+}
+
+async function canonicalizeRuleUserId(userId: string, orgId: string): Promise<string | null> {
+  if (!userId || userId === '*') return userId || '*';
+  if (!userId.includes('@')) return userId;
+  const identity = await resolvePrincipalIdentity(userId, orgId);
+  return identity?.userId ?? null;
+}
+
+async function aliasesForTargetUser(
+  targetUserId: string,
+  caller: UserContext,
+  orgId: string
+): Promise<string[]> {
+  if (targetUserId === caller.userId) {
+    return caller.email ? [caller.email] : [];
+  }
+  const identity = await resolvePrincipalIdentity(targetUserId, orgId);
+  return identity?.email ? [identity.email] : [];
+}
+
+function principalLookupValues(userId: string, aliases: string[] = []): string[] {
+  const seen = new Set<string>();
+  const values: string[] = [];
+  for (const value of [userId, ...aliases]) {
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    values.push(trimmed);
+  }
+  return values;
+}
+
 /**
  * Fetches all permission rules applicable to a user by ID, roles, and wildcards.
  *
@@ -875,7 +997,8 @@ async function fetchAllUserRules(
   userId: string,
   orgId: string,
   vaultId: string,
-  roles: string[] = []
+  roles: string[] = [],
+  aliases: string[] = []
 ): Promise<PermissionRule[]> {
   const results: PermissionRule[] = [];
   const seen = new Set<string>();
@@ -888,17 +1011,21 @@ async function fetchAllUserRules(
     }
   };
 
-  // User-specific rules (scoped to org + vault)
-  const userResult = await docClient.send(
-    new QueryCommand({
-      TableName: PERMISSIONS_TABLE,
-      IndexName: 'userId-index',
-      KeyConditionExpression: 'userId = :uid',
-      FilterExpression: 'orgId = :orgId AND vaultId = :vaultId',
-      ExpressionAttributeValues: { ':uid': userId, ':orgId': orgId, ':vaultId': vaultId },
-    })
-  );
-  pushRules(userResult.Items);
+  // User-specific rules (scoped to org + vault). Include legacy aliases so
+  // older email-targeted rules resolve to the same effective permissions
+  // view as canonical Cognito subject rules.
+  for (const lookupUserId of principalLookupValues(userId, aliases)) {
+    const userResult = await docClient.send(
+      new QueryCommand({
+        TableName: PERMISSIONS_TABLE,
+        IndexName: 'userId-index',
+        KeyConditionExpression: 'userId = :uid',
+        FilterExpression: 'orgId = :orgId AND vaultId = :vaultId',
+        ExpressionAttributeValues: { ':uid': lookupUserId, ':orgId': orgId, ':vaultId': vaultId },
+      })
+    );
+    pushRules(userResult.Items);
+  }
 
   // Role-based rules (scoped to org + vault)
   for (const role of roles) {

@@ -61,8 +61,13 @@ import {
   SESSIONS_TABLE,
   LEASES_TABLE,
   ORGANIZATIONS_TABLE,
+  PERMISSIONS_TABLE,
+  VAULTS_TABLE,
+  VAULT_MEMBERS_TABLE,
   RECOVERY_CODES_TABLE,
   BatchWriteCommand,
+  PermissionAction,
+  listVaultsForOrg,
   getActiveOrg,
   checkUserLimit,
   updateOrgUserCount,
@@ -448,6 +453,49 @@ async function handleInviteUser(
     }, { throwOnError: true });
   }
 
+  // Seed baseline vault membership + /** allow rule for non-admin invites.
+  // Admin-role invites are skipped: the inviting admin chooses which vaults to
+  // attach them to manually. See CLAUDE.md vault-scoping rule — every rule
+  // created here is per-vault, never org-wide.
+  let bootstrap: { vaultsJoined: number; failures: number } | null = null;
+  if (role === 'editor' || role === 'viewer') {
+    try {
+      bootstrap = await seedDefaultVaultMembershipForInvitee(
+        admin.orgId,
+        userId,
+        role,
+        admin.userId
+      );
+      if (bootstrap.failures > 0) {
+        await logAudit({
+          userId: admin.userId,
+          userEmail: admin.email,
+          orgId: admin.orgId,
+          action: 'admin.user_invite_bootstrap_partial',
+          resourcePath: `/users/${userId}`,
+          // The `outcome` enum doesn't include 'partial'; we mark it 'error'
+          // so it stands out in audit filters, and the metadata distinguishes
+          // partial from total failure via the (vaultsJoined, failures) pair.
+          outcome: 'error',
+          ipAddress: getClientIp(event),
+          userAgent: getUserAgent(event),
+          metadata: {
+            invitedEmail: email,
+            role,
+            vaultsJoined: bootstrap.vaultsJoined,
+            failures: bootstrap.failures,
+          },
+        });
+      }
+    } catch (bootstrapErr) {
+      // Non-fatal: invite already succeeded. Log so admin can investigate.
+      console.error(
+        `[VaultGuard] Vault-membership bootstrap failed after successful invite`,
+        { orgId: admin.orgId, newUserId: userId, error: bootstrapErr }
+      );
+    }
+  }
+
   await logAudit({
     userId: admin.userId,
     userEmail: admin.email,
@@ -462,6 +510,7 @@ async function handleInviteUser(
       role,
       sendWelcomeEmail,
       ...(displayName ? { displayName } : {}),
+      ...(bootstrap ? { vaultsJoined: bootstrap.vaultsJoined, vaultBootstrapFailures: bootstrap.failures } : {}),
     },
   });
 
@@ -1533,4 +1582,115 @@ async function handleResetOrgSettings(
   });
 
   return formatSuccess(200, resetSettings, requestId);
+}
+
+// ─── Vault-membership bootstrap for newly invited members ──────────────────
+
+/**
+ * Constants mirroring the canonical defaults in `vaults/handler.ts`. Kept
+ * inline because each Lambda is bundled independently by `build-lambdas.mjs`
+ * and cross-handler imports are not supported in the current build. If the
+ * canonical values ever change in `vaults/handler.ts`, update both.
+ */
+const DEFAULT_MEMBER_RULE_PRIORITY = 0;
+const DEFAULT_MEMBER_RULE_SK = 'RULE';
+const DEFAULT_MEMBER_RULE_SOURCE = 'vault-member-default';
+
+function defaultMemberPermissionRuleId(vaultId: string, userId: string): string {
+  return `${DEFAULT_MEMBER_RULE_SOURCE}#${vaultId}#${userId}`;
+}
+
+/**
+ * Mirrors `actionsForVaultRole` in vaults/handler.ts for editor and viewer.
+ * Admin role is intentionally not handled here — admins are not auto-added
+ * to vaults at invite time (the inviting admin chooses which vaults to
+ * attach them to manually).
+ */
+function actionsForOrgRole(role: 'editor' | 'viewer'): PermissionAction[] {
+  if (role === 'editor') return ['read', 'write', 'list'];
+  return ['read', 'list'];
+}
+
+/**
+ * Adds the newly invited user as a member of every vault in the org and
+ * creates the baseline `/**` allow rule per vault. Best-effort: failures
+ * are logged but do not roll back the Cognito invite, because the rule
+ * landscape is self-healing — the admin can add the user to vaults
+ * manually if any of these writes fail. We DO surface a non-fatal warning
+ * in the invite audit log when partial failures occur.
+ *
+ * Per CLAUDE.md vault-scoping rule: every rule we write carries a real
+ * `vaultId`. No org-wide rules are ever created.
+ */
+async function seedDefaultVaultMembershipForInvitee(
+  orgId: string,
+  newUserId: string,
+  role: 'editor' | 'viewer',
+  inviterUserId: string
+): Promise<{ vaultsJoined: number; failures: number }> {
+  let vaultsJoined = 0;
+  let failures = 0;
+
+  // 1. List every vault in the org. Reuses the shared helper so a future
+  //    schema change to VAULTS_TABLE only needs to touch one place.
+  const vaults = await listVaultsForOrg(orgId);
+  const nowIso = new Date().toISOString();
+
+  // 2. For each vault, write (a) the membership and (b) the default rule.
+  //    Both are idempotent on (vaultId, userId) so a partial retry is safe.
+  for (const vault of vaults) {
+    if (vault.archived) continue;
+    try {
+      try {
+        await docClient.send(new PutCommand({
+          TableName: VAULT_MEMBERS_TABLE,
+          Item: {
+            vaultId: vault.vaultId,
+            userId: newUserId,
+            role,                        // Vault role mirrors org role for non-admin invites.
+            joinedAt: nowIso,
+            invitedBy: inviterUserId,
+          },
+          ConditionExpression: 'attribute_not_exists(vaultId) AND attribute_not_exists(userId)',
+        }));
+      } catch (memberErr) {
+        // Conditional-check-failed means the user is already a vault member —
+        // proceed to (re)write the default rule so we still self-heal.
+        if ((memberErr as { name?: string }).name !== 'ConditionalCheckFailedException') {
+          throw memberErr;
+        }
+      }
+
+      const ruleId = defaultMemberPermissionRuleId(vault.vaultId, newUserId);
+      await docClient.send(new PutCommand({
+        TableName: PERMISSIONS_TABLE,
+        Item: {
+          pk: ruleId,
+          sk: DEFAULT_MEMBER_RULE_SK,
+          id: ruleId,
+          orgId,
+          vaultId: vault.vaultId,
+          userId: newUserId,
+          pathPattern: '/**',
+          actions: actionsForOrgRole(role),
+          effect: 'allow',
+          priority: DEFAULT_MEMBER_RULE_PRIORITY,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          createdBy: inviterUserId,
+          source: DEFAULT_MEMBER_RULE_SOURCE,
+        },
+      }));
+
+      vaultsJoined++;
+    } catch (err) {
+      console.error(
+        `[VaultGuard] Failed to seed vault membership during invite`,
+        { orgId, newUserId, vaultId: vault.vaultId, error: err }
+      );
+      failures++;
+    }
+  }
+
+  return { vaultsJoined, failures };
 }

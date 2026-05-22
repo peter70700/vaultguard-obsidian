@@ -68,6 +68,7 @@ export class VaultGuardSidebarView extends ItemView {
   private knownRoles: string[] = [];
   private userMap: Map<string, UserListEntry> = new Map();
   private isLoading = false;
+  private hasLoadedOnce = false;
   private contentEl_: HTMLElement | null = null;
   private revoked = false;
   private revokeReason = "";
@@ -536,6 +537,7 @@ export class VaultGuardSidebarView extends ItemView {
       this.entries = [];
     } finally {
       this.isLoading = false;
+      this.hasLoadedOnce = true;
       this.renderEntries();
     }
   }
@@ -768,6 +770,10 @@ export class VaultGuardSidebarView extends ItemView {
 
     // Apply filters
     const total = this.entries.length;
+    // Raw count before any filtering — used by the empty-state branch to
+    // distinguish "vault has files but the viewer can read none of them"
+    // from "vault has no files at all".
+    const totalRawFiles = this.entries.length;
     let filtered = this.entries;
 
     // Non-admins can't read "no access" rows — those files don't appear in
@@ -831,19 +837,47 @@ export class VaultGuardSidebarView extends ItemView {
     if (filtered.length === 0) {
       const emptyEl = listEl.createDiv({ cls: "vaultguard-sb-empty" });
       const icon = emptyEl.createDiv({ cls: "vaultguard-sb-empty-icon" });
-      setIcon(icon, this.hasActiveFilters() ? "filter" : "file-x");
-      emptyEl.createEl("p", {
-        text: this.hasActiveFilters()
-          ? "No files match the current filters."
-          : "No files in this vault yet.",
-      });
+
+      // State A — active filters: keep existing "no match" + reset action.
       if (this.hasActiveFilters()) {
+        setIcon(icon, "filter");
+        emptyEl.createEl("p", { text: "No files match the current filters." });
         const resetBtn = emptyEl.createEl("button", {
           cls: "vaultguard-sb-empty-action",
           text: "Clear filters",
         });
         resetBtn.addEventListener("click", () => this.clearAllFilters());
+        return;
       }
+
+      // State B — vault has files but the non-admin viewer has read
+      // permission to none of them. Only meaningful for non-admins (admins
+      // skip the no-access filter via isViewerEffectivelyAdmin above).
+      const noReadAccess =
+        !this.isViewerEffectivelyAdmin() &&
+        totalRawFiles > 0;
+
+      if (noReadAccess) {
+        setIcon(icon, "lock");
+        emptyEl.createEl("p", {
+          text: "You don't have read permission to any files in this vault yet.",
+        });
+        emptyEl.createEl("p", {
+          text: "Ask your organization admin to grant you access. Newly granted permissions appear here within a few seconds of the next sync.",
+          cls: "vaultguard-sb-empty-hint",
+        });
+        return;
+      }
+
+      // State C — vault has no files at all.
+      setIcon(icon, "file-x");
+      emptyEl.createEl("p", { text: "No files in this vault yet." });
+      emptyEl.createEl("p", {
+        text: this.isViewerEffectivelyAdmin()
+          ? "Create a note in Obsidian and it will sync here automatically."
+          : "When your admin adds files (or grants you access to existing ones), they'll appear here.",
+        cls: "vaultguard-sb-empty-hint",
+      });
       return;
     }
 

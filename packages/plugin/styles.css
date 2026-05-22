@@ -1954,6 +1954,11 @@
   color: var(--color-red);
 }
 
+.vaultguard-fh-badge-unknown {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-muted);
+}
+
 /* ─── Skeleton / Shimmer ──────────────────────────────────────────────── */
 
 .vaultguard-fh-shimmer {

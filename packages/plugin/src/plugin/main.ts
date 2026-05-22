@@ -2893,6 +2893,12 @@ export default class VaultGuardPlugin extends Plugin {
     if (!this.session) return false;
     if (rule.userId === "*") return true;
     if (rule.userId === this.session.userId) return true;
+    if (
+      this.session.email &&
+      rule.userId.trim().toLowerCase() === this.session.email.trim().toLowerCase()
+    ) {
+      return true;
+    }
     if (rule.role) {
       const userRoles = this.session.roles?.length
         ? this.session.roles
@@ -8858,6 +8864,7 @@ export default class VaultGuardPlugin extends Plugin {
       // would see read-only affordances.
       currentUserRole: this.getEffectiveUiRole(),
       isAdmin: this.isEffectiveAdmin(),
+      getPermissionLevel: (path) => this.getEffectivePermission(path),
       // Propagate header-side rule edits (manage panel, popover dropdown)
       // to the rest of the UI so file-explorer dots and the read-only
       // editor guard refresh in lockstep — without this, only the header

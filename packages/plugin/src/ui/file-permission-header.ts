@@ -9,6 +9,7 @@
 
 import { App, MarkdownView, TFile, setIcon } from "obsidian";
 import { VaultGuardApiClient, PermissionRule, UserListEntry, VaultMemberRecord } from "../api/client";
+import { PermissionLevel } from "../types";
 import { FilePermissionPanel } from "./file-permission-panel";
 import { setButtonLoading, setControlBusy } from "./loading-button";
 import {
@@ -39,6 +40,12 @@ interface HeaderContext {
    * header itself.
    */
   onRulesChanged?: (path?: string) => void | Promise<void>;
+  /**
+   * Authoritative current-user permission resolver. Used when raw rule
+   * listing is unavailable, so the "Your access" badge follows the same
+   * backend check that enforces editor read/write protection.
+   */
+  getPermissionLevel?: (path: string) => Promise<PermissionLevel>;
 }
 
 interface RuleCacheEntry {
@@ -47,7 +54,7 @@ interface RuleCacheEntry {
   inFlight?: Promise<PermissionRule[]>;
 }
 
-type AccessLevel = "none" | "read" | "write" | "admin";
+type AccessLevel = "unknown" | "none" | "read" | "write" | "admin";
 type AccessPrincipal = {
   id: string;
   label: string;
@@ -59,6 +66,11 @@ type AccessPrincipalState = AccessPrincipal & {
   specificity: number;
   denied: boolean;
 };
+
+interface AccessListOptions {
+  includeVaultMemberDefaults?: boolean;
+  currentUserLevel?: AccessLevel;
+}
 
 export class FilePermissionHeader {
   private ctx: HeaderContext;
@@ -151,7 +163,12 @@ export class FilePermissionHeader {
       this.activePanel?.setRules(rules);
     } catch {
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
-      this.renderHeader(headerEl, file, []);
+      const currentUserLevel = await this.fetchCurrentUserLevel(file.path);
+      if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
+      this.renderHeader(headerEl, file, [], {
+        includeVaultMemberDefaults: false,
+        currentUserLevel,
+      });
       this.activePanel?.setRules([]);
     } finally {
       if (showRefreshing && headerEl.isConnected) {
@@ -492,16 +509,21 @@ export class FilePermissionHeader {
     }
   }
 
-  private renderHeader(container: HTMLElement, file: TFile, rules: PermissionRule[]): void {
+  private renderHeader(
+    container: HTMLElement,
+    file: TFile,
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): void {
     container.empty();
     const inner = container.createDiv({ cls: "vaultguard-fh-inner" });
 
     // ── Section 1: Current user's effective level ────────────────────
-    const myLevel = this.resolveMyLevel(file.path, rules);
+    const myLevel = this.resolveMyLevel(file.path, rules, options);
     const levelSection = inner.createDiv({ cls: "vaultguard-fh-level" });
 
     const lockIcon = levelSection.createSpan({ cls: "vaultguard-fh-lock-icon" });
-    setIcon(lockIcon, myLevel === "admin" ? "shield" : myLevel === "write" ? "edit" : myLevel === "read" ? "eye" : "lock");
+    setIcon(lockIcon, this.iconForLevel(myLevel));
 
     const badge = levelSection.createSpan({
       cls: `vaultguard-fh-badge vaultguard-fh-badge-${myLevel}`,
@@ -513,7 +535,7 @@ export class FilePermissionHeader {
 
     // ── Section 2: Access list (avatars) ─────────────────────────────
     const accessSection = inner.createDiv({ cls: "vaultguard-fh-access" });
-    this.renderAccessList(accessSection, file, rules);
+    this.renderAccessList(accessSection, file, rules, options);
 
     // ── Section 3: Actions ───────────────────────────────────────────
     const actionsSection = inner.createDiv({ cls: "vaultguard-fh-actions" });
@@ -545,15 +567,25 @@ export class FilePermissionHeader {
     }
   }
 
-  private renderAccessList(container: HTMLElement, file: TFile, rules: PermissionRule[]): void {
-    const sorted = this.buildVisibleAccessPrincipals(rules);
+  private renderAccessList(
+    container: HTMLElement,
+    file: TFile,
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): void {
+    const sorted = this.buildVisibleAccessPrincipals(rules, options);
 
     const MAX_SHOWN = 4;
     const shown = sorted.slice(0, MAX_SHOWN);
     const overflow = sorted.length - MAX_SHOWN;
 
     if (sorted.length === 0) {
-      container.createSpan({ cls: "vaultguard-fh-no-access", text: "No visible access" });
+      container.createSpan({
+        cls: "vaultguard-fh-no-access",
+        text: options.includeVaultMemberDefaults === false
+          ? "Access details unavailable"
+          : "No visible access",
+      });
       return;
     }
 
@@ -981,11 +1013,45 @@ export class FilePermissionHeader {
   }
 
   private resolveCanonicalUserId(userId: string): string {
-    return resolveAccessUserId(this.users, userId);
+    const trimmed = userId.trim();
+    const fromDirectory = resolveAccessUserId(this.users, trimmed);
+    if (fromDirectory !== trimmed) {
+      return fromDirectory;
+    }
+
+    const normalized = trimmed.toLowerCase();
+    const member = this.vaultMembers.find((entry) =>
+      entry.userId.toLowerCase() === normalized ||
+      entry.email?.trim().toLowerCase() === normalized
+    );
+    return member?.userId ?? trimmed;
   }
 
-  private buildVisibleAccessPrincipals(rules: PermissionRule[]): AccessPrincipal[] {
+  private async fetchCurrentUserLevel(path: string): Promise<AccessLevel> {
+    if (!this.ctx.getPermissionLevel) {
+      return "unknown";
+    }
+
+    try {
+      return this.permissionLevelToAccessLevel(await this.ctx.getPermissionLevel(path));
+    } catch {
+      return "unknown";
+    }
+  }
+
+  private permissionLevelToAccessLevel(level: PermissionLevel): AccessLevel {
+    if (level >= PermissionLevel.ADMIN) return "admin";
+    if (level >= PermissionLevel.WRITE) return "write";
+    if (level >= PermissionLevel.READ) return "read";
+    return "none";
+  }
+
+  private buildVisibleAccessPrincipals(
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): AccessPrincipal[] {
     const principals = new Map<string, AccessPrincipalState>();
+    const includeVaultMemberDefaults = options.includeVaultMemberDefaults !== false;
 
     const applyUserAccess = (
       userId: string,
@@ -993,15 +1059,16 @@ export class FilePermissionHeader {
       specificity: number,
       denied: boolean
     ): void => {
-      const key = `user:${userId}`;
+      const canonicalUserId = this.resolveCanonicalUserId(userId);
+      const key = `user:${canonicalUserId}`;
       const current = principals.get(key);
       if (!this.shouldReplacePrincipalAccess(current, level, specificity, denied)) {
         return;
       }
 
       principals.set(key, {
-        id: userId,
-        label: this.resolveUserLabel(userId),
+        id: canonicalUserId,
+        label: this.resolveUserLabel(canonicalUserId),
         level,
         type: "user",
         specificity,
@@ -1034,10 +1101,12 @@ export class FilePermissionHeader {
     // Seed with vault membership. A user can see the file unless a matching
     // path rule denies them later. This is the piece the old header missed:
     // inherited access from VaultMembers is real access, not merely metadata.
-    for (const member of this.vaultMembers) {
-      const level = this.levelForVaultMemberRole(member.role);
-      if (level !== "none") {
-        applyUserAccess(this.resolveCanonicalUserId(member.userId), level, Number.NEGATIVE_INFINITY, false);
+    if (includeVaultMemberDefaults) {
+      for (const member of this.vaultMembers) {
+        const level = this.levelForVaultMemberRole(member.role);
+        if (level !== "none") {
+          applyUserAccess(this.resolveCanonicalUserId(member.userId), level, Number.NEGATIVE_INFINITY, false);
+        }
       }
     }
 
@@ -1105,7 +1174,15 @@ export class FilePermissionHeader {
     }
   }
 
-  private resolveMyLevel(_path: string, rules: PermissionRule[]): AccessLevel {
+  private resolveMyLevel(
+    _path: string,
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): AccessLevel {
+    if (options.currentUserLevel) {
+      return options.currentUserLevel;
+    }
+
     if (this.ctx.currentUserRole === "admin" || this.ctx.currentUserRole === "owner") {
       return "admin";
     }
@@ -1238,10 +1315,21 @@ export class FilePermissionHeader {
 
   private formatLevel(level: string): string {
     switch (level) {
+      case "unknown": return "Unknown";
       case "admin": return "Admin";
       case "write": return "Write";
       case "read": return "Read";
       default: return "No Access";
+    }
+  }
+
+  private iconForLevel(level: AccessLevel): string {
+    switch (level) {
+      case "admin": return "shield";
+      case "write": return "edit";
+      case "read": return "eye";
+      case "unknown": return "help-circle";
+      default: return "lock";
     }
   }
 

@@ -89,28 +89,38 @@ async function buildOrgIdentityMap(orgId: string): Promise<Map<string, CognitoId
   if (!USER_POOL_ID || !orgId) return map;
 
   try {
-    const result = await cognitoClient.send(
-      new ListUsersCommand({ UserPoolId: USER_POOL_ID, Limit: 60 })
-    );
+    let paginationToken: string | undefined;
 
-    for (const u of result.Users ?? []) {
-      const attrs = Object.fromEntries(
-        (u.Attributes ?? []).map((a) => [a.Name, a.Value ?? ''])
+    do {
+      const result = await cognitoClient.send(
+        new ListUsersCommand({
+          UserPoolId: USER_POOL_ID,
+          Limit: 60,
+          PaginationToken: paginationToken,
+        })
       );
-      if (attrs['custom:org'] !== orgId) continue;
 
-      const sub = attrs['sub'] || u.Username || '';
-      if (!sub) continue;
+      for (const u of result.Users ?? []) {
+        const attrs = Object.fromEntries(
+          (u.Attributes ?? []).map((a) => [a.Name, a.Value ?? ''])
+        );
+        if (attrs['custom:org'] !== orgId) continue;
 
-      const givenName = attrs['given_name'] || '';
-      const familyName = attrs['family_name'] || '';
-      const explicitName = attrs['name']?.trim() || '';
-      const email = attrs['email'] || '';
-      const composed = [givenName, familyName].filter(Boolean).join(' ').trim();
-      const displayName = explicitName || composed || email || sub;
+        const sub = attrs['sub'] || u.Username || '';
+        if (!sub) continue;
 
-      map.set(sub, { displayName, email });
-    }
+        const givenName = attrs['given_name'] || '';
+        const familyName = attrs['family_name'] || '';
+        const explicitName = attrs['name']?.trim() || '';
+        const email = attrs['email'] || '';
+        const composed = [givenName, familyName].filter(Boolean).join(' ').trim();
+        const displayName = explicitName || composed || email || sub;
+
+        map.set(sub, { displayName, email });
+      }
+
+      paginationToken = result.PaginationToken;
+    } while (paginationToken);
   } catch (err) {
     console.warn('[VAULTS_HANDLER] Cognito directory lookup failed', (err as Error).message);
   }

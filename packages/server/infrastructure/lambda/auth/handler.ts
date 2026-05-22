@@ -451,7 +451,8 @@ async function handleRefresh(
     'read',
     permissionProbePath,
     user.orgId,
-    renewalVaultId
+    renewalVaultId,
+    { userAliases: user.email ? [user.email] : [] }
   );
   if (!permission.allowed) {
     await logAudit({
@@ -1479,7 +1480,8 @@ async function handleScopedKeyLease(
     'read',
     permissionProbePath,
     user.orgId,
-    vaultId
+    vaultId,
+    { userAliases: user.email ? [user.email] : [] }
   );
   if (!permission.allowed) {
     await logAudit({
@@ -1529,7 +1531,8 @@ async function assertScopeHasNoReadDenyRules(
     'read',
     scope,
     user.orgId,
-    vaultId
+    vaultId,
+    { userAliases: user.email ? [user.email] : [] }
   );
 
   if (denyRules.length === 0) return;

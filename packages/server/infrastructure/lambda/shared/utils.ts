@@ -241,6 +241,14 @@ export interface PermissionCheckResult {
   evaluatedRules: PermissionRule[];
 }
 
+export interface PermissionEvaluationOptions {
+  /**
+   * Legacy principal aliases for the same user, such as older rules that
+   * stored an email address before the API canonicalized users to Cognito sub.
+   */
+  userAliases?: string[];
+}
+
 /** Audit log entry structure. */
 export interface AuditEntry {
   id: string;
@@ -513,7 +521,8 @@ export async function evaluatePermission(
   action: PermissionAction,
   path: string,
   orgId: string,
-  vaultId: string
+  vaultId: string,
+  options: PermissionEvaluationOptions = {}
 ): Promise<PermissionCheckResult> {
   if (!vaultId) {
     throw new Error('CRITICAL: evaluatePermission called without vaultId — vault isolation breach prevented');
@@ -530,7 +539,12 @@ export async function evaluatePermission(
   }
 
   // Fetch all potentially applicable rules, scoped to the caller's org + vault.
-  const rules = await fetchApplicableRules(userId, roles, orgId, vaultId);
+  const rules = await fetchApplicableRules(
+    principalLookupValues(userId, options.userAliases),
+    roles,
+    orgId,
+    vaultId
+  );
 
   // Drop expired time-bound rules.
   const now = new Date().toISOString();
@@ -586,13 +600,19 @@ export async function findApplicableDenyRulesInScope(
   action: PermissionAction,
   scope: string,
   orgId: string,
-  vaultId: string
+  vaultId: string,
+  options: PermissionEvaluationOptions = {}
 ): Promise<PermissionRule[]> {
   if (rolesIncludeOrgAdmin(roles)) {
     return [];
   }
 
-  const rules = await fetchApplicableRules(userId, roles, orgId, vaultId);
+  const rules = await fetchApplicableRules(
+    principalLookupValues(userId, options.userAliases),
+    roles,
+    orgId,
+    vaultId
+  );
   const now = new Date().toISOString();
   return rules.filter((rule) => {
     if (rule.effect !== 'deny') return false;
@@ -614,12 +634,21 @@ function scopesOverlap(left: string, right: string): boolean {
  * @returns Array of matching permission rules
  */
 async function fetchApplicableRules(
-  userId: string,
+  userIds: string[],
   roles: string[],
   orgId: string,
   vaultId: string
 ): Promise<PermissionRule[]> {
   const results: PermissionRule[] = [];
+  const seen = new Set<string>();
+  const pushRules = (items: PermissionRule[] | undefined) => {
+    for (const rule of items ?? []) {
+      const key = rule.id || `${rule.userId}:${rule.role ?? ''}:${rule.pathPattern}:${rule.effect}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push(rule);
+    }
+  };
 
   // Tenant + vault filter — every query enforces both layers of isolation.
   const scopeFilter = {
@@ -627,18 +656,20 @@ async function fetchApplicableRules(
     scopeValues: { ':orgId': orgId, ':vaultId': vaultId } as Record<string, unknown>,
   };
 
-  // Fetch user-specific rules
-  const userRulesResult = await docClient.send(
-    new QueryCommand({
-      TableName: PERMISSIONS_TABLE,
-      IndexName: 'userId-index',
-      KeyConditionExpression: 'userId = :uid',
-      FilterExpression: scopeFilter.FilterExpression,
-      ExpressionAttributeValues: { ':uid': userId, ...scopeFilter.scopeValues },
-    })
-  );
-  if (userRulesResult.Items) {
-    results.push(...(userRulesResult.Items as PermissionRule[]));
+  // Fetch user-specific rules. Include canonical subject id plus legacy
+  // aliases (notably email-address principals) so old rules and new rules
+  // are evaluated by the same backend source of truth.
+  for (const lookupUserId of userIds) {
+    const userRulesResult = await docClient.send(
+      new QueryCommand({
+        TableName: PERMISSIONS_TABLE,
+        IndexName: 'userId-index',
+        KeyConditionExpression: 'userId = :uid',
+        FilterExpression: scopeFilter.FilterExpression,
+        ExpressionAttributeValues: { ':uid': lookupUserId, ...scopeFilter.scopeValues },
+      })
+    );
+    pushRules(userRulesResult.Items as PermissionRule[] | undefined);
   }
 
   // Fetch role-based rules
@@ -653,9 +684,7 @@ async function fetchApplicableRules(
         ExpressionAttributeValues: { ':role': role, ...scopeFilter.scopeValues },
       })
     );
-    if (roleRulesResult.Items) {
-      results.push(...(roleRulesResult.Items as PermissionRule[]));
-    }
+    pushRules(roleRulesResult.Items as PermissionRule[] | undefined);
   }
 
   // Fetch wildcard rules (apply to all users within the same org+vault)
@@ -668,11 +697,23 @@ async function fetchApplicableRules(
       ExpressionAttributeValues: { ':uid': '*', ...scopeFilter.scopeValues },
     })
   );
-  if (wildcardResult.Items) {
-    results.push(...(wildcardResult.Items as PermissionRule[]));
-  }
+  pushRules(wildcardResult.Items as PermissionRule[] | undefined);
 
   return results;
+}
+
+function principalLookupValues(userId: string, aliases: string[] | undefined): string[] {
+  const seen = new Set<string>();
+  const values: string[] = [];
+  for (const value of [userId, ...(aliases ?? [])]) {
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    values.push(trimmed);
+  }
+  return values;
 }
 
 /**

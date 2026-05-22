@@ -103,9 +103,10 @@ export function buildAccessUserMap(users: UserListEntry[]): Map<string, UserList
   const map = new Map<string, UserListEntry>();
   for (const user of users) {
     map.set(user.id, user);
-    if (user.email.trim()) {
-      map.set(user.email, user);
-      map.set(user.email.toLowerCase(), user);
+    const email = user.email.trim();
+    if (email) {
+      map.set(email, user);
+      map.set(email.toLowerCase(), user);
     }
   }
   return map;
@@ -135,7 +136,7 @@ export function findExactAccessUserMatch(users: UserListEntry[], value: string):
   const exactIdMatch = users.find((user) => user.id.toLowerCase() === normalizedValue);
   if (exactIdMatch) return exactIdMatch;
 
-  const exactEmailMatch = users.find((user) => user.email.toLowerCase() === normalizedValue);
+  const exactEmailMatch = users.find((user) => user.email.trim().toLowerCase() === normalizedValue);
   if (exactEmailMatch) return exactEmailMatch;
 
   const namedMatches = users.filter((user) => {
