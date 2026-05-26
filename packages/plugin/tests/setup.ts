@@ -304,4 +304,31 @@ vi.mock('obsidian', () => ({
   normalizePath: (p: string) => p,
   addIcon: vi.fn(),
   setIcon: vi.fn(),
+  // ── Events ─────────────────────────────────────────────────────────────────
+  // Required so `class PermissionStore extends Events` instantiates under
+  // vi.mock('obsidian'). The stub actually dispatches listeners synchronously
+  // through `trigger(name, ...args)` so fan-out spy tests can assert that
+  // emitting fires registered handlers.
+  Events: class {
+    private listeners = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    on(name: string, cb: (...args: unknown[]) => unknown) {
+      const arr = this.listeners.get(name) ?? [];
+      arr.push(cb);
+      this.listeners.set(name, arr);
+      return { name, cb };
+    }
+    off(name: string, cb: (...args: unknown[]) => unknown) {
+      const arr = this.listeners.get(name) ?? [];
+      this.listeners.set(name, arr.filter((x) => x !== cb));
+    }
+    offref(ref: { name: string; cb: (...args: unknown[]) => unknown }) {
+      if (ref && typeof ref === "object" && "name" in ref && "cb" in ref) {
+        this.off(ref.name as string, ref.cb as (...args: unknown[]) => unknown);
+      }
+    }
+    trigger(name: string, ...args: unknown[]) {
+      for (const cb of this.listeners.get(name) ?? []) cb(...args);
+    }
+    tryTrigger() {}
+  },
 }));

@@ -41,6 +41,7 @@ import {
 import { PermissionEditor } from "../admin/permission-editor";
 import { FilePermissionHeader } from "../ui/file-permission-header";
 import { ReadOnlyGuard } from "./readonly-guard";
+import { PermissionStore } from "./permission-store";
 import { UpdateChecker } from "./update-checker";
 import { AtRestCipher, AtRestStorage } from "../crypto/at-rest-cipher";
 import { SafeStorageLike, probeSafeStorage } from "../crypto/safe-storage";
@@ -471,25 +472,27 @@ export default class VaultGuardPlugin extends Plugin {
    * persisted bytes whose plaintext starts with the VG1 magic header. */
   private corruptedWriteNoticeAt: Map<string, number> = new Map();
 
-  /** Cache of file permissions to avoid repeated API calls */
-  private permissionCache: Map<string, PermissionLevel> = new Map();
+  /**
+   * Unified permission cache + event bus (Phase 9). Replaces the previous
+   * `permissionCache` Map, `vaultDefaultPermission`, and
+   * `permissionWarmupPromise` fields. Constructed in `onload()` after
+   * `rebuildApiClient()` so cfg.apiClient is non-null. All surface UI
+   * invalidations now fan out via `permissionStore.emit('changed', ...)`;
+   * the four `init*` methods subscribe with `registerEvent(...)` for
+   * auto-cleanup.
+   */
+  private permissionStore!: PermissionStore;
 
   /**
-   * Catch-all permission level for any path that has no rule and isn't
-   * cached. Derived from the user's vault membership role at session
-   * restore. Lets non-admin file opens skip the per-file network round
-   * trip in `fetchPermissionLevelFromServer`. `null` until the warm-up
-   * has run; readers fall back to the legacy network path.
+   * Mirror of warm-up in-flight state for the status bar — the store
+   * coalesces concurrent warm calls internally, but the status bar still
+   * wants to render "Loading permissions..." while warm-up is running.
+   * Counter (not boolean) so two overlapping warm-up triggers don't have the
+   * later finally clear the flag while the earlier is still running (WR-03).
+   * `> 0` = in-flight; incremented on entry, decremented in finally.
    */
-  private vaultDefaultPermission: PermissionLevel | null = null;
+  private permissionWarmupInFlight = 0;
 
-  /**
-   * Tracks the in-flight warm-up so concurrent triggers (session restore
-   * + initial sync + vault rebind) coalesce into one network burst, and
-   * so the read interceptor can wait briefly during cold-start instead
-   * of throwing "Access denied" while permissions are still loading.
-   */
-  private permissionWarmupPromise: Promise<void> | null = null;
 
   /** Queue of operations made while offline */
   private offlineQueue: Array<{
@@ -558,6 +561,25 @@ export default class VaultGuardPlugin extends Plugin {
 
     // Create API client (tokens are set later during session restore or login)
     this.rebuildApiClient();
+
+    // Phase 9: construct the unified permission store. The store does not
+    // hold an apiClient reference (see PermissionStoreConfig note) — all
+    // server probes go through the injected `fetchPermissionLevelFromServer`
+    // callback, which itself checks `this.apiClient` and `this.session` at
+    // call time. This is the correct nullability boundary: it lets onload()
+    // succeed even when `apiEndpoint` is empty (manual / Community-edition
+    // first-run). Must precede any init* method that subscribes via
+    // `this.registerEvent(this.permissionStore.on('changed', ...))`.
+    this.permissionStore = new PermissionStore({
+      getSession: () => this.session,
+      getVaultMemberRole: () => this.vaultMemberRole,
+      isOnline: () => this.isOnline(),
+      log: (msg) => this.log(msg),
+      onOfflineDetected: () => this.setConnectionStatus("offline"),
+      fetchPermissionLevelFromServer: (path) => this.fetchPermissionLevelFromServer(path),
+      isNetworkError: (err) => this.isNetworkError(err),
+      app: this.app,
+    });
 
     // Install the adapter intercept BEFORE any awaited startup work. Reads that
     // Obsidian fires during plugin load (workspace restore, initial indexer)
@@ -633,6 +655,14 @@ export default class VaultGuardPlugin extends Plugin {
       }
       return view;
     });
+
+    // Phase 9: subscribe the sidebar to the unified permission bus. One
+    // emit fans out to decorations + header + sidebar + readOnlyGuard.
+    this.registerEvent(
+      this.permissionStore.on("changed", () => {
+        this.reloadVaultGuardSidebar();
+      })
+    );
 
     // Build sidebar config from current session (if restored)
     const sidebarConfig = this.createSidebarViewConfig();
@@ -2101,6 +2131,15 @@ export default class VaultGuardPlugin extends Plugin {
         5000
       );
     }
+
+    // Phase 9 (D-20, D-21): warm the unified permission store and run the
+    // post-warm leaf sweep. Non-blocking — slow backends won't lock up
+    // workspace restore because each step has its own timeout/coalescing.
+    void this.runPermissionWarmup()
+      .then(() => this.permissionStore.sweepLeavesAfterWarm())
+      .catch((err) => {
+        this.logError("Permission store warm-up failed (non-blocking)", err);
+      });
   }
 
   /**
@@ -2601,8 +2640,11 @@ export default class VaultGuardPlugin extends Plugin {
       delete this.settings.bindingReconciledVaultId;
       delete this.settings.lastSyncTimestamp;
       this.syncState.lastSync = null;
-      this.permissionCache.clear();
-      this.readOnlyGuard?.refreshAll();
+      // Phase 9: BROADCAST — vault binding changed, surfaces must refresh.
+      // Subscriptions in the four init* methods invoke readOnlyGuard /
+      // file-explorer / sidebar / header invalidations; the bus listener
+      // replaces the explicit per-surface fan-out that lived here.
+      this.permissionStore.emit("changed", { serverConfirmed: true });
       this.localOnlyCatchupCompleted = false;
       this.stopSyncTimer();
     }
@@ -2746,189 +2788,58 @@ export default class VaultGuardPlugin extends Plugin {
       this.vaultMemberRole = null;
     }
 
-    // Per-file permission cache is keyed by path only, so a role change
-    // could invalidate previously-cached grants for the same path.
-    this.permissionCache.clear();
-    this.vaultDefaultPermission = null;
+    // Phase 9: role changed — broadcast through the bus. The four init*
+    // subscriptions handle readOnlyGuard / fileExplorer / sidebar / header.
     this.applyEffectiveRoleToUi();
+    this.permissionStore.emit("changed", { serverConfirmed: true });
 
     // Kick off cache warm-up so subsequent file reads hit the cache and
-    // skip the per-file network round trip. Non-blocking — the read
-    // interceptor coalesces against `permissionWarmupPromise` for the
-    // brief moment before warm-up completes.
-    this.warmPermissionCache()
-      .catch((err) => {
-        this.logError("Permission cache warm-up failed (non-blocking)", err);
-      })
-      .finally(() => {
-        // Re-evaluate any open editor lock state once warm-up has settled
-        // (or failed) — the role just changed, so previously-writable files
-        // may now be read-only and vice versa.
-        this.readOnlyGuard?.refreshAll();
-      });
+    // skip the per-file network round trip. Non-blocking — the store's
+    // warm() coalesces concurrent triggers internally.
+    this.runPermissionWarmup().catch((err) => {
+      this.logError("Permission cache warm-up failed (non-blocking)", err);
+    });
   }
 
   /**
-   * Pre-fills `permissionCache` and `vaultDefaultPermission` so non-admin
-   * users can open files instantly post-login instead of paying a 3-call
-   * permission probe per file. Composed of two pieces:
-   *
-   * 1. Vault-default level — derived from the user's vault membership
-   *    role (admin → ADMIN, editor → WRITE, viewer → READ). Stored at
-   *    the empty-string root key so the cache walk-up always finds an
-   *    answer for paths without specific rules.
-   *
-   * 2. Per-rule overrides — for each rule that explicitly applies to
-   *    the current user (by userId, role, or wildcard), the rule's path
-   *    pattern is cached if it's a literal path (no glob). Glob patterns
-   *    are left to per-file resolution because they need pattern-aware
-   *    matching the cache walk doesn't do.
-   *
-   * Failures degrade gracefully — without the warm-up, file reads fall
-   * back to the original per-file network probe.
+   * Fetches the applicable rule set so the caller can hand it to
+   * `permissionStore.warm(rules, vaultRole)`. The store is decoupled from
+   * the rule-fetch choice (D-04), so the call shape lives here.
    */
-  private async warmPermissionCache(): Promise<void> {
-    if (this.permissionWarmupPromise) {
-      return this.permissionWarmupPromise;
-    }
-
-    if (!this.session || !this.apiClient || !this.settings.serverVaultId) {
-      return;
-    }
-
-    const promise = this.runPermissionWarmup();
-    this.permissionWarmupPromise = promise;
-    this.updateStatusBar();
+  private async collectRulesForWarmup(): Promise<PermissionRule[]> {
+    if (!this.session || !this.apiClient) return [];
+    if (this.session.role === "admin" || this.session.role === "owner") return [];
     try {
-      await promise;
-    } finally {
-      if (this.permissionWarmupPromise === promise) {
-        this.permissionWarmupPromise = null;
-      }
-      this.updateStatusBar();
-    }
-  }
-
-  private async runPermissionWarmup(): Promise<void> {
-    if (!this.session || !this.apiClient) return;
-
-    // Org-level admins/owners take the existing fast path — no warm-up
-    // needed because every getEffectivePermission call short-circuits.
-    if (this.session.role === "admin" || this.session.role === "owner") {
-      return;
-    }
-
-    let rules: PermissionRule[] = [];
-    try {
-      rules = this.isEffectiveAdmin()
+      return this.isEffectiveAdmin()
         ? await this.apiClient.getPermissions()
         : await this.apiClient.getUserPermissions(this.session.userId);
     } catch (err) {
       this.log(`Permission warm-up: rules fetch failed: ${(err as Error).message}`);
+      return [];
+    }
+  }
+
+  /**
+   * Drives a single warm-up cycle through the PermissionStore. Coalesced
+   * by the store internally (one in-flight promise per warm). Also bumps
+   * `permissionWarmupInFlight` so the status bar can render "Loading
+   * permissions..." until warm-up settles. The counter (vs a boolean) means
+   * two overlapping triggers don't have the later finally clear the flag
+   * while the earlier is still running (WR-03).
+   */
+  private async runPermissionWarmup(): Promise<void> {
+    if (!this.session || !this.apiClient || !this.settings.serverVaultId) {
       return;
     }
-
-    const applicableRules = rules.filter(
-      (rule) => this.ruleAppliesToCurrentUser(rule) && !this.ruleIsExpired(rule)
-    );
-    const hasDynamicRules = applicableRules.some((rule) =>
-      this.isGlobPattern(rule.pathPattern)
-    );
-
-    const defaultLevel = this.deriveDefaultPermissionLevel();
-    if (defaultLevel !== null) {
-      this.vaultDefaultPermission = defaultLevel;
-      // A root default is only safe when every applicable rule can be
-      // represented by the literal ancestor cache below. Glob rules need the
-      // backend's matcher; otherwise a cached viewer READ would bypass
-      // `/secret/**` denies or miss `/editable/**` write grants.
-      if (!hasDynamicRules) {
-        this.permissionCache.set("", defaultLevel);
-      }
+    this.permissionWarmupInFlight = this.permissionWarmupInFlight + 1;
+    this.updateStatusBar();
+    try {
+      const rules = await this.collectRulesForWarmup();
+      await this.permissionStore.warm(rules, this.vaultMemberRole);
+    } finally {
+      this.permissionWarmupInFlight = Math.max(0, this.permissionWarmupInFlight - 1);
+      this.updateStatusBar();
     }
-
-    for (const rule of applicableRules) {
-      // Glob patterns can't be exact-matched in the path-walk cache —
-      // leave them to the per-file network probe.
-      if (this.isGlobPattern(rule.pathPattern)) continue;
-
-      const level = this.ruleToPermissionLevel(rule);
-      const cacheKey = this.normalizeVaultPath(rule.pathPattern);
-
-      // Deny wins over allow at the same literal path, matching the backend
-      // evaluator. Allows can still combine upward by level when no deny is
-      // present for that exact cache key.
-      const existing = this.permissionCache.get(cacheKey);
-      if (rule.effect === "deny") {
-        this.permissionCache.set(cacheKey, PermissionLevel.NONE);
-        continue;
-      }
-      if (existing === PermissionLevel.NONE) continue;
-      if (existing !== undefined && existing >= level) continue;
-      this.permissionCache.set(cacheKey, level);
-    }
-  }
-
-  private deriveDefaultPermissionLevel(): PermissionLevel | null {
-    const role = this.vaultMemberRole ?? this.deriveSessionVaultRole();
-    if (!role) return null;
-    switch (role) {
-      case "admin": return PermissionLevel.ADMIN;
-      case "editor": return PermissionLevel.WRITE;
-      case "viewer": return PermissionLevel.READ;
-      default: return null;
-    }
-  }
-
-  private deriveSessionVaultRole(): VaultMemberRole | null {
-    // Session roles are org-level ("member" | "editor" | "admin" | "owner");
-    // map them onto the vault-member axis ("viewer" | "editor" | "admin").
-    // "member" is the default org seat with read-only intent at the vault.
-    const role = this.session?.role;
-    if (role === "admin" || role === "owner") return "admin";
-    if (role === "editor") return "editor";
-    if (role === "member") return "viewer";
-    return null;
-  }
-
-  private ruleAppliesToCurrentUser(rule: PermissionRule): boolean {
-    if (!this.session) return false;
-    if (rule.userId === "*") return true;
-    if (rule.userId === this.session.userId) return true;
-    if (
-      this.session.email &&
-      rule.userId.trim().toLowerCase() === this.session.email.trim().toLowerCase()
-    ) {
-      return true;
-    }
-    if (rule.role) {
-      const userRoles = [
-        ...(this.vaultMemberRole ? [this.vaultMemberRole] : []),
-        ...(this.session.roles?.length ? this.session.roles : [this.session.role]),
-      ];
-      return userRoles.includes(rule.role);
-    }
-    return false;
-  }
-
-  private ruleToPermissionLevel(rule: PermissionRule): PermissionLevel {
-    if (rule.effect === "deny") return PermissionLevel.NONE;
-    if (rule.actions.includes("admin")) return PermissionLevel.ADMIN;
-    if (rule.actions.includes("write") || rule.actions.includes("delete")) {
-      return PermissionLevel.WRITE;
-    }
-    if (rule.actions.includes("read") || rule.actions.includes("list")) {
-      return PermissionLevel.READ;
-    }
-    return PermissionLevel.NONE;
-  }
-
-  private ruleIsExpired(rule: PermissionRule): boolean {
-    return typeof rule.expiresAt === "string" && rule.expiresAt <= new Date().toISOString();
-  }
-
-  private isGlobPattern(pattern: string): boolean {
-    return pattern.includes("*") || pattern.includes("?") || pattern.includes("[");
   }
 
   /**
@@ -2937,9 +2848,15 @@ export default class VaultGuardPlugin extends Plugin {
    * or once the warm-up resolves. The cap exists so a stuck backend can't
    * lock up Obsidian's workspace restore — slow paths fall through to the
    * existing per-file network probe.
+   *
+   * Races the store's in-flight warm-up promise against a 5 s timeout. Using
+   * Promise.race (not a polled setTimeout chain) means a stuck warm-up
+   * cannot leak a chained 50 ms timer loop, and repeated calls cannot stack
+   * multiple poll loops on the same in-flight warm (WR-02).
    */
   private async awaitPermissionWarmup(): Promise<void> {
-    if (!this.permissionWarmupPromise) return;
+    const inFlight = this.permissionStore.inFlightWarmup;
+    if (!inFlight) return;
 
     let timer: ReturnType<typeof setTimeout> | null = null;
     const timeout = new Promise<void>((resolve) => {
@@ -2947,7 +2864,10 @@ export default class VaultGuardPlugin extends Plugin {
     });
 
     try {
-      await Promise.race([this.permissionWarmupPromise, timeout]);
+      // Swallow rejection from the warm promise — this is a best-effort
+      // pause, not an error surface. The race resolves on whichever fires
+      // first; the loser's outcome is discarded.
+      await Promise.race([inFlight.catch(() => undefined), timeout]);
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -3749,11 +3669,12 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private refreshPermissionUiAfterMembershipChange(): void {
-    this.permissionCache.clear();
-    this.readOnlyGuard?.refreshAll();
-    this.fileExplorerDecorations?.invalidate();
-    this.reloadVaultGuardSidebar();
-    this.filePermissionHeader?.invalidateCache();
+    // Phase 9: single bus emit replaces the 5-call fan-out. The four
+    // init* subscriptions invoke readOnlyGuard / fileExplorer / sidebar /
+    // header invalidations. The `update({ force: true })` line is
+    // preserved because it's a force-refresh of the CURRENT header view,
+    // not an invalidation — the listener doesn't pass force: true.
+    this.permissionStore.emit("changed", { serverConfirmed: true });
     void this.filePermissionHeader?.update({ force: true });
   }
 
@@ -4227,12 +4148,11 @@ export default class VaultGuardPlugin extends Plugin {
     this.setConnectionStatus("offline");
     // Re-evaluate UI surfaces so already-open views flip from "no access"
     // overlay to the read-only banner without needing a tab close/reopen.
-    this.permissionCache.clear();
-    this.readOnlyGuard?.refreshAll();
-    this.fileExplorerDecorations?.invalidate();
-    this.reloadVaultGuardSidebar();
-    this.filePermissionHeader?.invalidateCache();
-    this.filePermissionHeader?.update();
+    // Phase 9: single bus emit replaces the 5-call fan-out — the four
+    // init* subscriptions handle readOnlyGuard / fileExplorer / sidebar /
+    // header. Server-confirmed because forceLogout is the authoritative
+    // teardown signal.
+    this.permissionStore.emit("changed", { serverConfirmed: true });
     new Notice(noticeMessage);
   }
 
@@ -5562,7 +5482,7 @@ export default class VaultGuardPlugin extends Plugin {
       }
 
       await this.emitAuditEvent("file.delete", path);
-      this.permissionCache.delete(path);
+      this.permissionStore.emit("changed", { path });
     } catch (error) {
       if (this.isNetworkError(error)) {
         this.setConnectionStatus("offline");
@@ -5602,7 +5522,9 @@ export default class VaultGuardPlugin extends Plugin {
     // local-only move — the server has no record of these paths and
     // shouldn't gain one through a rename.
     if (this.isPathExcluded(oldNormalized) || this.isPathExcluded(newNormalized)) {
-      this.permissionCache.delete(oldNormalized);
+      // Pitfall 5: emit OLD path so cache + metadataCache invalidate; leaf
+      // sweep resolves CURRENT view per leaf (Plan 09-03).
+      this.permissionStore.emit("changed", { path: oldNormalized });
       return;
     }
 
@@ -5614,7 +5536,8 @@ export default class VaultGuardPlugin extends Plugin {
     // out here so we don't double-handle or corrupt the marker path.
     const renamedItem = this.app.vault.getAbstractFileByPath(newPath);
     if (renamedItem instanceof TFolder) {
-      this.permissionCache.delete(oldNormalized);
+      // Pitfall 5: rename emits OLD path.
+      this.permissionStore.emit("changed", { path: oldNormalized });
       return;
     }
     // Marker files should never round-trip through this path either.
@@ -5644,7 +5567,8 @@ export default class VaultGuardPlugin extends Plugin {
         this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
       }
       this.queueOfflineOperation("delete", oldNormalized);
-      this.permissionCache.delete(oldNormalized);
+      // Pitfall 5: rename emits OLD path.
+      this.permissionStore.emit("changed", { path: oldNormalized });
       return;
     }
 
@@ -5682,7 +5606,8 @@ export default class VaultGuardPlugin extends Plugin {
         this.queueOfflineOperation("delete", oldNormalized);
       }
 
-      this.permissionCache.delete(oldNormalized);
+      // Pitfall 5: rename emits OLD path.
+      this.permissionStore.emit("changed", { path: oldNormalized });
       await this.emitAuditEvent("file.rename", oldNormalized, { newPath: newNormalized });
       this.syncState.pendingChanges = this.offlineQueue.length;
       this.updateStatusBar();
@@ -5696,7 +5621,8 @@ export default class VaultGuardPlugin extends Plugin {
           this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
         }
         this.queueOfflineOperation("delete", oldNormalized);
-        this.permissionCache.delete(oldNormalized);
+        // Pitfall 5: rename emits OLD path.
+        this.permissionStore.emit("changed", { path: oldNormalized });
       } else {
         throw error;
       }
@@ -5713,51 +5639,15 @@ export default class VaultGuardPlugin extends Plugin {
    * @param path - The vault-relative path to check
    * @returns The effective permission level
    */
+  /**
+   * Thin wrapper over `permissionStore.getPermission(path)`. Many call
+   * sites in main.ts still reference this method by name; this passthrough
+   * preserves the surface area without duplicating cache/walk-up logic
+   * (Phase 9). The store owns admin shortcut, walk-up, TTL, concurrent-call
+   * dedup, offline fallback, and network-error tolerance.
+   */
   private async getEffectivePermission(path: string): Promise<PermissionLevel> {
-    // Check cache first
-    if (this.permissionCache.has(path)) {
-      return this.permissionCache.get(path)!;
-    }
-
-    // No session means no permission can be established; fail closed.
-    if (!this.session) {
-      return PermissionLevel.NONE;
-    }
-
-    // Admin and owner roles always have full access — no server round-trip needed
-    if (this.session.role === "admin" || this.session.role === "owner") {
-      this.permissionCache.set(path, PermissionLevel.ADMIN);
-      return PermissionLevel.ADMIN;
-    }
-
-    // Cache walk-up — when the warm-up has seeded specific paths and a
-    // vault-default at the root, the parent walk usually finds an answer
-    // here without paying the per-file network round trip. This is the
-    // hot path for non-admin viewers post-warm-up.
-    const cached = this.resolvePermissionFromCache(path);
-    if (cached > PermissionLevel.NONE) {
-      this.permissionCache.set(path, cached);
-      return cached;
-    }
-
-    try {
-      if (this.isOnline()) {
-        const level = await this.fetchPermissionLevelFromServer(path);
-        this.permissionCache.set(path, level);
-        return level;
-      }
-
-      // Offline: check hierarchically from cache
-      return this.resolvePermissionFromCache(path);
-    } catch (error) {
-      if (this.isNetworkError(error)) {
-        this.setConnectionStatus("offline");
-        return this.resolvePermissionFromCache(path);
-      }
-      // On unexpected errors, use only known cached grants. Cache misses deny.
-      this.log(`Permission check failed for "${path}", falling back to cache: ${error}`);
-      return this.resolvePermissionFromCache(path);
-    }
+    return this.permissionStore.getPermission(path);
   }
 
   private async fetchPermissionLevelFromServer(path: string): Promise<PermissionLevel> {
@@ -5889,22 +5779,24 @@ export default class VaultGuardPlugin extends Plugin {
    * @returns Cached permission level, or NONE when no cached grant applies
    */
   private resolvePermissionFromCache(path: string): PermissionLevel {
-    // Walk up the path hierarchy looking for cached permissions
+    // Walk up the path hierarchy looking for cached permissions (Phase 9:
+    // store-backed). Uses `getCachedPermission` for sync probing — the
+    // store's own internal walk-up runs inside async `getPermission`, so
+    // the sync delete-probe call sites (interceptedDelete fallbacks)
+    // need this explicit walk to stay synchronous.
     const segments = path.split("/");
     for (let i = segments.length; i > 0; i--) {
       const parentPath = segments.slice(0, i).join("/");
-      if (this.permissionCache.has(parentPath)) {
-        return this.permissionCache.get(parentPath)!;
-      }
+      const level = this.permissionStore.getCachedPermission(parentPath);
+      if (level !== undefined) return level;
     }
 
     // Final fallback: the empty-string key acts as the vault root, where
     // the warm-up stores the user's vault-default level (READ for viewers,
     // WRITE for editors, etc.). Without this, any path not explicitly
     // cached fell through to the network even after warm-up.
-    if (this.permissionCache.has("")) {
-      return this.permissionCache.get("")!;
-    }
+    const rootLevel = this.permissionStore.getCachedPermission("");
+    if (rootLevel !== undefined) return rootLevel;
 
     return PermissionLevel.NONE;
   }
@@ -6097,7 +5989,8 @@ export default class VaultGuardPlugin extends Plugin {
         new Error(delResp.error?.message ?? "unknown")
       );
     }
-    this.permissionCache.delete(oldNormalized);
+    // Pitfall 5: rename emits OLD path.
+    this.permissionStore.emit("changed", { path: oldNormalized });
   }
 
   /**
@@ -6120,7 +6013,7 @@ export default class VaultGuardPlugin extends Plugin {
         new Error(response.error?.message ?? "unknown")
       );
     }
-    this.permissionCache.delete(normalized);
+    this.permissionStore.emit("changed", { path: normalized });
   }
 
   /**
@@ -6492,7 +6385,7 @@ export default class VaultGuardPlugin extends Plugin {
 
     try {
       await this.originalAdapterMethods.remove(path);
-      this.permissionCache.delete(path);
+      this.permissionStore.emit("changed", { path });
       return true;
     } catch (err) {
       this.logError(`Catch-up: failed to remove local-only "${path}"`, err);
@@ -7152,7 +7045,7 @@ export default class VaultGuardPlugin extends Plugin {
         );
         if (response.success || response.error?.statusCode === 404) {
           deleted += 1;
-          this.permissionCache.delete(path);
+          this.permissionStore.emit("changed", { path });
         } else {
           failed += 1;
           this.logError(`Purge: DELETE "${path}" failed`, new Error(response.error?.message ?? "unknown"));
@@ -7334,18 +7227,12 @@ export default class VaultGuardPlugin extends Plugin {
       // wipe it — the next interceptedRead/Write will re-fetch from the
       // server and reflect the new rule set.
       if (response.data.permissionsChanged) {
-        this.permissionCache.clear();
-        this.log("Sync: permission rules changed on the server — local permission cache cleared.");
-        // Mirror the post-edit fan-out from `onRulesChanged`. Without this,
-        // the file-explorer decorations and sidebar view keep their own
-        // rule caches and render stale dots/avatars/hide-state until the
-        // user manually edits a rule. The header has a TTL cache too, so
-        // invalidate + re-render it for the active file.
-        this.readOnlyGuard?.refreshAll();
-        this.fileExplorerDecorations?.invalidate();
-        this.reloadVaultGuardSidebar();
-        this.filePermissionHeader?.invalidateCache();
-        this.filePermissionHeader?.update();
+        this.log("Sync: permission rules changed on the server — emitting bus event.");
+        // Phase 9: single bus emit replaces the 5-call fan-out. Server-
+        // confirmed because the sync delta carries an authoritative
+        // permission-rules-changed signal from the server. The four init*
+        // bus subscriptions handle the surface invalidations.
+        this.permissionStore.emit("changed", { serverConfirmed: true });
       }
 
       deltaCount = response.data.deltas.length;
@@ -8013,7 +7900,9 @@ export default class VaultGuardPlugin extends Plugin {
 
   private async handleServerRevocation(reason: string): Promise<void> {
     this.keyLease = null;
-    this.permissionCache.clear();
+    // Phase 9: SILENT — forceLogout below broadcasts the wildcard 'changed'
+    // (collapsed in Task 3 of plan 09-02). A broadcast here would double-fire.
+    this.permissionStore.invalidate();
     await this.forceLogout(`VaultGuard Sync: Access revoked (${reason}). Local session cleared.`);
   }
 
@@ -8065,19 +7954,19 @@ export default class VaultGuardPlugin extends Plugin {
           if (result === "ok") {
             this.log("Vault-scoped key lease recovered — full access restored.");
             new Notice("VaultGuard Sync: Full vault access restored.");
-            // Permission rules may have widened; clear the cache so the next
-            // file open re-evaluates instead of using a stale "denied" entry.
-            this.permissionCache.clear();
+            // Phase 9: BROADCAST — permission rules may have widened (per
+            // pre-existing comment). Surfaces must refresh, otherwise post-
+            // recovery views show stale deny-state visuals. The four init*
+            // bus subscriptions invoke readOnlyGuard / fileExplorer /
+            // sidebar / header invalidations. The explicit fan-out lines
+            // that lived here are removed in Task 3 of plan 09-02.
+            this.permissionStore.emit("changed", { serverConfirmed: true });
             // Phase-8: clear the in-memory placeholder set so subsequent reads
             // go through the normal readPlainFromDisk path (the on-disk VG1
             // bytes are still placeholders until the next reconcile writes
             // real content; that's the existing sync engine's job once the
             // lease is back).
             this.placeholderPaths.clear();
-            this.readOnlyGuard?.refreshAll();
-            this.fileExplorerDecorations?.invalidate();
-            this.filePermissionHeader?.invalidateCache();
-            this.filePermissionHeader?.update();
           }
         } catch (err) {
           // Network blips and 5xxs are expected during recovery polling.
@@ -8876,10 +8765,9 @@ export default class VaultGuardPlugin extends Plugin {
       // /** default-member rule) can affect every file, so per-path
       // invalidation here would leave neighboring files miscolored.
       onRulesChanged: () => {
-        this.permissionCache.clear();
-        this.fileExplorerDecorations?.invalidate();
-        this.reloadVaultGuardSidebar();
-        this.readOnlyGuard?.refreshAll();
+        // Phase 9: single bus emit replaces the 4-call fan-out. The four
+        // init* bus subscriptions handle the surface invalidations.
+        this.permissionStore.emit("changed", { serverConfirmed: true });
       },
     });
 
@@ -8894,6 +8782,16 @@ export default class VaultGuardPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("file-open", () => {
         this.filePermissionHeader?.update();
+      })
+    );
+
+    // Phase 9: subscribe to the unified permission bus. One emit fans out
+    // here + to fileExplorerDecorations + sidebar + readOnlyGuard.
+    this.registerEvent(
+      this.permissionStore.on("changed", (...args: unknown[]) => {
+        const payload = (args[0] as { path?: string } | undefined) ?? {};
+        this.filePermissionHeader?.invalidateCache(payload.path);
+        void this.filePermissionHeader?.update();
       })
     );
 
@@ -8916,6 +8814,14 @@ export default class VaultGuardPlugin extends Plugin {
       isLoggedIn: () => this.session !== null,
     });
     this.readOnlyGuard.start();
+
+    // Phase 9: subscribe to the unified permission bus. readOnlyGuard
+    // doesn't take a path — it refreshes the active leaf's lock state.
+    this.registerEvent(
+      this.permissionStore.on("changed", () => {
+        this.readOnlyGuard?.refreshAll();
+      })
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -8944,6 +8850,15 @@ export default class VaultGuardPlugin extends Plugin {
         this.fileExplorerDecorations?.enable();
       }, 1000);
     }
+
+    // Phase 9: subscribe to the unified permission bus. Per-path payload
+    // scopes the invalidation; wildcard payload (no path) re-renders all.
+    this.registerEvent(
+      this.permissionStore.on("changed", (...args: unknown[]) => {
+        const payload = (args[0] as { path?: string } | undefined) ?? {};
+        this.fileExplorerDecorations?.invalidate(payload.path);
+      })
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -9038,7 +8953,7 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
-    if (this.permissionWarmupPromise) {
+    if (this.permissionWarmupInFlight > 0) {
       this.statusBarEl.setText("VaultGuard Sync ↻ Loading permissions...");
       return;
     }
@@ -9219,16 +9134,12 @@ export default class VaultGuardPlugin extends Plugin {
       // the admin-side controls in the path-permissions modal.
       currentUserRole: this.getEffectiveUiRole(),
       onRulesChanged: () => {
-        // Full invalidation: rules edited from the modal can include glob
-        // patterns (e.g. deleting an inherited `/docs/**` rule from this
-        // file's panel), so per-path invalidation would leave sibling
-        // files showing stale colors.
-        this.permissionCache.clear();
-        this.filePermissionHeader?.invalidateCache();
-        this.filePermissionHeader?.update();
-        this.fileExplorerDecorations?.invalidate();
-        this.reloadVaultGuardSidebar();
-        this.readOnlyGuard?.refreshAll();
+        // Phase 9: full invalidation via the bus. Rules edited from the
+        // modal can include glob patterns (e.g. deleting an inherited
+        // `/docs/**` rule from this file's panel), so per-path invalidation
+        // would leave sibling files showing stale colors. The four init*
+        // bus subscriptions handle the surface invalidations.
+        this.permissionStore.emit("changed", { serverConfirmed: true });
       },
     });
     modal.open();
@@ -9247,13 +9158,8 @@ export default class VaultGuardPlugin extends Plugin {
     const rulePath = isFolder ? (path.endsWith("/") ? path : path + "/") : path;
     const editor = new PermissionEditor(this.app, this.apiClient);
     editor.showAddRuleForPath(rulePath, async () => {
-      // Invalidate caches so UI refreshes
-      this.permissionCache.clear();
-      this.filePermissionHeader?.invalidateCache();
-      this.filePermissionHeader?.update();
-      this.fileExplorerDecorations?.invalidate();
-      this.reloadVaultGuardSidebar();
-      this.readOnlyGuard?.refreshAll();
+      // Phase 9: single bus emit replaces the 5-call fan-out.
+      this.permissionStore.emit("changed", { serverConfirmed: true });
     });
   }
 
@@ -9266,7 +9172,9 @@ export default class VaultGuardPlugin extends Plugin {
    * Used for security wipe or manual cache reset.
    */
   async clearLocalCache(): Promise<void> {
-    this.permissionCache.clear();
+    // Phase 9: SILENT — teardown path, surfaces will be torn down
+    // immediately by surrounding lifecycle code. No subscribers to notify.
+    this.permissionStore.invalidate();
     this.readOnlyGuard?.refreshAll();
     this.offlineQueue = [];
     this.syncState = {
@@ -9294,7 +9202,8 @@ export default class VaultGuardPlugin extends Plugin {
     this.stopKeyRenewalMonitor();
     this.stopHeartbeatMonitor();
     this.stopAutoLockTimer();
-    this.permissionCache.clear();
+    // Phase 9: SILENT — teardown path; no subscribers to notify.
+    this.permissionStore.invalidate();
     this.offlineQueue = [];
     this.log("Sensitive data cleared from memory.");
   }

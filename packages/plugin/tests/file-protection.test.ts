@@ -52,6 +52,28 @@ vi.mock('obsidian', () => ({
   normalizePath: (p: string) => p,
   addIcon: vi.fn(),
   setIcon: vi.fn(),
+  Events: class {
+    private listeners = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    on(name: string, cb: (...args: unknown[]) => unknown) {
+      const arr = this.listeners.get(name) ?? [];
+      arr.push(cb);
+      this.listeners.set(name, arr);
+      return { name, cb };
+    }
+    off(name: string, cb: (...args: unknown[]) => unknown) {
+      const arr = this.listeners.get(name) ?? [];
+      this.listeners.set(name, arr.filter((x) => x !== cb));
+    }
+    offref(ref: { name: string; cb: (...args: unknown[]) => unknown }) {
+      if (ref && typeof ref === "object" && "name" in ref && "cb" in ref) {
+        this.off(ref.name as string, ref.cb as (...args: unknown[]) => unknown);
+      }
+    }
+    trigger(name: string, ...args: unknown[]) {
+      for (const cb of this.listeners.get(name) ?? []) cb(...args);
+    }
+    tryTrigger() {}
+  },
   Modal: class {
     app: any;
     containerEl: any = document.createElement('div');
@@ -120,8 +142,57 @@ function createTestPlugin() {
     remove: vi.fn().mockResolvedValue(undefined),
   };
 
-  // Default: no session, no cache
-  plugin.permissionCache = new Map();
+  // Phase 9: the production code routes all permission reads through
+  // `this.permissionStore` instead of a plain `permissionCache` Map.
+  // Install a backing-Map-only stub that keeps the historical
+  // `plugin.permissionCache.set(path, level)` test seeding API working.
+  const permissionCache = new Map<string, PermissionLevel>();
+  plugin.permissionCache = permissionCache;
+  plugin.permissionStore = {
+    async getPermission(path: string): Promise<PermissionLevel> {
+      if (!plugin.session) return PermissionLevel.NONE;
+      if (plugin.session.role === 'admin' || plugin.session.role === 'owner') {
+        permissionCache.set(path, PermissionLevel.ADMIN);
+        return PermissionLevel.ADMIN;
+      }
+      const exact = permissionCache.get(path);
+      if (exact !== undefined) return exact;
+      // Walk-up: parent segments then root sentinel.
+      const segments = path.split('/');
+      for (let i = segments.length - 1; i > 0; i--) {
+        const parent = segments.slice(0, i).join('/');
+        const lvl = permissionCache.get(parent);
+        if (lvl !== undefined) return lvl;
+      }
+      const root = permissionCache.get('');
+      if (root !== undefined) return root;
+      return PermissionLevel.NONE;
+    },
+    getCachedPermission(path: string): PermissionLevel | undefined {
+      return permissionCache.get(path);
+    },
+    get inFlightWarmup(): Promise<void> | null { return null; },
+    emit: vi.fn((event: string, payload?: { path?: string; serverConfirmed?: boolean }) => {
+      // Mirror PermissionStore's 'changed' handler enough for tests: when a
+      // specific path is invalidated, drop its cache entry so subsequent
+      // getCachedPermission/getPermission re-resolves. When the payload is a
+      // server-confirmed wildcard (no path), clear the whole cache.
+      if (event !== 'changed') return;
+      if (payload && typeof payload.path === 'string') {
+        permissionCache.delete(payload.path);
+      } else if (payload?.serverConfirmed) {
+        permissionCache.clear();
+      }
+    }),
+    on: vi.fn(() => ({ name: '', cb: () => undefined })),
+    off: vi.fn(),
+    offref: vi.fn(),
+    trigger: vi.fn(),
+    tryTrigger: vi.fn(),
+    invalidate: vi.fn(),
+    sweepLeavesAfterWarm: vi.fn().mockResolvedValue(undefined),
+    warm: vi.fn().mockResolvedValue(undefined),
+  };
   plugin.offlineQueue = [];
   plugin.keyLease = null;
   plugin.atRestCipher = {

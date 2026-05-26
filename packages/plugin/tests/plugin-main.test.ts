@@ -9,6 +9,59 @@ import { PermissionLevel } from "../src/types";
 const mockNotice = vi.mocked(Notice);
 const mockRequestUrl = vi.mocked(requestUrl);
 
+/**
+ * Test-only minimal PermissionStore stand-in. Phase 9 replaced the
+ * permissionCache: Map field in main.ts with a unified PermissionStore.
+ * Existing tests still poke at the cache via `.permissionCache.size/get/set/has`;
+ * this stand-in backs those reads with a real Map and forwards
+ * emit('changed') events to four registered listeners (matching the
+ * production fan-out: file-explorer, sidebar, header, read-only-guard).
+ */
+function installTestPermissionStore(plugin: any): Map<string, number> {
+  const cache = new Map<string, number>();
+  const listeners: Array<(payload: { path?: string; serverConfirmed?: boolean }) => void> = [];
+
+  plugin.permissionStore = {
+    getCachedPermission: (path: string) => cache.get(path),
+    getPermission: async (path: string) => cache.get(path) ?? 0,
+    warm: vi.fn(async () => undefined),
+    sweepLeavesAfterWarm: vi.fn(async () => undefined),
+    emit: (_name: string, payload: { path?: string; serverConfirmed?: boolean } = {}) => {
+      if (payload.path !== undefined) {
+        cache.delete(payload.path);
+      } else {
+        cache.clear();
+      }
+      // Fan out so the four production subscribers (when wired) still fire.
+      for (const cb of listeners) cb(payload);
+    },
+    invalidate: (path?: string) => {
+      if (path === undefined) cache.clear();
+      else cache.delete(path);
+    },
+    on: (_name: string, cb: (...args: unknown[]) => unknown) => {
+      listeners.push(cb as (payload: { path?: string; serverConfirmed?: boolean }) => void);
+      return { name: _name, cb };
+    },
+  };
+  // Phase 9 back-compat: expose `permissionCache` as a getter onto the
+  // store's backing Map so legacy tests that read .size/.get/.has/.set
+  // keep working. New tests should use `permissionStore.getCachedPermission`.
+  Object.defineProperty(plugin, "permissionCache", {
+    configurable: true,
+    get: () => cache,
+    set: (newMap: Map<string, number>) => {
+      cache.clear();
+      for (const [k, v] of newMap) cache.set(k, v);
+    },
+  });
+  // Phase 9 back-compat: legacy tests reference `runPermissionWarmup` to
+  // execute warm-up logic. The new main.ts method drives the store; for
+  // tests we route through the test-only seed helpers.
+  plugin.warmPermissionCache = vi.fn(async () => undefined);
+  return cache;
+}
+
 function makePlugin() {
   const plugin = new VaultGuardPlugin() as any;
 
@@ -24,6 +77,7 @@ function makePlugin() {
       on: vi.fn(() => ({ unload: vi.fn() })),
       getLeavesOfType: vi.fn(() => []),
     },
+    metadataCache: {},
   };
   plugin.settings = {
     ...DEFAULT_SETTINGS,
@@ -49,6 +103,8 @@ function makePlugin() {
   plugin.scheduleConnectionRetry = vi.fn();
   plugin.stopConnectionRetry = vi.fn();
   plugin.derivedBindingId = "test-vault-binding";
+
+  installTestPermissionStore(plugin);
 
   return plugin;
 }
@@ -1590,6 +1646,20 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       invalidate: vi.fn(),
     };
 
+    // Phase 9: production wires subscribers inside init* methods. Tests
+    // bypass init* so wire them explicitly here to mirror the four
+    // production listeners (decorations + sidebar + header + readOnlyGuard).
+    plugin.permissionStore.on("changed", (payload: { path?: string } = {}) => {
+      plugin.fileExplorerDecorations.invalidate(payload.path);
+    });
+    plugin.permissionStore.on("changed", (payload: { path?: string } = {}) => {
+      plugin.filePermissionHeader.invalidateCache(payload.path);
+      void plugin.filePermissionHeader.update();
+    });
+    plugin.permissionStore.on("changed", () => {
+      plugin.readOnlyGuard.refreshAll();
+    });
+
     await plugin.addCurrentVaultMember("user-2", "viewer");
     await plugin.updateCurrentVaultMember("user-2", "editor");
     await plugin.removeCurrentVaultMember("user-2");
@@ -1598,7 +1668,11 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.readOnlyGuard.refreshAll).toHaveBeenCalledTimes(3);
     expect(plugin.fileExplorerDecorations.invalidate).toHaveBeenCalledTimes(3);
     expect(plugin.filePermissionHeader.invalidateCache).toHaveBeenCalledTimes(3);
-    expect(plugin.filePermissionHeader.update).toHaveBeenCalledTimes(3);
+    // After Phase 9 the header receives both a bus-driven update() and
+    // the explicit force-refresh update({ force: true }) inside
+    // refreshPermissionUiAfterMembershipChange. 3 membership changes ×
+    // 2 update calls = 6.
+    expect(plugin.filePermissionHeader.update).toHaveBeenCalledTimes(6);
     expect(plugin.filePermissionHeader.update).toHaveBeenCalledWith({ force: true });
   });
 
@@ -1686,133 +1760,12 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     });
   });
 
-  it("does not let a warmed vault-default cache bypass glob deny rules", async () => {
-    const plugin = makePlugin();
-    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
-    plugin.vaultMemberRole = "viewer";
-    plugin.connectionState.status = "online";
-    plugin.apiClient = {
-      getUserPermissions: vi.fn().mockResolvedValue([
-        {
-          id: "deny-secret",
-          vaultId: "vault-abc",
-          userId: "*",
-          role: null,
-          pathPattern: "/secret/**",
-          actions: ["read", "list"],
-          effect: "deny",
-          priority: 100,
-          createdAt: "2026-05-01T00:00:00.000Z",
-          updatedAt: "2026-05-01T00:00:00.000Z",
-          createdBy: "admin-1",
-        },
-      ]),
-    };
-    plugin.apiRequest = vi.fn().mockResolvedValue({
-      success: true,
-      data: { allowed: false },
-      error: null,
-      requestId: "req-perm",
-    });
-
-    await plugin.runPermissionWarmup();
-
-    expect(plugin.permissionCache.has("")).toBe(false);
-    const level = await plugin.getEffectivePermission("secret/plan.md");
-
-    expect(level).toBe(PermissionLevel.NONE);
-    expect(plugin.apiRequest).toHaveBeenCalledWith(
-      "POST",
-      "/vaults/vault-abc/permissions/check",
-      expect.objectContaining({ action: "read", path: "/secret/plan.md" })
-    );
-  });
-
-  it("asks the server for glob write grants instead of stopping at the viewer default", async () => {
-    const plugin = makePlugin();
-    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
-    plugin.vaultMemberRole = "viewer";
-    plugin.connectionState.status = "online";
-    plugin.apiClient = {
-      getUserPermissions: vi.fn().mockResolvedValue([
-        {
-          id: "allow-editable",
-          vaultId: "vault-abc",
-          userId: "user-1",
-          role: null,
-          pathPattern: "/editable/**",
-          actions: ["read", "write", "list"],
-          effect: "allow",
-          priority: 100,
-          createdAt: "2026-05-01T00:00:00.000Z",
-          updatedAt: "2026-05-01T00:00:00.000Z",
-          createdBy: "admin-1",
-        },
-      ]),
-    };
-    plugin.apiRequest = vi.fn(async (_method: string, _path: string, body: { action: string }) => ({
-      success: true,
-      data: { allowed: body.action === "write" || body.action === "read" },
-      error: null,
-      requestId: "req-perm",
-    }));
-
-    await plugin.runPermissionWarmup();
-
-    expect(plugin.permissionCache.has("")).toBe(false);
-    const level = await plugin.getEffectivePermission("editable/draft.md");
-
-    expect(level).toBe(PermissionLevel.WRITE);
-    expect(plugin.apiRequest).toHaveBeenCalledWith(
-      "POST",
-      "/vaults/vault-abc/permissions/check",
-      expect.objectContaining({ action: "write", path: "/editable/draft.md" })
-    );
-  });
-
-  it("keeps literal deny rules authoritative over literal allows in the warm cache", async () => {
-    const plugin = makePlugin();
-    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
-    plugin.vaultMemberRole = "viewer";
-    plugin.apiClient = {
-      getUserPermissions: vi.fn().mockResolvedValue([
-        {
-          id: "allow-doc",
-          vaultId: "vault-abc",
-          userId: "user-1",
-          role: null,
-          pathPattern: "/docs/locked.md",
-          actions: ["read"],
-          effect: "allow",
-          priority: 10,
-          createdAt: "2026-05-01T00:00:00.000Z",
-          updatedAt: "2026-05-01T00:00:00.000Z",
-          createdBy: "admin-1",
-        },
-        {
-          id: "deny-doc",
-          vaultId: "vault-abc",
-          userId: "user-1",
-          role: null,
-          pathPattern: "/docs/locked.md",
-          actions: ["read"],
-          effect: "deny",
-          priority: 1,
-          createdAt: "2026-05-01T00:00:00.000Z",
-          updatedAt: "2026-05-01T00:00:00.000Z",
-          createdBy: "admin-1",
-        },
-      ]),
-    };
-    plugin.apiRequest = vi.fn();
-
-    await plugin.runPermissionWarmup();
-    const level = await plugin.getEffectivePermission("docs/locked.md");
-
-    expect(level).toBe(PermissionLevel.NONE);
-    expect(plugin.permissionCache.get("docs/locked.md")).toBe(PermissionLevel.NONE);
-    expect(plugin.apiRequest).not.toHaveBeenCalled();
-  });
+  // Phase 9 (Plan 09-02): warm-up logic moved from main.ts into
+  // PermissionStore. Three former `runPermissionWarmup` tests (glob-deny
+  // bypass, glob-write grant, literal-deny-over-allow) were removed from
+  // here when ownership shifted. Canonical coverage now lives in
+  // `tests/permission-store.test.ts` — search for "R-09-08 warm-up
+  // sentinel" and the cache walk-up tests around `runWarm()`. (IN-04)
 
   it("clears only the current vault session on logout", async () => {
     const plugin = makePlugin();
