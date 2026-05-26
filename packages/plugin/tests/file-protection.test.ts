@@ -359,6 +359,61 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
     });
 
+    it('REGRESSION 1.0.15: does not wipe when warm-up has not yet completed (production sequence)', async () => {
+      // Reproduces the 1.0.15 data-loss race. Production sequence:
+      //   1. onload sets sessionResumePromise = restoreServerSession()
+      //   2. Obsidian's "indexing vault" starts read()ing files immediately
+      //   3. restoreServerSession kicks off runPermissionWarmup fire-and-forget
+      //   4. restoreServerSession returns -> sessionResumePromise resolves
+      //   5. Warm-up is still in flight (collectRulesForWarmup HTTP fetch)
+      //   6. interceptedRead's awaitPermissionReadiness sees resolved
+      //      sessionResumePromise + null inFlightWarmup -> proceeds
+      //   7. getEffectivePermission returns NONE (cache cold) -> WIPE
+      // The fix: shouldDeferDenialWipe returns true while hasWarmedAtLeastOnce
+      // is false AND no cached entry exists, so the read returns disk content
+      // unchanged instead of wiping.
+      plugin.session = makeSession('member');
+      plugin.connectionState.status = 'offline';
+
+      // sessionResumePromise resolves BEFORE warm-up populates anything
+      // (the actual production timing).
+      plugin.sessionResumePromise = Promise.resolve();
+      // hasWarmedAtLeastOnce remains false; no cache seeded.
+
+      const content = await plugin.interceptedRead('docs/startup.md');
+
+      expect(content).toBe('local file content');
+      expect(plugin.originalAdapterMethods.read).toHaveBeenCalledWith('docs/startup.md');
+      expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
+    });
+
+    it('REGRESSION 1.0.15: wipes normally once a warm-up has completed at least once', async () => {
+      // After the first successful warm-up, NONE results reflect real server
+      // state and the wipe MUST proceed. shouldDeferDenialWipe returns false
+      // when hasWarmedAtLeastOnce is true.
+      plugin.session = makeSession('member');
+      plugin.connectionState.status = 'offline';
+      plugin.hasWarmedAtLeastOnce = true;
+
+      await expect(plugin.interceptedRead('secret/post-warmup-denied.md'))
+        .rejects.toThrow('Local cached content for "secret/post-warmup-denied.md" was wiped');
+
+      expect(plugin.originalAdapterMethods.write).toHaveBeenCalledWith('secret/post-warmup-denied.md', '');
+    });
+
+    it('REGRESSION 1.0.15: wipes when cache has positive denial entry even pre-warmup', async () => {
+      // Defense-in-depth check: a cached NONE for the exact path IS positive
+      // denial evidence even before the first warm-up cycle completes.
+      plugin.session = makeSession('member');
+      plugin.connectionState.status = 'offline';
+      plugin.permissionCache.set('secret/explicitly-denied.md', PermissionLevel.NONE);
+
+      await expect(plugin.interceptedRead('secret/explicitly-denied.md'))
+        .rejects.toThrow('Local cached content for "secret/explicitly-denied.md" was wiped');
+
+      expect(plugin.originalAdapterMethods.write).toHaveBeenCalledWith('secret/explicitly-denied.md', '');
+    });
+
     it('allows read when permission is WRITE', async () => {
       plugin.session = makeSession('editor');
       plugin.permissionCache.set('docs/readme.md', PermissionLevel.WRITE);

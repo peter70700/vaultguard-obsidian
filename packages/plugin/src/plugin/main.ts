@@ -493,6 +493,26 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private permissionWarmupInFlight = 0;
 
+  /**
+   * Tracks the active warm-up cycle promise (collectRulesForWarmup + store.warm).
+   *
+   * Different from `permissionStore.inFlightWarmup`, which only spans the
+   * inner `store.warm()` call. The plugin-level cycle promise is set BEFORE
+   * the `collectRulesForWarmup` HTTP fetch, so `awaitPermissionWarmup` can
+   * wait for the full cycle instead of racing against a null promise during
+   * the rule-fetch gap (1.0.15 data-loss regression).
+   */
+  private warmupCyclePromise: Promise<void> | null = null;
+
+  /**
+   * Latches `true` after the first warm-up cycle completes successfully.
+   * Used by `interceptedRead`/`interceptedReadBinary` as positive evidence
+   * that a denial result reflects real server state and not a cold cache.
+   * Without this, a fresh-start race could wipe vault content before the
+   * first warm-up cycle ever ran.
+   */
+  private hasWarmedAtLeastOnce = false;
+
 
   /** Queue of operations made while offline */
   private offlineQueue: Array<{
@@ -2833,13 +2853,23 @@ export default class VaultGuardPlugin extends Plugin {
     }
     this.permissionWarmupInFlight = this.permissionWarmupInFlight + 1;
     this.updateStatusBar();
-    try {
-      const rules = await this.collectRulesForWarmup();
-      await this.permissionStore.warm(rules, this.vaultMemberRole);
-    } finally {
-      this.permissionWarmupInFlight = Math.max(0, this.permissionWarmupInFlight - 1);
-      this.updateStatusBar();
-    }
+    const cycle = (async () => {
+      try {
+        const rules = await this.collectRulesForWarmup();
+        await this.permissionStore.warm(rules, this.vaultMemberRole);
+        this.hasWarmedAtLeastOnce = true;
+      } finally {
+        this.permissionWarmupInFlight = Math.max(0, this.permissionWarmupInFlight - 1);
+        this.updateStatusBar();
+      }
+    })();
+    this.warmupCyclePromise = cycle;
+    cycle.finally(() => {
+      if (this.warmupCyclePromise === cycle) {
+        this.warmupCyclePromise = null;
+      }
+    });
+    return cycle;
   }
 
   /**
@@ -2855,7 +2885,11 @@ export default class VaultGuardPlugin extends Plugin {
    * multiple poll loops on the same in-flight warm (WR-02).
    */
   private async awaitPermissionWarmup(): Promise<void> {
-    const inFlight = this.permissionStore.inFlightWarmup;
+    // Prefer the plugin-level cycle promise because it covers the
+    // collectRulesForWarmup HTTP fetch window. permissionStore.inFlightWarmup
+    // only spans the inner store.warm() call and is null during the gap
+    // between runPermissionWarmup() entry and store.warm() being reached.
+    const inFlight = this.warmupCyclePromise ?? this.permissionStore.inFlightWarmup;
     if (!inFlight) return;
 
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -4758,6 +4792,15 @@ export default class VaultGuardPlugin extends Plugin {
     const permission = await this.getEffectivePermission(path);
 
     if (permission < PermissionLevel.READ) {
+      if (this.shouldDeferDenialWipe(path)) {
+        // Cold permission state (warm-up never completed, no cached entry
+        // for this path) — refuse to wipe. Returning the on-disk copy is
+        // the lesser harm: we may transiently render a file the user is
+        // not authorised to see, but the next successful warm-up will
+        // reconcile without destroying data.
+        this.log(`Deferring wipe for "${path}": no warm-up evidence yet.`);
+        return this.readPlainFromDisk(path);
+      }
       await this.emitAuditEvent("file.read", path, { outcome: "denied" });
       await this.wipeDeniedLocalContent(path);
       this.notifyDeniedLocalWipe(path);
@@ -5238,6 +5281,24 @@ export default class VaultGuardPlugin extends Plugin {
     }
   }
 
+  /**
+   * Returns true when a NONE permission result for `path` should be treated
+   * as "permission unknown" rather than "explicitly denied". Used as a
+   * last-line guard inside the read interceptors so a cold-cache startup
+   * race cannot wipe vault content (1.0.15 data-loss regression).
+   *
+   * The check is deliberately strict: we only defer when there is no
+   * positive evidence whatsoever — no completed warm-up cycle AND no
+   * cached entry for this exact path. Once a warm-up has succeeded, a
+   * NONE result is real and the wipe proceeds.
+   */
+  private shouldDeferDenialWipe(path: string): boolean {
+    if (this.hasWarmedAtLeastOnce) return false;
+    const cached = this.permissionStore.getCachedPermission(path);
+    if (cached !== undefined) return false;
+    return true;
+  }
+
   private async wipeDeniedLocalContent(path: string): Promise<void> {
     try {
       if (!this.atRestCipher?.isReady()) {
@@ -5281,6 +5342,10 @@ export default class VaultGuardPlugin extends Plugin {
     await this.awaitPermissionReadiness();
     const permission = await this.getEffectivePermission(path);
     if (permission < PermissionLevel.READ) {
+      if (this.shouldDeferDenialWipe(path)) {
+        this.log(`Deferring binary wipe for "${path}": no warm-up evidence yet.`);
+        return this.readPlainBinaryFromDisk(path);
+      }
       await this.emitAuditEvent("file.read", path, { outcome: "denied" });
       await this.wipeDeniedLocalContent(path);
       this.notifyDeniedLocalWipe(path);
