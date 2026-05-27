@@ -16,6 +16,7 @@ import {
   PermissionAccessLevel,
   UserListEntry,
 } from "../api/client";
+import { PermissionLevel } from "../types";
 import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
 
 // ─── Constants ─────────────────────────────────────────────────────────────
@@ -29,11 +30,14 @@ const BATCH_PATH_LIMIT = 100; // matches backend cap
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
+type DecorationLevel = PermissionAccessLevel | "unknown";
+
 interface DecorationCacheEntry {
-  level: PermissionAccessLevel;
+  level: DecorationLevel;
   sharedWith: number;
   principals: Array<{ id: string; label: string; level: PermissionAccessLevel; type: "user" | "role" }>;
   fetchedAt: number;
+  source?: "backend" | "fallback";
 }
 
 export interface FileExplorerDecorationsConfig {
@@ -41,6 +45,8 @@ export interface FileExplorerDecorationsConfig {
   apiClient: VaultGuardApiClient;
   currentUserId: string;
   currentUserRole: string;
+  isReady?: () => boolean;
+  getPermissionLevel?: (path: string) => Promise<PermissionLevel>;
 }
 
 // ─── Main Class ────────────────────────────────────────────────────────────
@@ -58,6 +64,7 @@ export class FileExplorerDecorations {
   private userMap: Map<string, UserListEntry> = new Map();
   private usersLoaded = false;
   private usersLoadPromise: Promise<void> | null = null;
+  private batchAccessUnavailable = false;
 
   constructor(config: FileExplorerDecorationsConfig) {
     this.config = config;
@@ -237,6 +244,11 @@ export class FileExplorerDecorations {
   private async decorateAll(): Promise<void> {
     if (!this.enabled) return;
 
+    if (!this.isReady()) {
+      this.removeAllDecorations();
+      return;
+    }
+
     const container = this.getFileExplorerContainer();
     if (!container) {
       this.observeFileExplorer();
@@ -248,9 +260,7 @@ export class FileExplorerDecorations {
     this.observeFileExplorer();
 
     // Snapshot visible items + paths so we know what to fetch.
-    const items = Array.from(
-      container.querySelectorAll<HTMLElement>(".nav-file-title, .nav-folder-title")
-    );
+    const items = this.getExplorerItems(container);
     const itemPaths: Array<{ item: HTMLElement; path: string; isFile: boolean }> = [];
     const pathsToFetch: string[] = [];
     const seenPaths = new Set<string>();
@@ -258,7 +268,7 @@ export class FileExplorerDecorations {
     for (const item of items) {
       const path = this.getItemPath(item);
       if (!path) continue;
-      const isFile = item.classList.contains("nav-file-title");
+      const isFile = this.isExplorerFileItem(item);
       itemPaths.push({ item, path, isFile });
       if (!seenPaths.has(path) && this.needsFetch(path)) {
         seenPaths.add(path);
@@ -266,11 +276,9 @@ export class FileExplorerDecorations {
       }
     }
 
-    // Kick off backend fetches (user directory + path access summaries).
-    // The first paint may run before fetches return — items without cached
-    // data render in their "loading" state (no decoration). The MutationObserver
-    // would normally re-trigger us on every mutation; the in-flight guard
-    // below keeps us from stampeding the server with duplicate requests.
+    // Kick off backend fetches (user directory + path access summaries). If
+    // those calls fail, rows still get a role-based fallback decoration below
+    // so the native explorer never looks like VaultGuard forgot to render.
     await this.loadUsersIfNeeded();
     if (pathsToFetch.length > 0) {
       await this.fetchAccessForPaths(pathsToFetch);
@@ -279,41 +287,17 @@ export class FileExplorerDecorations {
     // Guard: set flag so observer ignores our own DOM mutations
     this.isDecorating = true;
     try {
-      // First pass: resolve every path's effective level so we can decide
-      // folder visibility based on whether any descendant grants access.
-      const accessiblePaths = new Set<string>();
-      for (const { path } of itemPaths) {
-        const entry = this.cache.get(path);
-        if (entry && entry.level !== "none") accessiblePaths.add(path);
-      }
-
-      const hasAccessibleDescendant = (folderPath: string): boolean => {
-        const prefix = folderPath + "/";
-        for (const p of accessiblePaths) {
-          if (p.startsWith(prefix)) return true;
-        }
-        return false;
-      };
-
       for (const { item, path, isFile } of itemPaths) {
-        const entry = this.cache.get(path);
+        const cachedEntry = this.cache.get(path);
+        const entry = cachedEntry ?? this.fallbackEntry();
 
-        // If we have no cached entry (fetch failed, or stale and refresh
-        // pending), leave the row unhidden and skip decoration — never hide
-        // a row based on a guess. The Obsidian file explorer treats absent
-        // decorations as "no info" rather than "no access", which is the
-        // safer default for a permission UI.
-        if (!entry) {
-          item.classList.remove(HIDDEN_CLS);
-          this.removeDecoration(item);
-          continue;
-        }
-
-        // Files: hide when the user has no access. Folders: hide only when
-        // the user has no access AND no descendant grants access — otherwise
-        // we'd hide a folder containing accessible children.
-        const shouldHide =
-          entry.level === "none" && (isFile || !hasAccessibleDescendant(path));
+        // Only file rows are hidden on an explicit no-access result. Folder
+        // path checks are not reliable enough to collapse folder rows:
+        // Obsidian only renders expanded descendants into the DOM, so a
+        // collapsed folder can look like it has no accessible children even
+        // when it contains readable files. Keeping folders visible prevents
+        // an entire vault tree from disappearing.
+        const shouldHide = cachedEntry ? this.shouldHideItem(isFile, cachedEntry) : false;
         item.classList.toggle(HIDDEN_CLS, shouldHide);
 
         this.applyDecoration(item, entry);
@@ -328,6 +312,37 @@ export class FileExplorerDecorations {
     const cached = this.cache.get(path);
     if (!cached) return true;
     return Date.now() - cached.fetchedAt >= CACHE_TTL_MS;
+  }
+
+  private getExplorerItems(container: HTMLElement): HTMLElement[] {
+    const primary = Array.from(
+      container.querySelectorAll<HTMLElement>(".nav-file-title, .nav-folder-title")
+    );
+    if (primary.length > 0) return primary;
+
+    // Obsidian's file-explorer markup has shifted across versions. Most
+    // builds expose .nav-file-title/.nav-folder-title, but some place the
+    // useful data-path on a generic tree item. Fall back to data-path rows so
+    // native navigation still gets badges when the title classes are absent.
+    return Array.from(container.querySelectorAll<HTMLElement>("[data-path]")).filter(
+      (item) =>
+        !item.classList.contains(DECORATION_CLS) &&
+        !item.closest(`.${DECORATION_CLS}`) &&
+        Boolean(
+          item.classList.contains("nav-file-title") ||
+          item.classList.contains("nav-folder-title") ||
+          item.classList.contains("tree-item-self") ||
+          item.closest(".nav-file") ||
+          item.closest(".nav-folder")
+        )
+    );
+  }
+
+  private isExplorerFileItem(item: HTMLElement): boolean {
+    if (item.classList.contains("nav-file-title")) return true;
+    if (item.classList.contains("nav-folder-title")) return false;
+    const owner = item.closest<HTMLElement>(".nav-file, .nav-folder");
+    return Boolean(owner?.classList.contains("nav-file"));
   }
 
   private applyDecoration(item: HTMLElement, data: DecorationCacheEntry): void {
@@ -404,6 +419,20 @@ export class FileExplorerDecorations {
     }
   }
 
+  private shouldHideItem(isFile: boolean, entry: DecorationCacheEntry): boolean {
+    return entry.level === "none" && isFile;
+  }
+
+  private fallbackEntry(): DecorationCacheEntry {
+    return {
+      level: "unknown",
+      sharedWith: 0,
+      principals: [],
+      fetchedAt: 0,
+      source: "fallback",
+    };
+  }
+
   private getItemPath(item: HTMLElement): string | null {
     const directPath = item.dataset.path;
     if (directPath) return directPath;
@@ -421,6 +450,8 @@ export class FileExplorerDecorations {
    * deduplicated via `inFlightPaths`.
    */
   private async fetchAccessForPaths(paths: string[]): Promise<void> {
+    if (!this.isReady()) return;
+
     // Dedupe paths that already have an in-flight fetch.
     const pending: string[] = [];
     const inFlightForThisCall: Array<Promise<void>> = [];
@@ -437,7 +468,7 @@ export class FileExplorerDecorations {
     // decorate passes can coalesce on it.
     for (let i = 0; i < pending.length; i += BATCH_PATH_LIMIT) {
       const chunk = pending.slice(i, i + BATCH_PATH_LIMIT);
-      const requestPromise = this.fetchBatchChunk(chunk);
+      const requestPromise = this.fetchPathDataChunk(chunk);
       for (const path of chunk) {
         this.inFlightPaths.set(path, requestPromise);
       }
@@ -458,7 +489,21 @@ export class FileExplorerDecorations {
     }
   }
 
+  private async fetchPathDataChunk(paths: string[]): Promise<void> {
+    await Promise.allSettled([this.fetchBatchChunk(paths)]);
+    // Must run after access summaries: the PermissionStore/enforcement path is
+    // authoritative for the current user's own dot. Access summaries provide
+    // principals/avatars and can lag during backend rollout, so they must not
+    // overwrite the enforced level.
+    await this.fetchEffectiveLevelsForPaths(paths);
+  }
+
   private async fetchBatchChunk(paths: string[]): Promise<void> {
+    if (this.batchAccessUnavailable) {
+      await this.fetchPerPathFallback(paths);
+      return;
+    }
+
     try {
       const summaries = await this.config.apiClient.getBatchPathAccess(paths);
       const byPath = new Map(summaries.map((s) => [this.normalizePath(s.path), s]));
@@ -468,22 +513,107 @@ export class FileExplorerDecorations {
         const summary = byPath.get(normalized);
         if (summary) {
           this.cache.set(path, this.summaryToCacheEntry(summary, now));
-        } else {
-          // Backend returned nothing for this path — treat as "no access"
-          // so the row is hidden. This matches the explicit "currentUserLevel:
-          // 'none'" branch the handler takes when the caller can't read the path.
-          this.cache.set(path, {
-            level: "none",
-            sharedWith: 0,
-            principals: [],
-            fetchedAt: now,
-          });
         }
       }
-    } catch {
-      // On error, don't poison the cache. The next decorate pass will retry
-      // the path because needsFetch() sees no cached entry.
+    } catch (err) {
+      if (this.shouldSilentlySkipAccessFetch(err)) {
+        return;
+      }
+      if (this.isMissingBatchAccessRoute(err)) {
+        this.batchAccessUnavailable = true;
+        await this.fetchPerPathFallback(paths);
+        return;
+      }
+      // Batch endpoint failed — most likely a backend deployment-drift
+      // where the /permissions/access/batch route's authorizer isn't wired
+      // up correctly in the live stage (Terraform code has it, but the
+      // deployed stage rejects valid Cognito tokens with a SigV4-style
+      // challenge). The single-path /permissions/access endpoint uses the
+      // same Lambda handler and works, so fall back to N parallel per-path
+      // calls. Slower for large vaults, but correct, and prevents one
+      // bad route from leaving the file explorer with no decorations.
+      console.warn("[VaultGuard] Batch access fetch failed, falling back to per-path:", (err as Error)?.message ?? err);
+      await this.fetchPerPathFallback(paths);
     }
+  }
+
+  /**
+   * Resolves the current user's level through the same PermissionStore path
+   * used by read-only/write/delete enforcement. The access-summary endpoint is
+   * still useful for "who else has access" avatars, but this value owns the
+   * native explorer's primary dot so the UI cannot claim READ when writes
+   * would actually be allowed.
+   */
+  private async fetchEffectiveLevelsForPaths(paths: string[]): Promise<void> {
+    if (!this.config.getPermissionLevel) return;
+
+    const now = Date.now();
+    await Promise.allSettled(
+      paths.map(async (path) => {
+        const level = await this.config.getPermissionLevel!(path);
+        this.mergeEffectiveLevel(path, this.permissionLevelToAccessLevel(level), now);
+      })
+    );
+  }
+
+  private mergeEffectiveLevel(
+    path: string,
+    level: PermissionAccessLevel,
+    fetchedAt: number
+  ): void {
+    const existing = this.cache.get(path);
+    this.cache.set(path, {
+      level,
+      sharedWith: existing?.sharedWith ?? 0,
+      principals: existing?.principals ?? [],
+      fetchedAt,
+      source: "backend",
+    });
+  }
+
+  /**
+   * Per-path fallback for fetchBatchChunk. Issues N parallel
+   * getPathAccess() requests, with caching on cache.set so subsequent
+   * decorate passes (debounced via the MutationObserver) hit warm data.
+   * Errors per path are individually swallowed so one failed file
+   * doesn't poison the rest.
+   */
+  private async fetchPerPathFallback(paths: string[]): Promise<void> {
+    const now = Date.now();
+    await Promise.allSettled(
+      paths.map(async (path) => {
+        try {
+          const summary = await this.config.apiClient.getPathAccess(path);
+          this.cache.set(path, this.summaryToCacheEntry(summary, now));
+        } catch {
+          // Individual path failure — leave the cache untouched so a later
+          // decorate pass will retry. Don't write a "none" entry: that
+          // would hide a row whose access we genuinely don't know yet.
+        }
+      })
+    );
+  }
+
+  private isReady(): boolean {
+    return this.config.isReady ? this.config.isReady() : true;
+  }
+
+  private shouldSilentlySkipAccessFetch(err: unknown): boolean {
+    const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+    return (
+      message.includes("not authenticated") ||
+      message.includes("please log in") ||
+      message.includes("session expired") ||
+      message.includes("api endpoint appears to be pointing at a website")
+    );
+  }
+
+  private isMissingBatchAccessRoute(err: unknown): boolean {
+    const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+    return (
+      message.includes("route not found") &&
+      message.includes("/permissions/access/batch")
+    );
   }
 
   private normalizePath(path: string): string {
@@ -511,6 +641,7 @@ export class FileExplorerDecorations {
       sharedWith: principals.length,
       principals,
       fetchedAt,
+      source: "backend",
     };
   }
 
@@ -545,7 +676,7 @@ export class FileExplorerDecorations {
 
   // ─── Helpers ──────────────────────────────────────────────────────────
 
-  private levelRank(level: PermissionAccessLevel): number {
+  private levelRank(level: DecorationLevel): number {
     switch (level) {
       case "admin": return 3;
       case "write": return 2;
@@ -554,13 +685,21 @@ export class FileExplorerDecorations {
     }
   }
 
-  private formatLevel(level: PermissionAccessLevel): string {
+  private formatLevel(level: DecorationLevel): string {
     switch (level) {
       case "admin": return "Admin";
       case "write": return "Write";
       case "read": return "Read";
-      default: return "No Access";
+      case "none": return "No Access";
+      case "unknown": return "Checking permissions";
     }
+  }
+
+  private permissionLevelToAccessLevel(level: PermissionLevel): PermissionAccessLevel {
+    if (level >= PermissionLevel.ADMIN) return "admin";
+    if (level >= PermissionLevel.WRITE) return "write";
+    if (level >= PermissionLevel.READ) return "read";
+    return "none";
   }
 
   private initials(userId: string, label: string): string {

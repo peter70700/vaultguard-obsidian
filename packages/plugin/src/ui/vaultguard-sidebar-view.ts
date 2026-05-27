@@ -7,7 +7,15 @@
  */
 
 import { ItemView, TFile, WorkspaceLeaf, setIcon } from "obsidian";
-import { VaultGuardApiClient, PermissionRule, UserListEntry } from "../api/client";
+import {
+  VaultGuardApiClient,
+  PathAccessPrincipal,
+  PathAccessSummary,
+  PermissionAccessLevel,
+  PermissionRule,
+  UserListEntry,
+  VaultMemberRole,
+} from "../api/client";
 import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
 
 // ─── Constants ─────────────────────────────────────────────────────────────
@@ -15,6 +23,7 @@ import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials
 export const VAULTGUARD_VIEW_TYPE = "vaultguard-files-view";
 const CACHE_TTL_MS = 60_000;
 const SEARCH_DEBOUNCE_MS = 120;
+const BATCH_PATH_LIMIT = 100; // matches backend /permissions/access/batch cap
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -23,12 +32,12 @@ interface FileEntry {
   name: string;
   lowerPath: string;
   lowerName: string;
-  level: string;
+  level: PermissionAccessLevel;
   sharedWith: number;
   principals: Array<{
     id: string;
     label: string;
-    level: string;
+    level: PermissionAccessLevel;
     type: "user" | "role";
   }>;
   userIds: Set<string>;
@@ -56,6 +65,7 @@ export interface VaultGuardSidebarViewConfig {
 export class VaultGuardSidebarView extends ItemView {
   private config: VaultGuardSidebarViewConfig | null = null;
   private ruleCache: Map<string, ViewCacheEntry> = new Map();
+  private accessCache: Map<string, { summary: PathAccessSummary; fetchedAt: number }> = new Map();
   private filterLevel: string = "all";
   private filterUser: string = "all";
   private filterRole: string = "all";
@@ -73,6 +83,7 @@ export class VaultGuardSidebarView extends ItemView {
   private revoked = false;
   private revokeReason = "";
   private leaseExpiresAt: number | null = null;
+  private batchAccessUnavailable = false;
 
   // References to filter/UI elements so we can update them in place
   private userSelectEl: HTMLSelectElement | null = null;
@@ -128,6 +139,7 @@ export class VaultGuardSidebarView extends ItemView {
       this.searchDebounce = null;
     }
     this.ruleCache.clear();
+    this.accessCache.clear();
     this.entries = [];
     this.allRules = [];
     this.knownUsers = [];
@@ -151,6 +163,7 @@ export class VaultGuardSidebarView extends ItemView {
    */
   async reload(): Promise<void> {
     this.ruleCache.clear();
+    this.accessCache.clear();
     this.userMap = new Map();
 
     if (!this.contentEl_) return;
@@ -514,25 +527,33 @@ export class VaultGuardSidebarView extends ItemView {
         }
       }
 
-      // Fetch permissions and users — if the API calls fail, still show files with defaults
+      // Fetch effective access for every visible file. This endpoint is the
+      // same source of truth used by the file header and file explorer dots,
+      // and it works for non-admin vault members. Raw rule listing is still
+      // useful for admin-only role filters, but it must never be the only
+      // way the sidebar learns per-file permissions.
       this.allRules = [];
-      try {
-        const [rules] = await Promise.all([
-          this.config.apiClient.getPermissions(),
-          this.loadUsersIfNeeded(),
-        ]);
-        this.allRules = rules;
-        this.ruleCache.set("__all__", { rules: this.allRules, fetchedAt: Date.now() });
-      } catch {
-        // API unavailable — proceed with empty rules (role-based defaults apply)
-      }
+      const [rules, accessByPath] = await Promise.all([
+        this.loadRulesIfAllowed(),
+        this.loadAccessSummaries(paths),
+        this.loadUsersIfNeeded(),
+      ]).then(([rulesResult, accessResult]) => [rulesResult, accessResult] as const);
 
-      // Extract known users and roles from rules
-      this.extractUsersAndRoles(this.allRules);
+      this.allRules = rules;
+      if (this.allRules.length > 0) {
+        this.ruleCache.set("__all__", { rules: this.allRules, fetchedAt: Date.now() });
+      }
+      this.mergePathAccessIntoDirectory([...accessByPath.values()]);
+
+      // Extract known users and roles from authoritative summaries plus
+      // raw rules when an admin can list them.
+      this.extractUsersAndRoles(this.allRules, [...accessByPath.values()]);
       this.populateFilterDropdowns();
 
       // Build entries from vault files regardless of API state
-      this.entries = paths.map((path) => this.buildEntry(path, this.allRules));
+      this.entries = paths.map((path) =>
+        this.buildEntry(path, this.allRules, accessByPath.get(this.normalizePath(path)))
+      );
     } catch {
       this.entries = [];
     } finally {
@@ -552,13 +573,138 @@ export class VaultGuardSidebarView extends ItemView {
     }
   }
 
+  private async loadRulesIfAllowed(): Promise<PermissionRule[]> {
+    if (!this.config || !this.isViewerEffectivelyAdmin()) {
+      return [];
+    }
+
+    try {
+      return await this.config.apiClient.getPermissions();
+    } catch {
+      return [];
+    }
+  }
+
+  private async loadAccessSummaries(paths: string[]): Promise<Map<string, PathAccessSummary>> {
+    const summariesByPath = new Map<string, PathAccessSummary>();
+    if (!this.config || paths.length === 0) return summariesByPath;
+
+    const pending: string[] = [];
+    const now = Date.now();
+
+    for (const path of paths) {
+      const key = this.normalizePath(path);
+      const cached = this.accessCache.get(key);
+      if (cached && now - cached.fetchedAt < CACHE_TTL_MS) {
+        summariesByPath.set(key, cached.summary);
+      } else {
+        pending.push(path);
+      }
+    }
+
+    for (let i = 0; i < pending.length; i += BATCH_PATH_LIMIT) {
+      const chunk = pending.slice(i, i + BATCH_PATH_LIMIT);
+      for (const summary of await this.fetchAccessChunk(chunk)) {
+        const key = this.normalizePath(summary.path);
+        this.accessCache.set(key, { summary, fetchedAt: now });
+        summariesByPath.set(key, summary);
+      }
+    }
+
+    return summariesByPath;
+  }
+
+  private async fetchAccessChunk(paths: string[]): Promise<PathAccessSummary[]> {
+    if (!this.config) return [];
+    if (this.batchAccessUnavailable) return this.fetchAccessPerPath(paths);
+
+    try {
+      const summaries = await this.config.apiClient.getBatchPathAccess(paths);
+      const byPath = new Map(summaries.map((summary) => [this.normalizePath(summary.path), summary]));
+      return paths.map((path) => {
+        const key = this.normalizePath(path);
+        return byPath.get(key) ?? { path: key, currentUserLevel: "none", principals: [] };
+      });
+    } catch (err) {
+      if (this.isMissingBatchAccessRoute(err)) {
+        this.batchAccessUnavailable = true;
+      }
+      return this.fetchAccessPerPath(paths);
+    }
+  }
+
+  private async fetchAccessPerPath(paths: string[]): Promise<PathAccessSummary[]> {
+    if (!this.config) return [];
+
+    const settled = await Promise.allSettled(
+      paths.map((path) => this.config!.apiClient.getPathAccess(path))
+    );
+
+    return settled.flatMap((result) =>
+      result.status === "fulfilled" ? [result.value] : []
+    );
+  }
+
+  private isMissingBatchAccessRoute(err: unknown): boolean {
+    const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+    return (
+      message.includes("route not found") &&
+      message.includes("/permissions/access/batch")
+    );
+  }
+
   private resolveUserLabel(userId: string): string {
     if (userId === "*") return "Everyone";
     const user = this.userMap.get(userId);
     return user ? getAccessUserDisplayName(user) : userId;
   }
 
-  private extractUsersAndRoles(rules: PermissionRule[]): void {
+  private principalLabel(principal: PathAccessPrincipal): string {
+    if (principal.displayName) return principal.displayName;
+    if (principal.email) return principal.email;
+    return this.resolveUserLabel(principal.userId);
+  }
+
+  private mergePathAccessIntoDirectory(summaries: PathAccessSummary[]): void {
+    if (summaries.length === 0) return;
+
+    const usersById = new Map<string, UserListEntry>();
+    for (const user of this.userMap.values()) {
+      usersById.set(user.id, user);
+    }
+
+    for (const summary of summaries) {
+      for (const principal of summary.principals) {
+        if (usersById.has(principal.userId)) continue;
+        if (!principal.displayName && !principal.email) continue;
+        usersById.set(principal.userId, {
+          id: principal.userId,
+          email: principal.email ?? "",
+          displayName: principal.displayName ?? "",
+          name: principal.displayName ?? "",
+          role: this.mapVaultRoleToUserRole(principal.role),
+          status: "active",
+          lastActive: "",
+          createdAt: "",
+          mfaEnabled: false,
+          deviceCount: 0,
+          type: "user",
+        });
+      }
+    }
+
+    this.userMap = buildAccessUserMap([...usersById.values()]);
+  }
+
+  private mapVaultRoleToUserRole(role: VaultMemberRole | string | undefined): UserListEntry["role"] {
+    if (role === "admin" || role === "editor" || role === "viewer") return role;
+    return "custom";
+  }
+
+  private extractUsersAndRoles(
+    rules: PermissionRule[],
+    summaries: PathAccessSummary[] = []
+  ): void {
     const users = new Map<string, string>(); // id → label
     const roles = new Set<string>();
     const selfId = this.config?.currentUserId ?? "";
@@ -577,6 +723,21 @@ export class VaultGuardSidebarView extends ItemView {
       // Skip revoked users — they're not actionable filter targets.
       if (user.status === "revoked") continue;
       users.set(user.id, getAccessUserDisplayName(user));
+    }
+
+    for (const summary of summaries) {
+      for (const principal of summary.principals) {
+        if (principal.role) {
+          roles.add(principal.role);
+        }
+        if (
+          principal.userId !== selfId &&
+          principal.level !== "none" &&
+          !users.has(principal.userId)
+        ) {
+          users.set(principal.userId, this.principalLabel(principal));
+        }
+      }
     }
 
     for (const rule of rules) {
@@ -648,7 +809,50 @@ export class VaultGuardSidebarView extends ItemView {
     }
   }
 
-  private buildEntry(path: string, allRules: PermissionRule[]): FileEntry {
+  private buildEntry(
+    path: string,
+    allRules: PermissionRule[],
+    access?: PathAccessSummary
+  ): FileEntry {
+    const name = path.split("/").pop() ?? path;
+
+    if (access) {
+      const principals = access.principals
+        .filter((principal) => principal.userId !== this.config!.currentUserId)
+        .filter((principal) => principal.level !== "none")
+        .map((principal) => ({
+          id: principal.userId,
+          label: this.principalLabel(principal),
+          level: principal.level,
+          type: "user" as const,
+          role: principal.role,
+        }))
+        .sort((a, b) => {
+          const levelDiff = this.levelRank(b.level) - this.levelRank(a.level);
+          if (levelDiff !== 0) return levelDiff;
+          return a.label.localeCompare(b.label);
+        });
+
+      const userIds = new Set<string>();
+      const roleIds = new Set<string>();
+      for (const principal of principals) {
+        userIds.add(principal.id);
+        if (principal.role) roleIds.add(principal.role);
+      }
+
+      return {
+        path,
+        name,
+        lowerPath: path.toLowerCase(),
+        lowerName: name.toLowerCase(),
+        level: access.currentUserLevel,
+        sharedWith: principals.length,
+        principals: principals.map(({ id, label, level, type }) => ({ id, label, level, type })),
+        userIds,
+        roleIds,
+      };
+    }
+
     // Filter rules that match this path
     const matchingRules = allRules.filter((r) => this.ruleMatchesPath(r.pathPattern, path));
 
@@ -656,13 +860,12 @@ export class VaultGuardSidebarView extends ItemView {
 
     // Per-principal state with the same conflict-resolution semantics the
     // header uses: more-specific path wins, deny wins at the same
-    // specificity. Without this, a deny rule on a folder was silently
-    // skipped while older allow rules kept the avatar visible — exactly
-    // the bug the user is asking to fix here.
+    // specificity. Without this, a deny rule on a folder can be skipped
+    // while older allow rules keep an avatar visible.
     interface PrincipalState {
       id: string;
       label: string;
-      level: string;
+      level: PermissionAccessLevel;
       type: "user" | "role";
       specificity: number;
       denied: boolean;
@@ -672,7 +875,7 @@ export class VaultGuardSidebarView extends ItemView {
 
     const shouldReplace = (
       current: PrincipalState | undefined,
-      nextLevel: string,
+      nextLevel: PermissionAccessLevel,
       specificity: number,
       denied: boolean
     ): boolean => {
@@ -685,7 +888,7 @@ export class VaultGuardSidebarView extends ItemView {
     };
 
     for (const rule of matchingRules) {
-      const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+      const level: PermissionAccessLevel = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
       const specificity = this.patternSpecificity(rule.pathPattern);
       const denied = rule.effect === "deny";
 
@@ -727,8 +930,6 @@ export class VaultGuardSidebarView extends ItemView {
       if (p.type === "user") userIds.add(p.id);
       else roleIds.add(p.id);
     }
-
-    const name = path.split("/").pop() ?? path;
 
     return {
       path,
@@ -1083,6 +1284,11 @@ export class VaultGuardSidebarView extends ItemView {
     }
   }
 
+  private normalizePath(path: string): string {
+    const trimmed = path.trim().replace(/\/+/g, "/");
+    return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  }
+
   // ─── Rule Matching ────────────────────────────────────────────────────
 
   private ruleMatchesPath(pattern: string, path: string): boolean {
@@ -1157,12 +1363,12 @@ export class VaultGuardSidebarView extends ItemView {
     return role === "admin" || role === "owner";
   }
 
-  private resolveMyLevel(rules: PermissionRule[]): string {
+  private resolveMyLevel(rules: PermissionRule[]): PermissionAccessLevel {
     if (!this.config) return "read";
     const role = this.config.currentUserRole;
     if (role === "admin" || role === "owner") return "admin";
 
-    let bestLevel = "none";
+    let bestLevel: PermissionAccessLevel = "none";
     let bestSpecificity = -1;
 
     for (const rule of rules) {
@@ -1178,7 +1384,7 @@ export class VaultGuardSidebarView extends ItemView {
         bestSpecificity = specificity;
         bestLevel = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
       } else if (specificity === bestSpecificity) {
-        const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+        const level: PermissionAccessLevel = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
         if (this.levelRank(level) > this.levelRank(bestLevel)) {
           bestLevel = level;
         }
@@ -1193,7 +1399,7 @@ export class VaultGuardSidebarView extends ItemView {
     return bestLevel;
   }
 
-  private ruleLevelString(rule: PermissionRule): string {
+  private ruleLevelString(rule: PermissionRule): PermissionAccessLevel {
     if (rule.actions.includes("admin")) return "admin";
     if (rule.actions.includes("write") || rule.actions.includes("delete")) return "write";
     if (rule.actions.includes("read")) return "read";

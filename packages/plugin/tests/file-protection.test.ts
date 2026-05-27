@@ -9,7 +9,7 @@
  * - interceptedRead: blocks read when permission < READ and wipes denied cache, falls back to cache offline
  * - interceptedWrite: blocks write when permission < WRITE, queues offline ops
  * - interceptedDelete: blocks delete when permission < WRITE
- * - interceptedList: filters out inaccessible files/folders
+ * - interceptedList: returns the local directory tree without live permission probes
  * - getEffectivePermission: cache, admin role shortcut, server fetch, offline fallback
  * - resolvePermissionFromCache: hierarchical walk, role defaults, key lease fallback
  * - Audit events emitted on denied operations
@@ -310,19 +310,20 @@ describe('File Protection: Vault Adapter Interception', () => {
       }
     });
 
-    it('fails closed and wipes local cache when effective permission is NONE', async () => {
+    it('returns disk content on NONE permission without wiping (1.0.17 fail-open)', async () => {
+      // 1.0.17 hardening: the read path NEVER wipes and NEVER throws on
+      // permission denial. Wiping was the 1.0.15 data-loss vector;
+      // throwing was the 1.0.16 indexer-flood vector. Revocation
+      // enforcement belongs in the sync engine, not the read interceptor.
       plugin.session = makeSession('member');
       plugin.permissionCache.set('secret/classified.md', PermissionLevel.NONE);
 
-      await expect(plugin.interceptedRead('secret/classified.md'))
-        .rejects.toThrow('Local cached content for "secret/classified.md" was wiped');
+      const content = await plugin.interceptedRead('secret/classified.md');
 
-      expect(plugin.originalAdapterMethods.read).not.toHaveBeenCalled();
-      expect(plugin.originalAdapterMethods.write).toHaveBeenCalledWith('secret/classified.md', '');
-      expect(mockNotice).toHaveBeenCalledWith(
-        expect.stringContaining('secret/classified.md'),
-        expect.any(Number)
-      );
+      expect(content).toBe('local file content');
+      expect(plugin.originalAdapterMethods.read).toHaveBeenCalledWith('secret/classified.md');
+      expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
+      expect(mockNotice).not.toHaveBeenCalled();
     });
 
     it('allows read from local cache when permission >= READ and offline', async () => {
@@ -387,31 +388,30 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
     });
 
-    it('REGRESSION 1.0.15: wipes normally once a warm-up has completed at least once', async () => {
-      // After the first successful warm-up, NONE results reflect real server
-      // state and the wipe MUST proceed. shouldDeferDenialWipe returns false
-      // when hasWarmedAtLeastOnce is true.
+    it('REGRESSION 1.0.16: does not throw post-warmup on denial (1.0.17 fail-open)', async () => {
+      // 1.0.16 still wiped + threw once hasWarmedAtLeastOnce was true,
+      // causing Obsidian's indexer to flood the console with "Access
+      // denied" errors per file ("stuck at indexing vault" report).
+      // 1.0.17 returns disk content silently.
       plugin.session = makeSession('member');
       plugin.connectionState.status = 'offline';
       plugin.hasWarmedAtLeastOnce = true;
 
-      await expect(plugin.interceptedRead('secret/post-warmup-denied.md'))
-        .rejects.toThrow('Local cached content for "secret/post-warmup-denied.md" was wiped');
+      const content = await plugin.interceptedRead('secret/post-warmup-denied.md');
 
-      expect(plugin.originalAdapterMethods.write).toHaveBeenCalledWith('secret/post-warmup-denied.md', '');
+      expect(content).toBe('local file content');
+      expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
     });
 
-    it('REGRESSION 1.0.15: wipes when cache has positive denial entry even pre-warmup', async () => {
-      // Defense-in-depth check: a cached NONE for the exact path IS positive
-      // denial evidence even before the first warm-up cycle completes.
+    it('REGRESSION 1.0.16: does not throw on explicit cache denial entry (1.0.17 fail-open)', async () => {
       plugin.session = makeSession('member');
       plugin.connectionState.status = 'offline';
       plugin.permissionCache.set('secret/explicitly-denied.md', PermissionLevel.NONE);
 
-      await expect(plugin.interceptedRead('secret/explicitly-denied.md'))
-        .rejects.toThrow('Local cached content for "secret/explicitly-denied.md" was wiped');
+      const content = await plugin.interceptedRead('secret/explicitly-denied.md');
 
-      expect(plugin.originalAdapterMethods.write).toHaveBeenCalledWith('secret/explicitly-denied.md', '');
+      expect(content).toBe('local file content');
+      expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
     });
 
     it('allows read when permission is WRITE', async () => {
@@ -445,17 +445,23 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(content).toBe('local file content');
     });
 
-    it('emits a denied audit event when permission is missing before wiping local cache', async () => {
+    it('emits a denied audit event when permission is missing (1.0.17 fail-open: no throw)', async () => {
       plugin.session = makeSession('member');
       plugin.permissionCache.set('secret.md', PermissionLevel.NONE);
       const auditSpy = vi.spyOn(plugin, 'emitAuditEvent').mockResolvedValue(undefined);
 
-      await expect(plugin.interceptedRead('secret.md')).rejects.toThrow('Access denied');
+      // 1.0.17: no throw, but the audit event still fires so server-side
+      // observability captures the access attempt.
+      const content = await plugin.interceptedRead('secret.md');
+      expect(content).toBe('local file content');
 
       expect(auditSpy).toHaveBeenCalledWith(
         'file.read',
         'secret.md',
-        expect.objectContaining({ outcome: 'denied' })
+        expect.objectContaining({
+          outcome: 'denied',
+          reason: 'permission-denied-read-fail-open',
+        })
       );
     });
   });
@@ -647,45 +653,38 @@ describe('File Protection: Vault Adapter Interception', () => {
   // ── interceptedList ──────────────────────────────────────────────────
 
   describe('interceptedList', () => {
-    it('filters out files without READ permission', async () => {
+    it('returns files from the local adapter without live permission probes', async () => {
       plugin.session = makeSession('member');
       plugin.permissionCache.set('public/doc.md', PermissionLevel.READ);
       plugin.permissionCache.set('private/secret.md', PermissionLevel.NONE);
       plugin.permissionCache.set('shared/notes.md', PermissionLevel.WRITE);
+      plugin.permissionStore.getPermission = vi.fn().mockResolvedValue(PermissionLevel.NONE);
+
+      const listing = await plugin.interceptedList('');
+
+      expect(listing.files).toEqual(['public/doc.md', 'private/secret.md', 'shared/notes.md']);
+      expect(plugin.permissionStore.getPermission).not.toHaveBeenCalled();
+    });
+
+    it('keeps folders visible even when folder permission cache is NONE', async () => {
+      plugin.session = makeSession('member');
       plugin.permissionCache.set('public', PermissionLevel.READ);
       plugin.permissionCache.set('private', PermissionLevel.NONE);
       plugin.permissionCache.set('shared', PermissionLevel.WRITE);
 
       const listing = await plugin.interceptedList('');
 
-      expect(listing.files).toContain('public/doc.md');
-      expect(listing.files).toContain('shared/notes.md');
-      expect(listing.files).not.toContain('private/secret.md');
+      expect(listing.folders).toEqual(['public', 'private', 'shared']);
     });
 
-    it('filters out folders without READ permission', async () => {
-      plugin.session = makeSession('member');
-      plugin.permissionCache.set('public/doc.md', PermissionLevel.READ);
-      plugin.permissionCache.set('private/secret.md', PermissionLevel.NONE);
-      plugin.permissionCache.set('shared/notes.md', PermissionLevel.WRITE);
-      plugin.permissionCache.set('public', PermissionLevel.READ);
-      plugin.permissionCache.set('private', PermissionLevel.NONE);
-      plugin.permissionCache.set('shared', PermissionLevel.WRITE);
-
-      const listing = await plugin.interceptedList('');
-
-      expect(listing.folders).toContain('public');
-      expect(listing.folders).toContain('shared');
-      expect(listing.folders).not.toContain('private');
-    });
-
-    it('returns an empty listing when no session (pre-auth fail closed)', async () => {
+    it('returns the local listing before auth so Obsidian can render the tree', async () => {
       plugin.session = null;
 
       const listing = await plugin.interceptedList('');
 
-      expect(listing.files).toHaveLength(0);
-      expect(listing.folders).toHaveLength(0);
+      expect(listing.files).toEqual(['public/doc.md', 'private/secret.md', 'shared/notes.md']);
+      expect(listing.folders).toEqual(['public', 'private', 'shared']);
+      expect(mockNotice).not.toHaveBeenCalled();
     });
 
     it('returns empty when no original list method', async () => {
@@ -907,20 +906,25 @@ describe('File Protection: End-to-End Flows', () => {
     expect(plugin.originalAdapterMethods.write).toHaveBeenCalledTimes(1); // not called again
   });
 
-  it('revoked access (NONE) blocks reads, writes, and deletes while wiping local read cache', async () => {
+  it('revoked access (NONE) blocks writes/deletes, returns disk content on reads (1.0.17 fail-open)', async () => {
     plugin.session = makeSession('member');
     plugin.permissionCache.set('revoked.md', PermissionLevel.NONE);
 
-    await expect(plugin.interceptedRead('revoked.md')).rejects.toThrow('Access denied');
+    // 1.0.17: reads no longer wipe or throw on denial. Writes and deletes
+    // still throw because those are mutations that the sync layer needs to
+    // block.
+    const content = await plugin.interceptedRead('revoked.md');
+    expect(content).toBe('local file content');
+
     await expect(plugin.interceptedWrite('revoked.md', 'data')).rejects.toThrow('Access denied');
     await expect(plugin.interceptedDelete('revoked.md')).rejects.toThrow('Access denied');
 
-    expect(plugin.originalAdapterMethods.read).not.toHaveBeenCalled();
-    expect(plugin.originalAdapterMethods.write).toHaveBeenCalledWith('revoked.md', '');
+    expect(plugin.originalAdapterMethods.read).toHaveBeenCalledWith('revoked.md');
+    expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
     expect(plugin.originalAdapterMethods.remove).not.toHaveBeenCalled();
   });
 
-  it('hidden files are excluded from directory listing', async () => {
+  it('directory listing stays raw; sidebar decorations hide confirmed no-access files', async () => {
     plugin.session = makeSession('member');
     plugin.permissionCache.set('public/doc.md', PermissionLevel.READ);
     plugin.permissionCache.set('private/secret.md', PermissionLevel.NONE);
@@ -931,9 +935,11 @@ describe('File Protection: End-to-End Flows', () => {
 
     const listing = await plugin.interceptedList('');
 
-    // private/secret.md and private/ should be hidden
-    expect(listing.files).toEqual(['public/doc.md', 'shared/notes.md']);
-    expect(listing.folders).toEqual(['public', 'shared']);
+    // Permission-driven visibility is handled by FileExplorerDecorations
+    // after backend access summaries arrive. adapter.list() itself must not
+    // collapse the tree while permissions are cold or unavailable.
+    expect(listing.files).toEqual(['public/doc.md', 'private/secret.md', 'shared/notes.md']);
+    expect(listing.folders).toEqual(['public', 'private', 'shared']);
   });
 
   it('offline queue deduplicates writes to the same file', async () => {

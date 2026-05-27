@@ -3373,7 +3373,8 @@ body.is-phone .vaultguard-fh-popover-inner {
 
 /* Make nav items flex so decoration pushes to the right */
 .nav-file-title,
-.nav-folder-title {
+.nav-folder-title,
+.workspace-leaf-content[data-type="file-explorer"] .tree-item-self[data-path] {
   display: flex;
   align-items: center;
 }
@@ -3381,7 +3382,8 @@ body.is-phone .vaultguard-fh-popover-inner {
 .nav-file-title .nav-file-title-content,
 .nav-folder-title .nav-folder-title-content,
 .nav-file-title .tree-item-inner,
-.nav-folder-title .tree-item-inner {
+.nav-folder-title .tree-item-inner,
+.workspace-leaf-content[data-type="file-explorer"] .tree-item-self[data-path] .tree-item-inner {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -3416,6 +3418,11 @@ body.is-phone .vaultguard-fh-popover-inner {
 .vaultguard-fe-dot-none {
   background-color: var(--color-red);
   box-shadow: 0 0 3px var(--color-red);
+}
+
+.vaultguard-fe-dot-unknown {
+  background-color: var(--text-faint);
+  box-shadow: none;
 }
 
 /* ─── Sharing Indicator ───────────────────────────────────────────────── */
@@ -3481,7 +3488,8 @@ body.is-phone .vaultguard-fh-popover-inner {
 .nav-file:has(.nav-file-title.vaultguard-fe-hidden),
 .nav-file-title.vaultguard-fe-hidden,
 .nav-folder:has(> .nav-folder-title.vaultguard-fe-hidden),
-.nav-folder-title.vaultguard-fe-hidden {
+.nav-folder-title.vaultguard-fe-hidden,
+.workspace-leaf-content[data-type="file-explorer"] .tree-item-self.vaultguard-fe-hidden {
   display: none !important;
 }
 

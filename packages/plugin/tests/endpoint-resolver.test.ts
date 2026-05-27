@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeVaultGuardApiBaseUrl } from "../src/api/endpoint-resolver";
+import {
+  looksLikeAwsSignatureError,
+  normalizeVaultGuardApiBaseUrl,
+} from "../src/api/endpoint-resolver";
 import { SAAS_DEFAULTS } from "../src/config/saas-defaults";
 
 describe("normalizeVaultGuardApiBaseUrl", () => {
@@ -57,5 +60,25 @@ describe("normalizeVaultGuardApiBaseUrl", () => {
     expect(normalizeVaultGuardApiBaseUrl("https://admin.example.com/settings")).toBe(
       "https://api.example.com"
     );
+  });
+});
+
+describe("looksLikeAwsSignatureError", () => {
+  it("does not classify generic malformed Authorization errors as endpoint misroutes", () => {
+    expect(
+      looksLikeAwsSignatureError(
+        "Authorization header requires 'Credential' parameter. Authorization header requires 'Signature' parameter.",
+        "",
+        "application/json"
+      )
+    ).toBe(true);
+
+    expect(
+      looksLikeAwsSignatureError(
+        "Invalid key=value pair (missing equal-sign) in Authorization header (hashed with sha-256 and encoded with base64)",
+        "",
+        "application/json"
+      )
+    ).toBe(false);
   });
 });

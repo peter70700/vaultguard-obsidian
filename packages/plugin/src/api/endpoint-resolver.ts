@@ -304,12 +304,21 @@ export function looksLikeAwsSignatureError(
   contentType: string
 ): boolean {
   const haystack = `${message}\n${bodyText}`.toLowerCase();
+  // Strict SigV4 markers (specific parameter names AWS only emits for sigv4)
+  // OR clear "you pasted a website URL" signals (HTML/XML body).
+  //
+  // NB: "hashed with sha-256" alone is too broad — API Gateway emits it on
+  // every malformed-Authorization-header response, including "Invalid
+  // key=value pair (missing equal-sign)" returned for routes that have
+  // drifted to AWS_IAM auth or for any case where a valid Bearer token
+  // wasn't accepted. Treating that as "misrouted URL" makes the plugin
+  // surface a confusing "check your API endpoint" error when the real
+  // problem is an auth failure on a specific endpoint.
   return (
     haystack.includes("authorization header requires 'credential' parameter") ||
     haystack.includes("authorization header requires 'signature' parameter") ||
     haystack.includes("authorization header requires 'signedheaders' parameter") ||
     haystack.includes("x-amz-date") ||
-    haystack.includes("hashed with sha-256") ||
     contentType.includes("xml") ||
     contentType.includes("text/html") ||
     bodyText.trim().startsWith("<")

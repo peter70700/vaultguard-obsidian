@@ -689,6 +689,30 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     );
   });
 
+  it("treats forbidden capability discovery as an unavailable optional endpoint", async () => {
+    const plugin = makePlugin();
+    plugin.settings.manualConfig = true;
+    plugin.settings.apiEndpoint = "https://api.ce.test/dev";
+    plugin.settings.organizationId = "org-1";
+    plugin.settings.orgSlug = "";
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    const logErrorSpy = vi.spyOn(plugin, "logError");
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 403,
+      json: { message: "Forbidden" },
+      text: "{\"message\":\"Forbidden\"}",
+      headers: {},
+    } as any);
+
+    await expect(plugin.refreshServerCapabilitiesFromConfiguredEndpoint()).resolves.toBe(false);
+
+    expect(logErrorSpy).not.toHaveBeenCalledWith(
+      "Server capability discovery failed",
+      expect.anything()
+    );
+    expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+
   it("uses bundled Cloud defaults in auto mode without persisting them as settings defaults", () => {
     const plugin = makePlugin();
     plugin.settings.manualConfig = false;
@@ -1678,6 +1702,11 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
   it("re-enables file explorer decorations when permission indicators are turned back on", () => {
     const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.apiClient = {
+      isAuthenticated: vi.fn(() => true),
+    };
     plugin.fileExplorerDecorations = {
       enable: vi.fn(),
       refresh: vi.fn(),

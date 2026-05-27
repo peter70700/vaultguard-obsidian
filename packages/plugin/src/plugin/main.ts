@@ -1325,6 +1325,9 @@ export default class VaultGuardPlugin extends Plugin {
         if (response.status === 404) {
           continue;
         }
+        if (response.status === 401 || response.status === 403) {
+          return false;
+        }
         if (response.status < 200 || response.status >= 300) {
           lastError = new Error(`Server returned ${response.status}`);
           continue;
@@ -2953,6 +2956,7 @@ export default class VaultGuardPlugin extends Plugin {
       currentUserId: userId,
       currentUserRole: role,
     });
+    this.syncFileExplorerDecorationsState();
 
     // Refresh sidebar config + ask any open sidebar view to re-render.
     const sidebarConfig = this.createSidebarViewConfig();
@@ -4180,6 +4184,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.clearSensitiveData();
     await this.clearStoredSession();
     this.setConnectionStatus("offline");
+    this.syncFileExplorerDecorationsState();
     // Re-evaluate UI surfaces so already-open views flip from "no access"
     // overlay to the read-only banner without needing a tab close/reopen.
     // Phase 9: single bus emit replaces the 5-call fan-out — the four
@@ -4792,21 +4797,36 @@ export default class VaultGuardPlugin extends Plugin {
     const permission = await this.getEffectivePermission(path);
 
     if (permission < PermissionLevel.READ) {
-      if (this.shouldDeferDenialWipe(path)) {
-        // Cold permission state (warm-up never completed, no cached entry
-        // for this path) — refuse to wipe. Returning the on-disk copy is
-        // the lesser harm: we may transiently render a file the user is
-        // not authorised to see, but the next successful warm-up will
-        // reconcile without destroying data.
-        this.log(`Deferring wipe for "${path}": no warm-up evidence yet.`);
-        return this.readPlainFromDisk(path);
-      }
-      await this.emitAuditEvent("file.read", path, { outcome: "denied" });
-      await this.wipeDeniedLocalContent(path);
-      this.notifyDeniedLocalWipe(path);
-      throw new Error(
-        `VaultGuard Sync: Access denied. Local cached content for "${path}" was wiped.`
-      );
+      // Permission denial during read: log the denial for audit, but do
+      // NOT wipe and do NOT throw. Rationale (1.0.17 hardening after
+      // 1.0.15 data loss + 1.0.16 still-flooding incident):
+      //
+      //   * Wiping was the data-loss vector — destroying user files because
+      //     the permission cache said NONE meant a single cache miss erased
+      //     local content. Even with shouldDeferDenialWipe guarding the
+      //     startup window, post-warm-up NONE for legitimately-denied files
+      //     still destroyed them.
+      //
+      //   * Throwing produced the "stuck at indexing vault" symptom —
+      //     Obsidian's indexer retries failed reads, flooding the console
+      //     with errors per denied file on every startup.
+      //
+      //   * Revocation enforcement belongs in the sync engine, fired on a
+      //     CONFIRMED server permission-change event, not on every read.
+      //
+      // Returning the on-disk content trades a narrow privacy concern
+      // (someone with local disk access could read a file they no longer
+      // have server permission for) for ending the data-loss + indexing-
+      // flood incidents. At-rest encryption still protects the bytes on
+      // disk; only an authenticated user with a valid LAK can decrypt
+      // them, so the worst case is "user kept their own laptop after
+      // losing vault access" — which the file system permits anyway.
+      await this.emitAuditEvent("file.read", path, {
+        outcome: "denied",
+        reason: "permission-denied-read-fail-open",
+      });
+      this.log(`Permission denied for "${path}" (read fail-open).`);
+      return this.readPlainFromDisk(path);
     }
 
     // Phase-8 limited-access primary branch (OD-4): if this path is a known
@@ -5342,16 +5362,15 @@ export default class VaultGuardPlugin extends Plugin {
     await this.awaitPermissionReadiness();
     const permission = await this.getEffectivePermission(path);
     if (permission < PermissionLevel.READ) {
-      if (this.shouldDeferDenialWipe(path)) {
-        this.log(`Deferring binary wipe for "${path}": no warm-up evidence yet.`);
-        return this.readPlainBinaryFromDisk(path);
-      }
-      await this.emitAuditEvent("file.read", path, { outcome: "denied" });
-      await this.wipeDeniedLocalContent(path);
-      this.notifyDeniedLocalWipe(path);
-      throw new Error(
-        `VaultGuard Sync: Access denied. Local cached content for "${path}" was wiped.`
-      );
+      // See interceptedRead for the fail-open rationale. Binary reads must
+      // not wipe or throw — they hit the same Obsidian-indexer retry loop
+      // and the same data-loss vector as text reads.
+      await this.emitAuditEvent("file.read", path, {
+        outcome: "denied",
+        reason: "permission-denied-read-fail-open",
+      });
+      this.log(`Permission denied for binary "${path}" (read fail-open).`);
+      return this.readPlainBinaryFromDisk(path);
     }
 
     return this.readPlainBinaryFromDisk(path);
@@ -5450,10 +5469,17 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Permission-filtered directory listing operation.
-   * Filters out files the user does not have permission to see.
+   * Directory listing operation.
+   *
+   * Keep this path local-only. Obsidian calls adapter.list() while mounting the
+   * native file explorer and during startup indexing; doing live permission
+   * probes here can turn a cold cache or transient backend error into an empty
+   * vault tree. The file-explorer decoration layer fetches backend-confirmed
+   * access summaries asynchronously and hides explicit no-access file rows once
+   * it has evidence. Mutating operations still enforce permissions.
+   *
    * @param path - Normalized vault-relative directory path
-   * @returns Filtered list of accessible files and folders
+   * @returns Raw local files and folders for the requested directory
    */
   private async interceptedList(
     path: string
@@ -5462,35 +5488,7 @@ export default class VaultGuardPlugin extends Plugin {
       return { files: [], folders: [] };
     }
 
-    if (!this.session) {
-      this.showLoginRequiredNotice("browse");
-      return { files: [], folders: [] };
-    }
-
-    await this.awaitPermissionReadiness();
-
-    // Get the raw listing
-    const rawListing = await this.originalAdapterMethods.list(path);
-
-    // Filter based on permissions
-    const accessibleFiles: string[] = [];
-    for (const file of rawListing.files) {
-      const permission = await this.getEffectivePermission(file);
-      if (permission >= PermissionLevel.READ) {
-        accessibleFiles.push(file);
-      }
-    }
-
-    // Folders are visible if the user has read access to the folder itself.
-    const accessibleFolders: string[] = [];
-    for (const folder of rawListing.folders) {
-      const permission = await this.getEffectivePermission(folder);
-      if (permission >= PermissionLevel.READ) {
-        accessibleFolders.push(folder);
-      }
-    }
-
-    return { files: accessibleFiles, folders: accessibleFolders };
+    return this.originalAdapterMethods.list(path);
   }
 
   /**
@@ -8907,14 +8905,16 @@ export default class VaultGuardPlugin extends Plugin {
       // Effective role so file-explorer badges reflect per-vault permissions
       // rather than the user's flat org role.
       currentUserRole: this.getEffectiveUiRole(),
+      isReady: () => this.isFileExplorerDecorationDataReady(),
+      getPermissionLevel: (path) => this.getEffectivePermission(path),
     });
 
-    if (this.settings.showPermissionIndicators) {
-      // Delay to let the file explorer render first on startup
-      setTimeout(() => {
-        this.fileExplorerDecorations?.enable();
-      }, 1000);
-    }
+    // Delay to let the file explorer render first on startup. The state sync
+    // also checks auth + vault binding, so first-run/no-session startups do
+    // not fire unauthenticated permission requests.
+    setTimeout(() => {
+      this.syncFileExplorerDecorationsState();
+    }, 1000);
 
     // Phase 9: subscribe to the unified permission bus. Per-path payload
     // scopes the invalidation; wildcard payload (no path) re-renders all.
@@ -8944,6 +8944,39 @@ export default class VaultGuardPlugin extends Plugin {
         void view.reload();
       }
     }
+  }
+
+  private isFileExplorerDecorationDataReady(): boolean {
+    const apiClient = this.apiClient as
+      | (typeof this.apiClient & { isAuthenticated?: () => boolean })
+      | null;
+    const apiAuthenticated =
+      typeof apiClient?.isAuthenticated === "function"
+        ? apiClient.isAuthenticated()
+        : Boolean(this.session && apiClient);
+
+    return Boolean(
+      this.session &&
+      apiAuthenticated &&
+      this.settings.serverVaultId
+    );
+  }
+
+  private syncFileExplorerDecorationsState(refresh = false): void {
+    const decorations = this.fileExplorerDecorations as
+      | (Partial<Pick<FileExplorerDecorations, "enable" | "disable" | "refresh">>)
+      | null;
+    if (!decorations) return;
+
+    if (this.settings.showPermissionIndicators && this.isFileExplorerDecorationDataReady()) {
+      decorations.enable?.();
+      if (refresh) {
+        decorations.refresh?.();
+      }
+      return;
+    }
+
+    decorations.disable?.();
   }
 
   /**
@@ -9056,14 +9089,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Called when the showPermissionIndicators setting changes.
    */
   refreshFileExplorerDecorations(): void {
-    if (this.fileExplorerDecorations) {
-      if (this.settings.showPermissionIndicators) {
-        this.fileExplorerDecorations.enable();
-        this.fileExplorerDecorations.refresh();
-      } else {
-        this.fileExplorerDecorations.disable();
-      }
-    }
+    this.syncFileExplorerDecorationsState(true);
   }
 
   /**
