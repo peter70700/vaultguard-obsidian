@@ -15,6 +15,7 @@ import {
   PathAccessSummary,
   PermissionAccessLevel,
   UserListEntry,
+  VaultMemberRecord,
 } from "../api/client";
 import { PermissionLevel } from "../types";
 import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
@@ -24,6 +25,7 @@ import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials
 const DECORATION_CLS = "vaultguard-fe-decoration";
 const HIDDEN_CLS = "vaultguard-fe-hidden";
 const CACHE_TTL_MS = 120_000; // 2 minutes
+const PARTIAL_CACHE_TTL_MS = 15_000; // retry principal summaries quickly when only dots are known
 const DEBOUNCE_MS = 300; // debounce observer-triggered repaints
 const ATTACH_RETRY_MS = 1_000; // file explorer can mount after plugin load
 const BATCH_PATH_LIMIT = 100; // matches backend cap
@@ -37,7 +39,7 @@ interface DecorationCacheEntry {
   sharedWith: number;
   principals: Array<{ id: string; label: string; level: PermissionAccessLevel; type: "user" | "role" }>;
   fetchedAt: number;
-  source?: "backend" | "fallback";
+  source?: "backend" | "level-only" | "fallback";
 }
 
 export interface FileExplorerDecorationsConfig {
@@ -61,9 +63,12 @@ export class FileExplorerDecorations {
   private isDecorating = false; // guard against observer re-entry
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private attachRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private users: UserListEntry[] = [];
   private userMap: Map<string, UserListEntry> = new Map();
   private usersLoaded = false;
   private usersLoadPromise: Promise<void> | null = null;
+  private vaultMembersLoaded = false;
+  private vaultMembersLoadPromise: Promise<void> | null = null;
   private batchAccessUnavailable = false;
 
   constructor(config: FileExplorerDecorationsConfig) {
@@ -122,9 +127,7 @@ export class FileExplorerDecorations {
       // Clear the user directory too — a permission grant may target a user
       // who was just invited and isn't in the cached map. Without this,
       // their chip would render as their UUID until the next session.
-      this.userMap = new Map();
-      this.usersLoaded = false;
-      this.usersLoadPromise = null;
+      this.clearUserDirectory();
     }
     if (this.enabled) {
       this.scheduleDecorate();
@@ -138,6 +141,7 @@ export class FileExplorerDecorations {
    * Clears the cache so badges re-render with the new role context.
    */
   setConfig(updates: { currentUserId?: string; currentUserRole?: string }): void {
+    const identityChanged = updates.currentUserId !== undefined && updates.currentUserId !== this.config.currentUserId;
     if (updates.currentUserId !== undefined) {
       this.config.currentUserId = updates.currentUserId;
     }
@@ -146,6 +150,9 @@ export class FileExplorerDecorations {
     }
     this.cache.clear();
     this.inFlightPaths.clear();
+    if (identityChanged) {
+      this.clearUserDirectory();
+    }
     if (this.enabled) {
       this.scheduleDecorate();
     }
@@ -302,7 +309,7 @@ export class FileExplorerDecorations {
     // Kick off backend fetches (user directory + path access summaries). If
     // those calls fail, rows still get a role-based fallback decoration below
     // so the native explorer never looks like VaultGuard forgot to render.
-    await this.loadUsersIfNeeded();
+    await this.loadPrincipalDirectoryIfNeeded();
     if (pathsToFetch.length > 0) {
       await this.fetchAccessForPaths(pathsToFetch);
     }
@@ -334,6 +341,9 @@ export class FileExplorerDecorations {
     if (this.inFlightPaths.has(path)) return false;
     const cached = this.cache.get(path);
     if (!cached) return true;
+    if (cached.source !== "backend") {
+      return Date.now() - cached.fetchedAt >= PARTIAL_CACHE_TTL_MS;
+    }
     return Date.now() - cached.fetchedAt >= CACHE_TTL_MS;
   }
 
@@ -590,7 +600,7 @@ export class FileExplorerDecorations {
       sharedWith: existing?.sharedWith ?? 0,
       principals: existing?.principals ?? [],
       fetchedAt,
-      source: "backend",
+      source: existing?.source ?? "level-only",
     });
   }
 
@@ -685,16 +695,127 @@ export class FileExplorerDecorations {
     this.usersLoadPromise = (async () => {
       try {
         const users = await this.config.apiClient.listUsers();
-        this.userMap = buildAccessUserMap(users);
+        this.mergeUsersIntoDirectory(users);
         this.usersLoaded = true;
       } catch {
-        // Silently fail — backend principal labels still come through; this
-        // is only a fallback for initials.
+        // Silently fail — the org-wide /users route is admin-only in normal
+        // deployments. Vault members and backend principal labels still give
+        // non-admins real names, so do not retry this endpoint on every
+        // decorate pass.
+        this.usersLoaded = true;
       } finally {
         this.usersLoadPromise = null;
       }
     })();
     await this.usersLoadPromise;
+  }
+
+  private async loadVaultMembersIfNeeded(): Promise<void> {
+    if (this.vaultMembersLoaded) return;
+    if (this.vaultMembersLoadPromise) {
+      await this.vaultMembersLoadPromise;
+      return;
+    }
+    this.vaultMembersLoadPromise = (async () => {
+      const getVaultId = this.config.apiClient.getVaultId;
+      const vaultId = typeof getVaultId === "function"
+        ? getVaultId.call(this.config.apiClient)
+        : "";
+      if (!vaultId) {
+        this.vaultMembersLoaded = true;
+        return;
+      }
+
+      try {
+        if (typeof this.config.apiClient.listVaultMembers !== "function") {
+          this.vaultMembersLoaded = true;
+          return;
+        }
+        const members = await this.config.apiClient.listVaultMembers(vaultId);
+        this.mergeVaultMembersIntoDirectory(members);
+        this.vaultMembersLoaded = true;
+      } catch {
+        // Leave loaded=false so a later full refresh can try again. This
+        // route is the non-admin-safe name source for avatar initials.
+        this.vaultMembersLoaded = false;
+      } finally {
+        this.vaultMembersLoadPromise = null;
+      }
+    })();
+    await this.vaultMembersLoadPromise;
+  }
+
+  private async loadPrincipalDirectoryIfNeeded(): Promise<void> {
+    await Promise.allSettled([
+      this.loadUsersIfNeeded(),
+      this.loadVaultMembersIfNeeded(),
+    ]);
+  }
+
+  private mergeUsersIntoDirectory(users: UserListEntry[]): void {
+    if (users.length === 0) return;
+
+    const byId = new Map(this.users.map((user) => [user.id, user]));
+    for (const user of users) {
+      byId.set(user.id, user);
+    }
+    this.users = [...byId.values()];
+    this.userMap = buildAccessUserMap(this.users);
+  }
+
+  private mergeVaultMembersIntoDirectory(members: VaultMemberRecord[]): void {
+    if (members.length === 0) return;
+
+    const byId = new Map(this.users.map((user) => [user.id, user]));
+    let changed = false;
+
+    for (const member of members) {
+      const existing = byId.get(member.userId);
+      if (existing && this.shouldKeepExistingIdentity(existing, member)) continue;
+      if (!member.displayName && !member.email) continue;
+
+      byId.set(member.userId, {
+        id: member.userId,
+        email: member.email ?? "",
+        displayName: member.displayName ?? "",
+        name: member.displayName ?? "",
+        role: this.mapVaultRoleToUserRole(member.role),
+        status: "active",
+        lastActive: "",
+        createdAt: member.joinedAt,
+        mfaEnabled: false,
+        deviceCount: 0,
+        type: "user",
+      });
+      changed = true;
+    }
+
+    if (!changed) return;
+    this.users = [...byId.values()];
+    this.userMap = buildAccessUserMap(this.users);
+  }
+
+  private clearUserDirectory(): void {
+    this.users = [];
+    this.userMap = new Map();
+    this.usersLoaded = false;
+    this.usersLoadPromise = null;
+    this.vaultMembersLoaded = false;
+    this.vaultMembersLoadPromise = null;
+  }
+
+  private shouldKeepExistingIdentity(user: UserListEntry, member: VaultMemberRecord): boolean {
+    if (user.displayName?.trim() || user.name?.trim()) return true;
+    return Boolean(user.email?.trim() && !member.displayName?.trim());
+  }
+
+  private mapVaultRoleToUserRole(role: VaultMemberRecord["role"]): UserListEntry["role"] {
+    switch (role) {
+      case "admin": return "admin";
+      case "editor": return "editor";
+      case "viewer":
+      default: return "viewer";
+    }
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────

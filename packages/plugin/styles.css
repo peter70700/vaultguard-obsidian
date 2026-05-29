@@ -3368,15 +3368,21 @@ body.is-phone .vaultguard-fh-popover-inner {
   margin-left: auto;
   padding-left: 6px;
   flex-shrink: 0;
+  min-width: max-content;
+  white-space: nowrap;
   pointer-events: auto;
 }
 
 /* Make nav items flex so decoration pushes to the right */
 .nav-file-title,
 .nav-folder-title,
-.workspace-leaf-content[data-type="file-explorer"] .tree-item-self[data-path] {
+.workspace-leaf-content[data-type="file-explorer"] .tree-item-self[data-path],
+.workspace-leaf-content[data-type="file-explorer"] .nav-file-title,
+.workspace-leaf-content[data-type="file-explorer"] .nav-folder-title {
   display: flex;
   align-items: center;
+  min-width: 0;
+  overflow: visible;
 }
 
 .nav-file-title .nav-file-title-content,
@@ -3430,12 +3436,15 @@ body.is-phone .vaultguard-fh-popover-inner {
 .vaultguard-fe-share-indicator {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
 }
 
 .vaultguard-fe-avatar-stack {
   display: inline-flex;
   align-items: center;
   flex-direction: row-reverse;
+  flex: 0 0 auto;
+  min-width: max-content;
 }
 
 .vaultguard-fe-mini-avatar {
