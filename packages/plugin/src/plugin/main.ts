@@ -711,8 +711,10 @@ export default class VaultGuardPlugin extends Plugin {
       });
     }
 
-    const loadBanner = `VaultGuard v${this.manifest.version} (sync-rev ${SYNC_FEATURE_REVISION}) loaded`;
-    new Notice(loadBanner, 4000);
+    if (this.settings.debugLogging) {
+      const loadBanner = `VaultGuard v${this.manifest.version} (sync-rev ${SYNC_FEATURE_REVISION}) loaded`;
+      new Notice(loadBanner, 2500);
+    }
 
     this.updateChecker = new UpdateChecker(this);
     this.updateChecker.start();
@@ -2116,7 +2118,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
     if (!storedSession) {
       this.log("No stored session found.");
-      if (Platform.isMobileApp) {
+      if (Platform.isMobileApp && this.settings.debugLogging) {
         new Notice(
           "VaultGuard diag: no stored session — login required",
           5000
@@ -2145,7 +2147,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.log(`Session restored for user: ${storedSession.displayName}`);
     this.updateStatusBar();
 
-    if (Platform.isMobileApp) {
+    if (Platform.isMobileApp && this.settings.debugLogging) {
       const userIdShort = (storedSession.userId ?? "").slice(0, 6) || "—";
       const rawVaultId = this.settings.serverVaultId ?? "";
       const vaultIdShort = rawVaultId.length > 0 ? rawVaultId.slice(0, 6) : "—";
@@ -4446,7 +4448,7 @@ export default class VaultGuardPlugin extends Plugin {
       }
       const method = status.kind === "unlocked" ? status.method : "unknown";
       this.log(`AtRestCipher ready (${method}).`);
-      if (Platform.isMobileApp) {
+      if (Platform.isMobileApp && this.settings.debugLogging) {
         const ready = status.kind === "unlocked";
         new Notice(
           `VaultGuard diag: at-rest method=${method}, ready=${ready}`,

@@ -622,12 +622,11 @@ export class FilePermissionHeader {
     currentUserLevel?: AccessLevel;
     rulesAvailable?: boolean;
   }): AccessListOptions {
-    // When raw rules are available (admin view), they are the authoritative
-    // source for each visible user's file-specific level. The access-summary
-    // endpoint is still useful for enriching labels, but its principals can
-    // lag or collapse to inherited defaults during backend rollout. Only use
-    // access principals when rules are unavailable, e.g. non-admin viewers.
-    const options = data.rulesAvailable ? {} : this.optionsFromAccess(data.access);
+    // The backend access summary is the only place that already has the
+    // complete server-computed effective-access table for every vault member
+    // (including explicit "No access" rows). Use it whenever available; raw
+    // rules remain a fallback for older/failed access-summary endpoints.
+    const options = this.optionsFromAccess(data.access);
     if (data.currentUserLevel !== undefined && data.currentUserLevel !== "unknown") {
       options.currentUserLevel = data.currentUserLevel;
       options.accessPrincipals = this.withCurrentUserPrincipalLevel(
@@ -688,7 +687,6 @@ export class FilePermissionHeader {
     }
 
     return updated
-      .filter((principal) => principal.level !== "none")
       .sort((a, b) => {
         const levelDiff = this.levelRank(b.level) - this.levelRank(a.level);
         if (levelDiff !== 0) return levelDiff;
@@ -724,7 +722,6 @@ export class FilePermissionHeader {
 
   private pathAccessToPrincipals(principals: PathAccessPrincipal[]): AccessPrincipal[] {
     return principals
-      .filter((principal) => principal.level !== "none")
       .map((principal) => {
         const label =
           principal.displayName ||
@@ -1425,7 +1422,6 @@ export class FilePermissionHeader {
     }
 
     return [...principals.values()]
-      .filter((principal) => principal.level !== "none")
       .sort((a, b) => {
         const levelDiff = this.levelRank(b.level) - this.levelRank(a.level);
         if (levelDiff !== 0) return levelDiff;
