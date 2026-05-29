@@ -8937,6 +8937,22 @@ export default class VaultGuardPlugin extends Plugin {
         this.fileExplorerDecorations?.invalidate(payload.path);
       })
     );
+
+    // Re-run decoration when the file explorer becomes visible. On mobile the
+    // explorer lives in a collapsed drawer whose view is deferred until shown,
+    // so the startup pass finds no items; opening the drawer fires these events
+    // and re-attaches the observer to the now-live container. Harmless on
+    // desktop where the explorer is already mounted.
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        this.syncFileExplorerDecorationsState();
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => {
+        this.syncFileExplorerDecorationsState();
+      })
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────────────

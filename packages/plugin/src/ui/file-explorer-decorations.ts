@@ -202,7 +202,30 @@ export class FileExplorerDecorations {
   private getFileExplorerContainer(): HTMLElement | null {
     const leaves = this.config.app.workspace.getLeavesOfType("file-explorer");
     if (leaves.length === 0) return null;
-    return leaves[0].view.containerEl;
+
+    const leaf = leaves[0] as typeof leaves[0] & {
+      isDeferred?: boolean;
+      loadIfDeferred?: () => Promise<void>;
+    };
+
+    // On mobile the file explorer lives in a collapsed left drawer. Under
+    // Obsidian's deferred-views model (1.7.2+) the leaf's view is a placeholder
+    // with no .nav-file-title rows until the drawer is shown. Reading
+    // containerEl now would attach the observer to a stale element that never
+    // gets file items. Force the real view to load and return null for this
+    // pass — the attach-retry timer and the layout/leaf-change listeners
+    // re-run decoration once the live view has mounted.
+    if (leaf.isDeferred === true) {
+      if (typeof leaf.loadIfDeferred === "function") {
+        void leaf.loadIfDeferred().then(() => {
+          if (this.enabled) this.scheduleDecorate();
+        });
+      }
+      this.scheduleAttachRetry();
+      return null;
+    }
+
+    return leaf.view.containerEl;
   }
 
   // ─── Debounced Decoration ─────────────────────────────────────────────
