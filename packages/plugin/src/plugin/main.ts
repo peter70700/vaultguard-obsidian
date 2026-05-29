@@ -2946,6 +2946,7 @@ export default class VaultGuardPlugin extends Plugin {
 
     this.filePermissionHeader?.setContext({
       currentUserId: userId,
+      currentUserEmail: this.session?.email ?? "",
       currentUserRole: role,
       isAdmin,
     });
@@ -3562,6 +3563,7 @@ export default class VaultGuardPlugin extends Plugin {
       // org role) so the sidebar reflects what the user can actually do on
       // the currently bound vault.
       currentUserRole: this.getEffectiveUiRole(),
+      getPermissionLevel: (path) => this.getEffectivePermission(path),
       onOpenMenu: (evt?: MouseEvent) => this.showVaultGuardMenu(evt),
       onOpenSettings: () => this.openVaultGuardSettings(),
     };
@@ -8814,11 +8816,22 @@ export default class VaultGuardPlugin extends Plugin {
       app: this.app,
       apiClient: this.apiClient,
       currentUserId: this.session?.userId ?? "",
+      currentUserEmail: this.session?.email ?? "",
       // Use the effective UI role (org admin/owner > vault membership role >
       // org role). Without this, an org "member" who is a vault "admin"
       // would see read-only affordances.
       currentUserRole: this.getEffectiveUiRole(),
       isAdmin: this.isEffectiveAdmin(),
+      // Resolve the current user's level through the same PermissionStore the
+      // sidebar, file-explorer dots, and read-only guard use. The store owns
+      // the warm-up cache that recognises file-specific grants (matched by
+      // canonical id, email, or role) and is invalidated on the permission bus,
+      // so it stays in lockstep with those surfaces. The earlier live-only
+      // `/permissions/check` probe diverged from them: the store matches grants
+      // by email (case-insensitively) and by session roles, while the backend
+      // self-check queries the userId index by exact value and collapses the
+      // caller to their vault-membership role — so an elevated grant the store
+      // honoured showed in the sidebar but the header fell back to inherited READ.
       getPermissionLevel: (path) => this.getEffectivePermission(path),
       // Propagate header-side rule edits (manage panel, popover dropdown)
       // to the rest of the UI so file-explorer dots and the read-only

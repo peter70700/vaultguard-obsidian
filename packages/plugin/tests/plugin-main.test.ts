@@ -1746,11 +1746,11 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     // Stale per-path entries from before the role change must be dropped;
     // the warm-up may seed the root key ("") with the new default level.
     expect(plugin.permissionCache.has("docs/readme.md")).toBe(false);
-    expect(plugin.filePermissionHeader.setContext).toHaveBeenCalledWith({
+    expect(plugin.filePermissionHeader.setContext).toHaveBeenCalledWith(expect.objectContaining({
       currentUserId: "user-1",
       currentUserRole: "admin",
       isAdmin: true,
-    });
+    }));
     expect(plugin.fileExplorerDecorations.setConfig).toHaveBeenCalledWith({
       currentUserId: "user-1",
       currentUserRole: "admin",
@@ -1778,11 +1778,11 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     await plugin.refreshVaultMemberRole();
 
     expect(plugin.vaultMemberRole).toBe("viewer");
-    expect(plugin.filePermissionHeader.setContext).toHaveBeenCalledWith({
+    expect(plugin.filePermissionHeader.setContext).toHaveBeenCalledWith(expect.objectContaining({
       currentUserId: "user-1",
       currentUserRole: "viewer",
       isAdmin: false,
-    });
+    }));
     expect(plugin.fileExplorerDecorations.setConfig).toHaveBeenCalledWith({
       currentUserId: "user-1",
       currentUserRole: "viewer",

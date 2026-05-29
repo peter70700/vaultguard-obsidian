@@ -590,7 +590,7 @@ data "aws_iam_policy_document" "audit_lambda" {
     resources = [var.audit_table_arn, "${var.audit_table_arn}/index/*"]
   }
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"]
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
     resources = [var.alerts_table_arn, "${var.alerts_table_arn}/index/*"]
   }
   statement {

@@ -37,6 +37,7 @@ interface HeaderContext {
   app: App;
   apiClient: VaultGuardApiClient;
   currentUserId: string;
+  currentUserEmail?: string;
   currentUserRole: string;
   isAdmin: boolean;
   /**
@@ -57,19 +58,24 @@ interface HeaderContext {
 
 interface RuleCacheEntry {
   rules?: PermissionRule[];
+  rulesAvailable?: boolean;
   access?: PathAccessSummary | null;
+  currentUserLevel?: AccessLevel;
   fetchedAt: number;
   inFlight?: Promise<HeaderData>;
 }
 
 interface HeaderData {
   rules: PermissionRule[];
+  rulesAvailable: boolean;
   access: PathAccessSummary | null;
+  currentUserLevel: AccessLevel;
 }
 
 type AccessLevel = "unknown" | "none" | "read" | "write" | "admin";
 type AccessPrincipal = {
   id: string;
+  email?: string;
   label: string;
   level: AccessLevel;
   type: "user" | "role";
@@ -151,15 +157,19 @@ export class FilePermissionHeader {
     }
 
     const cached = this.ruleCache.get(file.path);
-    if (cached?.rules) {
-      this.renderHeader(headerEl, file, cached.rules, this.optionsFromAccess(cached.access));
+    const needsAuthoritativeLevelRefresh = Boolean(cached?.rules && this.ctx.getPermissionLevel);
+    if (cached?.rules && !needsAuthoritativeLevelRefresh) {
+      this.renderHeader(headerEl, file, cached.rules, this.optionsFromData(cached));
       this.activePanel?.setRules(cached.rules);
     } else {
       this.renderSkeleton(headerEl, file);
     }
 
     const shouldRefresh =
-      options.force === true || !cached?.rules || this.isCacheStale(cached);
+      options.force === true ||
+      !cached?.rules ||
+      this.isCacheStale(cached) ||
+      Boolean(cached?.rules && this.ctx.getPermissionLevel);
     if (!shouldRefresh) {
       return;
     }
@@ -173,7 +183,7 @@ export class FilePermissionHeader {
       const data = await this.fetchHeaderDataForPath(file.path, options.force === true);
       // Check the element is still mounted (user may have switched files)
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
-      this.renderHeader(headerEl, file, data.rules, this.optionsFromAccess(data.access));
+      this.renderHeader(headerEl, file, data.rules, this.optionsFromData(data));
       this.activePanel?.setRules(data.rules);
     } catch {
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
@@ -242,11 +252,15 @@ export class FilePermissionHeader {
    */
   setContext(updates: {
     currentUserId?: string;
+    currentUserEmail?: string;
     currentUserRole?: string;
     isAdmin?: boolean;
   }): void {
     if (updates.currentUserId !== undefined) {
       this.ctx.currentUserId = updates.currentUserId;
+    }
+    if (updates.currentUserEmail !== undefined) {
+      this.ctx.currentUserEmail = updates.currentUserEmail;
     }
     if (updates.currentUserRole !== undefined) {
       this.ctx.currentUserRole = updates.currentUserRole;
@@ -315,7 +329,7 @@ export class FilePermissionHeader {
         if (cached?.rules) {
           const view = this.ctx.app.workspace.getActiveViewOfType(MarkdownView);
           if (view?.file?.path === this.activePath) {
-            this.renderHeader(this.activeHeader, view.file, cached.rules, this.optionsFromAccess(cached.access));
+            this.renderHeader(this.activeHeader, view.file, cached.rules, this.optionsFromData(cached));
           }
         }
       }
@@ -351,7 +365,7 @@ export class FilePermissionHeader {
         if (cached?.rules) {
           const view = this.ctx.app.workspace.getActiveViewOfType(MarkdownView);
           if (view?.file?.path === this.activePath) {
-            this.renderHeader(this.activeHeader, view.file, cached.rules, this.optionsFromAccess(cached.access));
+            this.renderHeader(this.activeHeader, view.file, cached.rules, this.optionsFromData(cached));
           }
         }
       }
@@ -450,8 +464,30 @@ export class FilePermissionHeader {
 
   private async fetchHeaderDataForPath(path: string, force = false): Promise<HeaderData> {
     const cached = this.ruleCache.get(path);
-    if (!force && cached?.rules && cached.access !== undefined && !this.isCacheStale(cached)) {
-      return { rules: cached.rules, access: cached.access ?? null };
+    if (
+      !force &&
+      cached?.rules &&
+      cached.access !== undefined &&
+      cached.currentUserLevel !== undefined &&
+      !this.isCacheStale(cached)
+    ) {
+      const currentUserLevel = await this.fetchCurrentUserLevel(path);
+      const refreshedLevel = currentUserLevel === "unknown"
+        ? cached.currentUserLevel
+        : currentUserLevel;
+      const displayedLevel = this.combineCurrentUserLevel(cached.access, refreshedLevel);
+      if (displayedLevel !== cached.currentUserLevel) {
+        this.ruleCache.set(path, {
+          ...cached,
+          currentUserLevel: displayedLevel,
+        });
+      }
+      return {
+        rules: cached.rules,
+        rulesAvailable: cached.rulesAvailable === true,
+        access: cached.access ?? null,
+        currentUserLevel: displayedLevel,
+      };
     }
 
     if (cached?.inFlight) {
@@ -459,29 +495,51 @@ export class FilePermissionHeader {
     }
 
     const rulesRequest = this.ctx.isAdmin
-      ? this.ctx.apiClient.getPermissions().catch(() => [] as PermissionRule[])
-      : Promise.resolve([] as PermissionRule[]);
-    const accessRequest = this.ctx.apiClient.getPathAccess(path).catch(() => null);
+      ? this.ctx.apiClient
+        .getPermissions()
+        .then((rules) => ({ rules, rulesAvailable: true }))
+        .catch(() => ({ rules: [] as PermissionRule[], rulesAvailable: false }))
+      : Promise.resolve({ rules: [] as PermissionRule[], rulesAvailable: false });
+    const accessRequest = this.fetchPathAccessForHeader(path);
+    const currentUserLevelRequest = this.fetchCurrentUserLevel(path);
 
     const request = Promise.all([
       rulesRequest,
       accessRequest,
+      currentUserLevelRequest,
       this.loadVaultMembersIfNeeded(),
     ])
-      .then(([rules, access]) => {
-        const matchingRules = rules.filter((rule) =>
+      .then(([rulesResult, access, currentUserLevel]) => {
+        const matchingRules = rulesResult.rules.filter((rule) =>
           this.ruleMatchesPath(rule.pathPattern, path)
         );
         if (access) {
           this.mergePathAccessIntoDirectory(access.principals);
         }
-        this.ruleCache.set(path, { rules: matchingRules, access, fetchedAt: Date.now() });
-        return { rules: matchingRules, access };
+        const displayedCurrentUserLevel = this.combineCurrentUserLevel(access, currentUserLevel);
+        this.ruleCache.set(path, {
+          rules: matchingRules,
+          rulesAvailable: rulesResult.rulesAvailable,
+          access,
+          currentUserLevel: displayedCurrentUserLevel,
+          fetchedAt: Date.now(),
+        });
+        return {
+          rules: matchingRules,
+          rulesAvailable: rulesResult.rulesAvailable,
+          access,
+          currentUserLevel: displayedCurrentUserLevel,
+        };
       })
       .catch((error) => {
         const fallback = this.ruleCache.get(path) ?? cached;
         if (fallback?.rules) {
-          return { rules: fallback.rules, access: fallback.access ?? null };
+          return {
+            rules: fallback.rules,
+            rulesAvailable: fallback.rulesAvailable === true,
+            access: fallback.access ?? null,
+            currentUserLevel: fallback.currentUserLevel ?? "unknown",
+          };
         }
         throw error;
       })
@@ -491,13 +549,17 @@ export class FilePermissionHeader {
           if (current.rules) {
             this.ruleCache.set(path, {
               rules: current.rules,
+              rulesAvailable: current.rulesAvailable,
               access: current.access,
+              currentUserLevel: current.currentUserLevel,
               fetchedAt: current.fetchedAt,
             });
           } else if (cached?.rules) {
             this.ruleCache.set(path, {
               rules: cached.rules,
+              rulesAvailable: cached.rulesAvailable,
               access: cached.access,
+              currentUserLevel: cached.currentUserLevel,
               fetchedAt: cached.fetchedAt,
             });
           } else {
@@ -508,7 +570,9 @@ export class FilePermissionHeader {
 
     this.ruleCache.set(path, {
       rules: cached?.rules,
+      rulesAvailable: cached?.rulesAvailable,
       access: cached?.access,
+      currentUserLevel: cached?.currentUserLevel,
       fetchedAt: cached?.fetchedAt ?? 0,
       inFlight: request,
     });
@@ -553,6 +617,111 @@ export class FilePermissionHeader {
     };
   }
 
+  private optionsFromData(data: {
+    access?: PathAccessSummary | null;
+    currentUserLevel?: AccessLevel;
+    rulesAvailable?: boolean;
+  }): AccessListOptions {
+    // When raw rules are available (admin view), they are the authoritative
+    // source for each visible user's file-specific level. The access-summary
+    // endpoint is still useful for enriching labels, but its principals can
+    // lag or collapse to inherited defaults during backend rollout. Only use
+    // access principals when rules are unavailable, e.g. non-admin viewers.
+    const options = data.rulesAvailable ? {} : this.optionsFromAccess(data.access);
+    if (data.currentUserLevel !== undefined && data.currentUserLevel !== "unknown") {
+      options.currentUserLevel = data.currentUserLevel;
+      options.accessPrincipals = this.withCurrentUserPrincipalLevel(
+        options.accessPrincipals,
+        data.currentUserLevel
+      );
+    }
+    return options;
+  }
+
+  private combineCurrentUserLevel(
+    access: PathAccessSummary | null | undefined,
+    checkedLevel: AccessLevel
+  ): AccessLevel {
+    if (checkedLevel === "none") return "none";
+
+    const accessLevel = access?.currentUserLevel;
+    if (!accessLevel) return checkedLevel;
+    if (checkedLevel === "unknown") return accessLevel;
+
+    return this.levelRank(accessLevel) > this.levelRank(checkedLevel)
+      ? accessLevel
+      : checkedLevel;
+  }
+
+  private withCurrentUserPrincipalLevel(
+    principals: AccessPrincipal[] | undefined,
+    level: AccessLevel
+  ): AccessPrincipal[] | undefined {
+    if (!principals || level === "unknown") return principals;
+
+    const currentUserId = this.resolveCanonicalUserId(this.ctx.currentUserId);
+    const currentUserEmail = this.ctx.currentUserEmail?.trim().toLowerCase() ?? "";
+    let foundCurrentUser = false;
+
+    const updated = principals.map((principal) => {
+      if (principal.type !== "user") return principal;
+      const principalId = this.resolveCanonicalUserId(principal.id);
+      const principalEmail = principal.email?.trim().toLowerCase() ?? "";
+      const isCurrentUser =
+        principal.id === this.ctx.currentUserId ||
+        principalId === currentUserId ||
+        (currentUserEmail.length > 0 && principalEmail === currentUserEmail);
+      if (!isCurrentUser) {
+        return principal;
+      }
+      foundCurrentUser = true;
+      return { ...principal, id: currentUserId || principalId, level };
+    });
+
+    if (!foundCurrentUser && level !== "none") {
+      updated.push({
+        id: currentUserId,
+        label: this.resolveUserLabel(currentUserId),
+        level,
+        type: "user",
+      });
+    }
+
+    return updated
+      .filter((principal) => principal.level !== "none")
+      .sort((a, b) => {
+        const levelDiff = this.levelRank(b.level) - this.levelRank(a.level);
+        if (levelDiff !== 0) return levelDiff;
+        return a.label.localeCompare(b.label);
+      });
+  }
+
+  private async fetchPathAccessForHeader(path: string): Promise<PathAccessSummary | null> {
+    try {
+      if (typeof this.ctx.apiClient.getBatchPathAccess === "function") {
+        const summaries = await this.ctx.apiClient.getBatchPathAccess([path]);
+        const target = this.normalizeAccessPath(path);
+        const summary = summaries.find((entry) =>
+          this.normalizeAccessPath(entry.path) === target
+        );
+        if (summary) return summary;
+      }
+    } catch {
+      // Fall through to the single-path endpoint.
+    }
+
+    try {
+      return await this.ctx.apiClient.getPathAccess(path);
+    } catch {
+      return null;
+    }
+  }
+
+  private normalizeAccessPath(path: string): string {
+    const trimmed = path.trim().replace(/\/+/g, "/");
+    return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  }
+
   private pathAccessToPrincipals(principals: PathAccessPrincipal[]): AccessPrincipal[] {
     return principals
       .filter((principal) => principal.level !== "none")
@@ -563,6 +732,7 @@ export class FilePermissionHeader {
           this.resolveUserLabel(principal.userId);
         return {
           id: principal.userId,
+          email: principal.email,
           label,
           level: principal.level,
           type: "user" as const,
@@ -583,6 +753,7 @@ export class FilePermissionHeader {
 
   private renderSkeleton(container: HTMLElement, _file: TFile): void {
     container.empty();
+    container.dataset.vaultguardCurrentUserLevel = "loading";
     const inner = container.createDiv({ cls: "vaultguard-fh-inner" });
 
     // Current user permission badge while rules are loading.
@@ -610,6 +781,7 @@ export class FilePermissionHeader {
 
     // ── Section 1: Current user's effective level ────────────────────
     const myLevel = this.resolveMyLevel(file.path, rules, options);
+    container.dataset.vaultguardCurrentUserLevel = myLevel;
     const levelSection = inner.createDiv({ cls: "vaultguard-fh-level" });
 
     const lockIcon = levelSection.createSpan({ cls: "vaultguard-fh-lock-icon" });
@@ -647,8 +819,8 @@ export class FilePermissionHeader {
         cls: "vaultguard-fh-btn vaultguard-fh-btn-view",
       });
       const viewIcon = viewBtn.createSpan({ cls: "vaultguard-fh-btn-icon" });
-      setIcon(viewIcon, "eye");
-      viewBtn.createSpan({ text: "View" });
+      setIcon(viewIcon, "info");
+      viewBtn.createSpan({ text: "Details" });
       viewBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         this.closePopover();
@@ -657,13 +829,36 @@ export class FilePermissionHeader {
     }
   }
 
+  /**
+   * Resolves the principal chips to render, always reconciling the current
+   * user's own chip with their authoritative level.
+   *
+   * `options.accessPrincipals` (from the backend access summary) is already
+   * reconciled in `optionsFromData`, but the `buildVisibleAccessPrincipals`
+   * fallback — used when the access summary is unavailable — seeds chips from
+   * vault-member ROLE defaults (viewer→read), which ignores file-specific
+   * grants. Without re-applying the override here, a viewer with a file-specific
+   * WRITE/ADMIN grant sees their own chip stuck on the inherited "read" while
+   * the header badge correctly shows the elevated level.
+   */
+  private visibleAccessPrincipals(
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): AccessPrincipal[] {
+    const base = options.accessPrincipals ?? this.buildVisibleAccessPrincipals(rules, options);
+    if (options.currentUserLevel && options.currentUserLevel !== "unknown") {
+      return this.withCurrentUserPrincipalLevel(base, options.currentUserLevel) ?? base;
+    }
+    return base;
+  }
+
   private renderAccessList(
     container: HTMLElement,
     file: TFile,
     rules: PermissionRule[],
     options: AccessListOptions = {}
   ): void {
-    const sorted = options.accessPrincipals ?? this.buildVisibleAccessPrincipals(rules, options);
+    const sorted = this.visibleAccessPrincipals(rules, options);
 
     const MAX_SHOWN = 4;
     const shown = sorted.slice(0, MAX_SHOWN);
@@ -808,7 +1003,7 @@ export class FilePermissionHeader {
     // org-admin/vault-admin/owner (see infrastructure/lambda/shared/utils.ts:528-530),
     // so offering the editable dropdown for the admin's own row would silently write
     // an orphan deny rule with no effect. Fold self-rows into the static-badge branch.
-    if (this.ctx.isAdmin && userId !== this.ctx.currentUserId) {
+    if (this.canEditUserRow(userId, file, rules)) {
       const levelSelect = levelRow.createEl("select", {
         cls: "vaultguard-fh-popover-level-select",
       });
@@ -1262,6 +1457,19 @@ export class FilePermissionHeader {
       default:
         return "read";
     }
+  }
+
+  /**
+   * Whether the current user may edit `userId`'s level on `file` from the popover.
+   * Org/vault admins (ctx.isAdmin) keep full power; a file-level admin
+   * (resolveMyLevel === "admin") may also edit OTHER principals' rows. The
+   * self-row is never editable — a user cannot drop their own access, mirroring
+   * the backend self-protection guardrail (authorizePermissionMutation).
+   */
+  private canEditUserRow(userId: string, file: TFile, rules: PermissionRule[]): boolean {
+    if (userId === this.ctx.currentUserId) return false;
+    if (this.ctx.isAdmin) return true;
+    return this.resolveMyLevel(file.path, rules) === "admin";
   }
 
   private resolveMyLevel(

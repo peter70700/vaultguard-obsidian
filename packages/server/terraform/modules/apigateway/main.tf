@@ -914,6 +914,34 @@ resource "aws_api_gateway_integration" "audit_alerts_get" {
   uri                     = var.audit_lambda_invoke_arn
 }
 
+resource "aws_api_gateway_resource" "audit_alerts_id" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.audit_alerts.id
+  path_part   = "{alertId}"
+}
+
+resource "aws_api_gateway_method" "audit_alerts_id_patch" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.audit_alerts_id.id
+  http_method   = "PATCH"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+
+  request_parameters = {
+    "method.request.path.vaultId" = true
+    "method.request.path.alertId" = true
+  }
+}
+
+resource "aws_api_gateway_integration" "audit_alerts_id_patch" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.audit_alerts_id.id
+  http_method             = aws_api_gateway_method.audit_alerts_id_patch.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.audit_lambda_invoke_arn
+}
+
 resource "aws_api_gateway_resource" "audit_user" {
   rest_api_id = aws_api_gateway_rest_api.vaultguard.id
   parent_id   = aws_api_gateway_resource.audit.id
@@ -1418,6 +1446,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.audit_get,
     aws_api_gateway_integration.audit_logs_get,
     aws_api_gateway_integration.audit_alerts_get,
+    aws_api_gateway_integration.audit_alerts_id_patch,
     aws_api_gateway_integration.audit_user_id_get,
     aws_api_gateway_integration.audit_file_path_get,
     aws_api_gateway_integration.audit_export_post,
@@ -1514,6 +1543,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.audit_get.id,
       aws_api_gateway_integration.audit_logs_get.id,
       aws_api_gateway_integration.audit_alerts_get.id,
+      aws_api_gateway_integration.audit_alerts_id_patch.id,
       aws_api_gateway_integration.audit_user_id_get.id,
       aws_api_gateway_integration.audit_file_path_get.id,
       aws_api_gateway_integration.audit_export_post.id,

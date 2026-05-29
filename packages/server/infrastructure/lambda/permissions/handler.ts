@@ -27,6 +27,8 @@ import {
   docClient,
   verifyActiveUser,
   evaluatePermission,
+  authorizePermissionMutation,
+  ruleLevelRank,
   requireOrgId,
   requireVaultMember,
   pathMatchesPattern,
@@ -210,6 +212,7 @@ async function handleListPermissions(
     Limit: limit,
     FilterExpression: filterExpression,
     ExpressionAttributeValues: expressionValues,
+    ConsistentRead: true,
   };
 
   if (filterExpression.includes('#effect')) {
@@ -358,9 +361,6 @@ async function handleCreatePermission(
   vault: VaultRecord,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  // Vault admin or org admin can create rules in this vault.
-  await requireVaultMember(user, vault.vaultId, 'admin');
-
   const body = parseBody(event);
   validateRequiredFields(body, ['pathPattern', 'actions', 'effect']);
 
@@ -403,6 +403,14 @@ async function handleCreatePermission(
     }
     userId = canonicalUserId;
   }
+
+  // Authorize the mutation. Vault/org admins keep full power; a non-vault-admin
+  // is authorized IFF they hold file-level admin on the rule path, capped at
+  // their own derived level, and may not drop their own admin.
+  const { viaFileAdmin } = await authorizePermissionMutation(
+    user, vault, pathPattern,
+    { userId, role, actions: actions as PermissionAction[], effect: effect as 'allow' | 'deny' }
+  );
 
   // Reject duplicate: same principal + same exact path already has a rule
   const existingUserRules = await fetchAllUserRules(
@@ -510,6 +518,9 @@ async function handleCreatePermission(
       actions,
       effect,
       conflictCount: conflicts.length,
+      viaFileAdmin,
+      targetPrincipal: role ? `role:${role}` : userId,
+      resultingLevel: ruleLevelRank(actions as PermissionAction[], effect as 'allow' | 'deny'),
     },
   });
 
@@ -545,8 +556,6 @@ async function handleUpdatePermission(
   vault: VaultRecord,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  await requireVaultMember(user, vault.vaultId, 'admin');
-
   const ruleId = event.pathParameters?.id;
   if (!ruleId) {
     return formatError(400, 'Permission rule ID is required', requestId);
@@ -610,6 +619,51 @@ async function handleUpdatePermission(
 
   if (Object.keys(updates).length === 0) {
     return formatError(400, 'No valid fields to update', requestId);
+  }
+
+  // Authorize the mutation against the resulting rule shape (after updates are
+  // merged onto the existing rule). Vault/org admins keep full power; a
+  // non-vault-admin needs file-level admin on the updated path, capped at their
+  // own derived level, and may not drop their own admin.
+  const updatedPath = (updates.pathPattern as string) ?? existingRule.pathPattern;
+  // CR-01 defense-in-depth: updates.userId is already canonicalized at the
+  // body.userId path above; when the update does NOT change userId, the target
+  // falls back to existingRule.userId — canonicalize that fallback too (email →
+  // caller's sub) so an email-aliased self rule resolves at the call site. The
+  // helper-side alias expansion remains the load-bearing fix.
+  const targetUserId =
+    (updates.userId as string) ??
+    (await canonicalizeRuleUserId(existingRule.userId, vault.orgId)) ??
+    existingRule.userId;
+  const { viaFileAdmin } = await authorizePermissionMutation(
+    user, vault, updatedPath,
+    {
+      userId: targetUserId,
+      role: (updates.role as string | null) ?? existingRule.role,
+      actions: (updates.actions as PermissionAction[]) ?? existingRule.actions,
+      effect: (updates.effect as 'allow' | 'deny') ?? existingRule.effect,
+    },
+    existingRule
+  );
+
+  // CR-02 old-path admit gate (FADM-02): authorizePermissionMutation only ever
+  // sees ONE path (the new/updated path). A permission rule is a vault-global
+  // object keyed only by id, so a file-admin could otherwise fetch ANY rule and
+  // move it into their scope. When a file-admin (viaFileAdmin) CHANGES the path,
+  // additionally require that they hold admin on the EXISTING (pre-update) path —
+  // otherwise reject with 403. This runs AFTER authorizePermissionMutation
+  // returns because viaFileAdmin is only known then. It is a path-admit gate
+  // ONLY: cap/self-protection stay in authorizePermissionMutation (single source
+  // of truth). Vault/org admins (viaFileAdmin === false) and same-path updates
+  // are unaffected.
+  if (viaFileAdmin && updates.pathPattern && updates.pathPattern !== existingRule.pathPattern) {
+    const oldPathCheck = await evaluatePermission(
+      user.userId, user.roles, 'admin', existingRule.pathPattern,
+      vault.orgId, vault.vaultId, { userAliases: user.email ? [user.email] : [] }
+    );
+    if (!oldPathCheck.allowed) {
+      return formatError(403, `You do not have admin on ${existingRule.pathPattern}`, requestId);
+    }
   }
 
   updates.updatedAt = new Date().toISOString();
@@ -688,6 +742,12 @@ async function handleUpdatePermission(
           if (key !== 'updatedAt') acc[key] = (existingRule as unknown as Record<string, unknown>)[key];
           return acc;
         }, {} as Record<string, unknown>),
+        viaFileAdmin,
+        targetPrincipal: existingRule.role ? `role:${existingRule.role}` : existingRule.userId,
+        resultingLevel: ruleLevelRank(
+          (updates.actions as PermissionAction[]) ?? existingRule.actions,
+          (updates.effect as 'allow' | 'deny') ?? existingRule.effect
+        ),
       },
     });
 
@@ -711,8 +771,6 @@ async function handleDeletePermission(
   vault: VaultRecord,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  await requireVaultMember(user, vault.vaultId, 'admin');
-
   const ruleId = event.pathParameters?.id;
   if (!ruleId) {
     return formatError(400, 'Permission rule ID is required', requestId);
@@ -731,6 +789,25 @@ async function handleDeletePermission(
   if (!existingRule || existingRule.orgId !== vault.orgId || existingRule.vaultId !== vault.vaultId) {
     return formatError(404, `Permission rule not found: ${ruleId}`, requestId);
   }
+
+  // Authorize the deletion. The `effect: 'deny'` deny sentinel models removal so
+  // cap-at-own-level (rank 0) always passes and self-protection fires when the
+  // existing rule granted the caller admin. Self-protection logic lives solely
+  // inside authorizePermissionMutation — there is no handler-side short-circuit.
+  //
+  // CR-01 defense-in-depth: canonicalize the existing rule's principal (email →
+  // caller's sub when it resolves) BEFORE passing it as the mutation target, so
+  // an email-aliased self rule also resolves to the sub at the call site. The
+  // helper-side alias expansion is the load-bearing fix; this mirrors the create
+  // path. Fall back to the raw value if canonicalize returns null so an unknown
+  // email does not crash the delete.
+  const targetUserId =
+    (await canonicalizeRuleUserId(existingRule.userId, vault.orgId)) ?? existingRule.userId;
+  const { viaFileAdmin } = await authorizePermissionMutation(
+    user, vault, existingRule.pathPattern,
+    { userId: targetUserId, role: existingRule.role, actions: existingRule.actions, effect: 'deny' },
+    existingRule
+  );
 
   // Delete the rule
   await docClient.send(
@@ -777,6 +854,9 @@ async function handleDeletePermission(
         actions: existingRule.actions,
         effect: existingRule.effect,
       },
+      viaFileAdmin,
+      targetPrincipal: existingRule.role ? `role:${existingRule.role}` : existingRule.userId,
+      resultingLevel: 0,
     },
   });
 

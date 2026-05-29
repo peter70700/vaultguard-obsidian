@@ -1032,6 +1032,68 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AuditLogPageResponse' }
 
+  /vaults/{vaultId}/audit/alerts:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+    get:
+      tags: [Audit]
+      summary: Page through persisted anomaly alerts for a vault
+      parameters:
+        - in: query
+          name: severity
+          schema:
+            type: string
+            enum: [low, medium, high, critical]
+        - in: query
+          name: type
+          schema:
+            type: string
+            enum: [revoked_access_attempt, unusual_pattern, bulk_download, repeated_denial, off_hours_access]
+        - in: query
+          name: acknowledged
+          schema: { type: boolean }
+          description: Filter active alerts with false or dismissed alerts with true.
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 20 }
+      responses:
+        '200':
+          description: Page of security alerts
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditAlertsPageResponse' }
+
+  /vaults/{vaultId}/audit/alerts/{alertId}:
+    parameters:
+      - $ref: '#/components/parameters/VaultId'
+      - in: path
+        name: alertId
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [Audit]
+      summary: Dismiss or restore a persisted security alert
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [acknowledged]
+              properties:
+                acknowledged:
+                  type: boolean
+                  description: true dismisses the alert; false restores it to the active list.
+      responses:
+        '200':
+          description: Updated security alert
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditAlertUpdateResponse' }
+
   /vaults/{vaultId}/audit/export:
     parameters:
       - $ref: '#/components/parameters/VaultId'
@@ -1535,6 +1597,52 @@ components:
           additionalProperties: true
           nullable: true
           description: 'DynamoDB-style continuation token. TODO: opaque to clients; servers may omit.'
+
+    AuditAlert:
+      type: object
+      required: [id, orgId, vaultId, type, severity, userId, description, timestamp, metadata, acknowledged]
+      properties:
+        id: { type: string }
+        orgId: { type: string }
+        vaultId: { type: string }
+        type:
+          type: string
+          enum: [revoked_access_attempt, unusual_pattern, bulk_download, repeated_denial, off_hours_access]
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        userId: { type: string }
+        description: { type: string }
+        timestamp: { type: string, format: date-time }
+        metadata:
+          type: object
+          additionalProperties: true
+        acknowledged: { type: boolean }
+        acknowledgedBy: { type: string }
+        acknowledgedAt: { type: string, format: date-time }
+
+    AuditAlertsPageResponse:
+      type: object
+      required: [alerts, count, unacknowledged]
+      properties:
+        alerts:
+          type: array
+          items: { $ref: '#/components/schemas/AuditAlert' }
+        count: { type: integer }
+        unacknowledged: { type: integer }
+        nextCursor:
+          type: string
+          nullable: true
+        lastEvaluatedKey:
+          type: object
+          additionalProperties: true
+          nullable: true
+
+    AuditAlertUpdateResponse:
+      type: object
+      required: [alert]
+      properties:
+        alert: { $ref: '#/components/schemas/AuditAlert' }
 
     OrgSettingsResponse:
       type: object

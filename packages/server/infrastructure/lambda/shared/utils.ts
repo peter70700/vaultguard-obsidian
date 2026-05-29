@@ -587,6 +587,205 @@ export async function evaluatePermission(
   };
 }
 
+// ─── File-admin delegated permission authorization ───────────────────────────
+
+/** Ordered access level derived from a rule's actions+effect. Higher = more power. */
+export function ruleLevelRank(actions: PermissionAction[], effect: 'allow' | 'deny'): number {
+  if (effect === 'deny') return 0;          // a deny rule grants nothing
+  if (!actions.includes('read')) return 0;  // no read => effectively none
+  if (actions.includes('admin')) return 3;  // admin
+  if (actions.includes('write') || actions.includes('delete')) return 2; // write
+  return 1;                                 // read
+}
+
+/** Desired rule shape for an authorization decision (the principal + grant). */
+export interface PermissionMutationTarget {
+  userId: string;          // canonical sub or '*'
+  role: string | null;
+  actions: PermissionAction[];
+  effect: 'allow' | 'deny';
+}
+
+export interface AuthorizePermissionMutationResult { viaFileAdmin: boolean; }
+
+/**
+ * Dependency seam for {@link authorizePermissionMutation}. Production callers
+ * omit this and get the real module functions. The seam exists ONLY so the unit
+ * suite can drive `evaluatePermission` per-action (the path-scope admin check
+ * and the admin→write→read cap probe call it with different `action` args, and
+ * intra-module calls are otherwise not interceptable by vi.spyOn under ESM).
+ * It does NOT alter production behavior — the defaults are the real functions.
+ */
+export interface AuthorizePermissionMutationDeps {
+  evaluatePermission: typeof evaluatePermission;
+  requireVaultMember: typeof requireVaultMember;
+}
+
+/**
+ * Authorizes a permission create/update/delete. Vault/org admins keep full
+ * power. A non-vault-admin is authorized IFF they hold file-level `admin` on
+ * `pathPattern`, capped at their own DERIVED level, and may never drop their own admin.
+ */
+export async function authorizePermissionMutation(
+  user: UserContext,
+  vault: VaultRecord,
+  pathPattern: string,
+  targetLevel: PermissionMutationTarget,
+  existingRule?: PermissionRule,
+  deps: AuthorizePermissionMutationDeps = { evaluatePermission, requireVaultMember }
+): Promise<AuthorizePermissionMutationResult> {
+  // 1. Vault/org admin bypass — unchanged behavior.
+  try {
+    await deps.requireVaultMember(user, vault.vaultId, 'admin');
+    return { viaFileAdmin: false };
+  } catch {
+    // fall through to file-admin path; the caller is at least a vault member
+    // (route-level requireVaultMember(viewer) already ran in the dispatcher).
+  }
+
+  const aliases = user.email ? [user.email] : [];
+
+  // 2. Path-scope guardrail. Authorization REQUIRES admin on the path — do NOT
+  //    loosen this to let write-holders manage rules (scope-locked).
+  const adminCheck = await deps.evaluatePermission(
+    user.userId, user.roles, 'admin', pathPattern, vault.orgId, vault.vaultId,
+    { userAliases: aliases }
+  );
+  if (!adminCheck.allowed) {
+    throw new AuthError(`You do not have admin on ${pathPattern}`, 403);
+  }
+
+  // 3. Cap at own level. Derive the caller's TRUE evaluated rank on the path via
+  //    the admin→write→read probe (the same ordering resolvePathAccessLevel uses
+  //    in permissions/handler.ts). This MUST be derived, never hardcoded: the cap
+  //    has to survive the deferred folder-admin work, where a caller could hold a
+  //    level below admin on the exact rule path while admin is required elsewhere.
+  const callerRank = await deriveCallerRank(
+    user.userId, user.roles, pathPattern, vault.orgId, vault.vaultId, aliases,
+    deps.evaluatePermission
+  );
+  if (ruleLevelRank(targetLevel.actions, targetLevel.effect) > callerRank) {
+    throw new AuthError('Cannot grant a level above your own', 403);
+  }
+
+  // 4. Self-protection — reject any mutation that drops the caller's own admin.
+  //    Self-targeting is detected via three vectors: exact userId, the '*'
+  //    wildcard, or a role the caller holds.
+  //
+  //    ROLE-NAMESPACE NOTE: `targetLevel.role` is a permission-rule role field
+  //    (which stores vault membership roles such as 'viewer'/'editor'/'admin'),
+  //    whereas `user.roles` is the lowercased set of Cognito group names plus
+  //    custom org-role claims (see extractRolesFromTokenPayload). The two
+  //    namespaces OVERLAP (e.g. 'editor', 'admin') but are NOT guaranteed
+  //    identical — a Cognito group could carry an org-level role with no vault
+  //    equivalent. The role self-protection vector below is therefore best-effort
+  //    until the two namespaces are formally reconciled; the '*' vector is exact
+  //    and carries real protection weight.
+  //
+  //    USER-ID VECTOR (alias-aware, CR-01): a self-targeting rule can carry ANY
+  //    form of the caller's principal — their Cognito sub OR their email alias.
+  //    An email-aliased self-admin rule (targetLevel.userId='pete@x.com', caller
+  //    sub='pete-sub') must still trigger self-protection. We expand the caller's
+  //    principal to its full alias set via principalLookupValues (the SAME helper
+  //    evaluatePermission and findApplicableDenyRulesInScope use) and compare
+  //    case-insensitively (the helper de-dupes case-insensitively but returns
+  //    original case, so we lowercase both sides here).
+  const callerAliases = principalLookupValues(user.userId, user.email ? [user.email] : [])
+    .map((v) => v.toLowerCase());
+  // WR-02: user.roles is already lowercased+trimmed (extractRolesFromTokenPayload),
+  // so lowercase ONLY the rule-side role here — a stored mixed-case role ('Editor')
+  // must still match the caller's lowercased held role ('editor').
+  const targetsSelf =
+    callerAliases.includes(targetLevel.userId.trim().toLowerCase()) ||
+    targetLevel.userId === '*' ||
+    (targetLevel.role !== null && user.roles.includes(targetLevel.role.toLowerCase()));
+  if (targetsSelf) {
+    // Demotion-to-none of a rule that currently grants the caller admin. Delete is
+    // modeled by the handler passing effect:'deny' (the deny sentinel — see the
+    // delete handler), so both an explicit deny and a delete surface here as
+    // effect === 'deny'. There is no separate "actions === undefined" delete
+    // branch: delete always passes the existing actions verbatim alongside the
+    // deny sentinel.
+    const droppedAdmin =
+      (existingRule && existingRule.actions.includes('admin') && existingRule.effect === 'allow' &&
+        (targetLevel.effect === 'deny' ||
+         !targetLevel.actions.includes('admin'))) ||
+      (!existingRule && targetLevel.effect === 'deny');
+    if (droppedAdmin) {
+      throw new AuthError('Cannot remove your own admin on this path', 403);
+    }
+  }
+
+  // 5. REASSIGNMENT VECTOR (FADM-04). The block above only consults the
+  //    POST-update principal (targetLevel.userId). A file-admin can hold a rule
+  //    that CURRENTLY grants THEM admin and change ONLY userId to point at
+  //    another principal (e.g. 'bob') — leaving targetsSelf (post-update) false,
+  //    so the droppedAdmin guard never runs and their own admin is silently
+  //    reassigned away (self-lockout). The EXISTING rule's principal is the
+  //    source of truth for self-protection: if existingRule's principal IS the
+  //    caller (sub/email alias, '*', or a held role) and granted them admin, the
+  //    mutation must still preserve the caller's admin on this path — otherwise
+  //    reject with the SAME canonical 403. Reuses callerAliases (computed once
+  //    above) and the SAME three self-targeting vectors against existingRule.
+  // WR-03: existingRule is an unvalidated DynamoDB cast — a legacy/role-only rule
+  // may have no userId, so guard userId against null/undefined before .trim() the
+  // SAME way the role term below is already guarded (a missing userId must not 500).
+  // WR-02: lowercase the rule-side role (user.roles is already lowercased) so a
+  // mixed-case stored role still matches the held role.
+  const existingTargetsSelf = existingRule
+    ? (
+        (existingRule.userId !== null && existingRule.userId !== undefined &&
+          callerAliases.includes(existingRule.userId.trim().toLowerCase())) ||
+        existingRule.userId === '*' ||
+        (existingRule.role !== null && existingRule.role !== undefined &&
+          user.roles.includes(existingRule.role.toLowerCase()))
+      )
+    : false;
+  const existingGrantedCallerAdmin =
+    !!existingRule && existingRule.effect === 'allow' && existingRule.actions.includes('admin');
+  // The post-update target preserves the caller's admin ONLY when the rule STAYS
+  // on the same path P AND still targets the caller AND remains an allow that
+  // includes admin. A path move (pathPattern changes — WR-01), a userId-only
+  // reassignment (target points elsewhere), or an admin downgrade fails this. The
+  // grant only "preserves" the caller's admin on P if the rule stays on P, so a
+  // pathPattern-only move off P no longer reads as preserved and the step-5 guard
+  // fires. (The flag is true when there is no existing rule, so creates are
+  // unaffected.)
+  const pathUnchanged = existingRule ? existingRule.pathPattern === pathPattern : true;
+  const targetPreservesCallerAdmin =
+    pathUnchanged && targetsSelf && targetLevel.effect === 'allow' && targetLevel.actions.includes('admin');
+  if (existingTargetsSelf && existingGrantedCallerAdmin && !targetPreservesCallerAdmin) {
+    throw new AuthError('Cannot remove your own admin on this path', 403);
+  }
+
+  return { viaFileAdmin: true };
+}
+
+/**
+ * The caller's true evaluated access level on `path`, as an ordered rank that
+ * lines up with ruleLevelRank (3 admin, 2 write, 1 read, 0 none). Reuses the
+ * admin→write→read probe ordering from permissions/handler.ts:resolvePathAccessLevel.
+ * Never a constant — this is what makes cap-at-own-level a real guardrail.
+ */
+async function deriveCallerRank(
+  userId: string, roles: string[], path: string,
+  orgId: string, vaultId: string, aliases: string[],
+  evaluate: typeof evaluatePermission = evaluatePermission
+): Promise<number> {
+  const probes: Array<{ action: PermissionAction; rank: number }> = [
+    { action: 'admin', rank: 3 },
+    { action: 'write', rank: 2 },
+    { action: 'read', rank: 1 },
+  ];
+  for (const probe of probes) {
+    const result = await evaluate(
+      userId, roles, probe.action, path, orgId, vaultId, { userAliases: aliases }
+    );
+    if (result.allowed) return probe.rank;   // first allowed wins
+  }
+  return 0;
+}
+
 /**
  * Finds deny rules inside a requested key-lease scope for this user. A broad
  * DEK lease can decrypt every ciphertext produced under its scope, so issuing

@@ -182,6 +182,7 @@ POST   /vaults/{vaultId}/permissions/access/batch         → batch access summa
 GET    /vaults/{vaultId}/audit                            → list audit events in vault
 GET    /vaults/{vaultId}/audit/logs                       → list audit events in vault
 GET    /vaults/{vaultId}/audit/alerts                     → list anomaly alerts in vault
+PATCH  /vaults/{vaultId}/audit/alerts/{alertId}           → dismiss or restore anomaly alert in vault
 GET    /vaults/{vaultId}/audit/user/{userId}              → user activity in vault
 GET    /vaults/{vaultId}/audit/file/{path+}               → file activity in vault
 POST   /vaults/{vaultId}/audit/export                     → export vault audit CSV

@@ -16,6 +16,7 @@ import {
   UserListEntry,
   VaultMemberRole,
 } from "../api/client";
+import { PermissionLevel } from "../types";
 import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
 
 // ─── Constants ─────────────────────────────────────────────────────────────
@@ -55,6 +56,7 @@ export interface VaultGuardSidebarViewConfig {
   apiClient: VaultGuardApiClient;
   currentUserId: string;
   currentUserRole: string;
+  getPermissionLevel?: (path: string) => Promise<PermissionLevel>;
   onNavigateToFile?: (path: string) => void;
   onOpenMenu?: (evt?: MouseEvent) => void;
   onOpenSettings?: () => void;
@@ -611,6 +613,8 @@ export class VaultGuardSidebarView extends ItemView {
       }
     }
 
+    await this.applyEffectiveLevels(paths, summariesByPath, now);
+
     return summariesByPath;
   }
 
@@ -621,9 +625,10 @@ export class VaultGuardSidebarView extends ItemView {
     try {
       const summaries = await this.config.apiClient.getBatchPathAccess(paths);
       const byPath = new Map(summaries.map((summary) => [this.normalizePath(summary.path), summary]));
-      return paths.map((path) => {
+      return paths.flatMap((path) => {
         const key = this.normalizePath(path);
-        return byPath.get(key) ?? { path: key, currentUserLevel: "none", principals: [] };
+        const summary = byPath.get(key);
+        return summary ? [summary] : [];
       });
     } catch (err) {
       if (this.isMissingBatchAccessRoute(err)) {
@@ -642,6 +647,29 @@ export class VaultGuardSidebarView extends ItemView {
 
     return settled.flatMap((result) =>
       result.status === "fulfilled" ? [result.value] : []
+    );
+  }
+
+  private async applyEffectiveLevels(
+    paths: string[],
+    summariesByPath: Map<string, PathAccessSummary>,
+    fetchedAt: number
+  ): Promise<void> {
+    if (!this.config?.getPermissionLevel) return;
+
+    await Promise.allSettled(
+      paths.map(async (path) => {
+        const level = this.permissionLevelToAccessLevel(
+          await this.config!.getPermissionLevel!(path)
+        );
+        const key = this.normalizePath(path);
+        const existing = summariesByPath.get(key);
+        const summary: PathAccessSummary = existing
+          ? { ...existing, currentUserLevel: level }
+          : { path: key, currentUserLevel: level, principals: [] };
+        summariesByPath.set(key, summary);
+        this.accessCache.set(key, { summary, fetchedAt });
+      })
     );
   }
 
@@ -1422,6 +1450,13 @@ export class VaultGuardSidebarView extends ItemView {
       case "read": return 1;
       default: return 0;
     }
+  }
+
+  private permissionLevelToAccessLevel(level: PermissionLevel): PermissionAccessLevel {
+    if (level >= PermissionLevel.ADMIN) return "admin";
+    if (level >= PermissionLevel.WRITE) return "write";
+    if (level >= PermissionLevel.READ) return "read";
+    return "none";
   }
 
   private formatLevel(level: string): string {

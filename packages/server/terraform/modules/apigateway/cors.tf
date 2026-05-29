@@ -50,6 +50,7 @@ locals {
     audit                    = aws_api_gateway_resource.audit.id
     audit_logs               = aws_api_gateway_resource.audit_logs.id
     audit_alerts             = aws_api_gateway_resource.audit_alerts.id
+    audit_alerts_id          = aws_api_gateway_resource.audit_alerts_id.id
     audit_user_id            = aws_api_gateway_resource.audit_user_id.id
     audit_file_path          = aws_api_gateway_resource.audit_file_path.id
     audit_export             = aws_api_gateway_resource.audit_export.id

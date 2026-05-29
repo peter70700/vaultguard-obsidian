@@ -14,6 +14,7 @@
  * - GET  /vaults/{vaultId}/audit/user/{userId} — Get all activity for a user in a vault
  * - GET  /vaults/{vaultId}/audit/file/{path}   — Get all access to a file in a vault
  * - GET  /vaults/{vaultId}/audit/alerts        — Get security alerts for a vault
+ * - PATCH /vaults/{vaultId}/audit/alerts/{alertId} — Acknowledge (dismiss) or reopen (restore) an alert
  * - POST /vaults/{vaultId}/audit/export        — Export audit logs as CSV
  * - POST /vaults/{vaultId}/audit/report        — Legacy alias for CSV export
  * - POST /vaults/{vaultId}/audit/bridge        — Agent-bridge lifecycle event emit (any member, bridge.* actions only)
@@ -38,6 +39,8 @@ import {
   ValidationError,
   PutCommand,
   QueryCommand,
+  GetCommand,
+  UpdateCommand,
   AUDIT_TABLE,
   DEFAULT_ORG_SETTINGS,
   getEffectiveOrgSettings,
@@ -177,6 +180,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       case method === 'GET' && resource === '/vaults/{vaultId}/audit/alerts':
         return await handleGetAlerts(event, user, vaultId, requestId);
 
+      case method === 'PATCH' && resource === '/vaults/{vaultId}/audit/alerts/{alertId}':
+        return await handleAcknowledgeAlert(event, user, vaultId, requestId);
+
       case method === 'POST' && (resource === '/vaults/{vaultId}/audit/export' || resource === '/vaults/{vaultId}/audit/report'):
         return await handleExport(event, user, vaultId, requestId);
 
@@ -206,6 +212,7 @@ function isAdvancedAuditRoute(method: string | undefined, resource: string): boo
     (method === 'GET' && resource === '/vaults/{vaultId}/audit/user/{userId}') ||
     (method === 'GET' && resource === '/vaults/{vaultId}/audit/file/{path+}') ||
     (method === 'GET' && resource === '/vaults/{vaultId}/audit/alerts') ||
+    (method === 'PATCH' && resource === '/vaults/{vaultId}/audit/alerts/{alertId}') ||
     (method === 'POST' && (resource === '/vaults/{vaultId}/audit/export' || resource === '/vaults/{vaultId}/audit/report'))
   );
 }
@@ -528,6 +535,96 @@ async function handleGetAlerts(
     },
     requestId
   );
+}
+
+// ─── PATCH /vaults/{vaultId}/audit/alerts/{alertId} ──────────────────────────
+
+/**
+ * Acknowledge (dismiss) or reopen (restore) a security alert.
+ *
+ * The alert record is never deleted — `acknowledged` is toggled. Dismissing
+ * sets acknowledgedBy/acknowledgedAt; restoring REMOVEs them so the alert
+ * looks pristine again. Every transition writes an audit row so the action
+ * stays auditable.
+ *
+ * Cross-vault / cross-org probing returns 404 (not 403) — mirrors the
+ * share-link pattern (CLAUDE.md Share-Link Rule) so a token/id can't be
+ * probed for existence by an unauthorised member.
+ *
+ * Admin gating is already enforced upstream by requireAuditVaultAdmin in
+ * handler() for every non-bridge resource — no second check here.
+ *
+ * @param event - API Gateway event with alertId path param + { acknowledged } body
+ * @param user - Authenticated admin user
+ * @param vaultId - Vault scope from the path
+ * @param requestId - Request ID for tracing
+ */
+async function handleAcknowledgeAlert(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vaultId: string,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  const alertId = decodeURIComponent(event.pathParameters?.alertId || '');
+  if (!alertId) {
+    return formatError(400, 'alertId path parameter is required', requestId);
+  }
+
+  const body = parseBody(event) as { acknowledged?: unknown };
+  // Explicit `false` un-acknowledges (restores); anything else acknowledges (dismisses).
+  const acknowledged = body.acknowledged === false ? false : true;
+
+  // Existence + cross-vault/org check. 404 (not 403) on mismatch to prevent probing.
+  const existingResult = await docClient.send(
+    new GetCommand({ TableName: ALERTS_TABLE, Key: { id: alertId } })
+  );
+  const existing = existingResult.Item as SecurityAlert | undefined;
+  if (!existing || existing.vaultId !== vaultId || existing.orgId !== user.orgId) {
+    return formatError(404, 'Alert not found', requestId);
+  }
+
+  let result;
+  if (acknowledged) {
+    result = await docClient.send(
+      new UpdateCommand({
+        TableName: ALERTS_TABLE,
+        Key: { id: alertId },
+        UpdateExpression: 'SET acknowledged = :ack, acknowledgedBy = :by, acknowledgedAt = :at',
+        ExpressionAttributeValues: {
+          ':ack': true,
+          ':by': user.userId,
+          ':at': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      })
+    );
+  } else {
+    result = await docClient.send(
+      new UpdateCommand({
+        TableName: ALERTS_TABLE,
+        Key: { id: alertId },
+        UpdateExpression: 'SET acknowledged = :ack REMOVE acknowledgedBy, acknowledgedAt',
+        ExpressionAttributeValues: { ':ack': false },
+        ReturnValues: 'ALL_NEW',
+      })
+    );
+  }
+
+  // This audit row is what keeps the dismissal saved/auditable.
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId,
+    action: acknowledged ? 'audit.alert.acknowledged' : 'audit.alert.reopened',
+    resourcePath: `/vaults/${vaultId}/audit/alerts/${alertId}`,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: { vaultId, alertId, alertType: existing.type, severity: existing.severity },
+  });
+
+  return formatSuccess(200, { alert: result.Attributes as SecurityAlert }, requestId);
 }
 
 // ─── POST /vaults/{vaultId}/audit/export ─────────────────────────────────────
