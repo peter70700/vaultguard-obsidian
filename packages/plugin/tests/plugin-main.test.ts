@@ -2350,3 +2350,150 @@ describe("VaultGuardPlugin limited-access placeholder flow", () => {
     warnSpy.mockRestore();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1.0.30 (Fix 1 + Fix 4): resumeStoredSession warm-up retry + degraded Notice
+//
+// Root cause behind the 2026-05-31 Pete incident: restoreSession()'s early
+// runPermissionWarmup() ran with the stale stored access token; on mobile
+// (background-killed for hours = expired token), the warm-up's HTTP call
+// 401'd and collectRulesForWarmup's catch returned []. PermissionStore.warm
+// seeded the cache with the vault-role baseline, so every per-file lookup
+// resolved to view-only. The state stuck because the only re-fire path
+// runs inside restoreServerSession → refreshVaultMemberRole, and any
+// earlier failure in resumeStoredSession killed the chain silently.
+//
+// Fix 1: re-fire runPermissionWarmup after a successful token refresh in
+// resumeStoredSession AND after a restoreServerSession failure (tokens are
+// fresh by then).
+// Fix 4: surface the degraded state via notifySessionRestoreDegraded so
+// users know to re-login if it doesn't self-heal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("VaultGuardPlugin resumeStoredSession — 1.0.30 Fix 1 + Fix 4", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  function makeResumePlugin(opts: {
+    tokenExpiring: boolean;
+    refreshOk: boolean;
+    restoreServerThrows: boolean;
+  }) {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.runPermissionWarmup = vi.fn().mockResolvedValue(undefined);
+    plugin.restoreServerSession = opts.restoreServerThrows
+      ? vi.fn().mockRejectedValue(new Error("simulated openServerSession 500"))
+      : vi.fn().mockResolvedValue(undefined);
+    plugin.isSessionTokenExpiring = vi.fn(() => opts.tokenExpiring);
+    plugin.refreshAccessToken = vi.fn().mockResolvedValue(
+      opts.refreshOk
+        ? { ok: true }
+        : { ok: false, message: "simulated cognito timeout" }
+    );
+    return plugin;
+  }
+
+  it("re-fires runPermissionWarmup after a successful token refresh (Fix 1)", async () => {
+    const plugin = makeResumePlugin({
+      tokenExpiring: true,
+      refreshOk: true,
+      restoreServerThrows: false,
+    });
+
+    await plugin.resumeStoredSession();
+
+    expect(plugin.refreshAccessToken).toHaveBeenCalledTimes(1);
+    // The retry fires non-blockingly via `void`; the call itself is
+    // synchronous from the assertion's perspective because the mock
+    // resolves on the next microtask. Flush microtasks before asserting.
+    await Promise.resolve();
+    expect(plugin.runPermissionWarmup).toHaveBeenCalledTimes(1);
+    expect(plugin.restoreServerSession).toHaveBeenCalledTimes(1);
+    // No degraded Notice on the happy path.
+    expect(mockNotice).not.toHaveBeenCalled();
+  });
+
+  it("does NOT re-fire warmup when the stored token was still fresh (Fix 1: only triggered by refresh)", async () => {
+    const plugin = makeResumePlugin({
+      tokenExpiring: false,
+      refreshOk: true,
+      restoreServerThrows: false,
+    });
+
+    await plugin.resumeStoredSession();
+
+    expect(plugin.refreshAccessToken).not.toHaveBeenCalled();
+    // Fresh tokens means the original restoreSession-time warmup landed
+    // correctly — no retry needed and we don't want to double-warm.
+    expect(plugin.runPermissionWarmup).not.toHaveBeenCalled();
+    expect(plugin.restoreServerSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a Notice and returns when token refresh fails (Fix 4)", async () => {
+    const plugin = makeResumePlugin({
+      tokenExpiring: true,
+      refreshOk: false,
+      restoreServerThrows: false,
+    });
+
+    await plugin.resumeStoredSession();
+
+    expect(plugin.refreshAccessToken).toHaveBeenCalledTimes(1);
+    // Refresh failed → must not proceed to restoreServerSession.
+    expect(plugin.restoreServerSession).not.toHaveBeenCalled();
+    // Notice fires so the user knows the session is degraded.
+    expect(mockNotice).toHaveBeenCalledTimes(1);
+    const message = String(mockNotice.mock.calls[0][0]);
+    expect(message).toContain("session refresh deferred");
+    expect(message).toContain("simulated cognito timeout");
+    // No warmup retry: we couldn't get a fresh token so a re-warm would
+    // 401 just like the original one.
+    expect(plugin.runPermissionWarmup).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a Notice AND re-fires warmup when restoreServerSession throws (Fix 1 + Fix 4)", async () => {
+    const plugin = makeResumePlugin({
+      tokenExpiring: true,
+      refreshOk: true,
+      restoreServerThrows: true,
+    });
+
+    await expect(plugin.resumeStoredSession()).rejects.toThrow(
+      /openServerSession 500/
+    );
+
+    expect(plugin.refreshAccessToken).toHaveBeenCalledTimes(1);
+    expect(plugin.restoreServerSession).toHaveBeenCalledTimes(1);
+    await Promise.resolve();
+    // Two warmup fires: post-refresh (Fix 1) + post-failure (Fix 1).
+    expect(plugin.runPermissionWarmup).toHaveBeenCalledTimes(2);
+    // Degraded Notice — see notifySessionRestoreDegraded.
+    expect(mockNotice).toHaveBeenCalledTimes(1);
+    expect(String(mockNotice.mock.calls[0][0])).toContain(
+      "openServerSession 500"
+    );
+  });
+
+  it("throttles the degraded Notice to one per 60s window (Fix 4)", async () => {
+    const plugin = makeResumePlugin({
+      tokenExpiring: true,
+      refreshOk: false,
+      restoreServerThrows: false,
+    });
+
+    await plugin.resumeStoredSession();
+    expect(mockNotice).toHaveBeenCalledTimes(1);
+
+    // Immediate second attempt — should NOT fire another Notice.
+    await plugin.resumeStoredSession();
+    expect(mockNotice).toHaveBeenCalledTimes(1);
+
+    // 61s later — Notice may fire again.
+    plugin.lastSessionDegradedNoticeAt = Date.now() - 61_000;
+    await plugin.resumeStoredSession();
+    expect(mockNotice).toHaveBeenCalledTimes(2);
+  });
+});

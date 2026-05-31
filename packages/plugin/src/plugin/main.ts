@@ -300,6 +300,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Debounces the "Limited access" Notice so it isn't shown more than once per minute. */
   private lastLimitedAccessNoticeAt = 0;
+  private lastSessionDegradedNoticeAt = 0;
 
   /**
    * Paths known to hold 36-byte VG1 placeholders pending hydration via the
@@ -3029,21 +3030,93 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     let session = this.session;
+    let tokenWasRefreshed = false;
     if (this.isSessionTokenExpiring(session)) {
       const refreshResult = await this.refreshAccessToken(session);
       if (!refreshResult.ok) {
+        // Fix 4 (1.0.30): surface the degraded state. Previously this was
+        // a silent `this.log(...)` that left the user with a permission
+        // cache poisoned by the earlier stale-token warm-up (Fix 1
+        // comment below). At minimum the user now knows to re-login if
+        // it persists.
         this.log(
           `Stored session token refresh deferred: ${refreshResult.message}`
         );
+        this.notifySessionRestoreDegraded(refreshResult.message);
         return;
       }
       if (!this.session) {
         return;
       }
       session = this.session;
+      tokenWasRefreshed = true;
     }
 
-    await this.restoreServerSession(session);
+    // Fix 1 (1.0.30): the warm-up fired from restoreSession() at the top
+    // of onload() ran with the stored — possibly expired — access token.
+    // On mobile, where the plugin is background-killed for hours at a
+    // time, that warm-up's HTTP call almost always 401s; the resulting
+    // empty rule set seeds PermissionStore with the vault-role baseline
+    // only, and every per-file lookup then resolves to view-only. Now
+    // that the refresh has landed fresh tokens onto the apiClient, fire
+    // a fresh warm-up so the cache reflects the user's actual rules.
+    // The 2026-05-31 Pete incident — mobile audit log silent for 4.5+
+    // hours until an explicit logout/login — is the proof case.
+    if (tokenWasRefreshed) {
+      void this.runPermissionWarmup().catch((err) =>
+        this.logError(
+          "Post-refresh permission warm-up retry failed (non-blocking)",
+          err
+        )
+      );
+    }
+
+    try {
+      await this.restoreServerSession(session);
+    } catch (err) {
+      // Fix 1 + Fix 4 (1.0.30): treat any failure inside the server-side
+      // resume as a session-degraded condition. Tokens are fresh by now
+      // (we refreshed above if needed), so a single warm-up retry has a
+      // real chance of repopulating the cache before the user opens a
+      // file. The Notice is the user's escape hatch — re-login if it
+      // doesn't self-heal within a focus cycle.
+      this.logError("restoreServerSession failed", err);
+      this.notifySessionRestoreDegraded(
+        err instanceof Error ? err.message : "background session restore failed"
+      );
+      void this.runPermissionWarmup().catch((e) =>
+        this.logError(
+          "Post-failure permission warm-up retry failed (non-blocking)",
+          e
+        )
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * Throttled Notice for the "session is restored locally but the
+   * background server-side resume couldn't finish" state (Fix 4, 1.0.30).
+   * Previously this state was completely silent (`this.log(...)` only),
+   * which is how the 2026-05-31 Pete incident hid for 4.5+ hours: mobile
+   * showed cached/baseline permissions while the audit log showed zero
+   * API activity, and the user had no way to know a re-login was the
+   * fix. Reuses the same 60 s window as `notifyLimitedAccess` so the
+   * two surfaces feel consistent.
+   */
+  private notifySessionRestoreDegraded(reason?: string): void {
+    const now = Date.now();
+    if (now - this.lastSessionDegradedNoticeAt < 60_000) {
+      return;
+    }
+    this.lastSessionDegradedNoticeAt = now;
+    const detail = reason ? ` (${reason})` : "";
+    new Notice(
+      `VaultGuard Sync: session refresh deferred${detail}. ` +
+        `Recent permission changes may not appear yet. ` +
+        `Re-login from settings if file permissions look wrong.`,
+      8000
+    );
   }
 
   private async restoreServerSession(session: UserSession): Promise<void> {
@@ -4188,6 +4261,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.keyLease = null;
     this.vaultLeaseDenied = false;
     this.lastLimitedAccessNoticeAt = 0;
+    this.lastSessionDegradedNoticeAt = 0;
     this.orgSettings = null;
     this.stopSyncTimer();
     this.stopKeyRenewalMonitor();
