@@ -2127,7 +2127,6 @@ describe("VaultGuardPlugin limited-access placeholder flow", () => {
     plugin.awaitPermissionReadiness = vi.fn().mockResolvedValue(undefined);
     plugin.getEffectivePermission = vi.fn().mockResolvedValue(3); // READ-or-better
     plugin.emitAuditEvent = vi.fn().mockResolvedValue(undefined);
-    plugin.wipeDeniedLocalContent = vi.fn().mockResolvedValue(undefined);
     plugin.writePlainToDisk = vi.fn().mockResolvedValue(undefined);
     plugin.readPlainFromDisk = vi.fn().mockResolvedValue("");
     plugin.notifyDeniedLocalWipe = vi.fn();
@@ -2169,9 +2168,18 @@ describe("VaultGuardPlugin limited-access placeholder flow", () => {
     expect(plugin.placeholderPaths.has("notes/welcome.md")).toBe(false);
   });
 
-  it("interceptedRead on 404 calls wipeDeniedLocalContent and removes from placeholderPaths", async () => {
+  it("interceptedRead on 404 fails open: returns on-disk content, drops the placeholder, does not wipe (Fix A, 2026-05-31)", async () => {
+    // 2026-05-31 Pete incident: the previous behavior here wiped local
+    // content and threw. That was the data-loss vector — any user with a
+    // read-deny rule overlapping /** got a 403 on the scoped lease,
+    // forcing vaultLeaseDenied=true, after which every read of a read-
+    // only file hit this branch and erased the local copy. The new
+    // contract mirrors the post-1.0.17 fail-open principle for the main
+    // read path: emit a denial audit event, return readPlainFromDisk,
+    // never throw, never wipe.
     const plugin = makeLimitedPlugin();
     plugin.placeholderPaths.add("secret/locked.md");
+    plugin.readPlainFromDisk = vi.fn().mockResolvedValue("on-disk fallback content");
     plugin.readFileDecrypted = vi.fn().mockResolvedValue({
       success: false,
       data: null,
@@ -2179,12 +2187,19 @@ describe("VaultGuardPlugin limited-access placeholder flow", () => {
       requestId: "req-2",
     });
 
-    await expect(plugin.interceptedRead("secret/locked.md")).rejects.toThrow(
-      /Access denied to "secret\/locked\.md"/
-    );
+    const result = await plugin.interceptedRead("secret/locked.md");
 
-    expect(plugin.wipeDeniedLocalContent).toHaveBeenCalledWith("secret/locked.md");
+    expect(result).toBe("on-disk fallback content");
     expect(plugin.placeholderPaths.has("secret/locked.md")).toBe(false);
+    expect(plugin.readPlainFromDisk).toHaveBeenCalledWith("secret/locked.md");
+    expect(plugin.emitAuditEvent).toHaveBeenCalledWith(
+      "file.read",
+      "secret/locked.md",
+      expect.objectContaining({
+        outcome: "denied",
+        reason: "limited-access-placeholder-404-fail-open",
+      })
+    );
   });
 
   it("performInitialReconciliation in limited-access mode writes placeholders for serverOnly paths AND does not show the modal", async () => {

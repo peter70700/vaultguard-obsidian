@@ -4855,10 +4855,26 @@ export default class VaultGuardPlugin extends Plugin {
         return plaintext;
       }
       if (response.error?.statusCode === 404) {
-        // D-16: previously-permitted, now-denied — cleanup + propagate
-        await this.wipeDeniedLocalContent(path);
+        // Read fail-open in limited-access mode. The prior behavior here
+        // (wipe + throw) was the data-loss vector behind the 2026-05-31
+        // Pete incident: any user with a deny-read rule overlapping /**
+        // gets a 403 on /auth/key-lease/scoped (see
+        // assertScopeHasNoReadDenyRules in auth/handler.ts), which forces
+        // vaultLeaseDenied=true for the whole session. From there, every
+        // read of a read-only file falls into this branch and erases
+        // local content. A 404 from readFileDecrypted is ambiguous — it
+        // could mean genuinely deleted, or denied-via-404 (share-bridge
+        // pattern). Deletion enforcement belongs in the sync engine on a
+        // confirmed permission_changed event, not on a single read 404.
+        // Mirrors the post-1.0.17 read fail-open principle at the top of
+        // this function.
         this.placeholderPaths.delete(path);
-        throw new Error(`VaultGuard Sync: Access denied to "${path}".`);
+        await this.emitAuditEvent("file.read", path, {
+          outcome: "denied",
+          reason: "limited-access-placeholder-404-fail-open",
+        });
+        this.log(`Limited-access decrypt 404 for "${path}" (read fail-open).`);
+        return this.readPlainFromDisk(path);
       }
       // Other errors (5xx, network) — fall through to existing logic which
       // already debounces a "decrypt failed" Notice.
@@ -4922,9 +4938,18 @@ export default class VaultGuardPlugin extends Plugin {
             return plaintext;
           }
           if (response.error?.statusCode === 404) {
-            await this.wipeDeniedLocalContent(path);
+            // Read fail-open — see the branch above for full rationale.
+            // Returning the (empty) localContent at least leaves the file
+            // visible rather than wiping it; the primary placeholder
+            // branch above will retry hydration on the next read once
+            // the server-side decrypt succeeds.
             this.placeholderPaths.delete(path);
-            throw new Error(`VaultGuard Sync: Access denied to "${path}".`);
+            await this.emitAuditEvent("file.read", path, {
+              outcome: "denied",
+              reason: "limited-access-empty-content-404-fail-open",
+            });
+            this.log(`Limited-access decrypt 404 for "${path}" (read fail-open).`);
+            return localContent;
           }
         } catch (err) {
           if (this.isNetworkError(err)) {
@@ -5330,28 +5355,6 @@ export default class VaultGuardPlugin extends Plugin {
     const cached = this.permissionStore.getCachedPermission(path);
     if (cached !== undefined) return false;
     return true;
-  }
-
-  private async wipeDeniedLocalContent(path: string): Promise<void> {
-    try {
-      if (!this.atRestCipher?.isReady()) {
-        if (this.originalAdapterMethods.writeBinary) {
-          await this.originalAdapterMethods.writeBinary(path, new ArrayBuffer(0));
-          return;
-        }
-        if (this.originalAdapterMethods.write) {
-          await this.originalAdapterMethods.write(path, "");
-        }
-        return;
-      }
-      if (this.originalAdapterMethods.writeBinary && !this.isAtRestExcluded(path)) {
-        await this.writePlainBinaryToDisk(path, new ArrayBuffer(0));
-        return;
-      }
-      await this.writePlainToDisk(path, "");
-    } catch (error) {
-      this.logError(`Failed to wipe denied local content for "${path}"`, error);
-    }
   }
 
   /**

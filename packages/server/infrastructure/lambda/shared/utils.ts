@@ -554,14 +554,42 @@ export async function evaluatePermission(
   // vault has no permission rule for them (e.g. vaults created before the
   // default-rule helper existed, or members added before that code shipped).
   //
-  // `respectAdminBypass: false` opts out — used by callers that need
-  // per-file deny rules to bind admins too (the
-  // `allowAdminPerFileRestrictions` org setting). Caller-side auth checks
-  // (authorize a mutation, decide if the caller can resolve the vault)
-  // should leave this true so admins keep the "manage everything" rights
-  // the rest of the system assumes.
+  // `respectAdminBypass: false` opts out for callers that need per-file
+  // deny rules to bind admins (the `allowAdminPerFileRestrictions` org
+  // setting). The opt-out is narrow: admins still get implicit access when
+  // no rule applies; they only lose access when an EXPLICIT deny rule on
+  // the path strips it (handled at the rule-matching stage further down).
+  // Without this narrowing, enabling the toggle would silently revoke
+  // admins' access to every file they don't have an explicit rule for —
+  // exactly the regression Pete reported on 2026-05-31 (org-admin login
+  // on mobile showed an empty file browser because every file with no
+  // pete-specific rule fell through to "no rule + not a vault member →
+  // denied"). Caller-side auth checks (authorize a mutation, decide if
+  // the caller can resolve the vault) should still leave respectAdminBypass
+  // at default true so admins keep the "manage everything" rights the rest
+  // of the system assumes.
   const respectAdminBypass = options.respectAdminBypass !== false;
-  if (respectAdminBypass && rolesIncludeOrgAdmin(roles)) {
+  const callerIsOrgAdmin = rolesIncludeOrgAdmin(roles);
+  // Per-user debug seam — see debugUserLog. We synthesize a minimal user
+  // shape from the evaluation inputs because evaluatePermission's args
+  // include only userId+roles; the email is needed to match the allow-list.
+  // The userAliases passed in by file-op handlers carry the email — sample
+  // the first one as a best-effort identity for the debug log.
+  const debugEmail = (options.userAliases ?? []).find((alias) => alias.includes('@'));
+  const debugUser: DebugUserContext = { userId, roles, email: debugEmail };
+  debugUserLog(debugUser, 'evaluatePermission.entry', {
+    action,
+    path,
+    orgId,
+    vaultId,
+    respectAdminBypass,
+    callerIsOrgAdmin,
+    excludeRuleIds: options.excludeRuleIds ?? [],
+  });
+  if (respectAdminBypass && callerIsOrgAdmin) {
+    debugUserLog(debugUser, 'evaluatePermission.result', {
+      action, path, allowed: true, reason: 'org-admin-bypass',
+    });
     return { allowed: true, matchedRule: null, evaluatedRules: [] };
   }
 
@@ -591,6 +619,21 @@ export async function evaluatePermission(
   });
 
   if (matchingRules.length === 0) {
+    // Org-admin baseline (allowAdminPerFileRestrictions narrowing). When the
+    // bypass was skipped above because the caller opted into the toggle,
+    // admins still need implicit access on files that no rule mentions —
+    // the toggle's intent is "deny rules bind admins", not "admins lose
+    // access by default". Without this branch, an org admin who isn't a
+    // vault member on this vault would 403 on every file they don't have
+    // an explicit rule for. See the comment above the bypass block for the
+    // 2026-05-31 incident this fix unblocks.
+    if (callerIsOrgAdmin) {
+      debugUserLog(debugUser, 'evaluatePermission.result', {
+        action, path, allowed: true, reason: 'org-admin-baseline',
+        liveRuleCount: liveRules.length,
+      });
+      return { allowed: true, matchedRule: null, evaluatedRules: liveRules };
+    }
     // Vault membership default — when a member has no rule that covers the
     // path (legacy memberships pre-dating the default-rule helper, brand-new
     // files at vault root, etc.), grant access at the membership role's
@@ -598,8 +641,19 @@ export async function evaluatePermission(
     // gets 403 on every file in their own vault.
     const membership = await getVaultMembership(vaultId, userId);
     if (membership && vaultRoleAllowsAction(membership.role, action)) {
+      debugUserLog(debugUser, 'evaluatePermission.result', {
+        action, path, allowed: true,
+        reason: 'membership-default', vaultRole: membership.role,
+        liveRuleCount: liveRules.length,
+      });
       return { allowed: true, matchedRule: null, evaluatedRules: liveRules };
     }
+    debugUserLog(debugUser, 'evaluatePermission.result', {
+      action, path, allowed: false,
+      reason: membership ? 'membership-role-disallows' : 'no-membership-no-rule',
+      vaultRole: membership?.role ?? null,
+      liveRuleCount: liveRules.length,
+    });
     return { allowed: false, matchedRule: null, evaluatedRules: liveRules };
   }
 
@@ -614,6 +668,21 @@ export async function evaluatePermission(
   });
 
   const winningRule = sorted[0];
+
+  debugUserLog(debugUser, 'evaluatePermission.result', {
+    action, path,
+    allowed: winningRule.effect === 'allow',
+    reason: 'rule-match',
+    matchedRule: {
+      id: winningRule.id,
+      pathPattern: winningRule.pathPattern,
+      effect: winningRule.effect,
+      actions: winningRule.actions,
+      priority: winningRule.priority,
+      principal: winningRule.role ? `role:${winningRule.role}` : winningRule.userId,
+    },
+    matchingRuleCount: matchingRules.length,
+  });
 
   return {
     allowed: winningRule.effect === 'allow',
@@ -1428,6 +1497,51 @@ export function generateSecretToken(): string {
  */
 export function isAdmin(user: UserContext): boolean {
   return rolesIncludeOrgAdmin(user.roles);
+}
+
+// ─── Per-user debug logging ─────────────────────────────────────────────────
+//
+// Targeted CloudWatch logging that only fires for the email addresses listed
+// in `DEBUG_USER_EMAILS`. Used for live-traffic investigations where the
+// audit log isn't granular enough and CloudWatch search by user is the
+// fastest path to a diagnosis. Strict allow-list so any other user's traffic
+// produces zero debug output — no PII leakage, no extra spend.
+//
+// To investigate a different user, edit DEBUG_USER_EMAILS, redeploy the
+// affected Lambda(s), and use `scripts/query-debug-logs.mjs` to read back.
+// Remove instrumented calls (or empty the allow-list) once the investigation
+// is over so production logs stay clean.
+const DEBUG_USER_EMAILS = new Set<string>([
+  'peter@sedmak.sk',
+  'pete.sedmak@gmail.com',
+]);
+
+interface DebugUserContext {
+  email?: string;
+  userId?: string;
+  roles?: string[];
+}
+
+export function debugUserLog(
+  user: DebugUserContext | null | undefined,
+  event: string,
+  data: Record<string, unknown> = {}
+): void {
+  const email = user?.email?.trim().toLowerCase();
+  if (!email || !DEBUG_USER_EMAILS.has(email)) return;
+  // Single-line JSON so CloudWatch Logs Insights and grep both work.
+  // `_dbg: 1` is the cheap discriminator the query script filters on.
+  console.log(
+    JSON.stringify({
+      _dbg: 1,
+      ts: new Date().toISOString(),
+      user: email,
+      userId: user?.userId,
+      roles: user?.roles,
+      event,
+      ...data,
+    })
+  );
 }
 
 /** Whether a roles list grants org-level admin privileges. */

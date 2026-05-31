@@ -60,6 +60,7 @@ import {
   recordVaultActivity,
   getVaultCursor,
   queryVaultActivity,
+  debugUserLog,
   UserContext,
   PermissionAction,
   VaultRecord,
@@ -2224,6 +2225,14 @@ async function handleSync(
     return formatError(400, 'Invalid lastSyncTimestamp format', requestId);
   }
 
+  const debugUser = { email: user.email, userId: user.userId, roles: user.roles };
+  debugUserLog(debugUser, 'handleSync.entry', {
+    vaultId: vault.vaultId,
+    lastSyncTimestamp,
+    prefix,
+    clientFileCount: Object.keys(clientChecksums).length,
+  });
+
   // ── Warm path: activity-log-driven incremental sync ───────────────────────
   // Only attempted when the client has a recent enough cursor for the log
   // to cover the gap. The result tells us whether the warm path was
@@ -2233,7 +2242,20 @@ async function handleSync(
   let permissionsChanged = false;
   if (!prefix) {
     const warm = await buildSyncDeltasFromActivityLog(user, vault, lastSyncDate.getTime());
+    debugUserLog(debugUser, 'handleSync.path', {
+      kind: warm.kind,
+      reason: warm.kind === 'fallback' ? warm.reason : undefined,
+      permissionsChanged: warm.kind === 'fallback' ? warm.permissionsChanged : false,
+      warmDeltaCount: warm.kind === 'warm' ? warm.deltas.length : undefined,
+    });
     if (warm.kind === 'warm') {
+      const warmDeletes = warm.deltas.filter((d) => d.action === 'deleted').map((d) => d.path);
+      if (warmDeletes.length > 0) {
+        debugUserLog(debugUser, 'handleSync.warm-deletes-emitted', {
+          count: warmDeletes.length,
+          paths: warmDeletes.slice(0, 50),
+        });
+      }
       const cursor = await getVaultCursor(user.orgId, vault.vaultId);
       await logAudit({
         userId: user.userId,
@@ -2370,6 +2392,10 @@ async function handleSync(
       // Verify user had permission to see this file
       const permResult = await evaluatePermission(user.userId, user.roles, 'read', clientPath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
       if (permResult.allowed) {
+        debugUserLog(debugUser, 'handleSync.cold-delete-emitted', {
+          path: clientPath,
+          reason: 'client-had-checksum-but-not-in-serverPaths',
+        });
         deltas.push({
           path: clientPath,
           action: 'deleted',
@@ -2380,6 +2406,15 @@ async function handleSync(
       }
     }
   }
+
+  debugUserLog(debugUser, 'handleSync.cold-summary', {
+    deltaCount: deltas.length,
+    created: deltas.filter((d) => d.action === 'created').length,
+    modified: deltas.filter((d) => d.action === 'modified').length,
+    deleted: deltas.filter((d) => d.action === 'deleted').length,
+    serverPathCount: serverPaths.size,
+    permissionsChanged,
+  });
 
   const cursor = await getVaultCursor(user.orgId, vault.vaultId);
 
