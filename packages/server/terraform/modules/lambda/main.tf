@@ -334,7 +334,7 @@ resource "aws_lambda_function" "auth" {
   timeout       = 30
 
   filename         = data.archive_file.auth_lambda.output_path
-  source_code_hash = data.archive_file.auth_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/auth/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -452,7 +452,7 @@ resource "aws_lambda_function" "files" {
   timeout       = 60
 
   filename         = data.archive_file.files_lambda.output_path
-  source_code_hash = data.archive_file.files_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/files/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -551,7 +551,7 @@ resource "aws_lambda_function" "permissions" {
   timeout       = 30
 
   filename         = data.archive_file.permissions_lambda.output_path
-  source_code_hash = data.archive_file.permissions_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/permissions/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -639,7 +639,7 @@ resource "aws_lambda_function" "audit" {
   timeout       = 30
 
   filename         = data.archive_file.audit_lambda.output_path
-  source_code_hash = data.archive_file.audit_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/audit/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -732,7 +732,7 @@ resource "aws_lambda_function" "billing" {
   timeout       = 30
 
   filename         = data.archive_file.billing_lambda.output_path
-  source_code_hash = data.archive_file.billing_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/billing/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -840,7 +840,7 @@ resource "aws_lambda_function" "signup" {
   timeout       = 30
 
   filename         = data.archive_file.signup_lambda.output_path
-  source_code_hash = data.archive_file.signup_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/signup/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -969,7 +969,7 @@ resource "aws_lambda_function" "users" {
   timeout       = 30
 
   filename         = data.archive_file.users_lambda.output_path
-  source_code_hash = data.archive_file.users_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/users/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -1077,7 +1077,7 @@ resource "aws_lambda_function" "reencryption" {
   timeout       = 300
 
   filename         = data.archive_file.reencryption_lambda.output_path
-  source_code_hash = data.archive_file.reencryption_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/reencryption/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -1195,7 +1195,7 @@ resource "aws_lambda_function" "reconciler" {
   timeout       = 300
 
   filename         = data.archive_file.reconciler_lambda.output_path
-  source_code_hash = data.archive_file.reconciler_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/reconciler/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -1327,7 +1327,7 @@ resource "aws_lambda_function" "vaults" {
   timeout       = 30
 
   filename         = data.archive_file.vaults_lambda.output_path
-  source_code_hash = data.archive_file.vaults_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/vaults/handler.js")
 
   tracing_config { mode = "Active" }
 
@@ -1426,7 +1426,7 @@ resource "aws_lambda_function" "shares" {
   timeout       = 30
 
   filename         = data.archive_file.shares_lambda.output_path
-  source_code_hash = data.archive_file.shares_lambda.output_base64sha256
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/shares/handler.js")
 
   tracing_config { mode = "Active" }
 

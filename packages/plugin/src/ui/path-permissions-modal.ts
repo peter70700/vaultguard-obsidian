@@ -16,6 +16,8 @@ import {
   VaultGuardApiClient,
   PermissionRule,
   PermissionMutationInput,
+  PathAccessPrincipal,
+  PathAccessSummary,
   UserListEntry,
 } from "../api/client";
 import { PermissionEditor } from "../admin/permission-editor";
@@ -42,6 +44,8 @@ interface PathPermissionsConfig {
   isAdmin: boolean;
   currentUserId: string;
   currentUserRole: string;
+  /** See FilePermissionHeader.HeaderContext.allowAdminPerFileRestrictions. */
+  allowAdminPerFileRestrictions?: boolean;
   onRulesChanged?: () => void;
 }
 
@@ -58,12 +62,16 @@ export class PathPermissionsModal extends Modal {
   private draftLevel = "write";
   private permissionsLoaded = false;
   private isClosed = false;
+  private canManage = false;
+  private currentUserLevel: "none" | "read" | "write" | "admin" = "none";
+  private accessSummary: PathAccessSummary | null = null;
   private permissionEditor: PermissionEditor;
 
   constructor(cfg: PathPermissionsConfig) {
     super(cfg.app);
     this.cfg = cfg;
     this.permissionEditor = new PermissionEditor(cfg.app, cfg.apiClient);
+    this.canManage = cfg.isAdmin;
     this.usersLoading = cfg.isAdmin;
   }
 
@@ -74,12 +82,19 @@ export class PathPermissionsModal extends Modal {
     this.contentEl.addClass("vaultguard-path-perms-content");
     this.renderLoading();
 
-    if (this.cfg.isAdmin) {
-      void this.loadUsers();
-    }
-
     try {
-      this.rules = await this.cfg.apiClient.getPermissions(this.cfg.path);
+      this.accessSummary = await this.cfg.apiClient.getPathAccess(this.cfg.path).catch(() => null);
+      this.currentUserLevel = this.accessSummary?.currentUserLevel ?? "none";
+      this.mergeAccessSummaryIntoDirectory();
+      this.canManage = this.cfg.isAdmin || this.currentUserLevel === "admin";
+      this.usersLoading = this.cfg.isAdmin;
+      if (this.cfg.isAdmin) {
+        void this.loadUsers();
+      }
+
+      this.rules = this.canManage
+        ? await this.cfg.apiClient.getPermissions(this.cfg.path).catch(() => [])
+        : [];
       this.permissionsLoaded = true;
       this.render();
     } catch (error) {
@@ -115,7 +130,7 @@ export class PathPermissionsModal extends Modal {
     this.renderHeader();
     this.renderMyAccess();
     this.renderAccessList();
-    if (this.cfg.isAdmin) {
+    if (this.canManage) {
       this.renderAddSection();
     }
   }
@@ -172,16 +187,21 @@ export class PathPermissionsModal extends Modal {
 
     const listEl = section.createDiv({ cls: "vaultguard-pp-list" });
 
+    if (this.accessSummary?.principals.length) {
+      this.renderEffectiveAccessRows(listEl, this.accessSummary.principals);
+      return;
+    }
+
     if (this.rules.length === 0) {
       listEl.createDiv({
         cls: "vaultguard-pp-empty",
-        text: "No explicit permission rules. Access is based on default role permissions.",
+        text: "Access details unavailable.",
       });
       return;
     }
 
     // Sort: highest level first, then by principal
-    const sorted = [...this.rules].sort((a, b) => {
+    const sorted = this.rawRulesForDisplay().sort((a, b) => {
       const la = this.ruleLevelRank(a);
       const lb = this.ruleLevelRank(b);
       if (la !== lb) return lb - la;
@@ -191,6 +211,67 @@ export class PathPermissionsModal extends Modal {
     for (const rule of sorted) {
       this.renderRuleRow(listEl, rule);
     }
+  }
+
+  private renderEffectiveAccessRows(container: HTMLElement, principals: PathAccessPrincipal[]): void {
+    const sorted = this.normalizeAccessPrincipals(principals).sort((a, b) => {
+      const levelDiff = this.levelRank(b.level) - this.levelRank(a.level);
+      if (levelDiff !== 0) return levelDiff;
+      return this.accessPrincipalLabel(a).localeCompare(this.accessPrincipalLabel(b));
+    });
+
+    for (const principal of sorted) {
+      this.renderEffectiveAccessRow(container, principal);
+    }
+  }
+
+  private renderEffectiveAccessRow(container: HTMLElement, principal: PathAccessPrincipal): void {
+    const row = container.createDiv({ cls: "vaultguard-pp-row vaultguard-pp-row-effective" });
+
+    const avatarEl = row.createDiv({ cls: "vaultguard-pp-avatar" });
+    avatarEl.createSpan({
+      cls: "vaultguard-pp-initials",
+      text: this.userInitials(principal.userId),
+    });
+
+    const infoEl = row.createDiv({ cls: "vaultguard-pp-info" });
+    infoEl.createDiv({ cls: "vaultguard-pp-name", text: this.accessPrincipalLabel(principal) });
+    infoEl.createDiv({
+      cls: "vaultguard-pp-meta",
+      text: principal.email || "Effective access",
+    });
+
+    const levelEl = row.createDiv({ cls: "vaultguard-pp-level" });
+    if (this.canEditAccessPrincipal(principal)) {
+      const select = levelEl.createEl("select", { cls: "vaultguard-pp-select" });
+      const options: { value: string; label: string }[] = [
+        { value: "admin", label: "Admin" },
+        { value: "write", label: "Write" },
+        { value: "read", label: "Read" },
+        { value: "none", label: "No Access" },
+      ];
+      for (const opt of options) {
+        const optEl = select.createEl("option", { text: opt.label, attr: { value: opt.value } });
+        if (opt.value === principal.level) optEl.selected = true;
+      }
+      select.addEventListener("change", async () => {
+        setControlBusy(select, true);
+        try {
+          await this.handleAccessPrincipalLevelChange(principal, select.value);
+          new Notice("Permission updated.");
+          await this.refresh();
+        } catch (error) {
+          new Notice(`Failed: ${(error as Error).message}`);
+          setControlBusy(select, false);
+        }
+      });
+      return;
+    }
+
+    const badge = levelEl.createSpan({
+      cls: `vaultguard-fh-badge vaultguard-fh-badge-${principal.level}`,
+    });
+    badge.setText(this.formatLevel(principal.level));
   }
 
   private renderRuleRow(container: HTMLElement, rule: PermissionRule): void {
@@ -221,7 +302,7 @@ export class PathPermissionsModal extends Modal {
     // Level + actions
     const levelEl = row.createDiv({ cls: "vaultguard-pp-level" });
 
-    if (this.cfg.isAdmin) {
+    if (this.canManage) {
       // Dropdown to change level
       const select = levelEl.createEl("select", { cls: "vaultguard-pp-select" });
       const options: { value: string; label: string }[] = [
@@ -232,7 +313,7 @@ export class PathPermissionsModal extends Modal {
       ];
       for (const opt of options) {
         const optEl = select.createEl("option", { text: opt.label, attr: { value: opt.value } });
-        if (opt.value === this.currentLevel(rule)) optEl.selected = true;
+        if (opt.value === this.displayLevelForRule(rule)) optEl.selected = true;
       }
       select.addEventListener("change", async () => {
         setControlBusy(select, true);
@@ -265,7 +346,7 @@ export class PathPermissionsModal extends Modal {
       });
     } else {
       // Read-only badge
-      const level = this.currentLevel(rule);
+      const level = this.displayLevelForRule(rule);
       const badge = levelEl.createSpan({
         cls: `vaultguard-fh-badge vaultguard-fh-badge-${level}`,
       });
@@ -462,14 +543,13 @@ export class PathPermissionsModal extends Modal {
       try {
         const pathPattern = this.toRulePath(this.cfg.path);
         const principalLabel = principalType === "user" ? this.userLabel(principalId) : principalId;
-        const input: PermissionMutationInput = {
-          pathPattern,
-          ...this.buildLevelMutation(level),
-          userId: principalType === "user" ? principalId : "*",
+        const canonicalUserId = principalType === "user" ? principalId : "*";
+        const response = await this.cfg.apiClient.setPermissionLevel({
+          userId: canonicalUserId,
           role: principalType === "role" ? principalId : null,
-        };
-
-        await this.cfg.apiClient.createPermission(input);
+          pathPattern,
+          level: level as "none" | "read" | "write" | "admin",
+        });
         new Notice(
           level === "none"
             ? `Access blocked for ${principalLabel}.`
@@ -477,6 +557,11 @@ export class PathPermissionsModal extends Modal {
         );
         this.draftPrincipalValue = "";
         this.draftSelectedUserId = null;
+        // Optimistic patch — show the new row before refresh().
+        if (response?.level && principalType === "user") {
+          this.patchAccessSummaryPrincipalLevel(canonicalUserId, response.level);
+          this.optimisticRender();
+        }
         await this.refresh();
       } catch (error) {
         new Notice(`Failed: ${(error as Error).message}`);
@@ -537,36 +622,142 @@ export class PathPermissionsModal extends Modal {
   // ─── Refresh ───────────────────────────────────────────────────────
 
   private async handleRuleLevelChange(rule: PermissionRule, newLevel: string): Promise<void> {
-    const mutation = this.buildLevelMutation(newLevel);
-    const exactRule = this.ruleTargetsCurrentPath(rule)
-      ? rule
-      : this.findExactRuleForPrincipal(rule);
-
-    if (exactRule) {
-      await this.cfg.apiClient.updatePermission(exactRule.id, {
-        pathPattern: exactRule.pathPattern,
-        ...mutation,
-      });
-      return;
-    }
-
-    await this.cfg.apiClient.createPermission({
-      pathPattern: this.toRulePath(this.cfg.path),
-      ...mutation,
-      userId: rule.role ? "*" : this.resolveCanonicalUserId(rule.userId),
+    // See file-permission-header for the architectural rationale — the
+    // server picks the right (delete/cap/grant) shape from (target,
+    // inherited). The client never has to know the principal's inherited
+    // level to land them on the desired effective level.
+    const canonicalUserId = rule.role ? "*" : this.resolveCanonicalUserId(rule.userId);
+    const response = await this.cfg.apiClient.setPermissionLevel({
+      userId: canonicalUserId,
       role: rule.role ?? null,
+      pathPattern: this.toRulePath(this.cfg.path),
+      level: newLevel as "none" | "read" | "write" | "admin",
     });
+    // Optimistic patch — see file-permission-panel.handleLevelChange for
+    // the rationale. The refresh() that fires in the dropdown's outer
+    // handler reconciles against the server within one round-trip.
+    if (response?.level && !rule.role) {
+      this.patchAccessSummaryPrincipalLevel(canonicalUserId, response.level);
+      this.optimisticRender();
+    }
+  }
+
+  private async handleAccessPrincipalLevelChange(
+    principal: PathAccessPrincipal,
+    newLevel: string
+  ): Promise<void> {
+    const canonicalUserId = this.resolveCanonicalUserId(principal.userId);
+    const response = await this.cfg.apiClient.setPermissionLevel({
+      userId: canonicalUserId,
+      role: null,
+      pathPattern: this.toRulePath(this.cfg.path),
+      level: newLevel as "none" | "read" | "write" | "admin",
+    });
+    if (response?.level) {
+      this.patchAccessSummaryPrincipalLevel(canonicalUserId, response.level);
+      this.optimisticRender();
+    }
+  }
+
+  /**
+   * Best-effort re-render after an optimistic patch. No-op when the modal
+   * isn't mounted (tests using Object.create skip the constructor). The
+   * authoritative render still fires through refresh() right after, so a
+   * skipped optimistic render only loses the instant-flip, not correctness.
+   */
+  private optimisticRender(): void {
+    if (this.isClosed) return;
+    // PanelFakeElement (used in tests) lacks `parentNode` / `isConnected`,
+    // so we look for the real-DOM-only `appendChild` to gate.
+    const contentEl = this.contentEl as unknown as { appendChild?: unknown };
+    if (typeof contentEl?.appendChild !== "function") return;
+    this.render();
+  }
+
+  /**
+   * Records a set-level write and reflects it in the cached path access
+   * summary so the row updates immediately. The same value is parked in
+   * `pendingLevelPatches` so subsequent refreshes — which may briefly read
+   * a stale GSI view — keep showing the user the level the server
+   * confirmed, not the stale read. Once the server's next refresh agrees,
+   * the patch self-clears.
+   */
+  private patchAccessSummaryPrincipalLevel(
+    canonicalUserId: string,
+    level: "none" | "read" | "write" | "admin"
+  ): void {
+    if (!this.pendingLevelPatches) this.pendingLevelPatches = new Map();
+    this.pendingLevelPatches.set(canonicalUserId, level);
+    if (!this.accessSummary) return;
+    this.reconcilePendingLevelPatches();
   }
 
   private async refresh(): Promise<void> {
     try {
-      this.rules = await this.cfg.apiClient.getPermissions(this.cfg.path);
+      this.accessSummary = await this.cfg.apiClient.getPathAccess(this.cfg.path).catch(() => this.accessSummary);
+      // Post-write read consistency: rules live in DDB tables that publish
+      // to GSIs eventually (typically <1s, occasionally longer). A refresh
+      // fired immediately after a set-level write can read the stale view
+      // and flip the chip back to its prior state — exactly the bug users
+      // keep reporting. We re-apply any patches that haven't been confirmed
+      // by the server yet, and drop a patch as soon as the server's view
+      // matches it (self-healing without TTL guesswork).
+      this.reconcilePendingLevelPatches();
+      this.currentUserLevel = this.accessSummary?.currentUserLevel ?? this.currentUserLevel;
+      this.mergeAccessSummaryIntoDirectory();
+      this.canManage = this.cfg.isAdmin || this.currentUserLevel === "admin";
+      this.rules = this.canManage
+        ? await this.cfg.apiClient.getPermissions(this.cfg.path).catch(() => [])
+        : [];
       this.permissionsLoaded = true;
       this.render();
       this.cfg.onRulesChanged?.();
     } catch (error) {
       this.renderError((error as Error).message);
     }
+  }
+
+  /**
+   * Tracks set-level results that the GSI may not have surfaced yet. Each
+   * entry is removed once a subsequent `getPathAccess` confirms it (the
+   * server's read view caught up). Until then, the entry overrides what the
+   * server returns for that principal, so the chip stays on the value the
+   * write produced rather than flipping back to a stale read.
+   */
+  private pendingLevelPatches = new Map<string, "none" | "read" | "write" | "admin">();
+
+  private reconcilePendingLevelPatches(): void {
+    if (!this.accessSummary) return;
+    if (!this.pendingLevelPatches) this.pendingLevelPatches = new Map();
+
+    // Drop any patch the server now agrees with.
+    for (const [userId, level] of [...this.pendingLevelPatches]) {
+      const principal = this.accessSummary.principals.find(
+        (p) => this.resolveCanonicalUserId(p.userId) === userId
+      );
+      if (principal && principal.level === level) {
+        this.pendingLevelPatches.delete(userId);
+      }
+    }
+
+    if (this.pendingLevelPatches.size === 0) return;
+
+    // Re-apply remaining patches against the freshly fetched summary.
+    const principals = this.accessSummary.principals.map((p) => {
+      const patched = this.pendingLevelPatches.get(this.resolveCanonicalUserId(p.userId));
+      return patched ? { ...p, level: patched } : p;
+    });
+
+    // Seed principals the server hasn't enumerated yet (e.g. just-added rows).
+    for (const [userId, level] of this.pendingLevelPatches) {
+      if (level === "none") continue;
+      const exists = principals.some(
+        (p) => this.resolveCanonicalUserId(p.userId) === userId
+      );
+      if (!exists) principals.push({ userId, level });
+    }
+
+    this.accessSummary = { ...this.accessSummary, principals };
   }
 
   private async loadUsers(): Promise<void> {
@@ -601,6 +792,9 @@ export class PathPermissionsModal extends Modal {
     if (this.cfg.currentUserRole === "admin" || this.cfg.currentUserRole === "owner") {
       return "admin";
     }
+    if (this.currentUserLevel !== "none") {
+      return this.currentUserLevel;
+    }
 
     let bestLevel = "none";
     let bestSpecificity = -1;
@@ -615,9 +809,9 @@ export class PathPermissionsModal extends Modal {
       const specificity = this.patternSpecificity(rule.pathPattern);
       if (specificity > bestSpecificity) {
         bestSpecificity = specificity;
-        bestLevel = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+        bestLevel = this.currentLevel(rule);
       } else if (specificity === bestSpecificity) {
-        const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+        const level = this.currentLevel(rule);
         if (this.levelRank(level) > this.levelRank(bestLevel)) {
           bestLevel = level;
         }
@@ -639,11 +833,51 @@ export class PathPermissionsModal extends Modal {
   }
 
   private currentLevel(rule: PermissionRule): string {
-    if (rule.effect === "deny") return "none";
+    if (rule.effect === "deny") return this.deniedActionsCapLevel(rule.actions);
     if (rule.actions.includes("admin")) return "admin";
     if (rule.actions.includes("write") || rule.actions.includes("delete")) return "write";
     if (rule.actions.includes("read")) return "read";
     return "none";
+  }
+
+  /**
+   * Backend-computed effective level for this rule's principal on the modal's
+   * current path. Returns null when no access summary is available or the
+   * rule targets a role/wildcard that the effective list does not enumerate.
+   * Mirrors the helper in file-permission-panel.ts so the three UI surfaces
+   * make the same downgrade-vs-upgrade decision from the same input.
+   */
+  private effectiveLevelForRulePrincipal(rule: PermissionRule): string | null {
+    const principals = this.accessSummary?.principals;
+    if (!principals || principals.length === 0) return null;
+    if (rule.role || rule.userId === "*") return null;
+
+    const canonicalUserId = this.resolveCanonicalUserId(rule.userId);
+    const principal = principals.find((entry) =>
+      this.resolveCanonicalUserId(entry.userId) === canonicalUserId
+    );
+    return principal ? principal.level : null;
+  }
+
+  private displayLevelForRule(rule: PermissionRule): string {
+    let level = this.currentLevel(rule);
+    if (rule.effect === "deny" || rule.role || rule.userId === "*" || !this.ruleTargetsCurrentPath(rule)) {
+      return level;
+    }
+
+    const canonicalUserId = this.resolveCanonicalUserId(rule.userId);
+    for (const candidate of this.rules) {
+      if (candidate === rule || candidate.role || candidate.userId === "*") continue;
+      if (this.ruleTargetsCurrentPath(candidate)) continue;
+      if (this.resolveCanonicalUserId(candidate.userId) !== canonicalUserId) continue;
+
+      const candidateLevel = this.currentLevel(candidate);
+      if (this.levelRank(candidateLevel) > this.levelRank(level)) {
+        level = candidateLevel;
+      }
+    }
+
+    return level;
   }
 
   private formatLevel(level: string): string {
@@ -664,12 +898,35 @@ export class PathPermissionsModal extends Modal {
     }
   }
 
-  private buildLevelMutation(level: string): Pick<PermissionMutationInput, "actions" | "effect"> {
+  /**
+   * Identical-by-construction with the helpers in file-permission-header.ts
+   * and file-permission-panel.ts so all three UI surfaces persist the same
+   * rule shape for the same transition. See the header for the full
+   * rationale; the downgrade branch covers every downgrade (admin→write,
+   * admin→read, write→read) via a deny cap that strips the actions above
+   * `level` while leaving lower actions to inheritance.
+   */
+  private buildLevelMutation(
+    level: string,
+    previousLevel: string = "none"
+  ): Pick<PermissionMutationInput, "actions" | "effect"> {
     if (level === "none") {
       return {
         actions: ["read", "write", "delete", "admin", "list"],
         effect: "deny",
       };
+    }
+
+    const targetRank = this.levelRank(level);
+    const previousRank = this.levelRank(previousLevel);
+
+    if (targetRank < previousRank) {
+      // See file-permission-header.ts for the ordering rationale.
+      const denyActions: PermissionMutationInput["actions"] = [];
+      if (targetRank < 1) denyActions.push("read", "list");
+      if (targetRank < 2) denyActions.push("write", "delete");
+      if (targetRank < 3) denyActions.push("admin");
+      return { actions: denyActions, effect: "deny" };
     }
 
     return {
@@ -686,7 +943,7 @@ export class PathPermissionsModal extends Modal {
   }
 
   private ruleLevelRank(rule: PermissionRule): number {
-    if (rule.effect === "deny") return -1;
+    if (rule.effect === "deny") return this.levelRank(this.deniedActionsCapLevel(rule.actions));
     if (rule.actions.includes("admin")) return 3;
     if (rule.actions.includes("write")) return 2;
     if (rule.actions.includes("read")) return 1;
@@ -696,6 +953,42 @@ export class PathPermissionsModal extends Modal {
   private userLabel(userId: string): string {
     const user = this.userMap.get(userId);
     return user ? getAccessUserDisplayName(user) : userId;
+  }
+
+  private accessPrincipalLabel(principal: PathAccessPrincipal): string {
+    return principal.displayName || principal.email || this.userLabel(principal.userId);
+  }
+
+  private normalizeAccessPrincipals(principals: PathAccessPrincipal[]): PathAccessPrincipal[] {
+    const byKey = new Map<string, PathAccessPrincipal>();
+
+    for (const principal of principals) {
+      const canonicalUserId = this.resolveCanonicalUserId(principal.userId);
+      const email = principal.email?.trim().toLowerCase();
+      const key = email || canonicalUserId;
+      const normalized = { ...principal, userId: canonicalUserId };
+      const existing = byKey.get(key);
+      if (!existing || this.levelRank(normalized.level) > this.levelRank(existing.level)) {
+        byKey.set(key, normalized);
+      }
+    }
+
+    return [...byKey.values()];
+  }
+
+  private canEditAccessPrincipal(principal: PathAccessPrincipal): boolean {
+    if (!this.canManage) return false;
+    if (principal.userId === this.cfg.currentUserId) return false;
+    // Vault admins/owners bypass per-file deny rules server-side
+    // (utils.ts: rolesIncludeOrgAdmin → unconditional allowed=true), so any
+    // attempted downgrade is a no-op that confuses the user — the chip
+    // would flicker to the target level and snap back to admin on refresh.
+    // Hide the dropdown and let the static "Admin" badge stand instead. The
+    // server enforces the same constraint with a 400 if a request slips
+    // through (e.g. via the legacy raw-rule editor).
+    const targetRole = principal.role?.toLowerCase();
+    if (!this.cfg.allowAdminPerFileRestrictions && targetRole === "admin") return false;
+    return true;
   }
 
   private existingExactDirectUserLevels(): Map<string, string> {
@@ -729,12 +1022,78 @@ export class PathPermissionsModal extends Modal {
     }) ?? null;
   }
 
+  private findExactUserRuleForCurrentPath(userId: string): PermissionRule | null {
+    const canonicalUserId = this.resolveCanonicalUserId(userId);
+    return this.rules.find((rule) =>
+      !rule.role &&
+      this.resolveCanonicalUserId(rule.userId) === canonicalUserId &&
+      this.ruleTargetsCurrentPath(rule)
+    ) ?? null;
+  }
+
+  private rawRulesForDisplay(): PermissionRule[] {
+    const exactDirectUsers = new Set<string>();
+    for (const rule of this.rules) {
+      if (rule.role || rule.userId === "*" || !this.ruleTargetsCurrentPath(rule)) continue;
+      exactDirectUsers.add(this.resolveCanonicalUserId(rule.userId));
+    }
+
+    if (exactDirectUsers.size === 0) return [...this.rules];
+
+    return this.rules.filter((rule) => {
+      if (rule.role || rule.userId === "*") return true;
+      if (this.ruleTargetsCurrentPath(rule)) return true;
+      return !exactDirectUsers.has(this.resolveCanonicalUserId(rule.userId));
+    });
+  }
+
   private normalizeRulePath(path: string): string {
     return path.replace(/^\/+/, "").replace(/\/+$/, "");
   }
 
   private resolveCanonicalUserId(userId: string): string {
     return resolveAccessUserId(this.users, userId);
+  }
+
+  private mergeAccessSummaryIntoDirectory(): void {
+    const principals = this.accessSummary?.principals ?? [];
+    if (principals.length === 0) return;
+
+    const knownIds = new Set(this.users.map((user) => user.id));
+    const additions: UserListEntry[] = [];
+
+    for (const principal of principals) {
+      if (knownIds.has(principal.userId)) continue;
+      if (!principal.displayName && !principal.email) continue;
+
+      additions.push({
+        id: principal.userId,
+        email: principal.email ?? "",
+        displayName: principal.displayName ?? principal.email ?? principal.userId,
+        name: principal.displayName ?? principal.email ?? principal.userId,
+        role: this.mapVaultRoleToUserRole(principal.role),
+        status: "active",
+        lastActive: "",
+        createdAt: "",
+        mfaEnabled: false,
+        deviceCount: 0,
+        type: "user",
+      });
+      knownIds.add(principal.userId);
+    }
+
+    if (additions.length === 0) return;
+    this.users = sortAccessUsers([...this.users, ...additions]);
+    this.userMap = buildAccessUserMap(this.users);
+  }
+
+  private mapVaultRoleToUserRole(role?: string): UserListEntry["role"] {
+    switch (role) {
+      case "admin": return "admin";
+      case "editor": return "editor";
+      case "viewer": return "viewer";
+      default: return "custom";
+    }
   }
 
   private syncSelectedUserFromDraft(): void {
@@ -804,5 +1163,12 @@ export class PathPermissionsModal extends Modal {
     if (userId === "*") return "*";
     const user = this.userMap.get(userId);
     return user ? getAccessUserNameInitials(user) : this.initials(userId);
+  }
+
+  private deniedActionsCapLevel(actions: PermissionRule["actions"]): string {
+    if (actions.includes("read") || actions.includes("list")) return "none";
+    if (actions.includes("write") || actions.includes("delete")) return "read";
+    if (actions.includes("admin")) return "write";
+    return "none";
   }
 }

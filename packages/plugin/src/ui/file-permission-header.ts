@@ -7,7 +7,7 @@
  * Avatar chips are clickable — showing a user info popover.
  */
 
-import { App, MarkdownView, TFile, setIcon } from "obsidian";
+import { App, MarkdownView, Notice, TFile, setIcon } from "obsidian";
 import {
   PathAccessPrincipal,
   PathAccessSummary,
@@ -17,7 +17,7 @@ import {
   VaultMemberRecord,
 } from "../api/client";
 import { PermissionLevel } from "../types";
-import { FilePermissionPanel } from "./file-permission-panel";
+import { EffectiveAccessPrincipal, FilePermissionPanel } from "./file-permission-panel";
 import { setButtonLoading, setControlBusy } from "./loading-button";
 import {
   buildAccessUserMap,
@@ -54,6 +54,16 @@ interface HeaderContext {
    * backend check that enforces editor read/write protection.
    */
   getPermissionLevel?: (path: string) => Promise<PermissionLevel>;
+  /**
+   * Org-level "allow per-file restrictions on admins" toggle (mirrors the
+   * backend setting of the same name). When true the header lets you
+   * change vault admins' / org owner's per-file level, because the server
+   * actually honors the resulting deny rule. When false (default) the
+   * dropdown stays hidden for those principals — see
+   * `isTargetVaultAdminOrOwner`. Plugin updates this via setContext()
+   * after every org-settings refresh.
+   */
+  allowAdminPerFileRestrictions?: boolean;
 }
 
 interface RuleCacheEntry {
@@ -79,6 +89,12 @@ type AccessPrincipal = {
   label: string;
   level: AccessLevel;
   type: "user" | "role";
+  /** Vault membership role for the principal, when known. Drives the
+   * "can't edit per-file level for vault admins" UI guard. Vault roles are
+   * viewer/editor/admin — "owner" is a Cognito org-level role only, and
+   * org owners are added to vaults as `admin`, so checking `admin` covers
+   * both. */
+  vaultRole?: VaultMemberRecord["role"];
 };
 
 type AccessPrincipalState = AccessPrincipal & {
@@ -160,7 +176,7 @@ export class FilePermissionHeader {
     const needsAuthoritativeLevelRefresh = Boolean(cached?.rules && this.ctx.getPermissionLevel);
     if (cached?.rules && !needsAuthoritativeLevelRefresh) {
       this.renderHeader(headerEl, file, cached.rules, this.optionsFromData(cached));
-      this.activePanel?.setRules(cached.rules);
+      this.updateActivePanel(cached.rules, this.optionsFromData(cached));
     } else {
       this.renderSkeleton(headerEl, file);
     }
@@ -184,7 +200,7 @@ export class FilePermissionHeader {
       // Check the element is still mounted (user may have switched files)
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
       this.renderHeader(headerEl, file, data.rules, this.optionsFromData(data));
-      this.activePanel?.setRules(data.rules);
+      this.updateActivePanel(data.rules, this.optionsFromData(data));
     } catch {
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
       const currentUserLevel = await this.fetchCurrentUserLevel(file.path);
@@ -193,7 +209,10 @@ export class FilePermissionHeader {
         includeVaultMemberDefaults: false,
         currentUserLevel,
       });
-      this.activePanel?.setRules([]);
+      this.updateActivePanel([], {
+        includeVaultMemberDefaults: false,
+        currentUserLevel,
+      });
     } finally {
       if (showRefreshing && headerEl.isConnected) {
         this.setRefreshing(headerEl, false);
@@ -255,6 +274,7 @@ export class FilePermissionHeader {
     currentUserEmail?: string;
     currentUserRole?: string;
     isAdmin?: boolean;
+    allowAdminPerFileRestrictions?: boolean;
   }): void {
     if (updates.currentUserId !== undefined) {
       this.ctx.currentUserId = updates.currentUserId;
@@ -267,6 +287,9 @@ export class FilePermissionHeader {
     }
     if (updates.isAdmin !== undefined) {
       this.ctx.isAdmin = updates.isAdmin;
+    }
+    if (updates.allowAdminPerFileRestrictions !== undefined) {
+      this.ctx.allowAdminPerFileRestrictions = updates.allowAdminPerFileRestrictions;
     }
     this.ruleCache.clear();
     this.vaultMembers = [];
@@ -494,40 +517,39 @@ export class FilePermissionHeader {
       return cached.inFlight;
     }
 
-    const rulesRequest = this.ctx.isAdmin
-      ? this.ctx.apiClient
-        .getPermissions()
-        .then((rules) => ({ rules, rulesAvailable: true }))
-        .catch(() => ({ rules: [] as PermissionRule[], rulesAvailable: false }))
-      : Promise.resolve({ rules: [] as PermissionRule[], rulesAvailable: false });
     const accessRequest = this.fetchPathAccessForHeader(path);
     const currentUserLevelRequest = this.fetchCurrentUserLevel(path);
 
     const request = Promise.all([
-      rulesRequest,
       accessRequest,
       currentUserLevelRequest,
       this.loadVaultMembersIfNeeded(),
     ])
-      .then(([rulesResult, access, currentUserLevel]) => {
+      .then(async ([access, currentUserLevel]) => {
+        const displayedCurrentUserLevel = this.combineCurrentUserLevel(access, currentUserLevel);
+        const rulesResult = await this.fetchEditableRulesForPath(path, displayedCurrentUserLevel);
         const matchingRules = rulesResult.rules.filter((rule) =>
           this.ruleMatchesPath(rule.pathPattern, path)
         );
         if (access) {
           this.mergePathAccessIntoDirectory(access.principals);
         }
-        const displayedCurrentUserLevel = this.combineCurrentUserLevel(access, currentUserLevel);
+        // Post-write read consistency: re-apply any pending set-level
+        // patches that the server's read view (GSI) might not have
+        // surfaced yet. Without this, a forced refresh fired right after a
+        // write can stomp the chip back to its pre-write level.
+        const reconciledAccess = access ? this.applyPendingPatchesToAccess(access) : access;
         this.ruleCache.set(path, {
           rules: matchingRules,
           rulesAvailable: rulesResult.rulesAvailable,
-          access,
+          access: reconciledAccess,
           currentUserLevel: displayedCurrentUserLevel,
           fetchedAt: Date.now(),
         });
         return {
           rules: matchingRules,
           rulesAvailable: rulesResult.rulesAvailable,
-          access,
+          access: reconciledAccess,
           currentUserLevel: displayedCurrentUserLevel,
         };
       })
@@ -578,6 +600,24 @@ export class FilePermissionHeader {
     });
 
     return request;
+  }
+
+  private async fetchEditableRulesForPath(
+    path: string,
+    currentUserLevel: AccessLevel
+  ): Promise<{ rules: PermissionRule[]; rulesAvailable: boolean }> {
+    if (!this.ctx.isAdmin && currentUserLevel !== "admin") {
+      return { rules: [], rulesAvailable: false };
+    }
+
+    try {
+      const rules = this.ctx.isAdmin
+        ? await this.ctx.apiClient.getPermissions()
+        : await this.ctx.apiClient.getPermissions(path);
+      return { rules, rulesAvailable: true };
+    } catch {
+      return { rules: [], rulesAvailable: false };
+    }
   }
 
   private mergePathAccessIntoDirectory(principals: PathAccessPrincipal[]): void {
@@ -727,12 +767,18 @@ export class FilePermissionHeader {
           principal.displayName ||
           principal.email ||
           this.resolveUserLabel(principal.userId);
+        const rawRole = principal.role?.toLowerCase();
+        const vaultRole: AccessPrincipal["vaultRole"] =
+          rawRole === "admin" || rawRole === "editor" || rawRole === "viewer"
+            ? rawRole
+            : undefined;
         return {
           id: principal.userId,
           email: principal.email,
           label,
           level: principal.level,
           type: "user" as const,
+          ...(vaultRole ? { vaultRole } : {}),
         };
       })
       .sort((a, b) => {
@@ -799,7 +845,7 @@ export class FilePermissionHeader {
     // ── Section 3: Actions ───────────────────────────────────────────
     const actionsSection = inner.createDiv({ cls: "vaultguard-fh-actions" });
 
-    if (this.ctx.isAdmin) {
+    if (this.canManageFile(file, rules, options)) {
       const manageBtn = actionsSection.createEl("button", {
         cls: "vaultguard-fh-btn vaultguard-fh-btn-manage",
       });
@@ -809,7 +855,7 @@ export class FilePermissionHeader {
       manageBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         this.closePopover();
-        this.togglePanel(container, file, rules);
+        this.togglePanel(container, file, rules, options);
       });
     } else {
       const viewBtn = actionsSection.createEl("button", {
@@ -821,7 +867,7 @@ export class FilePermissionHeader {
       viewBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         this.closePopover();
-        this.togglePanel(container, file, rules);
+        this.togglePanel(container, file, rules, options);
       });
     }
   }
@@ -916,7 +962,7 @@ export class FilePermissionHeader {
       if (principal.type === "user" && principal.id !== "*") {
         chip.addEventListener("click", (e) => {
           e.stopPropagation();
-          this.showUserPopover(chip, principal.id, principal.level, file, rules);
+          this.showUserPopover(chip, principal.id, principal.level, file, rules, options);
         });
       }
     }
@@ -930,7 +976,8 @@ export class FilePermissionHeader {
       overflowChip.addEventListener("click", (e) => {
         e.stopPropagation();
         this.closePopover();
-        this.togglePanel(this.activeHeader!, file, rules);
+        const cached = this.ruleCache.get(file.path);
+        this.togglePanel(this.activeHeader!, file, rules, this.optionsFromData(cached ?? {}));
       });
     }
   }
@@ -942,7 +989,8 @@ export class FilePermissionHeader {
     userId: string,
     level: AccessLevel,
     file: TFile,
-    rules: PermissionRule[]
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
   ): void {
     // Toggle off if clicking the same chip
     if (this.activePopover) {
@@ -1000,7 +1048,7 @@ export class FilePermissionHeader {
     // org-admin/vault-admin/owner (see infrastructure/lambda/shared/utils.ts:528-530),
     // so offering the editable dropdown for the admin's own row would silently write
     // an orphan deny rule with no effect. Fold self-rows into the static-badge branch.
-    if (this.canEditUserRow(userId, file, rules)) {
+    if (this.canEditUserRow(userId, file, rules, options)) {
       const levelSelect = levelRow.createEl("select", {
         cls: "vaultguard-fh-popover-level-select",
       });
@@ -1027,12 +1075,29 @@ export class FilePermissionHeader {
         setControlBusy(levelSelect, true);
         levelSpinner.style.display = "";
         try {
-          await this.upsertUserFileAccess(file, userId, newLevel, exactUserRule);
+          // Server set-level returns the new effective level for the
+          // principal. We don't drop it: patching the cache with that level
+          // lets the chip flip immediately, while the force-refresh below
+          // reconciles the rest of the principals on this path against the
+          // server's authoritative view. The patch costs nothing if it agrees
+          // with the refresh (the common case); if a race causes it to
+          // disagree, the refresh corrects within one round-trip.
+          const result = await this.upsertUserFileAccess(file, userId, newLevel, exactUserRule, level);
           this.closePopover();
-          this.invalidateCache(file.path);
+          if (result) {
+            this.patchCachedPrincipalLevel(file.path, result.canonicalUserId, result.effectiveLevel);
+          }
           await this.update({ force: true });
           await this.ctx.onRulesChanged?.(file.path);
-        } catch {
+        } catch (error) {
+          // Surface the failure — previously this catch was empty, which made
+          // any server-side rejection look like a non-event to the user. Now
+          // they see exactly what the server said (auth failure, validation
+          // error, network blip), and the dropdown returns to its prior
+          // state instead of getting stuck "loading".
+          const message = (error as Error)?.message ?? "unknown error";
+          new Notice(`Failed to update permission: ${message}`);
+          console.error(`[VaultGuard] upsertUserFileAccess(${userId} → ${newLevel}) on ${file.path}`, error);
           setControlBusy(levelSelect, false);
           levelSpinner.style.display = "none";
         }
@@ -1150,7 +1215,8 @@ export class FilePermissionHeader {
         e.stopPropagation();
         this.closePopover();
         if (!this.activePanel) {
-          this.togglePanel(this.activeHeader!, file, rules);
+          const cached = this.ruleCache.get(file.path);
+          this.togglePanel(this.activeHeader!, file, rules, this.optionsFromData(cached ?? {}));
         }
       });
     }
@@ -1191,19 +1257,30 @@ export class FilePermissionHeader {
 
   // ─── Panel Toggle ──────────────────────────────────────────────────
 
-  private togglePanel(headerEl: HTMLElement, file: TFile, rules: PermissionRule[]): void {
+  private togglePanel(
+    headerEl: HTMLElement,
+    file: TFile,
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): void {
     if (this.activePanel) {
       this.closePanel();
       return;
     }
 
+    const panelAccess = this.panelEffectiveAccess(rules, options);
     this.activePanel = new FilePermissionPanel({
       app: this.ctx.app,
       apiClient: this.ctx.apiClient,
       file,
       rules,
+      effectivePrincipals: panelAccess.principals,
+      effectiveAccessAvailable: panelAccess.available,
+      canManageAccess: this.canManageFile(file, rules, options),
       isAdmin: this.ctx.isAdmin,
       currentUserId: this.ctx.currentUserId,
+      currentUserEmail: this.ctx.currentUserEmail,
+      allowAdminPerFileRestrictions: this.ctx.allowAdminPerFileRestrictions === true,
       anchorEl: headerEl,
       initialUsers: this.users,
       onRulesChanged: async () => {
@@ -1217,38 +1294,184 @@ export class FilePermissionHeader {
     });
   }
 
+  private updateActivePanel(rules: PermissionRule[], options: AccessListOptions): void {
+    if (!this.activePanel) return;
+    const panelAccess = this.panelEffectiveAccess(rules, options);
+    this.activePanel.setData(rules, panelAccess.principals, panelAccess.available);
+  }
+
+  private panelEffectiveAccess(
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): { principals: EffectiveAccessPrincipal[]; available: boolean } {
+    const accessSummaryAvailable = options.accessPrincipals !== undefined;
+    return {
+      principals: accessSummaryAvailable
+        ? this.visibleAccessPrincipals(rules, options).map((principal) => ({
+          id: principal.id,
+          email: principal.email,
+          label: principal.label,
+          level: principal.level,
+          type: principal.type,
+          ...(principal.vaultRole ? { vaultRole: principal.vaultRole } : {}),
+        }))
+        : [],
+      available: accessSummaryAvailable,
+    };
+  }
+
   // ─── Helpers ───────────────────────────────────────────────────────
 
   private async upsertUserFileAccess(
     file: TFile,
     userId: string,
     level: AccessLevel,
-    exactRule: PermissionRule | null
-  ): Promise<void> {
-    const mutation = this.buildLevelMutation(level);
+    _exactRule: PermissionRule | null,
+    _knownCurrentLevel?: AccessLevel
+  ): Promise<{ effectiveLevel: AccessLevel; canonicalUserId: string } | null> {
     await this.ensureUsersLoaded();
     const canonicalUserId = this.resolveCanonicalUserId(userId);
 
-    const cachedRules = this.ruleCache.get(file.path)?.rules ?? [];
-    const currentExactRule = exactRule ?? this.findExactUserRuleForFile(cachedRules, canonicalUserId, file);
-
-    if (currentExactRule) {
-      await this.ctx.apiClient.updatePermission(currentExactRule.id, {
-        pathPattern: currentExactRule.pathPattern,
-        ...mutation,
-      });
-      return;
-    }
-
-    await this.ctx.apiClient.createPermission({
-      pathPattern: this.fileRulePath(file),
-      ...mutation,
+    // Delegate the decision (delete/cap/grant) to the server's set-level
+    // endpoint. The server knows the principal's INHERITED level (membership
+    // + broader rules) — that is the only correct basis for picking a single
+    // rule shape that lands the user at exactly `level`. See the
+    // permission transition matrix test for the failure modes that motivated
+    // moving this logic out of the client.
+    if (level === "unknown") return null;
+    const response = await this.ctx.apiClient.setPermissionLevel({
       userId: canonicalUserId,
       role: null,
+      pathPattern: this.fileRulePath(file),
+      level,
     });
+    // The server returns the principal's NEW effective level — that's the
+    // authoritative value we'd otherwise have to round-trip a getPathAccess
+    // call to learn. The popover handler uses it to patch the local cache
+    // optimistically so the chip flips immediately while the background
+    // refresh reconciles the rest of the principals on this path.
+    return {
+      effectiveLevel: (response?.level as AccessLevel) ?? level,
+      canonicalUserId,
+    };
   }
 
-  private buildLevelMutation(level: AccessLevel): Pick<PermissionRule, "actions" | "effect"> {
+  /**
+   * Mutates the cached path-access summary so the named principal shows the
+   * given level on the next render, without needing a network round-trip.
+   * Used as the optimistic-update side of "patch cache, then reconcile
+   * against server in the background". The full refresh that fires next
+   * still replaces the entire cache entry, so this patch is correct-by-
+   * construction even when the cached snapshot is otherwise stale — any
+   * lie the patch tells gets corrected within one network round-trip.
+   *
+   * No-op when the cached summary doesn't enumerate the principal (e.g.
+   * legacy admin view without an access summary); the background refresh
+   * still surfaces the correct level on completion.
+   */
+  patchCachedPrincipalLevel(
+    path: string,
+    userId: string,
+    level: AccessLevel
+  ): void {
+    // `unknown` is a UI-only sentinel for "level not yet resolved" — the
+    // server set-level endpoint never returns it. Bail rather than write a
+    // value the PathAccessPrincipal contract doesn't permit.
+    if (level === "unknown") return;
+
+    // Record the pending patch so subsequent refreshes (which may briefly
+    // read a stale GSI view) keep showing the new level until the server's
+    // read view catches up. Self-clears once the server agrees.
+    if (!this.pendingLevelPatches) this.pendingLevelPatches = new Map();
+    const canonical = this.resolveCanonicalUserId(userId);
+    let pending = this.pendingLevelPatches.get(path);
+    if (!pending) {
+      pending = new Map();
+      this.pendingLevelPatches.set(path, pending);
+    }
+    pending.set(canonical, level as Exclude<AccessLevel, "unknown">);
+
+    const cached = this.ruleCache.get(path);
+    if (!cached?.access) return;
+    const reconciled = this.applyPendingPatchesToAccess(cached.access, path);
+    this.ruleCache.set(path, { ...cached, access: reconciled });
+  }
+
+  /** Pending set-level writes per path, awaiting server-read agreement. */
+  private pendingLevelPatches: Map<string, Map<string, Exclude<AccessLevel, "unknown">>> = new Map();
+
+  /**
+   * Returns a `PathAccessSummary` with any pending patches applied for the
+   * given path, AND drops patches the freshly-fetched summary now agrees
+   * with. Called both at write-time (to reflect the optimistic value) and
+   * at refresh-time (to keep optimistic values in place until the server
+   * catches up).
+   */
+  private applyPendingPatchesToAccess(
+    access: PathAccessSummary,
+    path: string | null = null
+  ): PathAccessSummary {
+    if (!this.pendingLevelPatches) this.pendingLevelPatches = new Map();
+    const targetPath = path ?? access.path;
+    const pending = this.pendingLevelPatches.get(targetPath);
+    if (!pending || pending.size === 0) return access;
+
+    // Drop confirmed patches first.
+    for (const [userId, level] of [...pending]) {
+      const principal = access.principals.find(
+        (p) => this.resolveCanonicalUserId(p.userId) === userId
+      );
+      if (principal && principal.level === level) {
+        pending.delete(userId);
+      }
+    }
+    if (pending.size === 0) {
+      this.pendingLevelPatches.delete(targetPath);
+      return access;
+    }
+
+    const principals = access.principals.map((p) => {
+      const patched = pending.get(this.resolveCanonicalUserId(p.userId));
+      return patched ? { ...p, level: patched } : p;
+    });
+
+    for (const [userId, level] of pending) {
+      if (level === "none") continue;
+      const exists = principals.some(
+        (p) => this.resolveCanonicalUserId(p.userId) === userId
+      );
+      if (!exists) principals.push({ userId, level });
+    }
+
+    return { ...access, principals };
+  }
+
+  /**
+   * Builds the (actions, effect) tuple that brings the user from
+   * `previousLevel` to `level` on the target path.
+   *
+   * Permission rules carry ONE effect (allow OR deny), so a single rule cannot
+   * simultaneously raise and lower access. We use the user's inherited /
+   * effective baseline (previousLevel) to decide the shape:
+   *
+   *  - target === "none"        → deny all actions
+   *  - target  <  previousLevel → deny the actions ABOVE target (cap from above
+   *                                while leaving lower actions to inheritance)
+   *  - target  >= previousLevel → allow up to target (grant the actions
+   *                                explicitly; matches existing behavior for
+   *                                upgrades and same-level no-ops)
+   *
+   * Why deny-cap on downgrade: when the user inherits a higher level (e.g. an
+   * editor vault member, or a broader `/**` allow), a plain `allow [read,list]`
+   * rule does NOT remove the inherited write — it only re-grants read. The
+   * deny rule covers write/delete/admin so the higher actions are stripped
+   * while the lower actions fall through to inheritance. This is the only
+   * single-rule shape that yields the correct effective level.
+   */
+  private buildLevelMutation(
+    level: AccessLevel,
+    previousLevel: AccessLevel = "none"
+  ): Pick<PermissionRule, "actions" | "effect"> {
     if (level === "none") {
       return {
         actions: ["read", "write", "delete", "admin", "list"],
@@ -1256,10 +1479,48 @@ export class FilePermissionHeader {
       };
     }
 
+    const targetRank = this.levelRank(level);
+    const previousRank = this.levelRank(previousLevel);
+
+    if (targetRank < previousRank) {
+      // Order is: read/list, write/delete, admin — kept stable across
+      // downgrades so the resulting rules are bit-identical regardless of
+      // which transition produced them (helps idempotency and test pinning).
+      const denyActions: PermissionRule["actions"] = [];
+      if (targetRank < 1) denyActions.push("read", "list");
+      if (targetRank < 2) denyActions.push("write", "delete");
+      if (targetRank < 3) denyActions.push("admin");
+      return { actions: denyActions, effect: "deny" };
+    }
+
     return {
       actions: this.levelToActions(level),
       effect: "allow",
     };
+  }
+
+  private resolvePrincipalLevelForFile(
+    userId: string,
+    file: TFile,
+    rules: PermissionRule[]
+  ): AccessLevel {
+    const cached = this.ruleCache.get(file.path);
+    const cachedOptions = cached ? this.optionsFromData(cached) : {};
+    // Use the backend-aware resolver (visibleAccessPrincipals) — when the path
+    // access summary is in cache, it carries the server-computed effective
+    // level for every principal and overrides the local rule-derived view.
+    // The local view (buildVisibleAccessPrincipals) misclassifies cases like a
+    // stale `allow [read,list]` rule sitting on top of editor-membership write
+    // inheritance: locally the rule reads as level=read, but the user
+    // effectively still has write because the rule does not strip the
+    // inherited write/delete grants. Trusting the backend here makes the
+    // upsert flow downgrade through a deny cap instead of writing a no-op
+    // allow-read rule on top of the broken state.
+    return this.visibleAccessPrincipals(rules, cachedOptions)
+      .find((principal) =>
+        principal.type === "user" &&
+        this.resolveCanonicalUserId(principal.id) === this.resolveCanonicalUserId(userId)
+      )?.level ?? "none";
   }
 
   private findExactUserRuleForFile(
@@ -1393,7 +1654,7 @@ export class FilePermissionHeader {
     }
 
     for (const rule of rules) {
-      const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+      const level = this.ruleAccessLevel(rule);
       const specificity = this.patternSpecificity(rule.pathPattern);
       const denied = rule.effect === "deny";
 
@@ -1462,10 +1723,61 @@ export class FilePermissionHeader {
    * self-row is never editable — a user cannot drop their own access, mirroring
    * the backend self-protection guardrail (authorizePermissionMutation).
    */
-  private canEditUserRow(userId: string, file: TFile, rules: PermissionRule[]): boolean {
+  private canManageFile(
+    file: TFile,
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): boolean {
+    return this.resolveMyLevel(file.path, rules, options) === "admin";
+  }
+
+  private canEditUserRow(
+    userId: string,
+    file: TFile,
+    rules: PermissionRule[],
+    options: AccessListOptions = {}
+  ): boolean {
     if (userId === this.ctx.currentUserId) return false;
+    // Vault admins/owners bypass per-file deny rules in evaluatePermission
+    // (utils.ts: rolesIncludeOrgAdmin → allowed=true unconditionally), so
+    // by default any per-file mutation against them is a no-op and the
+    // server returns 400. We hide the dropdown then — but when the org
+    // has opted into `allowAdminPerFileRestrictions`, the bypass is
+    // disabled for target-side evaluation and the deny rules DO take
+    // effect, so the dropdown becomes editable. The plugin syncs the
+    // setting via setContext after every org-settings refresh.
+    if (
+      !this.ctx.allowAdminPerFileRestrictions &&
+      this.isTargetVaultAdminOrOwner(userId, options)
+    ) {
+      return false;
+    }
     if (this.ctx.isAdmin) return true;
-    return this.resolveMyLevel(file.path, rules) === "admin";
+    return this.canManageFile(file, rules, options);
+  }
+
+  /**
+   * Looks up the named principal's vault role from the cached access
+   * summary. Returns true only when the role is explicitly "admin" or
+   * "owner" — falling back to false (editable) when the role is unknown,
+   * so the server-side 400 remains the authoritative guardrail rather than
+   * a stale UI hint locking edits unnecessarily.
+   */
+  private isTargetVaultAdminOrOwner(
+    userId: string,
+    options: AccessListOptions = {}
+  ): boolean {
+    const canonical = this.resolveCanonicalUserId(userId);
+    const principal = options.accessPrincipals?.find(
+      (p) => p.type === "user" && this.resolveCanonicalUserId(p.id) === canonical
+    );
+    if (principal?.vaultRole === "admin") return true;
+    // Fallback to vaultMembers when the access summary doesn't enumerate
+    // a vaultRole (e.g. legacy backends that pre-date the role field).
+    const member = this.vaultMembers.find(
+      (m) => this.resolveCanonicalUserId(m.userId) === canonical
+    );
+    return member?.role === "admin";
   }
 
   private resolveMyLevel(
@@ -1495,9 +1807,9 @@ export class FilePermissionHeader {
       const specificity = this.patternSpecificity(rule.pathPattern);
       if (specificity > bestSpecificity) {
         bestSpecificity = specificity;
-        bestLevel = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+        bestLevel = this.ruleAccessLevel(rule);
       } else if (specificity === bestSpecificity) {
-        const level = rule.effect === "deny" ? "none" : this.ruleLevelString(rule);
+        const level = this.ruleAccessLevel(rule);
         if (this.levelRank(level) > this.levelRank(bestLevel)) {
           bestLevel = level;
         }
@@ -1525,6 +1837,14 @@ export class FilePermissionHeader {
     if (rule.actions.includes("admin")) return "admin";
     if (rule.actions.includes("write") || rule.actions.includes("delete")) return "write";
     if (rule.actions.includes("read")) return "read";
+    return "none";
+  }
+
+  private ruleAccessLevel(rule: PermissionRule): AccessLevel {
+    if (rule.effect !== "deny") return this.ruleLevelString(rule);
+    if (rule.actions.includes("read") || rule.actions.includes("list")) return "none";
+    if (rule.actions.includes("write") || rule.actions.includes("delete")) return "read";
+    if (rule.actions.includes("admin")) return "write";
     return "none";
   }
 

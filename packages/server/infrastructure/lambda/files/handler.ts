@@ -39,6 +39,7 @@ import {
   docClient,
   verifyActiveUser,
   evaluatePermission,
+  shouldRespectAdminBypassFor,
   logAudit,
   formatError,
   formatSuccess,
@@ -194,6 +195,26 @@ function permissionEvaluationOptions(user: UserContext): { userAliases: string[]
 }
 
 /**
+ * Async variant of {@link permissionEvaluationOptions} that ALSO carries
+ * the per-org `respectAdminBypass` flag. File operations call this so
+ * that when `allowAdminPerFileRestrictions` is on, per-file deny rules
+ * actually take effect on admins' reads/writes/deletes/lists — without
+ * this flag the bypass in `evaluatePermission` would short-circuit
+ * `allowed=true` for admins and the toggle would only affect what the UI
+ * displays, not what the API enforces.
+ */
+async function fileOpPermissionOptions(
+  user: UserContext,
+  vault: VaultRecord
+): Promise<{ userAliases: string[]; respectAdminBypass: boolean }> {
+  const respectAdminBypass = await shouldRespectAdminBypassFor(vault.orgId);
+  return {
+    userAliases: user.email ? [user.email] : [],
+    respectAdminBypass,
+  };
+}
+
+/**
  * Permission gate for a folder marker. Markers carry no content but their
  * mere presence in a delta leaks the folder path's name and structure. Gate
  * the marker on the same `read` permission the parent folder would require —
@@ -221,7 +242,7 @@ async function canSeeFolderMarker(
     probePath,
     user.orgId,
     vault.vaultId,
-    permissionEvaluationOptions(user)
+    await fileOpPermissionOptions(user, vault)
   );
   return perm.allowed;
 }
@@ -773,7 +794,7 @@ async function handleListFiles(
     if (isClientLocalOnlyPath(relativePath)) continue;
 
     // Check if user has 'list' or 'read' permission for this path
-    const permResult = await evaluatePermission(user.userId, user.roles, 'list', '/' + relativePath, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+    const permResult = await evaluatePermission(user.userId, user.roles, 'list', '/' + relativePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
     if (permResult.allowed) {
       files.push({
@@ -838,7 +859,7 @@ async function handleReadFile(
   }
 
   // Permission check
-  const permResult = await evaluatePermission(user.userId, user.roles, 'read', '/' + filePath, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+  const permResult = await evaluatePermission(user.userId, user.roles, 'read', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
   if (!permResult.allowed) {
     await logAudit({
@@ -951,7 +972,7 @@ async function handleReadDecrypted(
     '/' + filePath,
     user.orgId,
     vault.vaultId,
-    permissionEvaluationOptions(user)
+    await fileOpPermissionOptions(user, vault)
   );
   if (!permResult.allowed) {
     await logAudit({
@@ -1089,7 +1110,7 @@ async function handleWriteFile(
   }
 
   // Permission check
-  const permResult = await evaluatePermission(user.userId, user.roles, 'write', '/' + filePath, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+  const permResult = await evaluatePermission(user.userId, user.roles, 'write', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
   if (!permResult.allowed) {
     await logAudit({
@@ -1224,7 +1245,7 @@ async function handleDeleteFile(
   const filePath = sanitizeFilePath(rawPath);
 
   // Permission check
-  const permResult = await evaluatePermission(user.userId, user.roles, 'delete', '/' + filePath, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+  const permResult = await evaluatePermission(user.userId, user.roles, 'delete', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
   if (!permResult.allowed) {
     await logAudit({
@@ -1345,7 +1366,7 @@ async function handleGetHistory(
   }
 
   // Permission check
-  const permResult = await evaluatePermission(user.userId, user.roles, 'read', '/' + filePath, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+  const permResult = await evaluatePermission(user.userId, user.roles, 'read', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
   if (!permResult.allowed) {
     await logAudit({
@@ -1508,7 +1529,7 @@ async function handleRestoreDelete(
     '/' + filePath,
     user.orgId,
     vault.vaultId,
-    permissionEvaluationOptions(user)
+    await fileOpPermissionOptions(user, vault)
   );
   if (!permResult.allowed) {
     await logAudit({
@@ -1757,7 +1778,7 @@ async function handleRestoreVersion(
     '/' + filePath,
     user.orgId,
     vault.vaultId,
-    permissionEvaluationOptions(user)
+    await fileOpPermissionOptions(user, vault)
   );
   if (!permResult.allowed) {
     await logAudit(
@@ -2013,7 +2034,7 @@ async function handleListDeleted(
         '/' + relPath,
         user.orgId,
         vault.vaultId,
-        permissionEvaluationOptions(user)
+        await fileOpPermissionOptions(user, vault)
       );
       if (!perm.allowed) continue;
 
@@ -2120,7 +2141,7 @@ async function buildSyncDeltasFromActivityLog(
         // and structure. Gate on the parent folder's read permission.
         if (!(await canSeeFolderMarker(user, vault, path))) continue;
       } else {
-        const perm = await evaluatePermission(user.userId, user.roles, 'read', path, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+        const perm = await evaluatePermission(user.userId, user.roles, 'read', path, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
         if (!perm.allowed) continue;
       }
       deltas.push({
@@ -2140,7 +2161,7 @@ async function buildSyncDeltasFromActivityLog(
     if (isMarker) {
       if (!(await canSeeFolderMarker(user, vault, path))) continue;
     } else {
-      const perm = await evaluatePermission(user.userId, user.roles, 'read', path, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+      const perm = await evaluatePermission(user.userId, user.roles, 'read', path, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
       if (!perm.allowed) continue;
     }
 
@@ -2291,7 +2312,7 @@ async function handleSync(
       }
 
       // Check permission for each file
-      const permResult = await evaluatePermission(user.userId, user.roles, 'read', relativePath, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+      const permResult = await evaluatePermission(user.userId, user.roles, 'read', relativePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
       if (!permResult.allowed) continue;
 
       const objModified = obj.LastModified || new Date(0);
@@ -2347,7 +2368,7 @@ async function handleSync(
       }
 
       // Verify user had permission to see this file
-      const permResult = await evaluatePermission(user.userId, user.roles, 'read', clientPath, user.orgId, vault.vaultId, permissionEvaluationOptions(user));
+      const permResult = await evaluatePermission(user.userId, user.roles, 'read', clientPath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
       if (permResult.allowed) {
         deltas.push({
           path: clientPath,

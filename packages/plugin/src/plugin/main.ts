@@ -4070,6 +4070,15 @@ export default class VaultGuardPlugin extends Plugin {
   private applyOrgSettings(orgSettings?: OrgSettingsResponse | null): void {
     this.orgSettings = orgSettings ?? null;
 
+    // Keep the file-permission header in sync with the per-org
+    // allowAdminPerFileRestrictions toggle. Without this push, the header
+    // would render based on whatever flag was passed at construction time
+    // and would never pick up a setting change until the next plugin
+    // reload.
+    this.filePermissionHeader?.setContext({
+      allowAdminPerFileRestrictions: this.orgSettings?.allowAdminPerFileRestrictions === true,
+    });
+
     if (this.session) {
       this.restartSyncTimer();
       this.scheduleAutoLockTimer();
@@ -8824,6 +8833,13 @@ export default class VaultGuardPlugin extends Plugin {
       // would see read-only affordances.
       currentUserRole: this.getEffectiveUiRole(),
       isAdmin: this.isEffectiveAdmin(),
+      // Mirrors the backend OrgSettings.allowAdminPerFileRestrictions
+      // toggle so the per-file dropdown for vault admins/org owners
+      // becomes editable when the org opted in. Refreshed via
+      // applyOrgSettings() on every lease/session response that carries
+      // org settings.
+      allowAdminPerFileRestrictions:
+        this.orgSettings?.allowAdminPerFileRestrictions === true,
       // Resolve the current user's level through the same PermissionStore the
       // sidebar, file-explorer dots, and read-only guard use. The store owns
       // the warm-up cache that recognises file-specific grants (matched by
@@ -9255,6 +9271,11 @@ export default class VaultGuardPlugin extends Plugin {
       // Use effective role so a vault admin (org member elsewhere) gets
       // the admin-side controls in the path-permissions modal.
       currentUserRole: this.getEffectiveUiRole(),
+      // Mirrors backend OrgSettings.allowAdminPerFileRestrictions so the
+      // modal lets you edit a vault admin's per-file level when the org
+      // opted in.
+      allowAdminPerFileRestrictions:
+        this.orgSettings?.allowAdminPerFileRestrictions === true,
       onRulesChanged: () => {
         // Phase 9: full invalidation via the bus. Rules edited from the
         // modal can include glob patterns (e.g. deleting an inherited

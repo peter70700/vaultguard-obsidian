@@ -166,7 +166,7 @@ wrapped keys, checksums, ETags, version IDs, or any decrypted content.
 ### Permissions (vault-scoped)
 
 ```
-GET    /vaults/{vaultId}/permissions                      → list raw rules in vault (vault-admin)
+GET    /vaults/{vaultId}/permissions                      → list raw rules in vault (vault-admin; path-scoped file-admin with pathFilter)
 GET    /vaults/{vaultId}/permissions/user/{userId}        → effective perms for a user (self or vault-admin)
 POST   /vaults/{vaultId}/permissions                      → create rule (vault-admin)
 PUT    /vaults/{vaultId}/permissions/{id}                 → update rule (vault-admin)
@@ -175,6 +175,10 @@ POST   /vaults/{vaultId}/permissions/check                → check action on pa
 POST   /vaults/{vaultId}/permissions/access               → effective per-file access list (any member with read on path)
 POST   /vaults/{vaultId}/permissions/access/batch         → batch access summaries for many paths (any member; cap 100)
 ```
+
+`POST /vaults/{vaultId}/permissions` accepts `upsert: true` for UI edit
+fallbacks. When an exact principal/path rule already exists, the backend updates
+that rule instead of returning a duplicate-rule conflict.
 
 For plugin UI source-of-truth rules, including which Obsidian surfaces use raw
 rules versus server-computed effective access, see

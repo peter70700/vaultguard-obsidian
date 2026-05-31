@@ -254,6 +254,11 @@ export interface PermissionMutationInput {
   actions: Array<"read" | "write" | "delete" | "admin" | "list">;
   effect: "allow" | "deny";
   priority?: number;
+  /**
+   * When true, POST /permissions updates an existing exact principal/path rule
+   * instead of returning a duplicate-rule conflict.
+   */
+  upsert?: boolean;
 }
 
 export interface OrgSettingsResponse {
@@ -267,6 +272,13 @@ export interface OrgSettingsResponse {
   allowedDomains: string[];
   retentionDays: number;
   autoLockMinutes: number;
+  /**
+   * When true, per-file deny rules bind admins too (the backend's bypass
+   * is opt-in disabled for target-side evaluation and file ops). The
+   * plugin UI uses this to decide whether the per-file level dropdown is
+   * editable for vault admins/owners — off by default.
+   */
+  allowAdminPerFileRestrictions?: boolean;
 }
 
 export interface QueuedRequest {
@@ -632,6 +644,39 @@ export class VaultGuardApiClient {
   async createPermission(rule: PermissionMutationInput): Promise<PermissionRule> {
     const response = await this.request<{ rule: PermissionRule }>("POST", `${this.vaultBase()}/permissions`, rule);
     return response.rule;
+  }
+
+  /**
+   * Sets a principal's effective level on a path to exactly `level`, letting
+   * the server pick the right rule shape (delete / deny-cap / allow). This is
+   * the correct primitive for "make user X have level L on file F" — the
+   * legacy {@link createPermission} / {@link updatePermission} only work when
+   * the caller already knows the principal's INHERITED level (membership +
+   * broader rules), which is data the UI doesn't have. See the
+   * `handleSetLevel` Lambda for the decision logic.
+   *
+   * Body schema is dispatched server-side on the same POST /permissions
+   * route — when `level` is present the server runs the set-level pipeline;
+   * otherwise it runs the legacy create. No new API Gateway resource is
+   * required.
+   */
+  async setPermissionLevel(input: {
+    userId?: string;
+    role?: string | null;
+    pathPattern: string;
+    level: "none" | "read" | "write" | "admin";
+  }): Promise<{
+    decision: "create" | "update" | "delete" | "noop";
+    level: "none" | "read" | "write" | "admin";
+    inheritedLevel: "none" | "read" | "write" | "admin";
+    rule: PermissionRule | null;
+  }> {
+    return this.request<{
+      decision: "create" | "update" | "delete" | "noop";
+      level: "none" | "read" | "write" | "admin";
+      inheritedLevel: "none" | "read" | "write" | "admin";
+      rule: PermissionRule | null;
+    }>("POST", `${this.vaultBase()}/permissions`, input);
   }
 
   async updatePermission(id: string, rule: Partial<PermissionMutationInput>): Promise<PermissionRule> {

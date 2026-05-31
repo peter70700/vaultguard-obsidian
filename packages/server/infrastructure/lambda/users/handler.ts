@@ -1450,6 +1450,7 @@ async function persistOrgSettings(org: OrgRecord, settings: OrgSettings): Promis
     allowedDomains: settings.allowedDomains,
     retentionDays: settings.retentionDays,
     autoLockMinutes: settings.autoLockMinutes,
+    allowAdminPerFileRestrictions: settings.allowAdminPerFileRestrictions,
   };
 
   await docClient.send(
@@ -1531,6 +1532,10 @@ async function handleUpdateOrgSettings(
     autoLockMinutes:
       parseNonNegativeInteger(body.autoLockMinutes, currentSettings.autoLockMinutes) ??
       currentSettings.autoLockMinutes,
+    allowAdminPerFileRestrictions:
+      typeof body.allowAdminPerFileRestrictions === 'boolean'
+        ? body.allowAdminPerFileRestrictions
+        : currentSettings.allowAdminPerFileRestrictions,
   };
 
   await persistOrgSettings(org, settings);

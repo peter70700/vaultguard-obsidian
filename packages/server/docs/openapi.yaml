@@ -577,7 +577,7 @@ paths:
     get:
       tags: [Permissions]
       summary: List raw permission rules in a vault
-      description: Vault-admin only. Plugin views for non-admin members should use `POST /permissions/access` for per-file visibility.
+      description: Vault-admins can list raw rules for the vault. Non-vault-admin file admins may supply `pathFilter` to list only rules overlapping that path; other plugin views should use `POST /permissions/access` for per-file visibility.
       parameters:
         - in: query
           name: pathFilter
@@ -1437,6 +1437,9 @@ components:
           type: string
           enum: [allow, deny]
         priority: { type: integer }
+        upsert:
+          type: boolean
+          description: When true, POST updates an existing exact principal/path rule instead of returning a duplicate-rule conflict.
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
         expiresAt:

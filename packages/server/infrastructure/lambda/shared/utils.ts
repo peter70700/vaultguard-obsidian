@@ -247,6 +247,25 @@ export interface PermissionEvaluationOptions {
    * stored an email address before the API canonicalized users to Cognito sub.
    */
   userAliases?: string[];
+  /**
+   * Rule IDs to ignore during this evaluation. Lets callers ask hypothetical
+   * "what would the user's level be if rule X did not exist?" questions —
+   * used by the set-level endpoint to compute the user's inherited level
+   * (membership + broader rules) when deciding whether an exact rule is
+   * needed to land them at the requested target.
+   */
+  excludeRuleIds?: string[];
+  /**
+   * When true (default), an org/vault admin/owner short-circuits to
+   * allowed=true regardless of any deny rule on the path. When false, the
+   * bypass is skipped and the standard rule evaluation pipeline runs even
+   * for admins — used by callers that need per-file deny rules to bind
+   * admins (the `allowAdminPerFileRestrictions` org setting). Caller-side
+   * authorization checks (e.g. authorizePermissionMutation's admin probe)
+   * should always leave this true; only target-side level computation and
+   * file-operation auth should opt out.
+   */
+  respectAdminBypass?: boolean;
 }
 
 /** Audit log entry structure. */
@@ -534,7 +553,15 @@ export async function evaluatePermission(
   // resolve a vault but still get 403 on individual file ops whenever the
   // vault has no permission rule for them (e.g. vaults created before the
   // default-rule helper existed, or members added before that code shipped).
-  if (rolesIncludeOrgAdmin(roles)) {
+  //
+  // `respectAdminBypass: false` opts out — used by callers that need
+  // per-file deny rules to bind admins too (the
+  // `allowAdminPerFileRestrictions` org setting). Caller-side auth checks
+  // (authorize a mutation, decide if the caller can resolve the vault)
+  // should leave this true so admins keep the "manage everything" rights
+  // the rest of the system assumes.
+  const respectAdminBypass = options.respectAdminBypass !== false;
+  if (respectAdminBypass && rolesIncludeOrgAdmin(roles)) {
     return { allowed: true, matchedRule: null, evaluatedRules: [] };
   }
 
@@ -548,7 +575,15 @@ export async function evaluatePermission(
 
   // Drop expired time-bound rules.
   const now = new Date().toISOString();
-  const liveRules = rules.filter((rule) => !rule.expiresAt || rule.expiresAt > now);
+  // Hypothetical-removal seam: `excludeRuleIds` lets the set-level endpoint
+  // ask "what would this user's level be if rule X did not exist?" so it can
+  // decide between (a) deleting the exact rule because inheritance already
+  // matches the target and (b) writing the right cap/grant rule. Production
+  // callers omit the option and get exact evaluation.
+  const excludeRuleIds = new Set(options.excludeRuleIds ?? []);
+  const liveRules = rules.filter(
+    (rule) => (!rule.expiresAt || rule.expiresAt > now) && !excludeRuleIds.has(rule.id)
+  );
 
   // Filter to rules that match the requested path
   const matchingRules = liveRules.filter((rule) => {
@@ -619,6 +654,7 @@ export interface AuthorizePermissionMutationResult { viaFileAdmin: boolean; }
 export interface AuthorizePermissionMutationDeps {
   evaluatePermission: typeof evaluatePermission;
   requireVaultMember: typeof requireVaultMember;
+  getVaultMembership?: typeof getVaultMembership;
 }
 
 /**
@@ -632,7 +668,7 @@ export async function authorizePermissionMutation(
   pathPattern: string,
   targetLevel: PermissionMutationTarget,
   existingRule?: PermissionRule,
-  deps: AuthorizePermissionMutationDeps = { evaluatePermission, requireVaultMember }
+  deps: AuthorizePermissionMutationDeps = { evaluatePermission, requireVaultMember, getVaultMembership }
 ): Promise<AuthorizePermissionMutationResult> {
   // 1. Vault/org admin bypass — unchanged behavior.
   try {
@@ -644,11 +680,14 @@ export async function authorizePermissionMutation(
   }
 
   const aliases = user.email ? [user.email] : [];
+  const membership = await deps.getVaultMembership?.(vault.vaultId, user.userId);
+  const evaluationRoles = membership ? [membership.role] : user.roles;
+  const heldRoles = new Set([...user.roles, ...evaluationRoles].map((role) => role.toLowerCase()));
 
   // 2. Path-scope guardrail. Authorization REQUIRES admin on the path — do NOT
   //    loosen this to let write-holders manage rules (scope-locked).
   const adminCheck = await deps.evaluatePermission(
-    user.userId, user.roles, 'admin', pathPattern, vault.orgId, vault.vaultId,
+    user.userId, evaluationRoles, 'admin', pathPattern, vault.orgId, vault.vaultId,
     { userAliases: aliases }
   );
   if (!adminCheck.allowed) {
@@ -661,7 +700,7 @@ export async function authorizePermissionMutation(
   //    has to survive the deferred folder-admin work, where a caller could hold a
   //    level below admin on the exact rule path while admin is required elsewhere.
   const callerRank = await deriveCallerRank(
-    user.userId, user.roles, pathPattern, vault.orgId, vault.vaultId, aliases,
+    user.userId, evaluationRoles, pathPattern, vault.orgId, vault.vaultId, aliases,
     deps.evaluatePermission
   );
   if (ruleLevelRank(targetLevel.actions, targetLevel.effect) > callerRank) {
@@ -695,10 +734,23 @@ export async function authorizePermissionMutation(
   // WR-02: user.roles is already lowercased+trimmed (extractRolesFromTokenPayload),
   // so lowercase ONLY the rule-side role here — a stored mixed-case role ('Editor')
   // must still match the caller's lowercased held role ('editor').
+  //
+  // WR-04: DynamoDB drops null/undefined attributes when an item is written
+  // with `delete item.role` (the create handler strips `role: null` before
+  // PutItem so the role-index GSI doesn't reject the row). When the rule is
+  // read back, `role` is undefined, not null. The original `!== null` guards
+  // missed this case — `undefined !== null` is true, so the code fell
+  // through to `undefined.toLowerCase()` and threw 500. Same fix as the
+  // existingTargetsSelf branch below (line ~760). And `userId` may be
+  // undefined for legacy role-only rules that pre-date the canonicalization
+  // pass — guard the same way rather than blowing up.
+  const targetUserId = targetLevel.userId;
+  const targetRole = targetLevel.role;
   const targetsSelf =
-    callerAliases.includes(targetLevel.userId.trim().toLowerCase()) ||
-    targetLevel.userId === '*' ||
-    (targetLevel.role !== null && user.roles.includes(targetLevel.role.toLowerCase()));
+    (typeof targetUserId === 'string' &&
+      callerAliases.includes(targetUserId.trim().toLowerCase())) ||
+    targetUserId === '*' ||
+    (typeof targetRole === 'string' && heldRoles.has(targetRole.toLowerCase()));
   if (targetsSelf) {
     // Demotion-to-none of a rule that currently grants the caller admin. Delete is
     // modeled by the handler passing effect:'deny' (the deny sentinel — see the
@@ -738,7 +790,7 @@ export async function authorizePermissionMutation(
           callerAliases.includes(existingRule.userId.trim().toLowerCase())) ||
         existingRule.userId === '*' ||
         (existingRule.role !== null && existingRule.role !== undefined &&
-          user.roles.includes(existingRule.role.toLowerCase()))
+          heldRoles.has(existingRule.role.toLowerCase()))
       )
     : false;
   const existingGrantedCallerAdmin =
@@ -1463,6 +1515,26 @@ export interface OrgSettings {
   allowedDomains: string[];
   retentionDays: number;
   autoLockMinutes: number;
+  /**
+   * When false (default), vault admins/owners and org admins/owners bypass
+   * every per-file deny rule — `evaluatePermission` short-circuits to
+   * allowed=true for them. This is the safe default: lockout-prevention,
+   * backward compatible, and matches the "admins can always see everything"
+   * mental model.
+   *
+   * When true, per-file rules bind admins too. Pete (file-admin on /foo.md)
+   * can write a deny rule that restricts peter@sedmak.sk (org owner) on
+   * that file — the rule actually takes effect for both the access summary
+   * AND the underlying file read/write/delete/list operations. Admins still
+   * have admin rights elsewhere (managing users, vaults, billing) — the
+   * restriction is scoped to file content only, and admins can always
+   * re-elevate themselves via the permission management endpoints (those
+   * still bypass for caller-authorization).
+   *
+   * Surface this via the admin-panel "Allow per-file restrictions on
+   * admins" toggle. Off by default.
+   */
+  allowAdminPerFileRestrictions: boolean;
 }
 
 export type PersistedOrgSettings = Omit<OrgSettings, 'orgId' | 'orgName'>;
@@ -1476,6 +1548,7 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
   allowedDomains: [],
   retentionDays: 365,
   autoLockMinutes: 30,
+  allowAdminPerFileRestrictions: false,
 };
 
 const orgSettingsCache = new Map<string, {
@@ -1607,6 +1680,10 @@ export function normalizeStoredOrgSettings(
     normalized.autoLockMinutes = autoLockMinutes;
   }
 
+  if (typeof rawSettings.allowAdminPerFileRestrictions === 'boolean') {
+    normalized.allowAdminPerFileRestrictions = rawSettings.allowAdminPerFileRestrictions;
+  }
+
   return normalized;
 }
 
@@ -1696,6 +1773,21 @@ export async function getEffectiveOrgSettings(orgId: string): Promise<OrgSetting
     expiresAt: Date.now() + ORG_SETTINGS_CACHE_TTL_MS,
   });
   return settings;
+}
+
+/**
+ * Returns `false` when the org has `allowAdminPerFileRestrictions: true` —
+ * the inverse mapping that target-level evaluators and file-op handlers
+ * pass straight into `evaluatePermission`'s `respectAdminBypass` option.
+ *
+ * Centralizing the lookup here keeps the per-org setting check pinned to
+ * the same cached `getEffectiveOrgSettings()` path the settings endpoint
+ * already uses, so toggling the setting from the admin panel takes effect
+ * within the existing cache TTL (no separate invalidation needed).
+ */
+export async function shouldRespectAdminBypassFor(orgId: string): Promise<boolean> {
+  const settings = await getEffectiveOrgSettings(orgId);
+  return !(settings?.allowAdminPerFileRestrictions === true);
 }
 
 export function invalidateOrgSettingsCache(orgId?: string): void {

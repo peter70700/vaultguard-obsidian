@@ -29,6 +29,7 @@ import {
   evaluatePermission,
   authorizePermissionMutation,
   ruleLevelRank,
+  shouldRespectAdminBypassFor,
   requireOrgId,
   requireVaultMember,
   pathMatchesPattern,
@@ -123,8 +124,25 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       case method === 'GET' && resource === '/vaults/{vaultId}/permissions/user/{userId}':
         return await handleGetUserPermissions(event, user, vault, requestId);
 
-      case method === 'POST' && resource === '/vaults/{vaultId}/permissions':
+      case method === 'POST' && resource === '/vaults/{vaultId}/permissions': {
+        // Two-mode endpoint:
+        //   - body.level (a PathAccessLevel string) → set-level mode: server
+        //     computes inherited level and picks delete/update/create itself.
+        //     This is the canonical entry point from the file/folder
+        //     permission UIs, which only know the desired effective level.
+        //   - otherwise → legacy create mode: caller supplies the exact
+        //     (actions, effect) rule shape, used by the advanced rule editor
+        //     and any API consumers that need direct control.
+        //
+        // Mode-switching is intentionally NOT a separate API Gateway resource
+        // — keeping the dispatch in code means no API Gateway / Terraform
+        // change is required to ship the set-level fix.
+        const probe = parseBody(event);
+        if (typeof probe.level === 'string') {
+          return await handleSetLevel(event, user, vault, requestId, probe);
+        }
         return await handleCreatePermission(event, user, vault, requestId);
+      }
 
       case method === 'PUT' && resource === '/vaults/{vaultId}/permissions/{id}':
         return await handleUpdatePermission(event, user, vault, requestId);
@@ -181,13 +199,39 @@ async function handleListPermissions(
   requestId: string
 ): Promise<APIGatewayProxyResult> {
   // Permission rules can reveal hidden path names and target principals, so
-  // full rule listing is admin-only. Non-admin plugin clients should use the
-  // per-path `/permissions/check` route instead of pulling the rule table.
-  await requireVaultMember(user, vault.vaultId, 'admin');
-
+  // full rule listing is admin-only. A file-level admin may list only rules
+  // that overlap the requested pathFilter, which gives the plugin enough raw
+  // rule IDs to edit that file without leaking unrelated paths.
   const limit = Math.min(parseInt(event.queryStringParameters?.limit || '50', 10), 500);
   const pathFilter = event.queryStringParameters?.pathFilter;
   const effectFilter = event.queryStringParameters?.effectFilter;
+  const pathFilterTarget = pathFilter ? normalizePermissionPath(pathFilter) : null;
+  let fullRuleList = false;
+
+  try {
+    await requireVaultMember(user, vault.vaultId, 'admin');
+    fullRuleList = true;
+  } catch (err) {
+    if (!(err instanceof AuthError)) throw err;
+    if (!pathFilterTarget) {
+      return formatError(403, 'Vault admin access is required to list all permission rules', requestId);
+    }
+
+    const callerRoles = await resolvePermissionRolesForTarget(user.userId, user, vault);
+    const callerAliases = await aliasesForTargetUser(user.userId, user, vault.orgId);
+    const adminCheck = await evaluatePermission(
+      user.userId,
+      callerRoles,
+      'admin',
+      pathFilterTarget,
+      vault.orgId,
+      vault.vaultId,
+      { userAliases: callerAliases }
+    );
+    if (!adminCheck.allowed) {
+      return formatError(403, `You do not have admin on ${pathFilterTarget}`, requestId);
+    }
+  }
 
   let filterExpression: string = 'orgId = :orgId AND vaultId = :vaultId';
   const expressionValues: Record<string, unknown> = {
@@ -195,14 +239,7 @@ async function handleListPermissions(
     ':vaultId': vault.vaultId,
   };
 
-  if (pathFilter && effectFilter) {
-    filterExpression += ' AND contains(pathPattern, :pathFilter) AND #effect = :effectFilter';
-    expressionValues[':pathFilter'] = pathFilter;
-    expressionValues[':effectFilter'] = effectFilter;
-  } else if (pathFilter) {
-    filterExpression += ' AND contains(pathPattern, :pathFilter)';
-    expressionValues[':pathFilter'] = pathFilter;
-  } else if (effectFilter) {
+  if (effectFilter) {
     filterExpression += ' AND #effect = :effectFilter';
     expressionValues[':effectFilter'] = effectFilter;
   }
@@ -220,7 +257,13 @@ async function handleListPermissions(
   }
 
   const result = await docClient.send(new ScanCommand(scanParams as any));
-  const rules = (result.Items || []) as PermissionRule[];
+  let rules = (result.Items || []) as PermissionRule[];
+  if (pathFilterTarget) {
+    rules = rules.filter((rule) => permissionRuleOverlapsPath(rule, pathFilterTarget));
+  }
+  if (!fullRuleList) {
+    rules = rules.slice(0, limit);
+  }
 
   await logAudit({
     userId: user.userId,
@@ -232,7 +275,7 @@ async function handleListPermissions(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { resultCount: rules.length },
+    metadata: { resultCount: rules.length, pathFilter: pathFilterTarget, delegatedFileAdmin: !fullRuleList },
   });
 
   return formatSuccess(
@@ -371,6 +414,7 @@ async function handleCreatePermission(
   const actions = body.actions as string[];
   const effect = body.effect as string;
   const priority = (body.priority as number) || calculatePriority(pathPattern);
+  const upsert = body.upsert === true;
   const expiresAt = typeof body.expiresAt === 'string' && body.expiresAt
     ? body.expiresAt
     : undefined;
@@ -427,6 +471,82 @@ async function handleCreatePermission(
     return samePath && samePrincipal;
   });
   if (duplicate) {
+    if (upsert) {
+      const updates: Record<string, unknown> = {
+        actions: actions as PermissionAction[],
+        effect: effect as 'allow' | 'deny',
+      };
+      if (body.priority !== undefined) updates.priority = priority;
+      if (body.expiresAt !== undefined) {
+        updates.expiresAt = typeof body.expiresAt === 'string' ? body.expiresAt : null;
+      }
+      updates.updatedAt = new Date().toISOString();
+
+      const updateExpression = 'SET ' + Object.keys(updates)
+        .map((key, i) => `#k${i} = :v${i}`)
+        .join(', ');
+      const expressionAttributeNames: Record<string, string> = {};
+      const expressionAttributeValues: Record<string, unknown> = {};
+      Object.keys(updates).forEach((key, i) => {
+        expressionAttributeNames[`#k${i}`] = key;
+        expressionAttributeValues[`:v${i}`] = updates[key];
+      });
+
+      await docClient.send(
+        new UpdateCommand({
+          TableName: PERMISSIONS_TABLE,
+          Key: { pk: duplicate.id, sk: RULE_SK },
+          UpdateExpression: updateExpression,
+          ExpressionAttributeNames: expressionAttributeNames,
+          ExpressionAttributeValues: expressionAttributeValues,
+        })
+      );
+
+      const updatedRule = { ...duplicate, ...updates };
+      await revokeOverlappingLeases(
+        pathPattern,
+        duplicate.userId,
+        duplicate.role,
+        user.userId,
+        vault.orgId,
+        vault.vaultId
+      );
+
+      await recordVaultActivity({
+        orgId: vault.orgId,
+        vaultId: vault.vaultId,
+        action: 'permission_changed',
+        path: pathPattern,
+        actorUserId: user.userId,
+      });
+
+      await logAudit({
+        userId: user.userId,
+        userEmail: user.email,
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        action: 'permissions.update',
+        resourcePath: `/vaults/${vault.vaultId}/permissions/${duplicate.id}`,
+        outcome: 'success',
+        ipAddress: getClientIp(event),
+        userAgent: getUserAgent(event),
+        metadata: {
+          ruleId: duplicate.id,
+          updatedFields: Object.keys(updates).filter((key) => key !== 'updatedAt'),
+          previousValues: Object.keys(updates).reduce((acc, key) => {
+            if (key !== 'updatedAt') acc[key] = (duplicate as unknown as Record<string, unknown>)[key];
+            return acc;
+          }, {} as Record<string, unknown>),
+          viaFileAdmin,
+          targetPrincipal: duplicate.role ? `role:${duplicate.role}` : duplicate.userId,
+          resultingLevel: ruleLevelRank(actions as PermissionAction[], effect as 'allow' | 'deny'),
+          upsert: true,
+        },
+      });
+
+      return formatSuccess(200, { rule: updatedRule, upserted: true }, requestId);
+    }
+
     return formatError(
       409,
       `A permission rule already exists for this user on ${pathPattern}. Update the existing rule instead.`,
@@ -639,7 +759,10 @@ async function handleUpdatePermission(
     user, vault, updatedPath,
     {
       userId: targetUserId,
-      role: (updates.role as string | null) ?? existingRule.role,
+      // role normalization (WR-04): see handleSetLevel for the rationale —
+      // DDB returns `role` as undefined when the row was written without
+      // the attribute, so coalesce to null before passing to the helper.
+      role: (updates.role as string | null) ?? existingRule.role ?? null,
       actions: (updates.actions as PermissionAction[]) ?? existingRule.actions,
       effect: (updates.effect as 'allow' | 'deny') ?? existingRule.effect,
     },
@@ -805,7 +928,8 @@ async function handleDeletePermission(
     (await canonicalizeRuleUserId(existingRule.userId, vault.orgId)) ?? existingRule.userId;
   const { viaFileAdmin } = await authorizePermissionMutation(
     user, vault, existingRule.pathPattern,
-    { userId: targetUserId, role: existingRule.role, actions: existingRule.actions, effect: 'deny' },
+    // role normalization (WR-04): same DDB-strip rationale as handleSetLevel.
+    { userId: targetUserId, role: existingRule.role ?? null, actions: existingRule.actions, effect: 'deny' },
     existingRule
   );
 
@@ -1126,6 +1250,431 @@ async function handleBatchPathAccess(
   return formatSuccess(200, { summaries }, requestId);
 }
 
+// ─── POST /vaults/{vaultId}/permissions/set-level ──────────────────────────
+//
+// **The canonical endpoint for "make user X have level L on path P".**
+//
+// Why a dedicated endpoint instead of POST/PUT /permissions:
+//
+// A permission rule is shaped as `{actions: PermissionAction[], effect:
+// 'allow'|'deny'}` — one rule carries ONE effect. The user-facing concept
+// "Bob should have read access on /foo.md" can require an allow rule
+// (Bob's membership doesn't grant read), a deny-cap (Bob's membership
+// grants write and we need to STRIP write/delete/admin while leaving
+// read to fall through to inheritance), or no rule at all (inheritance
+// already matches). Picking the right shape requires knowing Bob's
+// INHERITED level — i.e., the level Bob would have if no exact rule on
+// /foo.md existed. The UI does not have that data (it only sees Bob's
+// CURRENT effective level, which includes any existing exact rule on
+// /foo.md), so it cannot reliably build the right mutation on its own.
+//
+// The matrix test
+// (tests/permission-transition-matrix.test.ts) exposes the gap: every
+// surface that built mutations from `currentLevel` instead of
+// `inheritedLevel` produced incorrect end states for some scenario
+// (viewer + admin-allow → write produced effective=read; editor +
+// deny-cap → read produced effective=write; etc.).
+//
+// This endpoint accepts (userId|role, pathPattern, level) and on the
+// server side:
+//   1. Loads any existing exact rule for that principal on that path.
+//   2. Evaluates the principal's level on the path WITH the existing
+//      rule excluded (the "inherited" level — membership defaults plus
+//      any broader rules).
+//   3. Compares inherited vs target and picks exactly one of:
+//        - delete the exact rule (inherited === target)
+//        - upsert a deny-cap rule (inherited > target)
+//        - upsert an allow rule (inherited < target)
+//   4. Applies the same authorization (authorizePermissionMutation),
+//      audit, lease-revocation, and cursor-bump as create/update/delete.
+//
+// The legacy POST/PUT /permissions endpoints remain for raw rule edits
+// (the advanced rule editor) and for API consumers that want exact
+// control over actions/effect; they are NOT removed.
+async function handleSetLevel(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string,
+  preParsedBody?: Record<string, unknown>
+): Promise<APIGatewayProxyResult> {
+  const body = preParsedBody ?? parseBody(event);
+  validateRequiredFields(body, ['pathPattern', 'level']);
+
+  let userId = (body.userId as string) || '*';
+  const role = (body.role as string | null) || null;
+  const pathPattern = body.pathPattern as string;
+  const level = body.level as PathAccessLevel;
+
+  if (!pathPattern.startsWith('/')) {
+    return formatError(400, 'pathPattern must start with /', requestId);
+  }
+  if (!['none', 'read', 'write', 'admin'].includes(level)) {
+    return formatError(400, `Invalid level: '${level}'`, requestId);
+  }
+  if (!role && userId !== '*') {
+    const canonicalUserId = await canonicalizeRuleUserId(userId, vault.orgId);
+    if (!canonicalUserId) {
+      return formatError(400, `Unknown user in this organization: ${userId}`, requestId);
+    }
+    userId = canonicalUserId;
+  }
+
+  // Vault admins/owners get an unconditional bypass in evaluatePermission
+  // (utils.ts: `if (rolesIncludeOrgAdmin(roles)) return allowed=true`), so
+  // any per-file deny rule written against them is a no-op. We reject the
+  // mutation loudly rather than let it persist a silently-ineffective rule
+  // — UNLESS the org has opted into
+  // `allowAdminPerFileRestrictions`. With that toggle on,
+  // evaluatePermission stops bypassing for admins on the target-side
+  // resolution paths, so a per-file deny rule against an admin actually
+  // takes effect; we let the mutation through. (Allowing `level === 'admin'`
+  // unconditionally is a true no-op either way, so it always passes.)
+  if (!role && userId !== '*' && level !== 'admin') {
+    const adminsBypass = await shouldRespectAdminBypassFor(vault.orgId);
+    if (adminsBypass) {
+      const targetMembership = await getVaultMembership(vault.vaultId, userId);
+      const targetVaultRole = targetMembership?.role?.toLowerCase();
+      if (targetVaultRole === 'admin' || targetVaultRole === 'owner') {
+        return formatError(
+          400,
+          `Cannot change per-file access for a vault ${targetVaultRole} — their access is granted by their vault role and overrides any per-file rule. Demote the vault role first or turn on "Allow per-file restrictions on admins" in org settings.`,
+          requestId
+        );
+      }
+    }
+  }
+
+  // 1. Find any existing exact rule for this principal on this path.
+  //    Vault-global rule table (only id is unique), so we filter by
+  //    principal + path here rather than relying on a composite key.
+  const existingUserRules = await fetchAllUserRules(
+    userId,
+    vault.orgId,
+    vault.vaultId,
+    role ? [role] : []
+  );
+  const existing = existingUserRules.find((rule) => {
+    const samePath = rule.pathPattern === pathPattern;
+    const samePrincipal = role
+      ? rule.role === role
+      : !rule.role && rule.userId === userId;
+    return samePath && samePrincipal;
+  }) ?? null;
+
+  // 2. Compute the principal's INHERITED level on this path — what would
+  //    they have if no exact rule on this path existed? This drives the
+  //    delete-vs-cap-vs-grant decision.
+  const aliases = !role && userId !== '*'
+    ? await aliasesForAccessTarget(userId, user, vault.orgId, new Map())
+    : [];
+  const evaluationRoles = role
+    ? [role]
+    : (userId === '*'
+        ? []
+        : await resolvePermissionRolesForTarget(userId, user, vault));
+  const inheritedLevel = await computeInheritedAccessLevel(
+    userId,
+    evaluationRoles,
+    pathPattern,
+    vault,
+    aliases,
+    existing?.id ?? null
+  );
+
+  const targetRank = pathAccessLevelRank(level);
+  const inheritedRank = pathAccessLevelRank(inheritedLevel);
+
+  // 3. Decide the action.
+  //    NOTE: every branch authorizes via the SAME authorizePermissionMutation
+  //    used by the create/update/delete handlers — never inline a bypass here.
+  const now = new Date().toISOString();
+
+  if (targetRank === inheritedRank) {
+    if (!existing) {
+      // Inheritance already matches, no rule on this path. No-op.
+      await logAudit({
+        userId: user.userId,
+        userEmail: user.email,
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        action: 'permissions.set-level',
+        resourcePath: `/vaults/${vault.vaultId}/permissions/set-level`,
+        outcome: 'success',
+        ipAddress: getClientIp(event),
+        userAgent: getUserAgent(event),
+        metadata: {
+          decision: 'noop',
+          pathPattern,
+          targetUserId: userId,
+          role,
+          level,
+          inheritedLevel,
+        },
+      });
+      return formatSuccess(200, {
+        decision: 'noop',
+        level,
+        inheritedLevel,
+        rule: null,
+      }, requestId);
+    }
+    // Delete the exact rule so inheritance reasserts.
+    // Delete-as-deny sentinel matches the delete handler's contract with
+    // authorizePermissionMutation.
+    //
+    // role normalization (WR-04 defense-in-depth): DDB drops the `role`
+    // attribute entirely when an item is written with `delete item.role`
+    // (handleCreatePermission strips `role: null` before PutItem so the
+    // role-index GSI doesn't reject the row). Reading it back gives
+    // `undefined`, not null — feed `?? null` into the helper so the
+    // null-typed contract holds even though the storage layer surfaces
+    // undefined.
+    await authorizePermissionMutation(
+      user, vault, existing.pathPattern,
+      {
+        userId: existing.userId,
+        role: existing.role ?? null,
+        actions: existing.actions,
+        effect: 'deny',
+      },
+      existing
+    );
+    await docClient.send(
+      new DeleteCommand({
+        TableName: PERMISSIONS_TABLE,
+        Key: { pk: existing.id, sk: RULE_SK },
+      })
+    );
+    await revokeOverlappingLeases(
+      existing.pathPattern,
+      existing.userId,
+      existing.role,
+      user.userId,
+      vault.orgId,
+      vault.vaultId
+    );
+    await recordVaultActivity({
+      orgId: vault.orgId,
+      vaultId: vault.vaultId,
+      action: 'permission_changed',
+      path: existing.pathPattern,
+      actorUserId: user.userId,
+    });
+    await logAudit({
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      action: 'permissions.set-level',
+      resourcePath: `/vaults/${vault.vaultId}/permissions/set-level`,
+      outcome: 'success',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: {
+        decision: 'delete',
+        deletedRuleId: existing.id,
+        pathPattern,
+        targetUserId: userId,
+        role,
+        level,
+        inheritedLevel,
+      },
+    });
+    return formatSuccess(200, {
+      decision: 'delete',
+      level,
+      inheritedLevel,
+      rule: null,
+    }, requestId);
+  }
+
+  // 4. Build the right mutation shape for downgrade vs upgrade.
+  let actions: PermissionAction[];
+  let effect: 'allow' | 'deny';
+  if (targetRank < inheritedRank) {
+    // Deny-cap: strip the actions above target so inheritance falls
+    // through for the actions ≤ target.
+    const denyActions: PermissionAction[] = [];
+    if (targetRank < 1) denyActions.push('read', 'list');
+    if (targetRank < 2) denyActions.push('write', 'delete');
+    if (targetRank < 3) denyActions.push('admin');
+    actions = denyActions;
+    effect = 'deny';
+  } else {
+    actions = levelToActions(level);
+    effect = 'allow';
+  }
+
+  await authorizePermissionMutation(
+    user, vault, pathPattern,
+    { userId, role, actions, effect },
+    existing ?? undefined
+  );
+
+  let resultRule: PermissionRule;
+  let decision: 'update' | 'create';
+
+  if (existing) {
+    const updates: Record<string, unknown> = {
+      actions,
+      effect,
+      updatedAt: now,
+    };
+    const updateExpression = 'SET ' + Object.keys(updates)
+      .map((_, i) => `#k${i} = :v${i}`)
+      .join(', ');
+    const expressionAttributeNames: Record<string, string> = {};
+    const expressionAttributeValues: Record<string, unknown> = {};
+    Object.keys(updates).forEach((key, i) => {
+      expressionAttributeNames[`#k${i}`] = key;
+      expressionAttributeValues[`:v${i}`] = updates[key];
+    });
+    await docClient.send(
+      new UpdateCommand({
+        TableName: PERMISSIONS_TABLE,
+        Key: { pk: existing.id, sk: RULE_SK },
+        UpdateExpression: updateExpression,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+      })
+    );
+    resultRule = { ...existing, actions, effect, updatedAt: now };
+    decision = 'update';
+  } else {
+    const ruleId = generateId();
+    const rule: PermissionRule = {
+      id: ruleId,
+      orgId: vault.orgId,
+      vaultId: vault.vaultId,
+      userId,
+      role,
+      pathPattern,
+      actions,
+      effect,
+      priority: calculatePriority(pathPattern),
+      createdAt: now,
+      updatedAt: now,
+      createdBy: user.userId,
+    };
+    const item: Record<string, unknown> = { ...rule, pk: ruleId, sk: RULE_SK };
+    if (item.role === null) delete item.role;
+    await docClient.send(
+      new PutCommand({
+        TableName: PERMISSIONS_TABLE,
+        Item: item,
+      })
+    );
+    resultRule = rule;
+    decision = 'create';
+  }
+
+  await revokeOverlappingLeases(
+    pathPattern,
+    userId,
+    role,
+    user.userId,
+    vault.orgId,
+    vault.vaultId
+  );
+  await recordVaultActivity({
+    orgId: vault.orgId,
+    vaultId: vault.vaultId,
+    action: 'permission_changed',
+    path: pathPattern,
+    actorUserId: user.userId,
+  });
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'permissions.set-level',
+    resourcePath: `/vaults/${vault.vaultId}/permissions/set-level`,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: {
+      decision,
+      ruleId: resultRule.id,
+      pathPattern,
+      targetUserId: userId,
+      role,
+      level,
+      inheritedLevel,
+      actions,
+      effect,
+    },
+  });
+
+  return formatSuccess(200, {
+    decision,
+    level,
+    inheritedLevel,
+    rule: resultRule,
+  }, requestId);
+}
+
+/**
+ * Effective level for a principal on a path with a specific rule treated as
+ * if it did not exist. Probes the same admin→write→read ordering as
+ * `resolvePathAccessLevel` so the answers line up bit-for-bit with the
+ * level the access-summary endpoint would return after a delete.
+ */
+async function computeInheritedAccessLevel(
+  userId: string,
+  roles: string[],
+  path: string,
+  vault: VaultRecord,
+  aliases: string[],
+  excludeRuleId: string | null
+): Promise<PathAccessLevel> {
+  const excludeIds = excludeRuleId ? [excludeRuleId] : [];
+  const probes: Array<{ action: PermissionAction; level: PathAccessLevel }> = [
+    { action: 'admin', level: 'admin' },
+    { action: 'write', level: 'write' },
+    { action: 'read', level: 'read' },
+  ];
+  // Set-level uses inherited to decide delete-vs-cap-vs-grant. We must
+  // probe with the SAME bypass policy the access summary uses, otherwise
+  // an admin's "inherited" level reads as "admin" via bypass even when
+  // `allowAdminPerFileRestrictions` is on — and set-level would refuse to
+  // create the deny rule (target==inherited==admin → delete branch),
+  // making the toggle a no-op.
+  const respectAdminBypass = await shouldRespectAdminBypassFor(vault.orgId);
+  for (const probe of probes) {
+    const result = await evaluatePermission(
+      userId,
+      roles,
+      probe.action,
+      path,
+      vault.orgId,
+      vault.vaultId,
+      { userAliases: aliases, excludeRuleIds: excludeIds, respectAdminBypass }
+    );
+    if (result.allowed) return probe.level;
+  }
+  return 'none';
+}
+
+function pathAccessLevelRank(level: PathAccessLevel): number {
+  switch (level) {
+    case 'admin': return 3;
+    case 'write': return 2;
+    case 'read': return 1;
+    default: return 0;
+  }
+}
+
+function levelToActions(level: PathAccessLevel): PermissionAction[] {
+  switch (level) {
+    case 'admin': return ['read', 'write', 'delete', 'admin', 'list'];
+    case 'write': return ['read', 'write', 'delete', 'list'];
+    case 'read': return ['read', 'list'];
+    default: return [];
+  }
+}
+
 /**
  * Shared per-path evaluator used by both the single-path and batch endpoints.
  * The caller is responsible for fetching `directory` (Cognito identity map)
@@ -1320,6 +1869,11 @@ function normalizePermissionPath(path: string): string {
   return normalized.startsWith('/') ? normalized : `/${normalized}`;
 }
 
+function permissionRuleOverlapsPath(rule: PermissionRule, targetPath: string): boolean {
+  const rulePath = normalizePermissionPath(rule.pathPattern);
+  return pathMatchesPattern(targetPath, rulePath) || pathMatchesPattern(rulePath, targetPath);
+}
+
 async function resolvePermissionRolesForTarget(
   targetUserId: string,
   caller: UserContext,
@@ -1382,6 +1936,13 @@ async function resolvePathAccessLevel(
     { action: 'read', level: 'read' },
   ];
 
+  // Target-side level computation honors the per-org
+  // `allowAdminPerFileRestrictions` toggle — when ON, admins are subject to
+  // per-file deny rules and the access summary reflects the restricted
+  // level instead of the unconditional "admin" the bypass would otherwise
+  // return. See shared/utils.ts:OrgSettings for the full design rationale.
+  const respectAdminBypass = await shouldRespectAdminBypassFor(vault.orgId);
+
   for (const check of checks) {
     const result = await evaluatePermission(
       userId,
@@ -1390,7 +1951,7 @@ async function resolvePathAccessLevel(
       path,
       vault.orgId,
       vault.vaultId,
-      { userAliases: aliases }
+      { userAliases: aliases, respectAdminBypass }
     );
     if (result.allowed) return check.level;
   }
