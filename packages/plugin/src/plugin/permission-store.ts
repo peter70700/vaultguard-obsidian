@@ -97,9 +97,26 @@ let metadataCacheWarnedOnce = false;
 
 // ── Store ────────────────────────────────────────────────────────────────────
 
+/**
+ * Wave 2 Fix 2 (1.0.31): observable store state so consumers (file
+ * header, file-explorer decorations, sidebar) can render a neutral
+ * skeleton until the warm-up actually lands. The pre-fix store had no
+ * way to distinguish "ready" from "we just haven't fetched yet" from
+ * "we tried to fetch and got a 401" — collapsing the latter two into
+ * the viewer-baseline lie was the 2026-05-31 Pete incident.
+ */
+export type PermissionStoreState =
+  | { kind: "cold" }
+  | { kind: "warming" }
+  | { kind: "warmed"; warmedAt: number }
+  | { kind: "fetch-failed"; statusCode: number | null; failedAt: number };
+
 export class PermissionStore extends Events {
   /** Unified permission cache. Empty-string key = vault root (warm-up seed). */
   private cache: Map<string, CacheEntry> = new Map();
+
+  /** Wave 2 Fix 2 (1.0.31): observable store state. */
+  private state: PermissionStoreState = { kind: "cold" };
 
   /** Concurrent-call deduplication (R-09-01). Same in-flight promise returned for same path. */
   private inFlight: Map<string, Promise<PermissionLevel>> = new Map();
@@ -217,9 +234,65 @@ export class PermissionStore extends Events {
    * Synchronous cache probe. Used by Plan 09-02 / 09-03 fan-out handlers to
    * check "did this path just drop to NONE without firing another fetch".
    * Returns `undefined` when the path is uncached.
+   *
+   * Wave 2 Fix 2 (1.0.31): kept as a literal-cache probe — the bug Fix 2
+   * prevents is the root-sentinel poisoning that happened when
+   * `runWarm` was called with an empty rule set after a fetch failure.
+   * That seeding never happens now (the fetch-failed path skips
+   * `runWarm` entirely; only the state flag flips). Direct cache reads
+   * via `getPermission` still populate entries that this probe should
+   * see, so this method intentionally does NOT consult `state`.
+   * Consumers that want to render based on lifecycle (skeleton vs
+   * chip) call `getStoreState()` instead.
    */
   getCachedPermission(path: string): PermissionLevel | undefined {
     return this.cache.get(path)?.level;
+  }
+
+  /**
+   * Wave 2 Fix 2 (1.0.31): exposes the store's lifecycle state so the
+   * file header, file-explorer decorations, sidebar, and read-only
+   * guard can render a loading skeleton (or a retry affordance, on
+   * `fetch-failed`) instead of inventing a baseline answer.
+   */
+  getStoreState(): PermissionStoreState {
+    return this.state;
+  }
+
+  /** Wave 2 Fix 2 (1.0.31): set before a warm-up cycle starts. */
+  markWarming(): void {
+    if (this.state.kind === "warming") return;
+    this.state = { kind: "warming" };
+    this.notifyStoreStateChanged();
+  }
+
+  /**
+   * Wave 2 Fix 2 (1.0.31): set when `runPermissionWarmup`'s rule fetch
+   * fails. The cache itself is left untouched — pre-existing warm
+   * entries from an earlier successful warm stay usable until a new
+   * warm overwrites them. The state flip is what tells consumers to
+   * render the skeleton / retry affordance.
+   */
+  markFetchFailed(statusCode: number | null): void {
+    this.state = {
+      kind: "fetch-failed",
+      statusCode,
+      failedAt: Date.now(),
+    };
+    this.notifyStoreStateChanged();
+  }
+
+  /**
+   * Wave 2 Fix 2 (1.0.31): fires the lifecycle-only `state-changed`
+   * event. Distinct from `changed` because `changed` triggers
+   * `handleChanged`'s wildcard invalidation, which would wipe the very
+   * cache entries `runWarm` just populated. UI consumers that want to
+   * re-render on lifecycle flip (skeleton ↔ chip) subscribe to
+   * `state-changed`; cache-invalidation consumers continue to use
+   * `changed`. Tests assert both paths in isolation.
+   */
+  private notifyStoreStateChanged(): void {
+    this.trigger("state-changed", { storeState: this.state });
   }
 
   // ── Warm-up ────────────────────────────────────────────────────────────────
@@ -252,8 +325,14 @@ export class PermissionStore extends Events {
     if (!session) return;
 
     // Org-level admins/owners take the fast path — every getPermission call
-    // short-circuits via the admin shortcut. No warm-up state needed.
+    // short-circuits via the admin shortcut. No warm-up state needed, but we
+    // still flip state to `warmed` (Wave 2 Fix 2, 1.0.31) so the file
+    // header / decorations stop showing the skeleton — admins always have
+    // the answer locally. Uses the lifecycle-only event so we don't
+    // trip handleChanged's wildcard invalidation.
     if (session.role === "admin" || session.role === "owner") {
+      this.state = { kind: "warmed", warmedAt: Date.now() };
+      this.notifyStoreStateChanged();
       return;
     }
 
@@ -293,6 +372,15 @@ export class PermissionStore extends Events {
       if (existing && existing.level >= level) continue;
       this.cache.set(cacheKey, { level, fetchedAt: 0 });
     }
+
+    // Wave 2 Fix 2 (1.0.31): flip the state to `warmed` so consumers
+    // can stop rendering the skeleton. Uses the lifecycle-only
+    // `state-changed` event so handleChanged's wildcard invalidation
+    // does NOT wipe the cache entries we just seeded above. UI
+    // consumers (file-permission-header) subscribe to this event
+    // explicitly via `permissionStore.on('state-changed', ...)`.
+    this.state = { kind: "warmed", warmedAt: Date.now() };
+    this.notifyStoreStateChanged();
   }
 
   // ── Event bus surface ──────────────────────────────────────────────────────
@@ -308,7 +396,11 @@ export class PermissionStore extends Events {
    */
   emit(
     name: "changed",
-    payload?: { path?: string; serverConfirmed?: boolean }
+    payload?: {
+      path?: string;
+      serverConfirmed?: boolean;
+      storeState?: PermissionStoreState;
+    }
   ): void {
     this.trigger(name, payload ?? {});
   }

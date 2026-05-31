@@ -125,6 +125,17 @@ const LOG_PREFIX = "[VaultGuard]";
 const MAX_SWEEP_ENTRIES = 5000;
 
 /**
+ * Hard cap on per-session permission warmup retries. After this many
+ * back-off retries fail, the store stays in `fetch-failed` until the
+ * user does something explicit (focus event, login, settings change),
+ * to avoid spinning forever in a degraded network. The store still
+ * functions in `fetch-failed`: per-file network probes via
+ * `getEffectivePermission`'s slow path still work; only the cache
+ * pre-population is disabled. Pairs with Wave 2 Fix 2 (1.0.31).
+ */
+const MAX_WARMUP_RETRIES = 3;
+
+/**
  * Plugin id -> list of historical plugin ids whose lak.envelope may still be
  * on disk and should be migrated INTO this id's folder before the at-rest
  * cipher initializes. Generic shape so a future rename appends cleanly.
@@ -178,6 +189,17 @@ interface ProtectedSessionEnvelope {
 type AccessTokenRefreshResult =
   | { ok: true }
   | { ok: false; message: string; error?: unknown };
+
+/**
+ * Result shape for `collectRulesForWarmup` (Wave 2 Fix 2, 1.0.31).
+ * The discriminator lets `runPermissionWarmup` decide between "seed the
+ * cache" and "schedule a retry" — the pre-fix code returned an empty
+ * array for both cases, which silently poisoned the cache with the
+ * viewer-baseline whenever the rules fetch 401'd.
+ */
+type WarmupRulesResult =
+  | { kind: "ok"; rules: PermissionRule[] }
+  | { kind: "fetch-failed"; statusCode: number | null; error: unknown };
 
 interface RemoteFileContentResponse {
   content: string;
@@ -514,6 +536,13 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private hasWarmedAtLeastOnce = false;
 
+  /**
+   * Wave 2 Fix 2 (1.0.31): per-session warmup-retry tracking. Resets
+   * on every successful warm and on explicit user actions (focus,
+   * login). Cap is `MAX_WARMUP_RETRIES`.
+   */
+  private warmupRetryCount = 0;
+  private warmupRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Queue of operations made while offline */
   private offlineQueue: Array<{
@@ -2145,6 +2174,16 @@ export default class VaultGuardPlugin extends Plugin {
     // Token refresh happens in background from onload.
     this.session = storedSession;
     this.initializeApiClientFromSession(storedSession);
+
+    // Wave 2 issue A (1.0.31): seed vaultMemberRole from the stored
+    // session so the imminent runPermissionWarmup uses the real role.
+    // refreshVaultMemberRole inside resumeStoredSession will still
+    // overwrite this with the server-confirmed value once the background
+    // resume lands; this prior is the best-effort answer for the gap.
+    if (storedSession.vaultMemberRole !== undefined) {
+      this.vaultMemberRole = storedSession.vaultMemberRole;
+    }
+
     this.log(`Session restored for user: ${storedSession.displayName}`);
     this.updateStatusBar();
 
@@ -2831,18 +2870,128 @@ export default class VaultGuardPlugin extends Plugin {
    * Fetches the applicable rule set so the caller can hand it to
    * `permissionStore.warm(rules, vaultRole)`. The store is decoupled from
    * the rule-fetch choice (D-04), so the call shape lives here.
+   *
+   * Wave 2 Fix 2 (1.0.31): returns a discriminated union so callers can
+   * tell the difference between "user genuinely has no rules" and
+   * "we couldn't fetch them". The pre-fix shape (return `[]` on error)
+   * was the silent-poison vector behind the 2026-05-31 Pete incident —
+   * an API failure looked identical to "this user has no permissions"
+   * and seeded the store with the viewer baseline.
    */
-  private async collectRulesForWarmup(): Promise<PermissionRule[]> {
-    if (!this.session || !this.apiClient) return [];
-    if (this.session.role === "admin" || this.session.role === "owner") return [];
+  private async collectRulesForWarmup(): Promise<WarmupRulesResult> {
+    if (!this.session || !this.apiClient) {
+      return { kind: "ok", rules: [] };
+    }
+    if (this.session.role === "admin" || this.session.role === "owner") {
+      return { kind: "ok", rules: [] };
+    }
     try {
-      return this.isEffectiveAdmin()
+      const rules = this.isEffectiveAdmin()
         ? await this.apiClient.getPermissions()
         : await this.apiClient.getUserPermissions(this.session.userId);
+      return { kind: "ok", rules };
     } catch (err) {
-      this.log(`Permission warm-up: rules fetch failed: ${(err as Error).message}`);
-      return [];
+      const statusCode = this.extractStatusCode(err);
+      this.log(
+        `Permission warm-up: rules fetch failed (status=${statusCode ?? "?"}): ${(err as Error).message}`
+      );
+      return { kind: "fetch-failed", statusCode, error: err };
     }
+  }
+
+  /**
+   * Best-effort status-code extraction for an unknown thrown value.
+   * Covers our `ApiClient` error shape, Obsidian `requestUrl` errors,
+   * and plain `Response`-style objects.
+   */
+  private extractStatusCode(err: unknown): number | null {
+    if (!err || typeof err !== "object") return null;
+    const candidate = err as {
+      statusCode?: unknown;
+      status?: unknown;
+      response?: { status?: unknown; statusCode?: unknown } | undefined;
+    };
+    const direct = candidate.statusCode ?? candidate.status;
+    if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+    const nested = candidate.response?.statusCode ?? candidate.response?.status;
+    if (typeof nested === "number" && Number.isFinite(nested)) return nested;
+    return null;
+  }
+
+  /**
+   * Picks a backoff delay for the next warmup retry given the status
+   * code of the failure that triggered it. 401/403 typically means the
+   * idToken on the request didn't pass API Gateway authoriser — the
+   * apiClient's auto-refresh should land before the retry; a short delay
+   * is fine. 5xx → server hiccup → wait a bit more. Anything else (incl.
+   * `null` for network errors) → assume the device is offline-ish and
+   * wait a full minute.
+   */
+  private pickWarmupRetryDelayMs(statusCode: number | null): number {
+    if (statusCode === 401 || statusCode === 403) return 5_000;
+    if (statusCode !== null && statusCode >= 500) return 30_000;
+    return 60_000;
+  }
+
+  /**
+   * Schedules a single warmup retry. Capped at MAX_WARMUP_RETRIES per
+   * session — after that, only an explicit user action (focus, login,
+   * settings change) re-fires.
+   */
+  private scheduleWarmupRetry(statusCode: number | null): void {
+    if (this.warmupRetryCount >= MAX_WARMUP_RETRIES) {
+      this.log(
+        `Permission warm-up: retry cap reached (${MAX_WARMUP_RETRIES}); waiting for focus / explicit refresh.`
+      );
+      return;
+    }
+    if (this.warmupRetryTimer !== null) {
+      // Already a retry scheduled — leave it alone.
+      return;
+    }
+    this.warmupRetryCount += 1;
+    const delayMs = this.pickWarmupRetryDelayMs(statusCode);
+    this.log(
+      `Permission warm-up: scheduling retry ${this.warmupRetryCount}/${MAX_WARMUP_RETRIES} in ${delayMs}ms (status=${statusCode ?? "?"}).`
+    );
+    this.warmupRetryTimer = setTimeout(() => {
+      this.warmupRetryTimer = null;
+      void this.runPermissionWarmup().catch((err) =>
+        this.logError("Permission warm-up retry failed (non-blocking)", err)
+      );
+    }, delayMs);
+  }
+
+  private resetWarmupRetryState(): void {
+    this.warmupRetryCount = 0;
+    if (this.warmupRetryTimer !== null) {
+      clearTimeout(this.warmupRetryTimer);
+      this.warmupRetryTimer = null;
+    }
+  }
+
+  /**
+   * Wave 2 issue D (1.0.31): focus-triggered re-warm. Self-heals the
+   * permission cache after long backgrounding without forcing the
+   * user through a logout/login dance. Skips the retry-cap when
+   * invoked from a user-visible signal — focus is an explicit
+   * "I'm here, please catch up" intent.
+   */
+  private maybeRewarmOnFocus(): void {
+    if (!this.session || !this.settings.serverVaultId) return;
+    const state = this.permissionStore.getStoreState();
+    if (state.kind === "warming") return;
+    if (state.kind === "warmed") {
+      const ageMs = Date.now() - state.warmedAt;
+      if (ageMs < 5 * 60 * 1000) return;
+    }
+    // Cold, fetch-failed, or stale-warmed → fire a fresh warm-up.
+    // Reset the retry counter so a fetch-failed state that exhausted
+    // its quiet-retries can recover on user-visible focus.
+    this.resetWarmupRetryState();
+    void this.runPermissionWarmup().catch((err) =>
+      this.logError("Focus-triggered permission warm-up failed (non-blocking)", err)
+    );
   }
 
   /**
@@ -2857,13 +3006,25 @@ export default class VaultGuardPlugin extends Plugin {
     if (!this.session || !this.apiClient || !this.settings.serverVaultId) {
       return;
     }
+    this.permissionStore.markWarming();
     this.permissionWarmupInFlight = this.permissionWarmupInFlight + 1;
     this.updateStatusBar();
     const cycle = (async () => {
       try {
-        const rules = await this.collectRulesForWarmup();
-        await this.permissionStore.warm(rules, this.vaultMemberRole);
+        const result = await this.collectRulesForWarmup();
+        if (result.kind === "fetch-failed") {
+          // Wave 2 Fix 2 (1.0.31): do NOT seed the store with an empty
+          // rule set when the fetch itself failed — that would put the
+          // cache into the silent-poison state the 2026-05-31 incident
+          // exposed. Mark the store fetch-failed (consumers render
+          // skeleton) and schedule a status-aware retry.
+          this.permissionStore.markFetchFailed(result.statusCode);
+          this.scheduleWarmupRetry(result.statusCode);
+          return;
+        }
+        await this.permissionStore.warm(result.rules, this.vaultMemberRole);
         this.hasWarmedAtLeastOnce = true;
+        this.resetWarmupRetryState();
       } finally {
         this.permissionWarmupInFlight = Math.max(0, this.permissionWarmupInFlight - 1);
         this.updateStatusBar();
@@ -7098,6 +7259,14 @@ export default class VaultGuardPlugin extends Plugin {
       void this.performSync().catch((err) =>
         this.logError("Focus-triggered sync failed", err)
       );
+      // Wave 2 issue D (1.0.31): self-heal the permission cache on
+      // focus. Catches the case where the initial warm-up ran while
+      // tokens were still being refreshed (Fix 1 patches the
+      // post-refresh side; this catches the longer-tail "Obsidian was
+      // backgrounded for an hour, come back to find a stale cache"
+      // case). Fires only if the store needs it — `warmed` < 5 min
+      // ago is a no-op.
+      this.maybeRewarmOnFocus();
     };
 
     this.registerDomEvent(window, "focus", trigger);
@@ -8966,6 +9135,22 @@ export default class VaultGuardPlugin extends Plugin {
       })
     );
 
+    // Wave 2 Fix 2 (1.0.31): also subscribe to the lifecycle-only
+    // `state-changed` event so the header re-renders when the store
+    // flips between cold / warming / fetch-failed / warmed. Without
+    // this, a fetch-failed → warmed transition (the typical recovery
+    // after Fix 1's post-refresh re-warm) would leave the header
+    // showing whatever data it last loaded from the per-file probe
+    // path until the next file open. `state-changed` is intentionally
+    // wildcard — we invalidate the whole ruleCache so every visible
+    // surface re-renders with the warmed authoritative data.
+    this.registerEvent(
+      this.permissionStore.on("state-changed", () => {
+        this.filePermissionHeader?.invalidateCache();
+        void this.filePermissionHeader?.update();
+      })
+    );
+
     // Initial render if a file is already open
     this.filePermissionHeader.update();
   }
@@ -9755,12 +9940,23 @@ export default class VaultGuardPlugin extends Plugin {
     const bindingId = this.getSessionBindingId();
     if (!bindingId) return;
 
-    let protectedSession = this.protectSessionForStorage(session);
+    // Wave 2 issue A (1.0.31): stamp the last-known vaultMemberRole
+    // onto the session before sealing. On the next plugin reload,
+    // restoreSession reads this back so the initial warmup uses the
+    // real role instead of synthesizing one from session.role —
+    // closes the race that mattered for users whose org role and
+    // vault role disagree.
+    const sessionToPersist: UserSession = {
+      ...session,
+      vaultMemberRole: this.vaultMemberRole ?? session.vaultMemberRole ?? null,
+    };
+
+    let protectedSession = this.protectSessionForStorage(sessionToPersist);
     if (!protectedSession) {
       // Desktop with broken keychain or mobile renderer — try the at-rest
       // cipher before warning. On mobile this is the normal path and the
       // user shouldn't see any Notice at all.
-      protectedSession = await this.protectSessionWithAtRest(session);
+      protectedSession = await this.protectSessionWithAtRest(sessionToPersist);
     }
     if (!protectedSession) {
       this.notifySafeStorageUnavailable();
@@ -9897,7 +10093,20 @@ export default class VaultGuardPlugin extends Plugin {
       role: parsed.role,
       roles: roles.length > 0 ? roles : [parsed.role],
       createdAt: parsed.createdAt,
+      // Wave 2 issue A (1.0.31): preserve the last-known vault role
+      // across plugin reloads. Optional, so older envelopes without
+      // the field stay valid; `null` means "we don't know, fall back
+      // to the synthesized derivation".
+      vaultMemberRole: this.isValidVaultMemberRole(parsed.vaultMemberRole)
+        ? parsed.vaultMemberRole
+        : null,
     };
+  }
+
+  private isValidVaultMemberRole(
+    value: unknown
+  ): value is "admin" | "editor" | "viewer" {
+    return value === "admin" || value === "editor" || value === "viewer";
   }
 
   private isValidSessionRole(value: unknown): value is UserSession["role"] {

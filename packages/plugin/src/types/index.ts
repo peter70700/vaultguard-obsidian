@@ -215,6 +215,16 @@ export interface UserSession {
   roles: string[];
   /** ISO 8601 timestamp of session creation */
   createdAt: string;
+  /**
+   * Wave 2 issue A (1.0.31): last-known per-vault role for this user
+   * on `serverVaultId`, stamped at `persistSession` time. Restored
+   * before the initial `runPermissionWarmup` fires so the warm-up
+   * doesn't synthesize a fallback from `session.role` while the real
+   * value is still null (pre-fix race). The server-confirmed value
+   * still overwrites this on `refreshVaultMemberRole`; this field is
+   * a best-effort prior, not a source of truth.
+   */
+  vaultMemberRole?: "admin" | "editor" | "viewer" | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

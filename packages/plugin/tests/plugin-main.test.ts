@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Menu, Notice, requestUrl } from "obsidian";
 
@@ -20,12 +20,24 @@ const mockRequestUrl = vi.mocked(requestUrl);
 function installTestPermissionStore(plugin: any): Map<string, number> {
   const cache = new Map<string, number>();
   const listeners: Array<(payload: { path?: string; serverConfirmed?: boolean }) => void> = [];
+  // Wave 2 Fix 2 (1.0.31): track the lifecycle state in the fixture so
+  // tests can assert state transitions via getStoreState().
+  let storeState: any = { kind: "cold" };
 
   plugin.permissionStore = {
     getCachedPermission: (path: string) => cache.get(path),
     getPermission: async (path: string) => cache.get(path) ?? 0,
-    warm: vi.fn(async () => undefined),
+    warm: vi.fn(async () => {
+      storeState = { kind: "warmed", warmedAt: Date.now() };
+    }),
     sweepLeavesAfterWarm: vi.fn(async () => undefined),
+    markWarming: vi.fn(() => {
+      storeState = { kind: "warming" };
+    }),
+    markFetchFailed: vi.fn((statusCode: number | null) => {
+      storeState = { kind: "fetch-failed", statusCode, failedAt: Date.now() };
+    }),
+    getStoreState: () => storeState,
     emit: (_name: string, payload: { path?: string; serverConfirmed?: boolean } = {}) => {
       if (payload.path !== undefined) {
         cache.delete(payload.path);
@@ -2495,5 +2507,173 @@ describe("VaultGuardPlugin resumeStoredSession — 1.0.30 Fix 1 + Fix 4", () => 
     plugin.lastSessionDegradedNoticeAt = Date.now() - 61_000;
     await plugin.resumeStoredSession();
     expect(mockNotice).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1.0.31 (Fix 2 + Issue A + Issue D): warmup discriminated result, retry
+// scheduling, vaultMemberRole persistence, focus re-warm
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("VaultGuardPlugin runPermissionWarmup — 1.0.31 Fix 2", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function makeWarmupPlugin(opts: {
+    fetchOutcome: "ok" | "401" | "500" | "network";
+    sessionRole?: "member" | "editor" | "admin" | "owner";
+  }) {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), role: opts.sessionRole ?? "member", roles: [opts.sessionRole ?? "member"] };
+    plugin.vaultMemberRole = "viewer";
+
+    const apiClient = {
+      getUserPermissions: vi.fn(async () => {
+        if (opts.fetchOutcome === "ok") return [];
+        if (opts.fetchOutcome === "401") {
+          const err: Error & { statusCode?: number } = new Error("unauth");
+          err.statusCode = 401;
+          throw err;
+        }
+        if (opts.fetchOutcome === "500") {
+          const err: Error & { statusCode?: number } = new Error("server");
+          err.statusCode = 503;
+          throw err;
+        }
+        // network error — no statusCode
+        throw new Error("network blew up");
+      }),
+      getPermissions: vi.fn(async () => []),
+    };
+    plugin.apiClient = apiClient;
+    plugin.isEffectiveAdmin = vi.fn(() => false);
+    return { plugin, apiClient };
+  }
+
+  it("on successful fetch: store flips to warmed, retry counter resets", async () => {
+    const { plugin } = makeWarmupPlugin({ fetchOutcome: "ok" });
+
+    await plugin.runPermissionWarmup();
+
+    expect(plugin.permissionStore.getStoreState().kind).toBe("warmed");
+    expect(plugin.warmupRetryCount).toBe(0);
+  });
+
+  it("on 401 fetch failure: store flips to fetch-failed, retry scheduled with 5s backoff", async () => {
+    const { plugin, apiClient } = makeWarmupPlugin({ fetchOutcome: "401" });
+
+    await plugin.runPermissionWarmup();
+
+    const state = plugin.permissionStore.getStoreState();
+    expect(state.kind).toBe("fetch-failed");
+    expect(state.statusCode).toBe(401);
+    expect(plugin.warmupRetryCount).toBe(1);
+    expect(plugin.warmupRetryTimer).not.toBeNull();
+
+    // Advance 5s → retry fires.
+    apiClient.getUserPermissions.mockResolvedValueOnce([]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    // After the retry's warmup resolves, the timer is cleared and the
+    // counter reset on success.
+    await Promise.resolve();
+    expect(plugin.permissionStore.getStoreState().kind).toBe("warmed");
+    expect(plugin.warmupRetryCount).toBe(0);
+  });
+
+  it("on 5xx fetch failure: retry uses 30s backoff", async () => {
+    const { plugin } = makeWarmupPlugin({ fetchOutcome: "500" });
+    await plugin.runPermissionWarmup();
+    expect(plugin.warmupRetryCount).toBe(1);
+
+    // 29s isn't enough.
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(plugin.warmupRetryCount).toBe(1);
+    // 30s lands the retry.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(plugin.warmupRetryCount).toBe(2);
+  });
+
+  it("on network error (no statusCode): retry uses 60s backoff", async () => {
+    const { plugin } = makeWarmupPlugin({ fetchOutcome: "network" });
+    await plugin.runPermissionWarmup();
+    expect(plugin.warmupRetryCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(plugin.warmupRetryCount).toBe(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(plugin.warmupRetryCount).toBe(2);
+  });
+
+  it("retry caps at MAX_WARMUP_RETRIES (3) per session", async () => {
+    const { plugin } = makeWarmupPlugin({ fetchOutcome: "401" });
+    // First attempt + 3 retries = 4 total scheduling attempts; the 4th
+    // attempt to schedule is the no-op.
+    await plugin.runPermissionWarmup();
+    expect(plugin.warmupRetryCount).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(plugin.warmupRetryCount).toBe(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(plugin.warmupRetryCount).toBe(3);
+    // 4th retry attempt — should be capped.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(plugin.warmupRetryCount).toBe(3);
+    expect(plugin.warmupRetryTimer).toBeNull();
+  });
+
+  it("maybeRewarmOnFocus resets retry state and forces a re-fire even after the cap", async () => {
+    const { plugin } = makeWarmupPlugin({ fetchOutcome: "401" });
+    await plugin.runPermissionWarmup();
+    plugin.warmupRetryCount = 3; // simulate already capped
+
+    // Focus signal — user-visible intent, bypasses the cap.
+    plugin.maybeRewarmOnFocus();
+
+    expect(plugin.warmupRetryCount).toBe(0);
+  });
+});
+
+describe("VaultGuardPlugin vaultMemberRole persistence — 1.0.31 Issue A", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  it("persistSession stamps current vaultMemberRole onto the protected envelope", async () => {
+    const plugin = makePlugin();
+    installFakeSafeStorage();
+    plugin.session = makeSession();
+    plugin.vaultMemberRole = "editor";
+    plugin.derivedBindingId = "test-binding";
+
+    let capturedPlaintext = "";
+    plugin.protectSessionForStorage = vi.fn((session: unknown) => {
+      capturedPlaintext = JSON.stringify(session);
+      return { v: 1, storage: "electron-safe-storage", ciphertext: "x" };
+    });
+    plugin.savePluginData = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.persistSession(plugin.session);
+
+    const parsed = JSON.parse(capturedPlaintext);
+    expect(parsed.vaultMemberRole).toBe("editor");
+  });
+
+  it("materializeSession round-trips vaultMemberRole when present and absent", () => {
+    const plugin = makePlugin();
+    const withRole = plugin.materializeSession({
+      ...makeSession(),
+      vaultMemberRole: "admin",
+    });
+    expect(withRole?.vaultMemberRole).toBe("admin");
+
+    const withoutRole = plugin.materializeSession({ ...makeSession() });
+    expect(withoutRole?.vaultMemberRole).toBeNull();
   });
 });

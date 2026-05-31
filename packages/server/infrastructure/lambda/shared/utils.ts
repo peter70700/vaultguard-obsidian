@@ -570,26 +570,7 @@ export async function evaluatePermission(
   // of the system assumes.
   const respectAdminBypass = options.respectAdminBypass !== false;
   const callerIsOrgAdmin = rolesIncludeOrgAdmin(roles);
-  // Per-user debug seam — see debugUserLog. We synthesize a minimal user
-  // shape from the evaluation inputs because evaluatePermission's args
-  // include only userId+roles; the email is needed to match the allow-list.
-  // The userAliases passed in by file-op handlers carry the email — sample
-  // the first one as a best-effort identity for the debug log.
-  const debugEmail = (options.userAliases ?? []).find((alias) => alias.includes('@'));
-  const debugUser: DebugUserContext = { userId, roles, email: debugEmail };
-  debugUserLog(debugUser, 'evaluatePermission.entry', {
-    action,
-    path,
-    orgId,
-    vaultId,
-    respectAdminBypass,
-    callerIsOrgAdmin,
-    excludeRuleIds: options.excludeRuleIds ?? [],
-  });
   if (respectAdminBypass && callerIsOrgAdmin) {
-    debugUserLog(debugUser, 'evaluatePermission.result', {
-      action, path, allowed: true, reason: 'org-admin-bypass',
-    });
     return { allowed: true, matchedRule: null, evaluatedRules: [] };
   }
 
@@ -628,10 +609,6 @@ export async function evaluatePermission(
     // an explicit rule for. See the comment above the bypass block for the
     // 2026-05-31 incident this fix unblocks.
     if (callerIsOrgAdmin) {
-      debugUserLog(debugUser, 'evaluatePermission.result', {
-        action, path, allowed: true, reason: 'org-admin-baseline',
-        liveRuleCount: liveRules.length,
-      });
       return { allowed: true, matchedRule: null, evaluatedRules: liveRules };
     }
     // Vault membership default — when a member has no rule that covers the
@@ -641,19 +618,8 @@ export async function evaluatePermission(
     // gets 403 on every file in their own vault.
     const membership = await getVaultMembership(vaultId, userId);
     if (membership && vaultRoleAllowsAction(membership.role, action)) {
-      debugUserLog(debugUser, 'evaluatePermission.result', {
-        action, path, allowed: true,
-        reason: 'membership-default', vaultRole: membership.role,
-        liveRuleCount: liveRules.length,
-      });
       return { allowed: true, matchedRule: null, evaluatedRules: liveRules };
     }
-    debugUserLog(debugUser, 'evaluatePermission.result', {
-      action, path, allowed: false,
-      reason: membership ? 'membership-role-disallows' : 'no-membership-no-rule',
-      vaultRole: membership?.role ?? null,
-      liveRuleCount: liveRules.length,
-    });
     return { allowed: false, matchedRule: null, evaluatedRules: liveRules };
   }
 
@@ -668,21 +634,6 @@ export async function evaluatePermission(
   });
 
   const winningRule = sorted[0];
-
-  debugUserLog(debugUser, 'evaluatePermission.result', {
-    action, path,
-    allowed: winningRule.effect === 'allow',
-    reason: 'rule-match',
-    matchedRule: {
-      id: winningRule.id,
-      pathPattern: winningRule.pathPattern,
-      effect: winningRule.effect,
-      actions: winningRule.actions,
-      priority: winningRule.priority,
-      principal: winningRule.role ? `role:${winningRule.role}` : winningRule.userId,
-    },
-    matchingRuleCount: matchingRules.length,
-  });
 
   return {
     allowed: winningRule.effect === 'allow',
@@ -1511,10 +1462,12 @@ export function isAdmin(user: UserContext): boolean {
 // affected Lambda(s), and use `scripts/query-debug-logs.mjs` to read back.
 // Remove instrumented calls (or empty the allow-list) once the investigation
 // is over so production logs stay clean.
-const DEBUG_USER_EMAILS = new Set<string>([
-  'peter@sedmak.sk',
-  'pete.sedmak@gmail.com',
-]);
+// 1.0.31 cleanup: emptied after the 2026-05-31 Pete investigation
+// closed (Wave 1 + Wave 2 fixes shipped). Helper kept for future
+// investigations — add an email here, insert one-off `debugUserLog`
+// calls in the code paths under investigation, redeploy, query via
+// `scripts/query-debug-logs.mjs`, then empty this set again.
+const DEBUG_USER_EMAILS = new Set<string>();
 
 interface DebugUserContext {
   email?: string;
