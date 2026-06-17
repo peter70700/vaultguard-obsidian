@@ -254,6 +254,8 @@ export interface PermissionMutationInput {
   actions: Array<"read" | "write" | "delete" | "admin" | "list">;
   effect: "allow" | "deny";
   priority?: number;
+  /** ISO timestamp; when set, the rule auto-expires (timed/time-bound access). */
+  expiresAt?: string | null;
   /**
    * When true, POST /permissions updates an existing exact principal/path rule
    * instead of returning a duplicate-rule conflict.
@@ -279,6 +281,12 @@ export interface OrgSettingsResponse {
    * editable for vault admins/owners — off by default.
    */
   allowAdminPerFileRestrictions?: boolean;
+  /**
+   * Audit actions the org has opted OUT of recording. The backend's
+   * `logAudit` skips writing a row whenever its action appears here. Empty
+   * by default (every action logged). Edited via the AuditConfigModal.
+   */
+  disabledAuditActions?: string[];
 }
 
 export interface QueuedRequest {

@@ -83,6 +83,7 @@ import {
   parsePositiveInteger,
   parseNonNegativeInteger,
   normalizeAllowedDomains,
+  normalizeDisabledAuditActions,
   isEmailAllowedForOrg,
   invalidateOrgSettingsCache,
 } from '../shared/utils';
@@ -1451,6 +1452,7 @@ async function persistOrgSettings(org: OrgRecord, settings: OrgSettings): Promis
     retentionDays: settings.retentionDays,
     autoLockMinutes: settings.autoLockMinutes,
     allowAdminPerFileRestrictions: settings.allowAdminPerFileRestrictions,
+    disabledAuditActions: settings.disabledAuditActions,
   };
 
   await docClient.send(
@@ -1536,6 +1538,9 @@ async function handleUpdateOrgSettings(
       typeof body.allowAdminPerFileRestrictions === 'boolean'
         ? body.allowAdminPerFileRestrictions
         : currentSettings.allowAdminPerFileRestrictions,
+    disabledAuditActions:
+      normalizeDisabledAuditActions(body.disabledAuditActions, currentSettings.disabledAuditActions) ??
+      currentSettings.disabledAuditActions,
   };
 
   await persistOrgSettings(org, settings);

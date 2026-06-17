@@ -449,13 +449,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     if (!session) {
       new Setting(sectionEl)
         .setName("Not connected")
-        .setDesc("Log in before viewing, binding, creating, or changing server vaults.")
-        .addButton((button) =>
-          button
-            .setButtonText("Login")
-            .setCta()
-            .onClick(() => this.plugin.triggerLogin())
-        );
+        .setDesc("Log in from the Account section above to view, bind, create, or change server vaults.");
       return;
     }
 
@@ -561,6 +555,20 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.handleSwitchVault(rootEl, button, boundId ? "Switch vault" : "Pick vault");
           })
       );
+
+    if (boundId) {
+      new Setting(sectionEl)
+        .setName("Permissions")
+        .setDesc(
+          "View and manage every permission rule for this vault — the same table-style configuration as the web admin panel. (The per-file controls in the editor header are separate.)"
+        )
+        .addButton((button) =>
+          button
+            .setButtonText("Manage permissions")
+            .setCta()
+            .onClick(() => this.plugin.showPermissionRulesModal())
+        );
+    }
 
     if (currentVault?.description) {
       sectionEl.createDiv({
@@ -1316,12 +1324,32 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               this.plugin.triggerLogin();
             })
         );
+
+      // Single login entry point above. Point self-hosters at the Connection
+      // section (manual configuration) instead of a second login button.
+      if (!isManualMode) {
+        const selfHostNote = containerEl.createDiv({
+          cls: "setting-item-description vaultguard-selfhost-note",
+        });
+        selfHostNote.appendText("Self-hosting your own VaultGuard server? ");
+        const link = selfHostNote.createEl("a", {
+          text: "Configure it in Connection settings",
+          href: "#",
+        });
+        link.addEventListener("click", (e) => {
+          e.preventDefault();
+          containerEl
+            .querySelector("#vaultguard-connection-section")
+            ?.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+        selfHostNote.appendText(" below (switch to manual configuration).");
+      }
     }
 
     this.renderCurrentVaultSettings(containerEl, session);
 
     // ── Connection Settings ─────────────────────────────────────────────────
-    containerEl.createEl("h2", { text: "Connection" });
+    containerEl.createEl("h2", { text: "Connection", attr: { id: "vaultguard-connection-section" } });
 
     new Setting(containerEl)
       .setName("Connected to")
@@ -1356,15 +1384,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     if (!isManualMode) {
       new Setting(containerEl)
         .setName("VaultGuard Cloud")
-        .setDesc("Uses the bundled api.example.com and Cognito configuration.")
-        .addButton((button) =>
-          button
-            .setButtonText("Continue")
-            .setCta()
-            .onClick(() => {
-              this.plugin.triggerLogin();
-            })
-        )
+        .setDesc("Uses the bundled api.example.com and Cognito configuration. Sign in from the Account section above.")
         .addButton((button) =>
           button
             .setButtonText("Reset")

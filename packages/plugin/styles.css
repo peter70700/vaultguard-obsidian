@@ -685,6 +685,64 @@
   background: var(--background-secondary);
 }
 
+/* ─── Audit logging config modal ─────────────────────────────────────────── */
+.vaultguard-audit-config-subtitle {
+  margin: 0 0 12px;
+  color: var(--text-muted);
+}
+
+.vaultguard-audit-config-summary {
+  margin-bottom: 8px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+.vaultguard-audit-config-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 12px;
+}
+
+.vaultguard-audit-config-tab {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 6px 10px;
+  font-weight: 600;
+}
+
+.vaultguard-audit-config-tab:hover {
+  color: var(--text-normal);
+}
+
+.vaultguard-audit-config-tab.is-active {
+  color: var(--interactive-accent);
+  border-bottom-color: var(--interactive-accent);
+}
+
+.vaultguard-audit-config-bulk {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.vaultguard-audit-config-list {
+  max-height: 45vh;
+  overflow-y: auto;
+}
+
+.vaultguard-audit-config-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
 .vaultguard-audit-vault-title {
   font-size: 0.92em;
   font-weight: 700;
@@ -4553,4 +4611,79 @@ button .vaultguard-btn-spinner:only-child {
   display: flex;
   justify-content: flex-end;
   margin-top: 16px;
+}
+.vaultguard-selfhost-note {
+  margin: 4px 0 12px;
+}
+
+/* ── Vault-wide permission rules manager (admin-panel-style table) ───────── */
+.vaultguard-rules-modal {
+  width: min(900px, 92vw);
+}
+.vaultguard-rules-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
+.vaultguard-rules-toolbar .vaultguard-search-input {
+  flex: 1;
+}
+.vaultguard-rules-table-wrap {
+  max-height: 60vh;
+  overflow: auto;
+}
+.vaultguard-rules-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.vaultguard-rules-table th,
+.vaultguard-rules-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  vertical-align: middle;
+}
+.vaultguard-rules-table th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  position: sticky;
+  top: 0;
+  background: var(--background-primary);
+  z-index: 1;
+}
+.vaultguard-rules-table code {
+  font-size: 12px;
+  word-break: break-all;
+}
+.vaultguard-rules-muted {
+  color: var(--text-muted);
+}
+.vaultguard-rules-row-actions {
+  display: flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+.vaultguard-effect-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.vaultguard-effect-allow {
+  background: rgba(52, 199, 89, 0.16);
+  color: var(--text-success, #2ecc71);
+}
+.vaultguard-effect-deny {
+  background: rgba(255, 69, 58, 0.16);
+  color: var(--text-error, #ff5a52);
+}
+.vaultguard-error-text {
+  color: var(--text-error, #ff5a52);
+  padding: 12px 0;
 }

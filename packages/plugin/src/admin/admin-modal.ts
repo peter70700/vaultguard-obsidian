@@ -19,6 +19,7 @@ import {
   VaultRecord,
 } from "../api/client";
 import { PermissionEditor } from "./permission-editor";
+import { PermissionRulesView } from "../ui/permission-rules-view";
 import { buildFallbackOrgSettings, shouldUseFallbackOrgSettings } from "./settings-support";
 import { UserManager } from "./user-manager";
 import { getAccessUserDisplayName } from "../ui/access-user-utils";
@@ -44,6 +45,9 @@ type AdminModalContext = {
    * server. Optional — if absent, all options are shown (historic behavior).
    */
   features?: ServerFeatures;
+  /** Called after a vault-access rule changes so the plugin can refresh the
+   *  file header, file-explorer decorations, and sidebar. */
+  onPermissionsChanged?: () => void;
 };
 type PermissionAccessSummary = {
   pathLabel: string;
@@ -289,34 +293,39 @@ export class AdminModal extends Modal {
   private async renderPermissionsTab(): Promise<void> {
     const container = this.contentContainer.createDiv({ cls: "vaultguard-permissions-tab" });
 
-    container.createEl("h3", {
-      text: this.permissionsUserId ? "My vault access" : "Current vault access",
-    });
+    // Admin "Vault access": the full rules table (search, add / edit / delete,
+    // principal dropdowns, level, priority, expiry) — same as the web admin
+    // panel. The per-user "My vault access" view keeps the read-only tree.
+    if (!this.permissionsUserId) {
+      const view = new PermissionRulesView(this.apiClient, container, {
+        currentUser: {
+          id: this.context.currentUser?.id,
+          orgRole: this.context.currentUser?.orgRole,
+          roles: this.context.currentUser?.roles,
+          vaultRole: this.context.currentUser?.vaultRole,
+        },
+        onChanged: this.context.onPermissionsChanged,
+      });
+      view.mount();
+      return;
+    }
+
+    container.createEl("h3", { text: "My vault access" });
     container.createDiv({
       cls: "setting-item-description vaultguard-admin-tab-description",
-      text: this.permissionsUserId
-        ? "Your vault role plus any direct rules returned for your account in the currently bound server vault."
-        : "Path rules for the server vault currently bound to this Obsidian folder.",
+      text:
+        "Your vault role plus any direct rules returned for your account in the currently bound server vault.",
     });
 
-    // Toolbar
     const toolbar = container.createDiv({ cls: "vaultguard-toolbar" });
     const treeContainer = container.createDiv({ cls: "vaultguard-permission-tree" });
     container.addEventListener("vaultguard-refresh-permissions", async () => {
       await this.renderPermissionTree(treeContainer);
     });
-
-    if (!this.permissionsUserId) {
-      new ButtonComponent(toolbar)
-        .setButtonText("Add Rule")
-        .setCta()
-        .onClick(() => this.permissionEditor.showAddRuleDialog(container));
-    } else {
-      toolbar.createSpan({
-        text: "Your currently assigned rule set.",
-        cls: "vaultguard-status-text",
-      });
-    }
+    toolbar.createSpan({
+      text: "Your currently assigned rule set.",
+      cls: "vaultguard-status-text",
+    });
 
     // Rule list grouped visually by path pattern
     await this.renderPermissionTree(treeContainer);
@@ -628,7 +637,33 @@ export class AdminModal extends Modal {
     return "vaultguard-level-read";
   }
 
+  /**
+   * Guards against self-lockout: deleting a rule that grants the current user
+   * their own `admin` (permission-management) access would leave them unable to
+   * manage permissions here. Org admins bypass all rules, so they can never
+   * lock themselves out and are exempt.
+   */
+  private wouldDeleteOwnAdminRule(rule: PermissionRule): boolean {
+    const cu = this.context.currentUser;
+    if (!cu?.id) return false;
+    const roles = [cu.orgRole, ...(cu.roles ?? [])].filter(
+      (role): role is string => Boolean(role)
+    );
+    if (this.rolesIncludeOrgAdmin(roles)) return false;
+    if (rule.effect !== "allow" || !rule.actions.includes("admin")) return false;
+    const appliesToSelf =
+      rule.userId === cu.id ||
+      (!!rule.role && (roles.includes(rule.role) || cu.vaultRole === rule.role));
+    return appliesToSelf;
+  }
+
   private async confirmDeletePermission(rule: PermissionRule, container: HTMLElement): Promise<void> {
+    if (this.wouldDeleteOwnAdminRule(rule)) {
+      new Notice(
+        "You can't delete a rule that grants your own admin access — ask another admin to do it."
+      );
+      return;
+    }
     const confirmed = await this.showConfirmDialog(
       "Delete Permission Rule",
       `Delete the ${this.formatPrincipalLabel(rule)} rule on "${rule.pathPattern}"? This cannot be undone.`

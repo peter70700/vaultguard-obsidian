@@ -287,6 +287,31 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
  * @param requestId - Request ID for tracing
  * @returns Session details (no key material)
  */
+/**
+ * Resolves the vault a session/auth audit event should be attributed to.
+ *
+ * Login and logout are org-level, but the audit log is queried per-vault
+ * (vaultId-index GSI), so a login/logout written without a vaultId is
+ * invisible in every vault's audit view. The plugin sends the vault it is
+ * bound to; we stamp the audit row with it so the event shows up where an
+ * admin actually looks — but only after confirming membership, so a client
+ * can't inject its login into a vault it doesn't belong to. Best-effort:
+ * any failure simply yields an unscoped (org-level) audit row as before.
+ */
+async function resolveAuditVaultId(
+  user: UserContext,
+  body: Record<string, unknown>
+): Promise<string | undefined> {
+  const vaultId = typeof body.vaultId === 'string' ? body.vaultId.trim() : '';
+  if (!vaultId) return undefined;
+  try {
+    await requireVaultMember(user, vaultId);
+    return vaultId;
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleLogin(
   event: APIGatewayProxyEvent,
   requestId: string
@@ -324,11 +349,15 @@ async function handleLogin(
     })
   );
 
-  // Step 3: Audit log
+  // Step 3: Audit log. Attribute the login to the plugin's bound vault (when
+  // the user is a member) so it surfaces in that vault's audit view, which is
+  // queried by the vaultId-index GSI.
+  const auditVaultId = await resolveAuditVaultId(user, parseBody(event));
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
     orgId: user.orgId,
+    vaultId: auditVaultId,
     action: 'auth.login',
     resourcePath: '/auth/login',
     outcome: 'success',
@@ -557,10 +586,12 @@ async function handleLogout(
   await invalidateSession(sessionId);
   const revokedLeaseCount = await revokeSessionLeases(sessionId, user.userId, user.orgId);
 
+  const auditVaultId = await resolveAuditVaultId(user, body);
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
     orgId: user.orgId,
+    vaultId: auditVaultId,
     action: 'auth.logout',
     resourcePath: '/auth/logout',
     outcome: 'success',

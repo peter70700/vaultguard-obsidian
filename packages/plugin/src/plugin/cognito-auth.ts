@@ -19,6 +19,67 @@ export interface CognitoAuthResult {
 }
 
 /**
+ * Sentinel pool id that puts the plugin into local dev-server auth mode.
+ * Matches the value documented in docs/SETUP.md (Option A) and the admin
+ * panel's IS_LOCAL_DEV branch (admin-panel/src/lib/auth.ts).
+ */
+export const LOCAL_DEV_POOL_ID = "local-dev";
+
+/** True when the plugin is configured to authenticate against the local dev server. */
+export function isLocalDevAuth(userPoolId: string): boolean {
+  return userPoolId === LOCAL_DEV_POOL_ID;
+}
+
+/**
+ * Authenticate against the local dev server's mock `/auth/login` endpoint
+ * (dev-server/server.ts) instead of Cognito. The dev server returns
+ * Cognito-shaped JWT tokens for the seeded test accounts, so the rest of the
+ * login flow is identical to the real path.
+ *
+ * Without this branch, `cognitoLogin` would derive a region of "local-dev"
+ * from the pool id and POST to https://cognito-idp.local-dev.amazonaws.com/,
+ * which fails with net::ERR_NAME_NOT_RESOLVED.
+ */
+export async function devServerLogin(
+  apiBaseUrl: string,
+  email: string,
+  password: string
+): Promise<CognitoAuthResult> {
+  const base = apiBaseUrl.replace(/\/+$/, "");
+  if (!base) {
+    throw new Error("API endpoint must be configured for local dev login.");
+  }
+
+  const response = await requestUrl({
+    url: `${base}/auth/login`,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+    throw: false,
+  });
+
+  const data = response.json ?? {};
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(data.message || data.Message || "Invalid email or password.");
+  }
+
+  const tokens = data.tokens ?? {};
+  if (!tokens.idToken) {
+    throw new Error("Dev server did not return a valid session token.");
+  }
+
+  return {
+    tokens: {
+      accessToken: tokens.accessToken ?? tokens.idToken,
+      idToken: tokens.idToken,
+      refreshToken: tokens.refreshToken ?? "",
+      expiresIn: 3600,
+    },
+  };
+}
+
+/**
  * Authenticate a user against Cognito using email/password.
  * Handles USER_PASSWORD_AUTH and NEW_PASSWORD_REQUIRED / MFA challenges.
  */
@@ -387,6 +448,88 @@ export async function cognitoConfirmForgotPassword(
     throw new Error("Reset code has expired. Please request a new one.");
   }
   if (errorType.includes('InvalidPasswordException')) {
+    throw new Error("Password must be 12+ characters with uppercase, lowercase, numbers, and symbols.");
+  }
+  throw new Error(data.message || data.Message || "Password reset failed.");
+}
+
+/**
+ * Initiate a password reset through the VaultGuard backend (not Cognito).
+ *
+ * The backend's POST /auth/forgot-password generates the reset code and sends
+ * a branded email via SES, deliberately bypassing Cognito's built-in
+ * ForgotPassword flow (see infrastructure/lambda/auth/handler.ts). Calling
+ * Cognito's ForgotPassword directly from the plugin produced no email when the
+ * pool has its native email delivery disabled — which is why the reset code
+ * never arrived when triggered from Obsidian.
+ *
+ * The endpoint always returns a generic success (even for unknown emails) to
+ * avoid account enumeration, so we surface failures only for real server
+ * errors and rate limiting.
+ */
+export async function vaultguardForgotPassword(
+  apiBaseUrl: string,
+  clientId: string,
+  email: string
+): Promise<void> {
+  const base = apiBaseUrl.replace(/\/+$/, "");
+  if (!base) {
+    throw new Error("API endpoint must be configured to reset your password.");
+  }
+
+  const response = await requestUrl({
+    url: `${base}/auth/forgot-password`,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, clientId }),
+    throw: false,
+  });
+
+  if (response.status >= 200 && response.status < 300) {
+    return;
+  }
+
+  const data = response.json ?? {};
+  if (response.status === 429 || (data.__type ?? "").includes("LimitExceeded")) {
+    throw new Error("Too many attempts. Please wait before trying again.");
+  }
+  throw new Error(data.message || data.Message || "Unable to send reset code right now. Please try again later.");
+}
+
+/**
+ * Confirm a password reset via the VaultGuard backend's POST /auth/confirm-reset
+ * using the emailed code and a new password. Mirrors the admin panel flow.
+ */
+export async function vaultguardConfirmReset(
+  apiBaseUrl: string,
+  clientId: string,
+  email: string,
+  code: string,
+  newPassword: string
+): Promise<void> {
+  const base = apiBaseUrl.replace(/\/+$/, "");
+  if (!base) {
+    throw new Error("API endpoint must be configured to reset your password.");
+  }
+
+  const response = await requestUrl({
+    url: `${base}/auth/confirm-reset`,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, code, newPassword, clientId }),
+    throw: false,
+  });
+
+  if (response.status >= 200 && response.status < 300) {
+    return;
+  }
+
+  const data = response.json ?? {};
+  const errorType = data.__type || "";
+  if (errorType.includes("CodeMismatch") || response.status === 400) {
+    throw new Error(data.message || "Invalid or expired reset code. Please check and try again.");
+  }
+  if (errorType.includes("InvalidPassword")) {
     throw new Error("Password must be 12+ characters with uppercase, lowercase, numbers, and symbols.");
   }
   throw new Error(data.message || data.Message || "Password reset failed.");

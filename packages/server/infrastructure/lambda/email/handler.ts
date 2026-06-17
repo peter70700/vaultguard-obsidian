@@ -366,7 +366,7 @@ function buildInvitationEmail(params: InvitationParams): { subject: string; html
       </table>
     `)}
 
-    ${renderButton('Open in Obsidian & Set Password', deepLink)}
+    ${renderButton('Set Your Password', adminFallbackUrl)}
 
     <p style="margin:0 0 12px 0;font-size:15px;color:${TEXT_COLOR};font-weight:600;">
       How to get started
@@ -375,41 +375,34 @@ function buildInvitationEmail(params: InvitationParams): { subject: string; html
       <tr>
         <td style="padding:8px 0;font-size:14px;color:${TEXT_COLOR};line-height:1.6;">
           <span style="display:inline-block;width:24px;height:24px;line-height:24px;text-align:center;border-radius:50%;background:${ACCENT_LIGHT};color:${ACCENT};font-weight:700;font-size:12px;margin-right:10px;border:1px solid #dbe8ff;">1</span>
-          Install the <strong>VaultGuard</strong> plugin in Obsidian (Settings &rarr; Community plugins).
+          Click <strong>Set Your Password</strong> above. The VaultGuard web panel opens; request the verification code sent to ${renderBadge(params.username)}, enter it, and choose your password.
         </td>
       </tr>
       <tr>
         <td style="padding:8px 0;font-size:14px;color:${TEXT_COLOR};line-height:1.6;">
           <span style="display:inline-block;width:24px;height:24px;line-height:24px;text-align:center;border-radius:50%;background:${ACCENT_LIGHT};color:${ACCENT};font-weight:700;font-size:12px;margin-right:10px;border:1px solid #dbe8ff;">2</span>
-          Click the button above. Obsidian opens, the plugin auto-configures, and the password-setup screen appears.
+          Install the <strong>VaultGuard</strong> plugin in Obsidian (Settings &rarr; Community plugins).
         </td>
       </tr>
       <tr>
         <td style="padding:8px 0;font-size:14px;color:${TEXT_COLOR};line-height:1.6;">
           <span style="display:inline-block;width:24px;height:24px;line-height:24px;text-align:center;border-radius:50%;background:${ACCENT_LIGHT};color:${ACCENT};font-weight:700;font-size:12px;margin-right:10px;border:1px solid #dbe8ff;">3</span>
-          Send the verification code to ${renderBadge(params.username)}, enter it, choose your password, and you're in.
+          Enter your organization slug ${params.orgSlug ? renderBadge(params.orgSlug) : '(from your admin)'} in the plugin settings and log in with ${renderBadge(params.username)} and your new password.
         </td>
       </tr>
     </table>
 
     <div style="background-color:${BG_ELEVATED};border-radius:8px;border:1px solid ${BORDER_COLOR};padding:16px 20px;margin:0 0 16px 0;">
       <p style="margin:0 0 8px 0;font-size:13px;color:${TEXT_COLOR};line-height:1.6;font-weight:600;">
-        Button didn't open Obsidian?
+        Prefer to finish setup inside Obsidian?
       </p>
       <p style="margin:0 0 10px 0;font-size:13px;color:${TEXT_MUTED};line-height:1.6;">
         Install the VaultGuard plugin first, then in Obsidian go to
         <strong style="color:${TEXT_COLOR};">Settings &rarr; VaultGuard &rarr; Redeem invite link</strong>
-        and paste this URL:
+        and paste this link (email clients can't open <code style="font-family:monospace;">obsidian://</code> links directly):
       </p>
       <p style="margin:0;font-size:12px;color:${TEXT_COLOR};line-height:1.5;word-break:break-all;font-family:'SF Mono',Monaco,'Cascadia Code','Courier New',monospace;background:${BG_CARD};border:1px solid ${BORDER_COLOR};border-radius:6px;padding:10px 12px;">
         ${escapeHtml(deepLink)}
-      </p>
-    </div>
-
-    <div style="background-color:${BG_ELEVATED};border-radius:8px;border:1px solid ${BORDER_COLOR};padding:16px 20px;margin:0 0 16px 0;">
-      <p style="margin:0;font-size:13px;color:${TEXT_MUTED};line-height:1.6;">
-        <strong style="color:${TEXT_COLOR};">Prefer the web admin panel?</strong>
-        <a href="${escapeHtml(adminFallbackUrl)}" style="color:${ACCENT};">Set your password there</a> instead, then install the plugin and enter the org slug ${params.orgSlug ? renderBadge(params.orgSlug) : ''} in Settings.
       </p>
     </div>
 

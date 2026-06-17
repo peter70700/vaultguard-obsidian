@@ -20,10 +20,11 @@ import { AgentBridgeLeaseModal } from "./agent-bridge-modal";
 import { BindingReconciliationModal, ReconciliationDecision, ReconciliationPlan } from "./binding-reconciliation-modal";
 import { ShareManagementModal } from "./share-management-modal";
 import { PluginAllowlistModal, PluginAllowlistPrompt } from "./plugin-allowlist-modal";
-import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, cognitoSetUserMfaPreference, cognitoForgotPassword, cognitoConfirmForgotPassword, vaultguardVerifyRecoveryCode, CognitoAuthResult } from "./cognito-auth";
+import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, cognitoSetUserMfaPreference, vaultguardForgotPassword, vaultguardConfirmReset, vaultguardVerifyRecoveryCode, devServerLogin, isLocalDevAuth, CognitoAuthResult } from "./cognito-auth";
 import { MfaSetupModal } from "./mfa-setup-modal";
 import { deriveConnectionConfigFromTokenPayload } from "./session-config";
 import { AdminModal } from "../admin/admin-modal";
+import { AuditConfigModal } from "../admin/audit-config-modal";
 import { VaultGuardApiClient } from "../api/client";
 import type {
   OrgSettingsResponse,
@@ -1892,6 +1893,13 @@ export default class VaultGuardPlugin extends Plugin {
       callback: () => this.showPermissionsModal(),
     });
 
+    // Manage the whole vault's permission rules (admin-panel-style table)
+    this.addCommand({
+      id: "manage-permission-rules",
+      name: "Manage Permissions",
+      callback: () => this.showPermissionRulesModal(),
+    });
+
     // Open VaultGuard Files sidebar
     this.addCommand({
       id: "files-panel",
@@ -2267,22 +2275,25 @@ export default class VaultGuardPlugin extends Plugin {
       this.settings.orgSlug,
       async (email: string) => {
         const cfg = this.getEffectiveConfig();
-        if (!cfg.cognitoUserPoolId || !cfg.cognitoClientId) {
+        if (!cfg.apiEndpoint || !cfg.cognitoClientId) {
           throw new Error("Organization configuration not resolved. Please enter your org slug and try logging in first.");
         }
-        await cognitoForgotPassword(
-          cfg.cognitoUserPoolId,
+        // Route through the VaultGuard backend (not Cognito directly) so the
+        // branded reset email is actually sent via SES. See item: reset code
+        // never arrived when triggered from Obsidian.
+        await vaultguardForgotPassword(
+          cfg.apiEndpoint,
           cfg.cognitoClientId,
           email
         );
       },
       async (email: string, code: string, newPassword: string) => {
         const cfg = this.getEffectiveConfig();
-        if (!cfg.cognitoUserPoolId || !cfg.cognitoClientId) {
+        if (!cfg.apiEndpoint || !cfg.cognitoClientId) {
           throw new Error("Organization configuration not resolved. Please enter your org slug and try logging in first.");
         }
-        await cognitoConfirmForgotPassword(
-          cfg.cognitoUserPoolId,
+        await vaultguardConfirmReset(
+          cfg.apiEndpoint,
           cfg.cognitoClientId,
           email,
           code,
@@ -2382,6 +2393,14 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     let authResult: CognitoAuthResult;
+
+    // Local dev server: bypass Cognito entirely and authenticate against the
+    // mock /auth/login endpoint. No MFA / challenge flow in dev mode.
+    if (isLocalDevAuth(cfg.cognitoUserPoolId)) {
+      authResult = await devServerLogin(cfg.apiEndpoint, credentials.email, credentials.password);
+      await this.completeLogin(authResult, credentials.email);
+      return;
+    }
 
     // If we have a pending MFA challenge, respond to it
     if (this.pendingChallengeSession && credentials.mfaCode) {
@@ -2591,7 +2610,14 @@ export default class VaultGuardPlugin extends Plugin {
       await this.saveSettings();
     }
 
-    if (!this.settings.manualConfig && this.session.organizationId) {
+    // The local dev server has no SaaS org-config endpoint (/orgs/{slug}/config),
+    // so don't attempt the post-login refresh in dev mode — it would just log a
+    // spurious "Organization not found" error every login.
+    if (
+      !this.settings.manualConfig &&
+      this.session.organizationId &&
+      !isLocalDevAuth(this.getEffectiveConfig().cognitoUserPoolId)
+    ) {
       try {
         await this.resolveOrgConfig(this.session.organizationId, { silent: true });
       } catch (err) {
@@ -2643,6 +2669,19 @@ export default class VaultGuardPlugin extends Plugin {
       this.setConnectionStatus("online");
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed (non-blocking)", err);
+      });
+
+      // First-login race fix: the header/decorations refresh fired inside
+      // refreshVaultMemberRole() above runs before the vault-scoped lease and
+      // the permission warmup have settled, so the per-file access list can
+      // render with only the current user (the access summary fell back before
+      // members/principals were ready) and stays that way until a restart.
+      // Once warmup settles, force one more refresh so every principal shows —
+      // this is exactly the fresh fetch a restart performs, done automatically.
+      void this.awaitPermissionWarmup().then(() => {
+        this.filePermissionHeader?.invalidateCache();
+        void this.filePermissionHeader?.update({ force: true });
+        this.syncFileExplorerDecorationsState();
       });
     } else {
       this.log("Vault binding skipped — sync engine deferred until a vault is picked.");
@@ -2731,9 +2770,38 @@ export default class VaultGuardPlugin extends Plugin {
       // inside ensureVaultScopedKeyLease — we just need to surface the
       // outcome to the caller's UI flow without throwing.
       await this.ensureVaultScopedKeyLease();
+      // The per-file access list can render with only the current user until
+      // the membership/permission data fully settles after a fresh bind.
+      // A reload reliably picks up everyone's access, so offer it.
+      this.offerReloadForAccessList();
     }
 
     return changed;
+  }
+
+  /**
+   * Non-blocking prompt offering to reload Obsidian after binding a vault.
+   * The per-file "who has access" list sometimes shows only the current user
+   * right after the first bind (membership/permission data hasn't settled);
+   * a reload reliably populates it. Dismissible — the user can ignore it.
+   */
+  private offerReloadForAccessList(): void {
+    // No DOM outside the Electron runtime (e.g. unit tests) — nothing to show.
+    if (typeof document === "undefined") return;
+    const frag = document.createDocumentFragment();
+    frag.appendText(
+      "VaultGuard: Vault connected. Reload Obsidian so every file shows everyone who has access to it."
+    );
+    const actions = frag.createDiv();
+    actions.style.marginTop = "8px";
+    const reloadBtn = actions.createEl("button", { text: "Reload now" });
+    reloadBtn.addEventListener("click", () => {
+      // "Reload app without saving" — re-runs the full startup (session
+      // restore), which is the path that populates the access list correctly.
+      (this.app as unknown as { commands: { executeCommandById: (id: string) => void } })
+        .commands.executeCommandById("app:reload");
+    });
+    new Notice(frag, 20000);
   }
 
   /**
@@ -3176,7 +3244,7 @@ export default class VaultGuardPlugin extends Plugin {
       roles: string[];
       expiresAt: string;
       orgSettings?: OrgSettingsResponse;
-    }>("POST", "/auth/session", undefined, idToken);
+    }>("POST", "/auth/session", { vaultId: this.settings.serverVaultId || undefined }, idToken);
 
     if (!response.success || !response.data) {
       throw new Error(response.error?.message ?? "VaultGuard Sync: Failed to create a server session.");
@@ -3384,6 +3452,15 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async refreshAccessToken(session: UserSession): Promise<AccessTokenRefreshResult> {
     const cfg = this.getEffectiveConfig();
+
+    // Local dev server has no token-refresh that returns fresh JWTs (it rotates
+    // the session token server-side only). Dev tokens are valid for an hour,
+    // which is plenty for a test session — keep the current session as-is.
+    if (isLocalDevAuth(cfg.cognitoUserPoolId)) {
+      this.session = session;
+      return { ok: true };
+    }
+
     if (!cfg.cognitoUserPoolId || !cfg.cognitoClientId || !session.refreshToken) {
       const message = "missing Cognito config or refresh token";
       this.log(`Cannot refresh: ${message}, keeping session.`);
@@ -3522,12 +3599,14 @@ export default class VaultGuardPlugin extends Plugin {
       throw new Error("VaultGuard Sync: Cognito is not configured for this vault.");
     }
     try {
-      const result = await cognitoLogin(
-        config.cognitoUserPoolId,
-        config.cognitoClientId,
-        this.session.email,
-        password
-      );
+      const result = isLocalDevAuth(config.cognitoUserPoolId)
+        ? await devServerLogin(config.apiEndpoint, this.session.email, password)
+        : await cognitoLogin(
+            config.cognitoUserPoolId,
+            config.cognitoClientId,
+            this.session.email,
+            password
+          );
       // Success either when we get tokens back OR when Cognito asks for an
       // MFA challenge — both outcomes confirm the password was correct.
       // We deliberately do NOT continue the MFA flow here; we just want to
@@ -3685,6 +3764,14 @@ export default class VaultGuardPlugin extends Plugin {
           .setIcon("file-text")
           .setDisabled(!this.apiClient)
           .onClick(() => this.openAuditLog())
+      );
+
+      menu.addItem((item) =>
+        item
+          .setTitle("Audit log settings")
+          .setIcon("sliders-horizontal")
+          .setDisabled(!this.apiClient)
+          .onClick(() => this.openAuditConfig())
       );
     }
 
@@ -4402,6 +4489,7 @@ export default class VaultGuardPlugin extends Plugin {
       if (this.session) {
         await this.apiRequest("POST", "/auth/logout", {
           sessionId: this.session.sessionId,
+          vaultId: this.settings.serverVaultId || undefined,
         });
       }
     } catch {
@@ -9425,6 +9513,52 @@ export default class VaultGuardPlugin extends Plugin {
     modal.open();
   }
 
+  /**
+   * Opens the vault-wide permission-rules manager (admin-panel-style table:
+   * list every rule, add / edit / delete with principal dropdowns, level,
+   * priority, and expiry). Distinct from the per-file controls in the header.
+   */
+  showPermissionRulesModal(): void {
+    if (!this.session) {
+      this.showLoginRequiredNotice("view permissions");
+      return;
+    }
+    if (!this.apiClient) {
+      new Notice("VaultGuard Sync: Please configure the API endpoint in settings first.");
+      return;
+    }
+    if (!this.settings.serverVaultId) {
+      new Notice(
+        "VaultGuard Sync: Bind this folder to a server vault first — open the VaultGuard sidebar to pick one."
+      );
+      return;
+    }
+    // Opens the Organization Admin modal at the "Vault access" tab, which now
+    // renders the full permission-rules table (PermissionRulesView).
+    const modal = new AdminModal(
+      this.app,
+      this.apiClient,
+      "permissions",
+      null,
+      this.createAdminModalContext()
+    );
+    modal.open();
+  }
+
+  /**
+   * Refresh every permission surface (file header, file-explorer decorations,
+   * sidebar) after vault-wide rules change in the Manage Permissions modal.
+   * Drops the warmed rule cache, re-warms from the server, and fires the
+   * shared "changed" bus event the per-file flow already uses.
+   */
+  notifyPermissionRulesChanged(): void {
+    this.permissionStore.invalidate();
+    this.permissionStore.emit("changed", { serverConfirmed: true });
+    void this.runPermissionWarmup().catch((err) =>
+      this.logError("Permission re-warm after rule change failed", err)
+    );
+  }
+
   private createAdminModalContext() {
     return {
       orgId: this.settings.organizationId,
@@ -9440,6 +9574,7 @@ export default class VaultGuardPlugin extends Plugin {
           }
         : undefined,
       features: this.serverFeatures ?? undefined,
+      onPermissionsChanged: () => this.notifyPermissionRulesChanged(),
     };
   }
 
@@ -9489,6 +9624,20 @@ export default class VaultGuardPlugin extends Plugin {
       null,
       this.createAdminModalContext()
     ).open();
+  }
+
+  /**
+   * Opens the org-wide audit logging configuration modal where an admin can
+   * pick which audit actions are recorded. Admin-only; reachable from the
+   * VaultGuard ribbon menu beside "Audit log".
+   */
+  private openAuditConfig(): void {
+    if (!this.session) return;
+    if (!this.apiClient) {
+      new Notice("VaultGuard Sync: not connected to a server.");
+      return;
+    }
+    new AuditConfigModal(this.app, this.apiClient).open();
   }
 
   /**

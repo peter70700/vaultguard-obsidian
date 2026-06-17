@@ -1129,7 +1129,25 @@ export async function logAudit(
   const id = entry.id || generateId();
   const timestamp = entry.timestamp || new Date().toISOString();
   const dateStr = timestamp.split('T')[0]; // YYYY-MM-DD
-  const expiresAtTtl = await getAuditExpiryTtl(entry.orgId, timestamp);
+
+  // Org-configurable audit filtering: an org can opt specific actions out of
+  // the audit trail via settings.disabledAuditActions. Look the settings up
+  // once and reuse them for both the opt-out check and the retention TTL.
+  // Fail open — if the lookup throws we still write the entry so a transient
+  // settings error never silently drops audit data.
+  let orgSettings: OrgSettings | null = null;
+  if (entry.orgId) {
+    try {
+      orgSettings = await getEffectiveOrgSettings(entry.orgId);
+    } catch (err) {
+      console.error('[AUDIT_SETTINGS_LOOKUP_FAILURE]', (err as Error).message, { orgId: entry.orgId });
+    }
+  }
+  if (orgSettings?.disabledAuditActions?.includes(entry.action)) {
+    return;
+  }
+
+  const expiresAtTtl = computeAuditExpiryTtl(orgSettings, timestamp);
   const vaultId = entry.vaultId
     || extractVaultIdFromMetadata(entry.metadata)
     || extractVaultIdFromResourcePath(entry.resourcePath);
@@ -1191,17 +1209,8 @@ function extractVaultIdFromResourcePath(resourcePath: string | undefined): strin
   return match?.[1] ? decodeURIComponent(match[1]) : undefined;
 }
 
-async function getAuditExpiryTtl(orgId: string | undefined, timestamp: string): Promise<number> {
-  const fallbackRetentionDays = DEFAULT_ORG_SETTINGS.retentionDays;
-  let retentionDays = fallbackRetentionDays;
-
-  try {
-    const settings = orgId ? await getEffectiveOrgSettings(orgId) : null;
-    retentionDays = settings?.retentionDays ?? fallbackRetentionDays;
-  } catch (error) {
-    console.error('[AUDIT_RETENTION_LOOKUP_FAILURE]', (error as Error).message, { orgId });
-  }
-
+function computeAuditExpiryTtl(settings: OrgSettings | null, timestamp: string): number {
+  const retentionDays = settings?.retentionDays ?? DEFAULT_ORG_SETTINGS.retentionDays;
   const eventTimeMs = new Date(timestamp).getTime();
   const baseTimeMs = Number.isNaN(eventTimeMs) ? Date.now() : eventTimeMs;
 
@@ -1602,6 +1611,15 @@ export interface OrgSettings {
    * admins" toggle. Off by default.
    */
   allowAdminPerFileRestrictions: boolean;
+  /**
+   * Audit actions the org has opted OUT of recording. `logAudit` skips
+   * writing a row whenever its `action` appears here. Empty by default, so
+   * every action is logged and any action added in a future release is
+   * logged automatically until an admin explicitly disables it. Configured
+   * via the "Audit logging" modal in the admin panel and the Obsidian
+   * ribbon menu.
+   */
+  disabledAuditActions: string[];
 }
 
 export type PersistedOrgSettings = Omit<OrgSettings, 'orgId' | 'orgName'>;
@@ -1616,6 +1634,7 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
   retentionDays: 365,
   autoLockMinutes: 30,
   allowAdminPerFileRestrictions: false,
+  disabledAuditActions: [],
 };
 
 const orgSettingsCache = new Map<string, {
@@ -1751,7 +1770,31 @@ export function normalizeStoredOrgSettings(
     normalized.allowAdminPerFileRestrictions = rawSettings.allowAdminPerFileRestrictions;
   }
 
+  const disabledAuditActions = normalizeDisabledAuditActions(rawSettings.disabledAuditActions, undefined);
+  if (disabledAuditActions !== undefined) {
+    normalized.disabledAuditActions = disabledAuditActions;
+  }
+
   return normalized;
+}
+
+/**
+ * Normalizes a stored `disabledAuditActions` value into a deduplicated array
+ * of non-empty action strings. Returns `fallback` when the input is not an
+ * array so callers can distinguish "not provided" from "explicitly empty".
+ */
+export function normalizeDisabledAuditActions(
+  value: unknown,
+  fallback: string[] | undefined
+): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return fallback;
+  }
+  const cleaned = value
+    .filter((action): action is string => typeof action === 'string')
+    .map((action) => action.trim())
+    .filter((action) => action.length > 0);
+  return Array.from(new Set(cleaned));
 }
 
 export function normalizeSyncMode(
@@ -2093,11 +2136,17 @@ export async function requireVaultMember(
 ): Promise<VaultRecord> {
   const orgId = requireOrgId(user);
   const vault = await getVault(orgId, vaultId);
+  // These are authorization failures, not authentication failures: the caller
+  // has a valid session, they just lack access to this vault / role. They must
+  // return 403, not the AuthError default of 401 — otherwise clients (the admin
+  // panel and the plugin) mistake "you can't see this" for "your session
+  // expired" and force a logout. A viewer opening an admin-only subpage was
+  // being signed out for exactly this reason.
   if (!vault) {
-    throw new AuthError(`Vault not found or access denied: ${vaultId}`);
+    throw new AuthError(`Vault not found or access denied: ${vaultId}`, 403);
   }
   if (vault.archived && requiredRole !== 'viewer') {
-    throw new AuthError(`Vault is archived and read-only: ${vaultId}`);
+    throw new AuthError(`Vault is archived and read-only: ${vaultId}`, 403);
   }
 
   const orgAdmin = isAdmin(user);
@@ -2107,12 +2156,13 @@ export async function requireVaultMember(
 
   const membership = await getVaultMembership(vaultId, user.userId);
   if (!membership) {
-    throw new AuthError(`You are not a member of this vault: ${vaultId}`);
+    throw new AuthError(`You are not a member of this vault: ${vaultId}`, 403);
   }
 
   if (!vaultRoleMeetsRequirement(membership.role, requiredRole)) {
     throw new AuthError(
-      `Requires "${requiredRole}" in this vault; you are "${membership.role}".`
+      `Requires "${requiredRole}" in this vault; you are "${membership.role}".`,
+      403
     );
   }
 

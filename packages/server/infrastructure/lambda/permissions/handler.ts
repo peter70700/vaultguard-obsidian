@@ -816,37 +816,54 @@ async function handleUpdatePermission(
 
   const updatedRule = { ...existingRule, ...updates };
 
-  // Revoke leases overlapping both old and new path patterns
+  // Post-write side effects run AFTER the rule is already persisted, so a
+  // failure here must NOT turn a successful update into a 500. Previously an
+  // unguarded throw in lease revocation or the activity cursor surfaced to the
+  // client as "Internal server error" even though the edit had saved (create
+  // never hits this path, which is why only edits appeared to fail).
   const affectedPath = (updates.pathPattern as string) || existingRule.pathPattern;
-  await revokeOverlappingLeases(
-    affectedPath,
-    existingRule.userId,
-    existingRule.role,
-    user.userId,
-    vault.orgId,
-    vault.vaultId
-  );
-  if (updates.pathPattern && updates.pathPattern !== existingRule.pathPattern) {
+  try {
+    // Revoke leases overlapping both old and new path patterns.
     await revokeOverlappingLeases(
-      existingRule.pathPattern,
+      affectedPath,
       existingRule.userId,
       existingRule.role,
       user.userId,
       vault.orgId,
       vault.vaultId
     );
+    if (updates.pathPattern && updates.pathPattern !== existingRule.pathPattern) {
+      await revokeOverlappingLeases(
+        existingRule.pathPattern,
+        existingRule.userId,
+        existingRule.role,
+        user.userId,
+        vault.orgId,
+        vault.vaultId
+      );
+    }
+  } catch (err) {
+    console.error(
+      '[PERMISSIONS] update: lease revocation failed (rule already updated)',
+      (err as Error).message
+    );
   }
 
-  // Cursor bump — see handleCreatePermission for rationale. We log the
-  // affected path so downstream consumers can correlate, but the path
-  // value isn't used by the warm-path detection logic.
-  await recordVaultActivity({
-    orgId: vault.orgId,
-    vaultId: vault.vaultId,
-    action: 'permission_changed',
-    path: affectedPath,
-    actorUserId: user.userId,
-  });
+  // Cursor bump — see handleCreatePermission for rationale. Best-effort.
+  try {
+    await recordVaultActivity({
+      orgId: vault.orgId,
+      vaultId: vault.vaultId,
+      action: 'permission_changed',
+      path: affectedPath,
+      actorUserId: user.userId,
+    });
+  } catch (err) {
+    console.error(
+      '[PERMISSIONS] update: recordVaultActivity failed (rule already updated)',
+      (err as Error).message
+    );
+  }
 
   await logAudit({
     userId: user.userId,

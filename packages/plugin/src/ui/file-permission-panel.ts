@@ -399,6 +399,20 @@ export class FilePermissionPanel {
     }) as HTMLInputElement;
     principalInput.value = this.draftPrincipalValue;
 
+    // Role selector — shown instead of the free-text input when the principal
+    // type is "Role", so admins pick from the known vault roles rather than
+    // typing a role name. Mirrors the user picker's dropdown.
+    const ROLE_VALUES = ["viewer", "editor", "admin"];
+    const roleSelect = form.createEl("select", {
+      cls: "vaultguard-fp-add-input vaultguard-fp-add-role",
+    }) as HTMLSelectElement;
+    roleSelect.createEl("option", { text: "Viewer", attr: { value: "viewer" } });
+    roleSelect.createEl("option", { text: "Editor", attr: { value: "editor" } });
+    roleSelect.createEl("option", { text: "Admin", attr: { value: "admin" } });
+    roleSelect.value = ROLE_VALUES.includes(this.draftPrincipalValue)
+      ? this.draftPrincipalValue
+      : "viewer";
+
     // Level selector
     const levelSelect = form.createEl("select", { cls: "vaultguard-fp-add-input" });
     levelSelect.createEl("option", { text: "Read", attr: { value: "read" } });
@@ -409,6 +423,17 @@ export class FilePermissionPanel {
     // option already available in the existing-rule dropdown.
     levelSelect.createEl("option", { text: "No Access", attr: { value: "none" } });
     levelSelect.value = this.draftLevel;
+
+    // Optional expiry — when set, the grant is written as a time-bound rule
+    // that the backend auto-expires. Leave blank for permanent access.
+    const expiresInput = form.createEl("input", {
+      cls: "vaultguard-fp-add-input vaultguard-fp-add-expires",
+      attr: {
+        type: "datetime-local",
+        title: "Optional: automatically expire this access at a set time",
+        "aria-label": "Access expires at (optional)",
+      },
+    }) as HTMLInputElement;
 
     // Add button
     const addBtn = form.createEl("button", {
@@ -421,12 +446,14 @@ export class FilePermissionPanel {
 
     const updateQuickList = (): void => {
       this.draftPrincipalType = typeSelect.value as "user" | "role";
-      this.draftPrincipalValue = principalInput.value;
+      const isRole = this.draftPrincipalType === "role";
+      // Swap the free-text user input for the role dropdown (and vice versa).
+      principalInput.style.display = isRole ? "none" : "";
+      roleSelect.style.display = isRole ? "" : "none";
+      this.draftPrincipalValue = isRole ? roleSelect.value : principalInput.value;
       this.draftLevel = levelSelect.value;
       this.syncSelectedUserFromDraft();
-      principalInput.placeholder = this.draftPrincipalType === "user"
-        ? "Search teammates or enter a user ID"
-        : "Role name";
+      principalInput.placeholder = "Search teammates or enter a user ID";
 
       quickListEl.empty();
 
@@ -541,10 +568,10 @@ export class FilePermissionPanel {
 
       const principalId = principalType === "user"
         ? this.resolveDraftUserId(rawPrincipalValue)
-        : rawPrincipalValue;
+        : roleSelect.value;
 
       if (!principalId) {
-        new Notice("Please enter a user ID or role name.");
+        new Notice("Please enter a user ID or pick a role.");
         return;
       }
 
@@ -556,39 +583,74 @@ export class FilePermissionPanel {
         }
       }
 
+      // Optional time-bound access. When the user picked an expiry we write an
+      // explicit expiring rule via createPermission (the set-level pipeline has
+      // no expiry concept); otherwise we keep the smart set-level path.
+      let expiresAt: string | null = null;
+      if (expiresInput.value) {
+        const parsed = new Date(expiresInput.value);
+        if (Number.isNaN(parsed.getTime())) {
+          new Notice("Invalid expiry date.");
+          return;
+        }
+        if (parsed.getTime() <= Date.now()) {
+          new Notice("Expiry must be in the future.");
+          return;
+        }
+        expiresAt = parsed.toISOString();
+      }
+
       setButtonLoading(addBtn, true);
 
       try {
         const filePath = this.cfg.file.path;
         const pathPattern = filePath.startsWith("/") ? filePath : `/${filePath}`;
         const principalLabel = principalType === "user" ? this.userLabel(principalId) : principalId;
-
-        // Use the server set-level endpoint so we land the principal at
-        // exactly `level` regardless of their inherited baseline. The Add
-        // form previously hand-built a rule shape (allow/deny) which is the
-        // same class of bug as the dropdown flows — see the matrix test for
-        // the failure modes.
         const canonicalUserId = principalType === "user" ? principalId : "*";
-        const response = await this.cfg.apiClient.setPermissionLevel({
-          userId: canonicalUserId,
-          role: principalType === "role" ? principalId : null,
-          pathPattern,
-          level: level as "none" | "read" | "write" | "admin",
-        });
-        new Notice(
-          level === "none"
-            ? `Access blocked for ${principalLabel}.`
-            : `Access granted to ${principalLabel}.`
-        );
+
+        if (expiresAt) {
+          // Time-bound grant: explicit expiring rule.
+          const mutation = this.buildLevelMutation(level);
+          await this.cfg.apiClient.createPermission({
+            userId: canonicalUserId,
+            role: principalType === "role" ? principalId : null,
+            pathPattern,
+            actions: mutation.actions,
+            effect: mutation.effect,
+            expiresAt,
+            upsert: true,
+          });
+          new Notice(
+            `${level === "none" ? "Access blocked" : "Access granted"} for ${principalLabel} until ${new Date(expiresAt).toLocaleString()}.`
+          );
+        } else {
+          // Use the server set-level endpoint so we land the principal at
+          // exactly `level` regardless of their inherited baseline. The Add
+          // form previously hand-built a rule shape (allow/deny) which is the
+          // same class of bug as the dropdown flows — see the matrix test for
+          // the failure modes.
+          const response = await this.cfg.apiClient.setPermissionLevel({
+            userId: canonicalUserId,
+            role: principalType === "role" ? principalId : null,
+            pathPattern,
+            level: level as "none" | "read" | "write" | "admin",
+          });
+          new Notice(
+            level === "none"
+              ? `Access blocked for ${principalLabel}.`
+              : `Access granted to ${principalLabel}.`
+          );
+          // Optimistic patch — appends the principal to the effective list
+          // (or updates an existing row) so the user sees the new row
+          // immediately. onRulesChanged() reconciles right after.
+          if (response?.level && principalType === "user") {
+            this.patchEffectivePrincipalLevel(canonicalUserId, response.level);
+            this.optimisticRender();
+          }
+        }
+
         this.draftPrincipalValue = "";
         this.draftSelectedUserId = null;
-        // Optimistic patch — appends the principal to the effective list
-        // (or updates an existing row) so the user sees the new row
-        // immediately. onRulesChanged() reconciles right after.
-        if (response?.level && principalType === "user") {
-          this.patchEffectivePrincipalLevel(canonicalUserId, response.level);
-          this.optimisticRender();
-        }
         await this.cfg.onRulesChanged();
       } catch (error) {
         new Notice(`Failed to add: ${(error as Error).message}`);
@@ -626,10 +688,17 @@ export class FilePermissionPanel {
       this.draftLevel = levelSelect.value;
     });
 
+    roleSelect.addEventListener("change", () => {
+      if (this.draftPrincipalType === "role") {
+        this.draftPrincipalValue = roleSelect.value;
+      }
+    });
+
     addBtn.addEventListener("click", () => {
       void submitAddRule();
     });
 
+    // Set the initial input/role visibility for the current principal type.
     updateQuickList();
   }
 

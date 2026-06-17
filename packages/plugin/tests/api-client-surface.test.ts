@@ -246,6 +246,33 @@ describe("VaultGuardApiClient surface", () => {
     });
   });
 
+  it("forwards expiresAt in the createPermission request body for time-bound grants", async () => {
+    const client = makeClient();
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(200, { rule: { id: "rule-1" } }));
+
+    const expiresAt = "2026-12-31T23:59:59.000Z";
+    await client.createPermission({
+      userId: "grantee-1",
+      role: null,
+      pathPattern: "/docs/**",
+      actions: ["read", "write", "list"],
+      effect: "allow",
+      expiresAt,
+      upsert: true,
+    });
+
+    expect(mockRequestUrl.mock.calls[0]![0].url).toBe(
+      "https://api.vaultguard.test/vaults/vault-abc/permissions"
+    );
+    expect(JSON.parse(mockRequestUrl.mock.calls[0]![0].body as string)).toMatchObject({
+      userId: "grantee-1",
+      pathPattern: "/docs/**",
+      effect: "allow",
+      expiresAt,
+      upsert: true,
+    });
+  });
+
   it("maps audit, org settings, and recovery endpoints correctly", async () => {
     const client = makeClient();
 
