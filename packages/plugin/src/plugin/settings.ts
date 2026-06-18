@@ -18,6 +18,13 @@ import {
   ConflictResolutionStrategy,
   UserSession,
 } from "../types";
+import type { AnthropicEffort } from "../types";
+import { AnthropicKeyStore } from "../ui/chat/api-key-store";
+import { AI_CHAT_MODELS, AI_CHAT_EFFORTS } from "../ui/chat/models";
+import {
+  getClaudeAuthStatus,
+  type ClaudeAuthStatus,
+} from "../ui/chat/claude-cli/claude-detector";
 import type {
   UserListEntry,
   VaultKind,
@@ -71,7 +78,14 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   maxRetryAttempts: 3,
   showStatusBar: true,
   excludedPaths: [...DEFAULT_EXCLUDED_PATHS],
+  aiChatModel: "claude-opus-4-8",
+  aiChatEffort: "high",
+  // On by default for live token-by-token feedback. Desktop-only; mobile always
+  // falls back to the Tier-1 requestUrl path (see chat-view streamingEnabled()).
+  aiChatStreaming: true,
+  aiChatProvider: "apiKey",
 };
+
 
 const VAULT_KIND_LABELS: Record<VaultKind, string> = {
   team: "Team",
@@ -114,10 +128,12 @@ interface AgentBridgeConnectionReveal {
 export class VaultGuardSettingTab extends PluginSettingTab {
   private plugin: VaultGuardPlugin;
   private latestAgentBridgeReveal: AgentBridgeConnectionReveal | null = null;
+  private aiChatKeyStore: AnthropicKeyStore;
 
   constructor(app: App, plugin: VaultGuardPlugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this.aiChatKeyStore = new AnthropicKeyStore(plugin);
   }
 
   /**
@@ -216,6 +232,400 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * from recovery code. Re-rendered after every successful action so the
    * tally and status reflect what's actually on disk.
    */
+  /**
+   * AI Chat configuration: provider selection, encrypted Anthropic API key
+   * (masked, never echoed), model + adaptive-thinking effort pickers, streaming
+   * toggle, custom instructions, and prompt templates. The key field writes
+   * through AnthropicKeyStore and NEVER renders the stored secret back into the
+   * DOM — it only shows whether a
+   * key is set and accepts a new one.
+   *
+   * TODO(ai-chat-feature-gate): there is no `aiChat` flag on ServerFeatures
+   * yet, so we cannot gate this with `plugin.featureEnabled("aiChat")`. When a
+   * server feature flag lands (AI-CHAT-PANEL.md §11), wrap this section in that
+   * check. For now AI Chat is a settings-level capability and makes no model
+   * call until the user stores a key or uses a logged-in Claude Code subscription.
+   */
+  private renderAiChatSection(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("AI Chat").setHeading();
+
+    this.renderAiProviderBlock(containerEl);
+
+    const hasKey = this.aiChatKeyStore.hasKey();
+
+    // ── API key (masked, write-only) ────────────────────────────────────────
+    new Setting(containerEl)
+      .setName("Anthropic API key")
+      .setDesc(
+        hasKey
+          ? "A key is stored and encrypted on this device. Enter a new key to replace it, or clear it. " +
+            "The stored key is never displayed."
+          : "Stored encrypted on this device (OS keychain, or the local at-rest key as a fallback). " +
+            "Used only when you run the AI Chat. Never sent anywhere except Anthropic.",
+      )
+      .addText((text) => {
+        text.setPlaceholder(hasKey ? "•••• key stored — enter to replace" : "sk-ant-...");
+        // Mask input so the typed key is not shoulder-surfable. We never set
+        // a value here, so the stored secret never re-enters the DOM.
+        text.inputEl.type = "password";
+        text.inputEl.autocomplete = "off";
+        text.inputEl.setAttribute("autocapitalize", "off");
+        text.inputEl.setAttribute("spellcheck", "false");
+
+        const inputEl = text.inputEl;
+        const settingEl = inputEl.closest(".setting-item");
+        const controlEl = settingEl?.querySelector(".setting-item-control");
+        if (!controlEl) return;
+
+        const saveBtn = controlEl.createEl("button", {
+          text: "Save",
+          cls: "mod-cta vaultguard-inline-save-btn",
+        });
+        saveBtn.addEventListener("click", async () => {
+          const newKey = inputEl.value.trim();
+          if (!newKey) {
+            this.showStatus(containerEl, "Enter an Anthropic API key first.", true);
+            return;
+          }
+          saveBtn.disabled = true;
+          saveBtn.textContent = "Saving...";
+          try {
+            await this.aiChatKeyStore.setKey(newKey);
+            // Wipe the plaintext from the field immediately after storing.
+            inputEl.value = "";
+            this.showStatus(containerEl, "Anthropic API key saved.", false);
+            this.display();
+          } catch (error) {
+            this.showStatus(
+              containerEl,
+              `Failed to save key: ${(error as Error).message}`,
+              true,
+            );
+          } finally {
+            saveBtn.disabled = false;
+            saveBtn.textContent = "Save";
+          }
+        });
+
+        if (hasKey) {
+          const clearBtn = controlEl.createEl("button", {
+            text: "Clear",
+            cls: "vaultguard-inline-save-btn",
+          });
+          clearBtn.addEventListener("click", async () => {
+            clearBtn.disabled = true;
+            try {
+              await this.aiChatKeyStore.clearKey();
+              this.showStatus(containerEl, "Anthropic API key removed.", false);
+              this.display();
+            } catch (error) {
+              this.showStatus(
+                containerEl,
+                `Failed to clear key: ${(error as Error).message}`,
+                true,
+              );
+            } finally {
+              clearBtn.disabled = false;
+            }
+          });
+        }
+      });
+
+    // ── Model ───────────────────────────────────────────────────────────────
+    new Setting(containerEl)
+      .setName("Model")
+      .setDesc("Anthropic model used for AI Chat turns.")
+      .addDropdown((dropdown) => {
+        for (const m of AI_CHAT_MODELS) dropdown.addOption(m.id, m.label);
+        dropdown
+          .setValue(this.plugin.settings.aiChatModel)
+          .onChange(async (value) => {
+            this.plugin.settings.aiChatModel = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    // ── Effort ──────────────────────────────────────────────────────────────
+    new Setting(containerEl)
+      .setName("Thinking effort")
+      .setDesc("How much adaptive-thinking budget the model spends per turn.")
+      .addDropdown((dropdown) => {
+        for (const e of AI_CHAT_EFFORTS) dropdown.addOption(e.id, e.label);
+        dropdown
+          .setValue(this.plugin.settings.aiChatEffort)
+          .onChange(async (value) => {
+            this.plugin.settings.aiChatEffort = value as AnthropicEffort;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    // ── Streaming (Tier 2 — opt-in, desktop-only) ───────────────────────────
+    new Setting(containerEl)
+      .setName("Stream responses")
+      .setDesc("Desktop only; streams responses token-by-token as they arrive. On by default (mobile always uses the non-streaming path).")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.aiChatStreaming)
+          .onChange(async (value) => {
+            this.plugin.settings.aiChatStreaming = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    // ── Custom instructions (appended to the system prompt; API-key mode) ────
+    new Setting(containerEl)
+      .setName("Custom instructions")
+      .setDesc(
+        "Optional instructions appended to the assistant's system prompt (e.g. tone, formatting, " +
+          "project conventions). They never override the built-in security and permission rules. " +
+          "Applies in API-key mode.",
+      )
+      .addTextArea((ta) => {
+        ta.setPlaceholder("e.g. Answer concisely. Prefer bullet points. Use British spelling.");
+        ta.setValue(this.plugin.settings.aiChatSystemPrompt ?? "");
+        ta.inputEl.rows = 4;
+        ta.inputEl.addClass("vaultguard-chat-system-prompt-input");
+        ta.onChange(async (value) => {
+          const trimmed = value.trim();
+          this.plugin.settings.aiChatSystemPrompt = trimmed.length > 0 ? value : undefined;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    this.renderPromptTemplates(containerEl);
+  }
+
+  /**
+   * Editor for user-defined slash-command prompt templates. Each row is a
+   * command name + prompt body; `{{input}}` in the body is replaced with any
+   * text the user types after the command. Built-ins (/clear, /model) cannot be
+   * shadowed — that is enforced in the chat input parser, not here.
+   */
+  private renderPromptTemplates(containerEl: HTMLElement): void {
+    const templates = this.plugin.settings.aiChatPromptTemplates ?? [];
+
+    new Setting(containerEl)
+      .setName("Prompt templates")
+      .setDesc(
+        "Reusable slash commands for the chat input. Type the command (e.g. /summarize) to expand " +
+          "its prompt; use {{input}} where text typed after the command should go.",
+      )
+      .addButton((btn) =>
+        btn
+          .setButtonText("Add template")
+          .setCta()
+          .onClick(async () => {
+            const next = [...(this.plugin.settings.aiChatPromptTemplates ?? [])];
+            next.push({ name: "", prompt: "" });
+            this.plugin.settings.aiChatPromptTemplates = next;
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    templates.forEach((tpl, index) => {
+      const setting = new Setting(containerEl).setClass("vaultguard-chat-template-row");
+      setting.addText((text) =>
+        text
+          .setPlaceholder("command (no slash)")
+          .setValue(tpl.name)
+          .onChange(async (value) => {
+            const next = [...(this.plugin.settings.aiChatPromptTemplates ?? [])];
+            next[index] = { ...next[index], name: value.trim().replace(/^\/+/, "") };
+            this.plugin.settings.aiChatPromptTemplates = next;
+            await this.plugin.saveSettings();
+          }),
+      );
+      setting.addTextArea((ta) => {
+        ta.setPlaceholder("Prompt body — use {{input}} for trailing text");
+        ta.setValue(tpl.prompt);
+        ta.inputEl.rows = 2;
+        ta.onChange(async (value) => {
+          const next = [...(this.plugin.settings.aiChatPromptTemplates ?? [])];
+          next[index] = { ...next[index], prompt: value };
+          this.plugin.settings.aiChatPromptTemplates = next;
+          await this.plugin.saveSettings();
+        });
+      });
+      setting.addExtraButton((btn) =>
+        btn
+          .setIcon("trash")
+          .setTooltip("Remove template")
+          .onClick(async () => {
+            const next = [...(this.plugin.settings.aiChatPromptTemplates ?? [])];
+            next.splice(index, 1);
+            this.plugin.settings.aiChatPromptTemplates = next;
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+    });
+  }
+
+  /**
+   * AI provider chooser + live subscription-detector status. The "subscription"
+   * provider drives the official Claude Code CLI with the user's own Claude
+   * Pro/Max login — the plugin NEVER handles the subscription token. The status
+   * line runs `claude auth status --json` (read-only, no token touched), and the
+   * "Sign in" button spawns `claude auth login` so the user authenticates in
+   * Anthropic's own browser flow. Desktop-only; on mobile we show a fallback note
+   * and the provider is forced to the API key.
+   */
+  private renderAiProviderBlock(containerEl: HTMLElement): void {
+    const onMobile = Platform.isMobileApp;
+
+    new Setting(containerEl)
+      .setName("AI provider")
+      .setDesc(
+        "Choose how AI Chat talks to Claude. Subscription mode uses your own Claude Code login " +
+          "(no API key, no per-token charge) and is desktop only; the plugin never handles your " +
+          "subscription token.",
+      )
+      .addDropdown((dropdown) => {
+        dropdown.addOption("subscription", "Claude subscription (Claude Code CLI)");
+        dropdown.addOption("apiKey", "Anthropic API key");
+        dropdown
+          .setValue(this.plugin.settings.aiChatProvider)
+          .onChange(async (value) => {
+            this.plugin.settings.aiChatProvider = value === "subscription" ? "subscription" : "apiKey";
+            this.plugin.settings.aiChatProviderExplicit = true;
+            await this.plugin.saveSettings();
+            // Re-render so the status line / API-key field reflect the choice.
+            this.display();
+          });
+        if (onMobile) dropdown.setDisabled(true);
+      });
+
+    if (this.plugin.settings.aiChatProvider !== "subscription") return;
+
+    // Status line + actions container (populated asynchronously by the detector).
+    const statusSetting = new Setting(containerEl)
+      .setName("Claude Code status")
+      .setDesc("Checking…");
+
+    if (onMobile) {
+      statusSetting.setDesc(
+        "Subscription mode needs desktop Obsidian — switch to an API key to chat on mobile.",
+      );
+      return;
+    }
+
+    void this.refreshClaudeStatus(statusSetting);
+  }
+
+  private async refreshClaudeStatus(statusSetting: Setting): Promise<void> {
+    let status: ClaudeAuthStatus;
+    try {
+      status = await getClaudeAuthStatus();
+    } catch (e) {
+      statusSetting.setDesc(`Could not check Claude Code: ${(e as Error).message}`);
+      return;
+    }
+
+    // Clear any prior action buttons before repopulating.
+    statusSetting.clear();
+    statusSetting.setName("Claude Code status");
+
+    switch (status.classification) {
+      case "logged-in-subscription": {
+        const tier = status.subscriptionType
+          ? status.subscriptionType.charAt(0).toUpperCase() + status.subscriptionType.slice(1)
+          : "subscription";
+        statusSetting.setDesc(
+          `Signed in — ${tier} subscription${status.email ? ` (${status.email})` : ""}. ` +
+            "Chat will use your Claude Code login; no API key needed.",
+        );
+        break;
+      }
+      case "logged-in-apikey": {
+        statusSetting.setDesc(
+          "Claude Code is signed in with an API key, not a Claude.ai subscription. " +
+            "Sign in with your subscription to avoid per-token charges, or use the API-key provider.",
+        );
+        statusSetting.addButton((btn) =>
+          btn.setButtonText("Sign in with subscription").onClick(() => void this.runClaudeLogin(statusSetting)),
+        );
+        break;
+      }
+      case "not-logged-in": {
+        statusSetting.setDesc(
+          "Claude Code is installed but not signed in. Sign in to use your Claude subscription.",
+        );
+        statusSetting.addButton((btn) =>
+          btn
+            .setButtonText("Sign in")
+            .setCta()
+            .onClick(() => void this.runClaudeLogin(statusSetting)),
+        );
+        break;
+      }
+      case "not-installed": {
+        statusSetting.setDesc(
+          "Claude Code CLI not found. Install it (npm i -g @anthropic-ai/claude-code, or see " +
+            "code.claude.com/docs/setup), then re-open settings.",
+        );
+        break;
+      }
+      case "unsupported": {
+        statusSetting.setDesc(
+          status.error ?? "Subscription mode is unavailable in this runtime — use an API key.",
+        );
+        break;
+      }
+      case "error":
+      default: {
+        statusSetting.setDesc(
+          `Could not determine Claude Code status${status.error ? `: ${status.error}` : "."}`,
+        );
+        break;
+      }
+    }
+  }
+
+  /**
+   * Spawn `claude auth login` so the user signs in through Anthropic's own
+   * browser OAuth flow, then re-check status. The plugin never reads the token;
+   * `claude` stores it in its own keychain.
+   */
+  private async runClaudeLogin(statusSetting: Setting): Promise<void> {
+    statusSetting.setDesc("Opening Claude Code sign-in… complete it in the window/browser that opens.");
+    try {
+      await this.plugin.startClaudeCliLogin();
+    } catch (e) {
+      statusSetting.setDesc(`Could not start Claude Code sign-in: ${(e as Error).message}`);
+      return;
+    }
+    // Re-check after the login subprocess finishes.
+    await this.refreshClaudeStatus(statusSetting);
+  }
+
+  /**
+   * Wraps a group of settings in a native <details>/<summary> disclosure so
+   * heavy, rarely-touched sections can default to collapsed and reduce the
+   * settings-tab scroll. The summary is a plain-text label (NOT a setHeading —
+   * a <summary> cannot host an Obsidian Setting); the builder writes into the
+   * body div, where the existing render* helpers keep emitting their own
+   * setHeading() labels unchanged. Defaults to CLOSED (no `open` attribute) by
+   * design. Native <details> open/closed state is browser-managed and resets on
+   * each this.display() re-render — accepted tradeoff for this mechanism.
+   * Styling is class-only (no `.style` assignments) per CLAUDE.md / Obsidian review.
+   */
+  private renderCollapsibleSection(
+    containerEl: HTMLElement,
+    label: string,
+    builder: (bodyEl: HTMLElement) => void
+  ): void {
+    const details = containerEl.createEl("details", {
+      cls: "vaultguard-settings-section",
+    });
+    details.createEl("summary", {
+      text: label,
+      cls: "vaultguard-settings-section-summary",
+    });
+    const bodyEl = details.createDiv({ cls: "vaultguard-settings-section-body" });
+    builder(bodyEl);
+  }
+
   private renderAtRestSection(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("Local at-rest encryption").setHeading();
     const atRestDesc = Platform.isMobileApp
@@ -443,7 +853,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private renderCurrentVaultSettings(containerEl: HTMLElement, session: UserSession | null): void {
-    new Setting(containerEl).setName("Vault settings").setHeading();
+    new Setting(containerEl).setName("Vault").setHeading();
     const sectionEl = containerEl.createDiv({ cls: "vaultguard-current-vault-settings" });
 
     if (!session) {
@@ -487,26 +897,39 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
 
     sectionEl.empty();
-    this.renderVaultBindingSettings(
-      sectionEl,
-      rootEl,
-      session,
-      vaults,
-      vaultListError,
-      currentVault,
-      currentVaultError,
-      memberRole
-    );
 
-    if (currentVault) {
-      this.renderLoadedVaultSettings(sectionEl, rootEl, session, currentVault, memberRole);
-      this.renderVaultMembersSettings(sectionEl, rootEl, session, currentVault, memberRole);
-    }
+    // The current-vault summary (name/desc + Refresh/Switch/Permissions
+    // buttons) stays VISIBLE on sectionEl. It is emitted into its own container
+    // FIRST so it precedes the disclosure in the DOM. The heavier sub-sections
+    // (Available vaults list, Create vault, Current vault options, Vault members)
+    // move into a single "Manage vaults & members" disclosure to reduce overwhelm.
+    const summaryEl = sectionEl.createDiv({ cls: "vaultguard-current-vault-summary" });
+    this.renderCollapsibleSection(sectionEl, "Manage vaults & members", (manageBody) => {
+      this.renderVaultBindingSettings(
+        summaryEl,
+        manageBody,
+        sectionEl,
+        rootEl,
+        session,
+        vaults,
+        vaultListError,
+        currentVault,
+        currentVaultError,
+        memberRole
+      );
 
-    this.renderCreateVaultSettings(sectionEl, rootEl, session);
+      if (currentVault) {
+        this.renderLoadedVaultSettings(manageBody, sectionEl, rootEl, session, currentVault, memberRole);
+        this.renderVaultMembersSettings(manageBody, sectionEl, rootEl, session, currentVault, memberRole);
+      }
+
+      this.renderCreateVaultSettings(manageBody, rootEl, session);
+    });
   }
 
   private renderVaultBindingSettings(
+    summaryEl: HTMLElement,
+    listEl: HTMLElement,
     sectionEl: HTMLElement,
     rootEl: HTMLElement,
     session: UserSession,
@@ -537,7 +960,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           ].filter((value): value is string => Boolean(value)).join(" · ")
         : "This Obsidian folder is not linked to a server-side vault yet.";
 
-    new Setting(sectionEl)
+    new Setting(summaryEl)
       .setName(currentVault ? currentVault.name : boundId ? cachedName : "Bound server vault")
       .setDesc(currentDesc)
       .addButton((button) =>
@@ -557,7 +980,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
 
     if (boundId) {
-      new Setting(sectionEl)
+      new Setting(summaryEl)
         .setName("Permissions")
         .setDesc(
           "View and manage every permission rule for this vault — the same table-style configuration as the web admin panel. (The per-file controls in the editor header are separate.)"
@@ -571,30 +994,30 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
 
     if (currentVault?.description) {
-      sectionEl.createDiv({
+      summaryEl.createDiv({
         text: currentVault.description,
         cls: "setting-item-description vaultguard-current-vault-description",
       });
     }
 
     if (boundId) {
-      sectionEl.createDiv({
+      summaryEl.createDiv({
         text: `Vault ID: ${boundId}`,
         cls: "setting-item-description vaultguard-current-vault-id",
       });
     }
 
-    new Setting(sectionEl).setName("Available vaults").setHeading();
+    new Setting(listEl).setName("Available vaults").setHeading();
 
     if (vaultListError) {
-      new Setting(sectionEl)
+      new Setting(listEl)
         .setName("Could not load vault list")
         .setDesc(this.errorMessage(vaultListError));
       return;
     }
 
     if (vaults.length === 0) {
-      new Setting(sectionEl)
+      new Setting(listEl)
         .setName("No vaults available")
         .setDesc(
           this.isOrgAdmin(session)
@@ -612,7 +1035,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         vault.archived ? "Archived" : "Active",
       ].join(" · ");
 
-      new Setting(sectionEl)
+      new Setting(listEl)
         .setName(isBound ? `${vault.name} (bound)` : vault.name)
         .setDesc(desc)
         .addButton((button) => {
@@ -647,14 +1070,14 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private renderCreateVaultSettings(
-    sectionEl: HTMLElement,
+    bodyEl: HTMLElement,
     rootEl: HTMLElement,
     session: UserSession
   ): void {
-    new Setting(sectionEl).setName("Create vault").setHeading();
+    new Setting(bodyEl).setName("Create vault").setHeading();
 
     if (!this.isOrgAdmin(session)) {
-      new Setting(sectionEl)
+      new Setting(bodyEl)
         .setName("New vaults")
         .setDesc("Only organization admins and owners can create server vaults.");
       return;
@@ -665,7 +1088,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     let nextKind: VaultKind = "team";
     let nextDefaultRole: VaultMemberRole = "editor";
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Name")
       .setDesc("Display name for the new server vault.")
       .addText((text) =>
@@ -677,7 +1100,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Description")
       .setDesc("Optional note about what belongs in this vault.")
       .addTextArea((text) => {
@@ -690,7 +1113,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         text.inputEl.rows = 2;
       });
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Kind")
       .setDesc("Used for labelling vaults in admin and plugin views.")
       .addDropdown((dropdown) => {
@@ -704,7 +1127,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Default role for new members")
       .setDesc("Used when a vault admin adds a member without choosing a specific role.")
       .addDropdown((dropdown) => {
@@ -718,7 +1141,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Create and bind")
       .setDesc("Creates the vault, adds you as its admin, and links this Obsidian folder to it.")
       .addButton((button) =>
@@ -758,6 +1181,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private renderLoadedVaultSettings(
+    bodyEl: HTMLElement,
     sectionEl: HTMLElement,
     rootEl: HTMLElement,
     session: UserSession,
@@ -767,10 +1191,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     const canEdit = this.canManageVault(session, memberRole);
     const canArchive = this.isOrgAdmin(session);
 
-    new Setting(sectionEl).setName("Current vault options").setHeading();
+    new Setting(bodyEl).setName("Vault details").setHeading();
 
     if (!canEdit) {
-      new Setting(sectionEl)
+      new Setting(bodyEl)
         .setName("Vault metadata")
         .setDesc("Only vault admins, organization admins, and owners can edit the vault name, description, and default role.");
       return;
@@ -780,7 +1204,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     let nextDescription = vault.description ?? "";
     let nextDefaultRole: VaultMemberRole = vault.defaultRole;
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Name")
       .setDesc("Display name shown in VaultGuard vault lists.")
       .addText((text) =>
@@ -791,7 +1215,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Description")
       .setDesc("Short note about what belongs in this vault.")
       .addTextArea((text) => {
@@ -803,7 +1227,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         text.inputEl.rows = 3;
       });
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Default role for new members")
       .setDesc("Used when a vault admin adds a member without choosing a specific role.")
       .addDropdown((dropdown) => {
@@ -817,7 +1241,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(sectionEl)
+    new Setting(bodyEl)
       .setName("Save vault settings")
       .setDesc(vault.archived ? "Reactivate this vault before changing metadata." : "Updates server-side vault metadata for every member.")
       .addButton((button) =>
@@ -851,7 +1275,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
 
     if (canArchive) {
-      new Setting(sectionEl)
+      new Setting(bodyEl)
         .setName(vault.archived ? "Reactivate vault" : "Archive vault")
         .setDesc(
           vault.archived
@@ -889,25 +1313,27 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private renderVaultMembersSettings(
+    bodyEl: HTMLElement,
     sectionEl: HTMLElement,
     rootEl: HTMLElement,
     session: UserSession,
     vault: VaultRecord,
     memberRole: VaultMemberRole | null
   ): void {
-    new Setting(sectionEl).setName("Vault members").setHeading();
+    new Setting(bodyEl).setName("Vault members").setHeading();
 
-    const membersEl = sectionEl.createDiv({ cls: "vaultguard-vault-members" });
+    const membersEl = bodyEl.createDiv({ cls: "vaultguard-vault-members" });
     membersEl.createDiv({
       text: "Loading vault members…",
       cls: "setting-item-description vaultguard-current-vault-loading",
     });
 
-    void this.renderVaultMembersContent(membersEl, rootEl, session, vault, memberRole);
+    void this.renderVaultMembersContent(membersEl, sectionEl, rootEl, session, vault, memberRole);
   }
 
   private async renderVaultMembersContent(
     membersEl: HTMLElement,
+    sectionEl: HTMLElement,
     rootEl: HTMLElement,
     session: UserSession,
     vault: VaultRecord,
@@ -951,7 +1377,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       }
 
       for (const member of members) {
-        this.renderVaultMemberRow(membersEl, rootEl, session, vault, member, userById, canManage);
+        this.renderVaultMemberRow(membersEl, sectionEl, rootEl, session, vault, member, userById, canManage);
       }
 
       if (vault.archived) {
@@ -968,7 +1394,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         return;
       }
 
-      this.renderAddVaultMemberForm(membersEl, rootEl, session, vault, members, users);
+      this.renderAddVaultMemberForm(membersEl, sectionEl, rootEl, session, vault, members, users);
     } catch (error) {
       membersEl.empty();
       new Setting(membersEl)
@@ -979,6 +1405,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
   private renderVaultMemberRow(
     membersEl: HTMLElement,
+    sectionEl: HTMLElement,
     rootEl: HTMLElement,
     session: UserSession,
     vault: VaultRecord,
@@ -1015,7 +1442,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.plugin.updateCurrentVaultMember(member.userId, nextRole);
             this.showStatus(rootEl, `Updated ${label}.`, false);
             await this.renderCurrentVaultSettingsContent(
-              membersEl.parentElement ?? membersEl,
+              sectionEl,
               rootEl,
               session
             );
@@ -1043,7 +1470,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.plugin.removeCurrentVaultMember(member.userId);
             this.showStatus(rootEl, `Removed ${label}.`, false);
             await this.renderCurrentVaultSettingsContent(
-              membersEl.parentElement ?? membersEl,
+              sectionEl,
               rootEl,
               session
             );
@@ -1058,6 +1485,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
   private renderAddVaultMemberForm(
     membersEl: HTMLElement,
+    sectionEl: HTMLElement,
     rootEl: HTMLElement,
     session: UserSession,
     vault: VaultRecord,
@@ -1130,7 +1558,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.plugin.addCurrentVaultMember(nextUserId.trim(), nextRole);
             this.showStatus(rootEl, "Vault member added.", false);
             await this.renderCurrentVaultSettingsContent(
-              membersEl.parentElement ?? membersEl,
+              sectionEl,
               rootEl,
               session
             );
@@ -1214,127 +1642,20 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     containerEl.addClass("vaultguard-settings-tab");
 
     // ── Header ──────────────────────────────────────────────────────────────
-    new Setting(containerEl).setName("VaultGuard Sync").setHeading();
+    // No top-level heading here: Obsidian already renders the plugin name as
+    // the settings-tab title, and repeating it trips the community-review
+    // linter (settings-tab/no-problematic-settings-headings, which also bans
+    // "settings"/"options"/"general" in setHeading labels). Lead with the
+    // description paragraph instead.
     containerEl.createEl("p", {
       text: "Enterprise-grade vault security with permission-aware encrypted cloud sync.",
       cls: "setting-item-description",
     });
 
-    // ── Account ─────────────────────────────────────────────────────────────
+    // `session` / `isManualMode` are computed once and read by both the
+    // Connection and Account blocks below.
     const session = this.plugin.getSession();
     const isManualMode = this.plugin.settings.manualConfig ?? false;
-    if (session) {
-      new Setting(containerEl).setName("Account").setHeading();
-
-      new Setting(containerEl)
-        .setName("Logged in as")
-        .setDesc(`${session.email} (${session.role})`);
-
-      // ── Profile: Display Name ────────────────────────────────────────────
-      new Setting(containerEl)
-        .setName("Display name")
-        .setDesc(
-          "Your name shown to teammates in permission headers and access lists. " +
-          "Use your first and last name (e.g. \"Jane Smith\")."
-        )
-        .addText((text) => {
-          text
-            .setPlaceholder("Jane Smith")
-            .setValue(session.displayName ?? "")
-            .onChange(() => {
-              // no-op: save on button click
-            });
-
-          const inputEl = text.inputEl;
-          const settingEl = inputEl.closest('.setting-item');
-          if (settingEl) {
-            const controlEl = settingEl.querySelector('.setting-item-control');
-            if (controlEl) {
-              const saveBtn = controlEl.createEl('button', {
-                text: 'Save',
-                cls: 'mod-cta vaultguard-inline-save-btn',
-              });
-              saveBtn.addEventListener('click', async () => {
-                const newName = inputEl.value.trim();
-                if (!newName) {
-                  this.showStatus(containerEl, "Display name cannot be empty.", true);
-                  return;
-                }
-                saveBtn.disabled = true;
-                saveBtn.textContent = "Saving...";
-                try {
-                  await this.plugin.updateUserProfile(session.userId, newName);
-                  this.showStatus(containerEl, "Display name updated.", false);
-                  this.display();
-                } catch (error) {
-                  this.showStatus(
-                    containerEl,
-                    `Failed to update name: ${(error as Error).message}`,
-                    true
-                  );
-                } finally {
-                  saveBtn.disabled = false;
-                  saveBtn.textContent = "Save";
-                }
-              });
-            }
-          }
-        });
-
-      new Setting(containerEl)
-        .setName("Logout")
-        .setDesc(
-          "Sign out and clear your session from this device."
-        )
-        .addButton((button) =>
-          button
-            .setButtonText("Logout")
-            .onClick(async () => {
-              await this.plugin.forceLogout();
-              this.display();
-            })
-        );
-    } else {
-      new Setting(containerEl).setName("Account").setHeading();
-
-      new Setting(containerEl)
-        .setName("Not logged in")
-        .setDesc(
-          isManualMode
-            ? "Sign in with your self-hosted VaultGuard server."
-            : "Sign in with your VaultGuard Cloud account."
-        )
-        .addButton((button) =>
-          button
-            .setButtonText(isManualMode ? "Login" : "Continue with VaultGuard Cloud")
-            .setCta()
-            .onClick(() => {
-              this.plugin.triggerLogin();
-            })
-        );
-
-      // Single login entry point above. Point self-hosters at the Connection
-      // section (manual configuration) instead of a second login button.
-      if (!isManualMode) {
-        const selfHostNote = containerEl.createDiv({
-          cls: "setting-item-description vaultguard-selfhost-note",
-        });
-        selfHostNote.appendText("Self-hosting your own VaultGuard server? ");
-        const link = selfHostNote.createEl("a", {
-          text: "Configure it in Connection settings",
-          href: "#",
-        });
-        link.addEventListener("click", (e) => {
-          e.preventDefault();
-          containerEl
-            .querySelector("#vaultguard-connection-section")
-            ?.scrollIntoView({ behavior: "smooth", block: "start" });
-        });
-        selfHostNote.appendText(" below (switch to manual configuration).");
-      }
-    }
-
-    this.renderCurrentVaultSettings(containerEl, session);
 
     // ── Connection Settings ─────────────────────────────────────────────────
     new Setting(containerEl)
@@ -1600,6 +1921,120 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         );
     }
 
+    // ── Account ─────────────────────────────────────────────────────────────
+    if (session) {
+      new Setting(containerEl).setName("Account").setHeading();
+
+      new Setting(containerEl)
+        .setName("Logged in as")
+        .setDesc(`${session.email} (${session.role})`);
+
+      // ── Profile: Display Name ────────────────────────────────────────────
+      new Setting(containerEl)
+        .setName("Display name")
+        .setDesc(
+          "Your name shown to teammates in permission headers and access lists. " +
+          "Use your first and last name (e.g. \"Jane Smith\")."
+        )
+        .addText((text) => {
+          text
+            .setPlaceholder("Jane Smith")
+            .setValue(session.displayName ?? "")
+            .onChange(() => {
+              // no-op: save on button click
+            });
+
+          const inputEl = text.inputEl;
+          const settingEl = inputEl.closest('.setting-item');
+          if (settingEl) {
+            const controlEl = settingEl.querySelector('.setting-item-control');
+            if (controlEl) {
+              const saveBtn = controlEl.createEl('button', {
+                text: 'Save',
+                cls: 'mod-cta vaultguard-inline-save-btn',
+              });
+              saveBtn.addEventListener('click', async () => {
+                const newName = inputEl.value.trim();
+                if (!newName) {
+                  this.showStatus(containerEl, "Display name cannot be empty.", true);
+                  return;
+                }
+                saveBtn.disabled = true;
+                saveBtn.textContent = "Saving...";
+                try {
+                  await this.plugin.updateUserProfile(session.userId, newName);
+                  this.showStatus(containerEl, "Display name updated.", false);
+                  this.display();
+                } catch (error) {
+                  this.showStatus(
+                    containerEl,
+                    `Failed to update name: ${(error as Error).message}`,
+                    true
+                  );
+                } finally {
+                  saveBtn.disabled = false;
+                  saveBtn.textContent = "Save";
+                }
+              });
+            }
+          }
+        });
+
+      new Setting(containerEl)
+        .setName("Logout")
+        .setDesc(
+          "Sign out and clear your session from this device."
+        )
+        .addButton((button) =>
+          button
+            .setButtonText("Logout")
+            .onClick(async () => {
+              await this.plugin.forceLogout();
+              this.display();
+            })
+        );
+    } else {
+      new Setting(containerEl).setName("Account").setHeading();
+
+      new Setting(containerEl)
+        .setName("Not logged in")
+        .setDesc(
+          isManualMode
+            ? "Sign in with your self-hosted VaultGuard server."
+            : "Sign in with your VaultGuard Cloud account."
+        )
+        .addButton((button) =>
+          button
+            .setButtonText(isManualMode ? "Login" : "Continue with VaultGuard Cloud")
+            .setCta()
+            .onClick(() => {
+              this.plugin.triggerLogin();
+            })
+        );
+
+      // Single login entry point above. Point self-hosters at the Connection
+      // section (manual configuration) instead of a second login button.
+      if (!isManualMode) {
+        const selfHostNote = containerEl.createDiv({
+          cls: "setting-item-description vaultguard-selfhost-note",
+        });
+        selfHostNote.appendText("Self-hosting your own VaultGuard server? ");
+        const link = selfHostNote.createEl("a", {
+          text: "Configure it in Connection settings",
+          href: "#",
+        });
+        link.addEventListener("click", (e) => {
+          e.preventDefault();
+          containerEl
+            .querySelector("#vaultguard-connection-section")
+            ?.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+        selfHostNote.appendText(" below (switch to manual configuration).");
+      }
+    }
+
+    this.renderCurrentVaultSettings(containerEl, session);
+
     // ── Sync Settings ───────────────────────────────────────────────────────
     new Setting(containerEl).setName("Synchronization").setHeading();
     const orgPolicy = this.plugin.getOrgPolicySettings();
@@ -1735,60 +2170,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           })
       );
 
-    // ── Security Settings ───────────────────────────────────────────────────
-    new Setting(containerEl).setName("Security").setHeading();
-
-    new Setting(containerEl)
-      .setName("Cache encryption strength")
-      .setDesc(
-        "Encryption level for locally cached files. Higher levels are more secure but slower."
-      )
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("standard", "Standard (AES-256-GCM)")
-          .addOption("high", "High (AES-256-GCM + key stretching)")
-          .addOption(
-            "maximum",
-            "Maximum (AES-256-GCM + Argon2 key derivation)"
-          )
-          .setValue(this.plugin.settings.cacheEncryptionStrength)
-          .onChange(async (value) => {
-            this.plugin.settings.cacheEncryptionStrength =
-              value as CacheEncryptionStrength;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Offline key lease duration")
-      .setDesc(
-        "How long encryption keys remain valid when offline (in hours). After expiry, files cannot be decrypted until reconnection."
-      )
-      .addSlider((slider) =>
-        slider
-          .setLimits(1, 168, 1)
-          .setValue(this.plugin.settings.offlineKeyLeaseDuration)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            this.plugin.settings.offlineKeyLeaseDuration = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Auto-wipe on auth failure")
-      .setDesc(
-        "Automatically clear all cached vault data if authentication fails repeatedly. This prevents unauthorized access but may cause data loss for unsynced changes."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.autoWipeOnAuthFailure)
-          .onChange(async (value) => {
-            this.plugin.settings.autoWipeOnAuthFailure = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
     // ── Display Settings ────────────────────────────────────────────────────
     new Setting(containerEl).setName("Display").setHeading();
 
@@ -1822,58 +2203,121 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           })
       );
 
-    // ── Local at-rest encryption ────────────────────────────────────────────
-    this.renderAtRestSection(containerEl);
+    // ── Advanced (collapsed) ─────────────────────────────────────────────────
+    // Security + Reliability + at-rest maintenance live behind one disclosure.
+    this.renderCollapsibleSection(containerEl, "Advanced", (body) => {
+      // ── Security ────────────────────────────────────────────────────────
+      new Setting(body).setName("Security").setHeading();
 
-    // ── Agent bridge connections ────────────────────────────────────────────
-    this.renderAgentBridgeSection(containerEl);
+      new Setting(body)
+        .setName("Cache encryption strength")
+        .setDesc(
+          "Encryption level for locally cached files. Higher levels are more secure but slower."
+        )
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("standard", "Standard (AES-256-GCM)")
+            .addOption("high", "High (AES-256-GCM + key stretching)")
+            .addOption(
+              "maximum",
+              "Maximum (AES-256-GCM + Argon2 key derivation)"
+            )
+            .setValue(this.plugin.settings.cacheEncryptionStrength)
+            .onChange(async (value) => {
+              this.plugin.settings.cacheEncryptionStrength =
+                value as CacheEncryptionStrength;
+              await this.plugin.saveSettings();
+            })
+        );
 
-    // ── Advanced Settings ───────────────────────────────────────────────────
-    new Setting(containerEl).setName("Advanced").setHeading();
+      new Setting(body)
+        .setName("Offline key lease duration")
+        .setDesc(
+          "How long encryption keys remain valid when offline (in hours). After expiry, files cannot be decrypted until reconnection."
+        )
+        .addSlider((slider) =>
+          slider
+            .setLimits(1, 168, 1)
+            .setValue(this.plugin.settings.offlineKeyLeaseDuration)
+            .setDynamicTooltip()
+            .onChange(async (value) => {
+              this.plugin.settings.offlineKeyLeaseDuration = value;
+              await this.plugin.saveSettings();
+            })
+        );
 
-    new Setting(containerEl)
-      .setName("Max retry attempts")
-      .setDesc(
-        "Maximum number of retry attempts for failed API calls before giving up."
-      )
-      .addSlider((slider) =>
-        slider
-          .setLimits(1, 10, 1)
-          .setValue(this.plugin.settings.maxRetryAttempts)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            this.plugin.settings.maxRetryAttempts = value;
-            await this.plugin.saveSettings();
-          })
-      );
+      new Setting(body)
+        .setName("Auto-wipe on auth failure")
+        .setDesc(
+          "Automatically clear all cached vault data if authentication fails repeatedly. This prevents unauthorized access but may cause data loss for unsynced changes."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.autoWipeOnAuthFailure)
+            .onChange(async (value) => {
+              this.plugin.settings.autoWipeOnAuthFailure = value;
+              await this.plugin.saveSettings();
+            })
+        );
 
-    new Setting(containerEl)
-      .setName("Debug logging")
-      .setDesc(
-        "Enable verbose logging to the developer console. Useful for troubleshooting but may expose sensitive data in logs."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.debugLogging)
-          .onChange(async (value) => {
-            this.plugin.settings.debugLogging = value;
-            await this.plugin.saveSettings();
-          })
-      );
+      // ── Reliability (formerly the top-level "Advanced" heading) ──────────
+      new Setting(body).setName("Reliability").setHeading();
 
-    new Setting(containerEl)
-      .setName("Disable update checks")
-      .setDesc(
-        "When enabled, the plugin won't poll GitHub for new releases. Default off: the plugin checks once every 24 h and shows a notification when a newer version is available. No telemetry is sent — only an outbound HTTPS request to api.github.com."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.disableUpdateChecks ?? false)
-          .onChange(async (value) => {
-            this.plugin.settings.disableUpdateChecks = value;
-            await this.plugin.saveSettings();
-          })
-      );
+      new Setting(body)
+        .setName("Max retry attempts")
+        .setDesc(
+          "Maximum number of retry attempts for failed API calls before giving up."
+        )
+        .addSlider((slider) =>
+          slider
+            .setLimits(1, 10, 1)
+            .setValue(this.plugin.settings.maxRetryAttempts)
+            .setDynamicTooltip()
+            .onChange(async (value) => {
+              this.plugin.settings.maxRetryAttempts = value;
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new Setting(body)
+        .setName("Debug logging")
+        .setDesc(
+          "Enable verbose logging to the developer console. Useful for troubleshooting but may expose sensitive data in logs."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.debugLogging)
+            .onChange(async (value) => {
+              this.plugin.settings.debugLogging = value;
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new Setting(body)
+        .setName("Disable update checks")
+        .setDesc(
+          "When enabled, the plugin won't poll GitHub for new releases. Default off: the plugin checks once every 24 h and shows a notification when a newer version is available. No telemetry is sent — only an outbound HTTPS request to api.github.com."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.disableUpdateChecks ?? false)
+            .onChange(async (value) => {
+              this.plugin.settings.disableUpdateChecks = value;
+              await this.plugin.saveSettings();
+            })
+        );
+
+      // ── Local at-rest encryption ─────────────────────────────────────────
+      this.renderAtRestSection(body);
+    });
+
+    // ── AI & automation (collapsed) ──────────────────────────────────────────
+    // Agent bridge + AI chat live behind one disclosure. Both helpers keep
+    // their own desktop gating and setHeading() labels.
+    this.renderCollapsibleSection(containerEl, "AI & automation", (body) => {
+      this.renderAgentBridgeSection(body);
+      this.renderAiChatSection(body);
+    });
 
     // ── Danger Zone ─────────────────────────────────────────────────────────
     new Setting(containerEl).setName("Danger Zone").setHeading();
@@ -1899,27 +2343,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             );
             if (confirmed) {
               await this.plugin.clearLocalCache();
-            }
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Force logout")
-      .setDesc(
-        "Immediately invalidate your session and clear all credentials from this device."
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Logout")
-          .setWarning()
-          .onClick(async () => {
-            const confirmed = await this.showDestructiveConfirmation(
-              containerEl,
-              "LOGOUT",
-              "Type LOGOUT to confirm. This will invalidate your session and wipe local credentials."
-            );
-            if (confirmed) {
-              await this.plugin.forceLogout();
             }
           })
       );

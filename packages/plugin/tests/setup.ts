@@ -135,6 +135,14 @@ class MockSetting {
     return this;
   }
 
+  setDisabled(): this {
+    return this;
+  }
+
+  clear(): this {
+    return this;
+  }
+
   addButton(cb: (button: MockButtonComponent) => void): this {
     cb(new MockButtonComponent());
     return this;

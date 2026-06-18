@@ -1,4 +1,6 @@
 import { AuditAction, PermissionLevel, UserSession } from "../types";
+import type { GraphArgs, GraphPermissionDeps, GraphResult } from "./graph/graph-types";
+import type { VaultGraph } from "./graph/vault-graph";
 
 // Cherry-picked from AuditAction so the bridge only emits its own events
 // and gets a compile error if those names drift.
@@ -9,7 +11,8 @@ export type AgentBridgeToolName =
   | "vaultguard_search"
   | "vaultguard_read"
   | "vaultguard_apply_patch"
-  | "vaultguard_create";
+  | "vaultguard_create"
+  | "vaultguard_graph";
 
 export type AgentWriteMode = "deny" | "confirm" | "allow";
 
@@ -99,6 +102,7 @@ export interface AgentBridgeToolSurface {
   read(leaseId: string, args: { path: string; maxBytes?: number }): Promise<AgentBridgeReadResult>;
   applyPatch(leaseId: string, args: { path: string; diff: string }): Promise<AgentBridgeWriteResult>;
   create(leaseId: string, args: { path: string; content: string }): Promise<AgentBridgeWriteResult>;
+  graph(leaseId: string, args: GraphArgs): Promise<GraphResult>;
 }
 
 interface AgentBridgeLease extends AgentBridgeLeaseSummary {
@@ -133,6 +137,13 @@ interface AgentBridgeDeps {
   ensureParentFolders(path: string): Promise<void>;
   isPathExcluded(path: string): boolean;
   getPermission(path: string): Promise<PermissionLevel>;
+  // Factory for the read-only metadataCache navigator. The bridge supplies a
+  // per-lease GraphPermissionDeps (scope predicate + the same permission/
+  // exclusion gates) so VaultGraph re-checks every emitted path on the way
+  // out. main.ts wires the App in; when graph support is unavailable (e.g.
+  // headless tests that don't need it) this may be absent and graph() fails
+  // closed with a clear error.
+  makeVaultGraph?: (deps: GraphPermissionDeps) => VaultGraph;
   readText(path: string): Promise<string>;
   writeText(path: string, content: string): Promise<void>;
   confirmWrite(request: {
@@ -200,6 +211,7 @@ const TOOLS: AgentBridgeToolName[] = [
   "vaultguard_read",
   "vaultguard_apply_patch",
   "vaultguard_create",
+  "vaultguard_graph",
 ];
 
 // Latest MCP spec revision we implement. Clients usually accept any version
@@ -283,6 +295,26 @@ const MCP_TOOLS: Record<string, McpToolDefinition> = {
       properties: {
         path: { type: "string", description: "Vault-relative path of the new file." },
         content: { type: "string", description: "File content as a UTF-8 string." },
+      },
+      additionalProperties: false,
+    },
+  },
+  graph: {
+    internal: "vaultguard_graph",
+    description:
+      "Navigate the vault's structure without reading whole files. Cheaper than listing+reading. " +
+      "Ops: 'neighbors' (links/backlinks/shared-tags of a note), 'related' (top notes connected to a " +
+      "note, ranked), 'tag' (notes carrying a tag), 'orphans' (unlinked notes), 'hubs' (most-connected " +
+      "notes), 'overview' (vault-wide structural summary). Results respect your permissions.",
+    inputSchema: {
+      type: "object",
+      required: ["op"],
+      properties: {
+        op: { type: "string", enum: ["neighbors", "related", "tag", "orphans", "hubs", "overview"] },
+        path: { type: "string", description: "Target note (required for neighbors/related)." },
+        tag: { type: "string", description: "Tag without '#' (required for op=tag)." },
+        depth: { type: "integer", minimum: 1, maximum: 3, description: "Hops for neighbors/related (default 1)." },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
       },
       additionalProperties: false,
     },
@@ -490,14 +522,60 @@ export class VaultGuardAgentBridge {
     return before;
   }
 
+  // In-process tool dispatch (the in-plugin AI chat via getToolSurface, and any
+  // trusted getAgentBridge() integration). Routes through the SAME
+  // invokeToolWithAudit wrapper as the rpc/mcp transports so in-process AI
+  // actions emit bridge.tool_invoked AND run inside withAgentContext (backend
+  // writes attributed to the lease). Without this, API-key-provider chat actions
+  // were invisible to the audit trail and indistinguishable from manual edits.
+  private invokeInProcess(
+    tool: AgentBridgeToolName,
+    leaseId: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const lease = this.requireLease(leaseId);
+    return this.invokeToolWithAudit(tool, lease, args, "inproc");
+  }
+
   getToolSurface(): AgentBridgeToolSurface {
     return {
       describe: () => this.describe(),
-      list: (leaseId, args) => this.list(leaseId, args),
-      search: (leaseId, args) => this.search(leaseId, args),
-      read: (leaseId, args) => this.read(leaseId, args),
-      applyPatch: (leaseId, args) => this.applyPatch(leaseId, args),
-      create: (leaseId, args) => this.create(leaseId, args),
+      list: (leaseId, args) =>
+        this.invokeInProcess(
+          "vaultguard_list",
+          leaseId,
+          (args ?? {}) as Record<string, unknown>,
+        ) as Promise<AgentBridgeListResult>,
+      search: (leaseId, args) =>
+        this.invokeInProcess(
+          "vaultguard_search",
+          leaseId,
+          args as Record<string, unknown>,
+        ) as Promise<AgentBridgeSearchResult>,
+      read: (leaseId, args) =>
+        this.invokeInProcess(
+          "vaultguard_read",
+          leaseId,
+          args as Record<string, unknown>,
+        ) as Promise<AgentBridgeReadResult>,
+      applyPatch: (leaseId, args) =>
+        this.invokeInProcess(
+          "vaultguard_apply_patch",
+          leaseId,
+          args as Record<string, unknown>,
+        ) as Promise<AgentBridgeWriteResult>,
+      create: (leaseId, args) =>
+        this.invokeInProcess(
+          "vaultguard_create",
+          leaseId,
+          args as Record<string, unknown>,
+        ) as Promise<AgentBridgeWriteResult>,
+      graph: (leaseId, args) =>
+        this.invokeInProcess(
+          "vaultguard_graph",
+          leaseId,
+          args as unknown as Record<string, unknown>,
+        ) as Promise<GraphResult>,
     };
   }
 
@@ -957,6 +1035,60 @@ export class VaultGuardAgentBridge {
     return { path, bytes: this.utf8Bytes(args.content ?? "") };
   }
 
+  // Read-only structural navigation over Obsidian's metadataCache. Resolves
+  // the lease exactly like list/search, then builds a VaultGraph whose
+  // canSee() re-checks every emitted path against the SAME gates the other
+  // tools use: lease scope (matchesAnyScope), exclusion/hidden/traversal
+  // (isBlockedPath), and per-file permission (getPermission). The graph must
+  // never leak the existence or link structure of a file the lease can't read
+  // (AI-GRAPH-CONTEXT.md §4.1).
+  async graph(leaseId: string, args: GraphArgs): Promise<GraphResult> {
+    const lease = this.requireLease(leaseId);
+    if (!lease.allowRead) {
+      throw new Error("VaultGuard agent lease does not allow reads.");
+    }
+    if (!this.deps.makeVaultGraph) {
+      throw new Error("VaultGuard agent bridge graph navigation is unavailable in this environment.");
+    }
+
+    const graph = this.deps.makeVaultGraph({
+      // The lease scope predicate — identical scope semantics to list/search.
+      matchesLeaseScope: (path) => this.matchesAnyScope(this.normalizePath(path), lease.scopes),
+      // Exclusion + hidden + traversal gate, reused from the read/list path.
+      isPathExcluded: (path) => this.isBlockedPath(path),
+      getPermission: (path) => this.deps.getPermission(this.normalizePath(path)),
+    });
+
+    const op = args.op;
+    switch (op) {
+      case "neighbors":
+        return graph.neighbors(this.requireGraphPath(args, "neighbors"), args.depth);
+      case "related":
+        return graph.related(this.requireGraphPath(args, "related"), args.depth, args.limit);
+      case "tag": {
+        const tag = (args.tag ?? "").trim();
+        if (!tag) throw new Error("vaultguard_graph op=tag requires a non-empty tag.");
+        return graph.tag(tag, args.limit);
+      }
+      case "orphans":
+        return graph.orphans(args.limit);
+      case "hubs":
+        return graph.hubs(args.limit);
+      case "overview":
+        return graph.overview();
+      default:
+        throw new Error(`vaultguard_graph: unknown op "${String(op)}".`);
+    }
+  }
+
+  private requireGraphPath(args: GraphArgs, op: string): string {
+    const path = (args.path ?? "").trim();
+    if (!path) {
+      throw new Error(`vaultguard_graph op=${op} requires a "path".`);
+    }
+    return path;
+  }
+
   private async requireWritablePath(
     rawPath: string,
     lease: AgentBridgeLease,
@@ -1385,7 +1517,7 @@ export class VaultGuardAgentBridge {
         version: "1",
       },
       instructions:
-        "VaultGuard exposes vault files through five tools: list, search, read, apply_patch, create. All paths are vault-relative. Hidden files (.obsidian, .trash, ...) are blocked. Writes obey the lease writeMode (deny / confirm / allow). Do not ask the user for a filesystem path; use list/search to discover files first.",
+        "VaultGuard exposes vault files through six tools: list, search, read, apply_patch, create, graph. All paths are vault-relative. Hidden files (.obsidian, .trash, ...) are blocked. Writes obey the lease writeMode (deny / confirm / allow). Prefer graph (related/neighbors/tag) to discover a small candidate set, then read only the few files that matter. Do not ask the user for a filesystem path; use list/search/graph to discover files first.",
     };
   }
 
@@ -1491,7 +1623,7 @@ export class VaultGuardAgentBridge {
     tool: AgentBridgeToolName,
     lease: AgentBridgeLease,
     args: Record<string, unknown>,
-    transport: "rpc" | "mcp"
+    transport: "rpc" | "mcp" | "inproc"
   ): Promise<unknown> {
     const auditMeta: Record<string, unknown> = {
       leaseId: lease.leaseId,
@@ -1502,6 +1634,10 @@ export class VaultGuardAgentBridge {
     };
     if (typeof args.path === "string") auditMeta.path = args.path;
     if (typeof args.scope === "string") auditMeta.scope = args.scope;
+    // Graph calls: record op + tag + depth (structure-only, never content).
+    if (typeof args.op === "string") auditMeta.op = args.op;
+    if (typeof args.tag === "string") auditMeta.tag = args.tag;
+    if (typeof args.depth === "number") auditMeta.depth = args.depth;
     if (typeof args.query === "string") {
       auditMeta.queryLength = args.query.length;
     }
@@ -1580,6 +1716,14 @@ export class VaultGuardAgentBridge {
         return this.create(leaseId, {
           path: typeof args.path === "string" ? args.path : "",
           content: typeof args.content === "string" ? args.content : "",
+        });
+      case "vaultguard_graph":
+        return this.graph(leaseId, {
+          op: (typeof args.op === "string" ? args.op : "") as GraphArgs["op"],
+          path: typeof args.path === "string" ? args.path : undefined,
+          tag: typeof args.tag === "string" ? args.tag : undefined,
+          depth: typeof args.depth === "number" ? args.depth : undefined,
+          limit: typeof args.limit === "number" ? args.limit : undefined,
         });
     }
   }

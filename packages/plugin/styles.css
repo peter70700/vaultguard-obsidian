@@ -1226,6 +1226,34 @@
   word-break: break-word;
 }
 
+/* ─── Settings tab disclosures ─────────────────────────────────────────────
+   Native <details>/<summary> wrappers (see renderCollapsibleSection in
+   src/plugin/settings.ts) used to collapse the heavy/rarely-touched settings
+   groups (Advanced, AI & automation, Manage vaults & members). Mirrors the
+   .vaultguard-reconciliation-details precedent above. Theme variables only —
+   no hardcoded colors so dark/light mode both read correctly. */
+
+.vaultguard-settings-section {
+  margin-bottom: 18px;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 12px;
+}
+
+.vaultguard-settings-section-summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: var(--font-ui-medium);
+  color: var(--text-normal);
+}
+
+.vaultguard-settings-section[open] .vaultguard-settings-section-summary {
+  color: var(--text-accent);
+}
+
+.vaultguard-settings-section-body {
+  padding-top: 8px;
+}
+
 /* ─── MFA Setup Modal ──────────────────────────────────────────────────── */
 
 .modal.vaultguard-mfa-setup-modal {
@@ -4687,4 +4715,618 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-error-text {
   color: var(--text-error, #ff5a52);
   padding: 12px 0;
+}
+
+/* ─── AI Chat panel (AI-CHAT-PANEL.md §9) ─────────────────────────────────── */
+
+.vaultguard-chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.vaultguard-chat-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Chat header (title + history / new-chat affordances) */
+.vaultguard-chat-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.vaultguard-chat-header-title {
+  flex: 1 1 auto;
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vaultguard-chat-header-btn {
+  flex: 0 0 auto;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+/* Connect / empty state */
+.vaultguard-chat-empty {
+  margin: auto;
+  text-align: center;
+  color: var(--text-muted);
+  max-width: 320px;
+  padding: 24px 12px;
+}
+.vaultguard-chat-empty-icon {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 10px;
+  color: var(--text-faint);
+}
+.vaultguard-chat-empty-icon svg {
+  width: 32px;
+  height: 32px;
+}
+.vaultguard-chat-empty-hint {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* Message bubbles */
+.vaultguard-chat-message {
+  display: flex;
+}
+.vaultguard-chat-message-user {
+  justify-content: flex-end;
+  position: relative;
+  align-items: center;
+  gap: 4px;
+}
+/* Edit/delete actions sit left of the right-aligned user bubble, on hover */
+.vaultguard-chat-user-actions {
+  order: -1;
+  display: inline-flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+.vaultguard-chat-message-user:hover .vaultguard-chat-user-actions {
+  opacity: 0.8;
+}
+.vaultguard-chat-user-actions .clickable-icon {
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.vaultguard-chat-user-actions svg {
+  width: 14px;
+  height: 14px;
+}
+.vaultguard-chat-message-assistant {
+  justify-content: flex-start;
+}
+.vaultguard-chat-bubble {
+  max-width: 88%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: var(--font-ui-small, 13px);
+  line-height: 1.5;
+  word-break: break-word;
+}
+.vaultguard-chat-message-user .vaultguard-chat-bubble {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  white-space: pre-wrap;
+}
+.vaultguard-chat-message-assistant .vaultguard-chat-bubble {
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+}
+.vaultguard-chat-bubble p:first-child {
+  margin-top: 0;
+}
+.vaultguard-chat-bubble p:last-child {
+  margin-bottom: 0;
+}
+
+/* Copy buttons (whole message + per code block) — reveal on hover */
+.vaultguard-chat-copy-btn {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.vaultguard-chat-copy-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.vaultguard-chat-message-assistant {
+  position: relative;
+}
+.vaultguard-chat-message-copy {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+  background: var(--background-primary);
+  border-radius: 6px;
+  padding: 2px;
+}
+.vaultguard-chat-message-assistant:hover .vaultguard-chat-message-copy {
+  opacity: 0.85;
+}
+.vaultguard-chat-message-copy:hover {
+  opacity: 1 !important;
+}
+.vaultguard-chat-code-pre {
+  position: relative;
+}
+.vaultguard-chat-code-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+  background: var(--background-secondary);
+  border-radius: 6px;
+  padding: 2px;
+}
+.vaultguard-chat-code-pre:hover .vaultguard-chat-code-copy {
+  opacity: 0.85;
+}
+.vaultguard-chat-code-copy:hover {
+  opacity: 1 !important;
+}
+
+/* Pending "thinking…" indicator — animated dots shown until first content */
+.vaultguard-chat-pending .vaultguard-chat-bubble {
+  padding: 10px 14px;
+}
+.vaultguard-chat-pending-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.vaultguard-chat-pending-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  opacity: 0.4;
+  animation: vaultguard-chat-pending-bounce 1.2s infinite ease-in-out;
+}
+.vaultguard-chat-pending-dot:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.vaultguard-chat-pending-dot:nth-child(3) {
+  animation-delay: 0.36s;
+}
+@keyframes vaultguard-chat-pending-bounce {
+  0%, 80%, 100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+/* Collapsible primitive (thinking + tool cards) */
+.vaultguard-chat-collapsible {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary-alt);
+  overflow: hidden;
+}
+.vaultguard-chat-collapsible-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+  user-select: none;
+}
+.vaultguard-chat-collapsible-header:hover {
+  background: var(--background-modifier-hover);
+}
+.vaultguard-chat-collapsible-chevron {
+  display: inline-flex;
+  transition: transform 0.12s ease;
+}
+.vaultguard-chat-collapsible-chevron svg {
+  width: 14px;
+  height: 14px;
+}
+.vaultguard-chat-collapsible.is-open .vaultguard-chat-collapsible-chevron {
+  transform: rotate(90deg);
+}
+.vaultguard-chat-collapsible-label {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vaultguard-chat-collapsible-body {
+  padding: 8px 10px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+/* Thinking block — dimmed */
+.vaultguard-chat-thinking {
+  background: transparent;
+  border-style: dashed;
+}
+.vaultguard-chat-thinking-text {
+  font-size: 12px;
+  color: var(--text-faint);
+  white-space: pre-wrap;
+  font-style: italic;
+}
+
+/* Tool-call card — the trust surface */
+.vaultguard-chat-tool-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.vaultguard-chat-tool-icon svg {
+  width: 13px;
+  height: 13px;
+}
+.vaultguard-chat-tool-card.is-error {
+  border-color: var(--text-error, #ff5a52);
+}
+.vaultguard-chat-tool-section {
+  margin-bottom: 8px;
+}
+.vaultguard-chat-tool-section:last-child {
+  margin-bottom: 0;
+}
+.vaultguard-chat-tool-section-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  margin-bottom: 4px;
+}
+.vaultguard-chat-tool-code {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--background-primary);
+  border-radius: 6px;
+  font-size: 11px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+.vaultguard-chat-tool-pending-text {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.vaultguard-chat-tool-error-text {
+  font-size: 12px;
+  color: var(--text-error, #ff5a52);
+  white-space: pre-wrap;
+}
+
+/* Inline error row */
+.vaultguard-chat-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(255, 69, 58, 0.1);
+  color: var(--text-error, #ff5a52);
+  font-size: 12px;
+}
+.vaultguard-chat-error-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Input bar */
+.vaultguard-chat-input-bar {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+/* @-mention suggestion popup (anchored above the textarea) */
+.vaultguard-chat-mention-popup {
+  position: absolute;
+  bottom: calc(100% - 4px);
+  left: 12px;
+  right: 12px;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-s);
+  z-index: 20;
+  padding: 4px;
+}
+.vaultguard-chat-mention-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.vaultguard-chat-mention-item.is-active,
+.vaultguard-chat-mention-item:hover {
+  background: var(--background-modifier-hover);
+}
+.vaultguard-chat-mention-name {
+  font-size: 13px;
+  color: var(--text-normal);
+  white-space: nowrap;
+}
+.vaultguard-chat-mention-path {
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vaultguard-chat-input {
+  flex: 1 1 auto;
+  resize: none;
+  min-height: 34px;
+  max-height: 140px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small, 13px);
+  line-height: 22px;
+}
+.vaultguard-chat-input:disabled {
+  opacity: 0.6;
+}
+/* Image attach button + pending-attachment thumbnails */
+.vaultguard-chat-attach-btn {
+  flex: 0 0 auto;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.vaultguard-chat-attach-btn:hover {
+  color: var(--text-normal);
+}
+.vaultguard-chat-attach-btn svg {
+  width: 18px;
+  height: 18px;
+}
+.vaultguard-chat-attachments {
+  position: absolute;
+  bottom: calc(100% - 4px);
+  left: 12px;
+  right: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  z-index: 19;
+}
+.vaultguard-chat-attachment {
+  position: relative;
+}
+.vaultguard-chat-attachment-thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 6px;
+  display: block;
+}
+.vaultguard-chat-attachment-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  background: var(--background-secondary);
+  border-radius: 50%;
+  cursor: pointer;
+  color: var(--text-normal);
+}
+.vaultguard-chat-attachment-remove svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* Image thumbnails inside a sent user bubble */
+.vaultguard-chat-bubble-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.vaultguard-chat-bubble-image {
+  max-width: 160px;
+  max-height: 160px;
+  border-radius: 6px;
+  display: block;
+}
+.vaultguard-chat-bubble-text {
+  white-space: pre-wrap;
+}
+
+.vaultguard-chat-send-btn {
+  flex: 0 0 auto;
+  align-self: stretch;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: none;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  cursor: pointer;
+  font-weight: 600;
+}
+.vaultguard-chat-send-btn:hover {
+  background: var(--interactive-accent-hover);
+}
+.vaultguard-chat-send-btn.is-busy {
+  background: var(--background-modifier-error, #c0392b);
+}
+
+/* Status footer */
+.vaultguard-chat-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 12px;
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.vaultguard-chat-status-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  padding: 1px 4px 1px 6px;
+  border-radius: 6px;
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.vaultguard-chat-status-model:hover {
+  background: var(--background-modifier-active-hover, var(--background-modifier-hover));
+}
+.vaultguard-chat-status-model-chevron {
+  display: inline-flex;
+  color: var(--text-faint);
+}
+.vaultguard-chat-status-model-chevron svg {
+  width: 12px;
+  height: 12px;
+}
+.vaultguard-chat-status-conn.is-online {
+  color: var(--text-success, #2ecc71);
+}
+.vaultguard-chat-status-conn.is-offline {
+  color: var(--text-faint);
+}
+.vaultguard-chat-status-usage {
+  margin-left: auto;
+  color: var(--text-faint);
+}
+
+/* ─── Write-confirm diff (AI-CHAT-PANEL.md §9.5) ──────────────────────────── */
+.vaultguard-chat-write-confirm-summary {
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+.vaultguard-chat-write-confirm-meta {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.vaultguard-chat-write-confirm-diff {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+}
+.vaultguard-chat-diff {
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.vaultguard-chat-diff-row {
+  display: flex;
+  align-items: flex-start;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.vaultguard-chat-diff-gutter {
+  flex: 0 0 auto;
+  width: 3.5em;
+  padding: 0 8px;
+  text-align: right;
+  color: var(--text-faint);
+  user-select: none;
+  border-right: 1px solid var(--background-modifier-border);
+}
+.vaultguard-chat-diff-text {
+  flex: 1 1 auto;
+  padding: 0 8px;
+  white-space: pre-wrap;
+}
+.vaultguard-chat-diff-row.is-add {
+  background: rgba(46, 204, 113, 0.12);
+}
+.vaultguard-chat-diff-row.is-del {
+  background: rgba(231, 76, 60, 0.12);
+}
+.vaultguard-chat-diff-row.is-context {
+  color: var(--text-muted);
+}
+.vaultguard-chat-diff-row.is-meta {
+  color: var(--text-faint);
+  background: var(--background-secondary);
+}
+.vaultguard-chat-diff-word-add {
+  background: rgba(46, 204, 113, 0.35);
+  border-radius: 2px;
+}
+.vaultguard-chat-diff-word-del {
+  background: rgba(231, 76, 60, 0.35);
+  border-radius: 2px;
+}
+
+/* ─── AI Chat: live-streaming text node (pre-markdown finalize) ───────────── */
+/* While a Tier-2 reply streams we paint plain text; preserve newlines/wrapping
+   so it doesn't collapse into one line before finalize() re-renders markdown. */
+.vaultguard-chat-stream-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ─── AI Chat settings: custom instructions + prompt templates ────────────── */
+.vaultguard-chat-system-prompt-input {
+  width: 100%;
+  min-height: 5.5em;
+  resize: vertical;
+  font-family: var(--font-text);
+}
+.vaultguard-chat-template-row .setting-item-control {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.vaultguard-chat-template-row .setting-item-control input[type="text"] {
+  flex: 1 1 8em;
+  min-width: 6em;
+}
+.vaultguard-chat-template-row .setting-item-control textarea {
+  flex: 1 1 100%;
+  width: 100%;
+  min-height: 3.5em;
+  resize: vertical;
+  font-family: var(--font-text);
 }

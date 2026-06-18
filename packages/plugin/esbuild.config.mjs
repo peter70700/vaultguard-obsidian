@@ -1,6 +1,17 @@
 import esbuild from "esbuild";
 import process from "process";
 import { existsSync, mkdirSync } from "fs";
+import { builtinModules } from "module";
+
+// Node built-ins are available in Electron's CJS runtime — keep them external so
+// esbuild doesn't try to bundle/polyfill them. The Tier-2 AI-chat streaming path
+// (src/ui/chat/anthropic-stream.ts) imports the `https` builtin (the same Node
+// networking layer Obsidian's requestUrl wraps; see CLAUDE.md Streaming
+// exception). Cover both bare ("https") and prefixed ("node:https") specifiers.
+const nodeBuiltins = [
+  ...builtinModules,
+  ...builtinModules.map((m) => `node:${m}`),
+];
 
 const banner = `/*
   VaultGuard Plugin
@@ -24,6 +35,7 @@ const context = await esbuild.context({
   external: [
     "obsidian",
     "electron",
+    ...nodeBuiltins,
     "@codemirror/autocomplete",
     "@codemirror/collab",
     "@codemirror/commands",

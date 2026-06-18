@@ -471,7 +471,67 @@ export interface VaultGuardSettings {
     lastCheckedAt: number;
     lastSeenVersion: string;
   };
+  /**
+   * Anthropic API key for the AI Chat panel, stored as a method-tagged,
+   * base64-encoded encrypted envelope (never plaintext). Written and read
+   * exclusively through `AnthropicKeyStore` (src/ui/chat/api-key-store.ts):
+   * "ss:" = OS-keychain safeStorage, "ar:" = local AtRestCipher fallback.
+   */
+  encryptedAnthropicKey?: string;
+  /** Anthropic model id for the AI Chat panel (default "claude-opus-4-8"). */
+  aiChatModel: string;
+  /** Adaptive-thinking effort level for AI Chat turns (default "high"). */
+  aiChatEffort: AnthropicEffort;
+  /**
+   * Whether to stream AI Chat responses token-by-token (Tier 2). Default true;
+   * desktop-only (mobile always falls back to the non-streaming requestUrl path).
+   */
+  aiChatStreaming: boolean;
+  /**
+   * Which AI Chat transport to use:
+   *   "subscription" — drive the official Claude Code CLI with the user's own
+   *      Claude Pro/Max login (desktop only; the plugin never touches the
+   *      subscription token). Vault access stays MCP-only via AgentBridge.
+   *   "apiKey" — call the Anthropic Messages API with the user's stored key.
+   * Defaults to "subscription" the first time a logged-in CLI subscription is
+   * detected, otherwise "apiKey". The user's explicit choice is persisted.
+   */
+  aiChatProvider: AiChatProvider;
+  /**
+   * True once the user has explicitly picked an AI provider. Until then the
+   * plugin may auto-default to "subscription" when a logged-in Claude Code
+   * subscription is detected on first open. Set when the settings dropdown is
+   * changed; never overrides an explicit choice afterward.
+   */
+  aiChatProviderExplicit?: boolean;
+  /**
+   * Optional user-authored instructions appended to the frozen system prompt
+   * (API-key mode). They refine behavior but NEVER override the built-in
+   * security / permission rules. Empty/undefined = no custom instructions.
+   */
+  aiChatSystemPrompt?: string;
+  /**
+   * User-defined slash-command prompt templates (e.g. `/summarize`). Each maps a
+   * command name to a prompt body; an `{{input}}` placeholder is substituted with
+   * any text typed after the command (omit it and that text is appended instead).
+   * Built-ins (`/clear`, `/model`) always take precedence and cannot be shadowed.
+   */
+  aiChatPromptTemplates?: ChatPromptTemplate[];
 }
+
+/** A user-defined slash-command prompt template for the AI Chat panel. */
+export interface ChatPromptTemplate {
+  /** Command name without the leading slash, e.g. "summarize". */
+  name: string;
+  /** Prompt body; supports {{input}} (text after the command) substitution. */
+  prompt: string;
+}
+
+/** AI Chat transport selection. */
+export type AiChatProvider = "subscription" | "apiKey";
+
+/** Adaptive-thinking effort levels accepted by the Anthropic Messages API. */
+export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API Communication

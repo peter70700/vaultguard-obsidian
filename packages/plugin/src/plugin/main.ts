@@ -16,6 +16,11 @@ import { Notice, Plugin, Platform, TFile, TFolder, TAbstractFile, Menu, normaliz
 import { VaultGuardSettingTab, DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
 import { AgentBridgeLeaseModal } from "./agent-bridge-modal";
+import { WriteConfirmModal } from "../ui/chat/render/write-confirm-modal";
+import {
+  ConversationStore,
+  type ConversationStorageAdapter,
+} from "../ui/chat/conversation-store";
 import { BindingReconciliationModal, ReconciliationDecision, ReconciliationPlan } from "./binding-reconciliation-modal";
 import { ShareManagementModal } from "./share-management-modal";
 import { PluginAllowlistModal, PluginAllowlistPrompt } from "./plugin-allowlist-modal";
@@ -49,6 +54,9 @@ import { PathPermissionsModal } from "../ui/path-permissions-modal";
 import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
 import { VaultGuardSidebarView, VAULTGUARD_VIEW_TYPE } from "../ui/vaultguard-sidebar-view";
+import { registerChatDebugCommand } from "../ui/chat/chat-debug-command";
+import { VaultGuardChatView, VAULTGUARD_CHAT_VIEW_TYPE } from "../ui/chat/chat-view";
+import { findClaudeBinary } from "../ui/chat/claude-cli/claude-detector";
 import type { VaultGuardSidebarViewConfig } from "../ui/vaultguard-sidebar-view";
 import {
   AgentBridgeLeaseInput,
@@ -59,6 +67,7 @@ import {
   AgentBridgeToolSurface,
   VaultGuardAgentBridge,
 } from "./agent-bridge";
+import { VaultGraph } from "./graph/vault-graph";
 import {
   inspectSkillInstall,
   installSkill,
@@ -70,6 +79,13 @@ import {
 
 // Shield icon SVG for the ribbon
 const VAULTGUARD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>`;
+// The AI Chat ribbon button and view tab use Obsidian's stock lucide
+// `message-square` icon. Stock icons are pre-registered by Obsidian, so the
+// ribbon button always carries its glyph at first paint. A custom `addIcon`
+// icon can lose that registration race and render an INVISIBLE ribbon button —
+// which is why the chat icon used to be missing until the view was opened from
+// the command palette.
+export const VAULTGUARD_CHAT_ICON_ID = "message-square";
 import {
   VaultGuardSettings,
   ServerEdition,
@@ -585,6 +601,26 @@ export default class VaultGuardPlugin extends Plugin {
   async onload(): Promise<void> {
     this.log("Loading VaultGuard plugin...");
 
+    // Register the ribbon buttons SYNCHRONOUSLY, up front, before the first
+    // `await`. Ribbon buttons created *after* an await can be appended after
+    // Obsidian has already taken its initial ribbon snapshot, leaving the button
+    // missing until a later workspace event re-rendered the ribbon — which is
+    // exactly why the chat icon only showed up after opening the view from the
+    // command palette. The chat button uses a STOCK lucide icon, so its glyph is
+    // always present at first paint (a custom `addIcon` icon can lose that race).
+    addIcon("vaultguard-shield", VAULTGUARD_ICON);
+    this.addRibbonIcon("vaultguard-shield", "VaultGuard", (evt: MouseEvent) => {
+      this.showVaultGuardMenu(evt);
+    });
+
+    // AI Chat ribbon entry. TODO(ai-chat-feature-gate): no server `aiChat` flag
+    // yet — always present for now; the view shows a connect state and makes no
+    // model call until the user stores a key or uses a logged-in Claude Code
+    // subscription (§11).
+    this.addRibbonIcon(VAULTGUARD_CHAT_ICON_ID, "VaultGuard Chat", () => {
+      void this.activateVaultGuardChat();
+    });
+
     // Load persisted settings
     await this.loadSettings();
 
@@ -593,12 +629,6 @@ export default class VaultGuardPlugin extends Plugin {
 
     // Register the settings tab
     this.addSettingTab(new VaultGuardSettingTab(this.app, this));
-
-    // Register custom icon and add ribbon button
-    addIcon("vaultguard-shield", VAULTGUARD_ICON);
-    this.addRibbonIcon("vaultguard-shield", "VaultGuard", (evt: MouseEvent) => {
-      this.showVaultGuardMenu(evt);
-    });
 
     // Initialize status bar
     if (this.settings.showStatusBar) {
@@ -703,6 +733,19 @@ export default class VaultGuardPlugin extends Plugin {
       return view;
     });
 
+    // Register the VaultGuard AI Chat view. Construction wires it to the agent
+    // bridge tool surface + lease minting + the encrypted key store + settings;
+    // the view reaches vault content ONLY through the lease (encryption boundary
+    // §3) and makes no model call until the user stores a key or uses a logged-in
+    // Claude Code subscription (§11).
+    // TODO(ai-chat-feature-gate): there is no `aiChat` ServerFeatures flag yet —
+    // keep registration visible for now. Replace with featureEnabled("aiChat")
+    // once the server advertises the capability.
+    this.registerView(
+      VAULTGUARD_CHAT_VIEW_TYPE,
+      (leaf) => new VaultGuardChatView(leaf, this),
+    );
+
     // Phase 9: subscribe the sidebar to the unified permission bus. One
     // emit fans out to decorations + header + sidebar + readOnlyGuard.
     this.registerEvent(
@@ -720,7 +763,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Initialize file explorer decorations (permission dots + avatar stacks)
     this.initFileExplorerDecorations();
 
-    // Auto-open the VaultGuard sidebar in the right panel on first load
+    // Auto-open the VaultGuard sidebar in the right panel on first load.
     this.app.workspace.onLayoutReady(() => {
       this.ensureVaultGuardSidebar();
     });
@@ -973,6 +1016,11 @@ export default class VaultGuardPlugin extends Plugin {
       ensureParentFolders: (path) => this.ensureParentFoldersForPath(path),
       isPathExcluded: (path) => this.isPathExcluded(path),
       getPermission: (path) => this.getEffectivePermission(path),
+      // VaultGraph reads only the in-memory metadataCache. The bridge hands
+      // in a per-lease GraphPermissionDeps (scope predicate + the same gates);
+      // we supply the App so the same compiled service serves the in-plugin
+      // chat and external MCP clients.
+      makeVaultGraph: (graphDeps) => new VaultGraph(this.app, graphDeps),
       readText: (path) => this.interceptedRead(path),
       writeText: (path, content) => this.interceptedWrite(path, content),
       confirmWrite: (request) => this.confirmAgentBridgeWrite(request),
@@ -1045,6 +1093,65 @@ export default class VaultGuardPlugin extends Plugin {
         }
       },
     };
+  }
+
+  /**
+   * Build a ConversationStore for the chat panel, backed by the plugin's own
+   * config dir (`.obsidian/plugins/<id>/chat/`, which is `isPathExcluded` —
+   * plugin data, not vault content) and LAK-encrypted via AtRestCipher. Mirrors
+   * the agent-leases envelope mechanism: binary read/write through the raw
+   * adapter, but ONLY for the plugin's own excluded chat dir.
+   *
+   * Returns null if the vault adapter isn't ready yet; the caller treats that
+   * as "no persistence available" and continues.
+   */
+  getConversationStore(): ConversationStore | null {
+    const cipher = this.atRestCipher;
+    if (!cipher) return null;
+
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    const DIR = `.obsidian/plugins/${pluginId}/chat`;
+    const adapter: ConversationStorageAdapter = {
+      exists: async (name) => {
+        try {
+          return await this.app.vault.adapter.exists(`${DIR}/${name}`);
+        } catch {
+          return false;
+        }
+      },
+      readBinary: async (name) => {
+        const readBin = this.originalAdapterMethods.readBinary;
+        if (!readBin) throw new Error("Vault adapter not initialized.");
+        return readBin(`${DIR}/${name}`);
+      },
+      writeBinary: async (name, bytes) => {
+        const writeBin = this.originalAdapterMethods.writeBinary;
+        if (!writeBin) throw new Error("Vault adapter not initialized.");
+        await this.ensureParentFoldersForPath(`${DIR}/${name}`);
+        await writeBin(`${DIR}/${name}`, bytes);
+      },
+      remove: async (name) => {
+        try {
+          if (await this.app.vault.adapter.exists(`${DIR}/${name}`)) {
+            await this.app.vault.adapter.remove(`${DIR}/${name}`);
+          }
+        } catch (err) {
+          this.logError("Failed to remove conversation envelope", err);
+        }
+      },
+      list: async () => {
+        try {
+          if (!(await this.app.vault.adapter.exists(DIR))) return [];
+          const listing = await this.app.vault.adapter.list(DIR);
+          // adapter.list returns full paths under DIR; strip the dir prefix.
+          return listing.files.map((p) => p.slice(p.lastIndexOf("/") + 1));
+        } catch {
+          return [];
+        }
+      },
+    };
+
+    return new ConversationStore({ cipher, adapter });
   }
 
   private ensureAgentBridge(): VaultGuardAgentBridge {
@@ -1205,12 +1312,103 @@ export default class VaultGuardPlugin extends Plugin {
     await this.ensureAgentBridge().stopHttpServer();
   }
 
+  /**
+   * Spawn `claude auth login` so the user signs in to Claude Code through
+   * Anthropic's own browser OAuth flow. The plugin NEVER reads, stores, or
+   * transmits the resulting token — `claude` keeps it in its own keychain. We
+   * only launch the official binary and wait for it to exit. Desktop-only.
+   *
+   * Resolves when the login subprocess closes (success or user-cancel). Rejects
+   * only if the binary can't be found or launched.
+   */
+  async startClaudeCliLogin(): Promise<void> {
+    if (Platform.isMobileApp) {
+      throw new Error("Claude Code sign-in needs desktop Obsidian.");
+    }
+    const maybeWindow =
+      typeof window !== "undefined" ? (window as unknown as Record<string, unknown>) : {};
+    const maybeGlobal = globalThis as unknown as Record<string, unknown>;
+    const req =
+      typeof maybeWindow.require === "function"
+        ? (maybeWindow.require as NodeRequire)
+        : typeof maybeGlobal.require === "function"
+          ? (maybeGlobal.require as NodeRequire)
+          : null;
+    if (!req) {
+      throw new Error("Node child_process is unavailable in this runtime.");
+    }
+
+    const binaryPath = await findClaudeBinary();
+    if (!binaryPath) {
+      throw new Error(
+        "Claude Code CLI not found. Install it (see code.claude.com/docs/setup) and retry.",
+      );
+    }
+
+    const childProcess = req("child_process") as {
+      spawn(
+        cmd: string,
+        args: ReadonlyArray<string>,
+        opts: { stdio?: "ignore" | "inherit"; env?: NodeJS.ProcessEnv },
+      ): {
+        on(ev: "error", cb: (err: Error) => void): void;
+        on(ev: "close", cb: (code: number | null) => void): void;
+      };
+    };
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      try {
+        const child = childProcess.spawn(binaryPath, ["auth", "login"], {
+          stdio: "ignore",
+          env: typeof process !== "undefined" ? process.env : undefined,
+        });
+        child.on("error", (err) => {
+          if (settled) return;
+          settled = true;
+          reject(new Error(`Could not start Claude Code sign-in: ${err.message}`));
+        });
+        child.on("close", () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        });
+      } catch (e) {
+        if (!settled) {
+          settled = true;
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+      }
+    });
+  }
+
   private async confirmAgentBridgeWrite(request: {
     lease: AgentBridgeLeaseSummary;
     operation: "create" | "apply_patch";
     path: string;
     preview: string;
   }): Promise<boolean> {
+    // Render a real red/green diff in an Obsidian modal when the app UI is
+    // available. This is presentation-only: the approve/reject Promise<boolean>
+    // contract and the upstream-capped preview are unchanged.
+    if (this.app?.workspace) {
+      return new Promise<boolean>((resolve) => {
+        new WriteConfirmModal(
+          this.app,
+          {
+            agentName: request.lease.agentName,
+            operation: request.operation,
+            path: request.path,
+            scopes: request.lease.scopes,
+            expiresAt: request.lease.expiresAt,
+            preview: request.preview,
+          },
+          (allow) => resolve(allow),
+        ).open();
+      });
+    }
+
+    // Headless fallback (tests / no-DOM hosts): keep the prior text confirm.
     const operationLabel =
       request.operation === "create" ? "create" : "patch";
     const message =
@@ -2061,6 +2259,86 @@ export default class VaultGuardPlugin extends Plugin {
         }
       })
     );
+
+    // AI Chat — the real entry point for the chat panel.
+    // TODO(ai-chat-feature-gate): no server `aiChat` flag yet — always listed;
+    // the view stays offline until a key or logged-in subscription is available.
+    this.addCommand({
+      id: "vaultguard-open-chat",
+      name: "VaultGuard Chat: Open AI chat panel",
+      callback: () => {
+        void this.activateVaultGuardChat();
+      },
+    });
+
+    // Previous chats — open the panel and surface the saved-conversation list.
+    this.addCommand({
+      id: "vaultguard-chat-history",
+      name: "VaultGuard Chat: Previous chats",
+      callback: () => {
+        void this.openVaultGuardChatHistory();
+      },
+    });
+
+    // New chat in its own tab — lets several conversations stay open at once
+    // (stacked in the right sidebar). The + button inside the panel still
+    // resets the current chat in place; this opens a separate tab.
+    this.addCommand({
+      id: "vaultguard-chat-new-tab",
+      name: "VaultGuard Chat: New chat (new tab)",
+      callback: () => {
+        void this.openNewVaultGuardChatTab();
+      },
+    });
+
+    // The headless debug harness stays useful for proving the tool path, but the
+    // chat view above is the real entry now. It remains invisible unless
+    // settings.debugLogging is on (checkCallback guard).
+    registerChatDebugCommand(this);
+  }
+
+  /**
+   * Open (or reveal) the VaultGuard AI Chat panel in the right sidebar.
+   */
+  private async activateVaultGuardChat(): Promise<void> {
+    const existing = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
+    if (existing.length > 0) {
+      this.app.workspace.revealLeaf(existing[0]);
+      return;
+    }
+
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (leaf) {
+      await leaf.setViewState({ type: VAULTGUARD_CHAT_VIEW_TYPE, active: true });
+      this.app.workspace.revealLeaf(leaf);
+    }
+  }
+
+  /**
+   * Open a brand-new VaultGuard AI Chat conversation in its OWN right-sidebar
+   * tab, leaving any already-open chats untouched. `getRightLeaf(false)` creates
+   * a new leaf stacked as a tab (not a split); the `fresh` state tells the view
+   * to start blank instead of restoring the most-recent conversation.
+   */
+  async openNewVaultGuardChatTab(): Promise<void> {
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (!leaf) return;
+    await leaf.setViewState({
+      type: VAULTGUARD_CHAT_VIEW_TYPE,
+      active: true,
+      state: { fresh: true },
+    });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** Open the chat panel and pop the previous-chats picker. */
+  private async openVaultGuardChatHistory(): Promise<void> {
+    await this.activateVaultGuardChat();
+    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
+    const view = leaves[0]?.view;
+    if (view instanceof VaultGuardChatView) {
+      view.showHistoryPicker();
+    }
   }
 
   /**
@@ -3508,6 +3786,15 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * The local at-rest cipher, exposed for the AI-chat key store's
+   * safeStorage-unavailable fallback (see src/ui/chat/api-key-store.ts).
+   * Returns null before init or after the plugin unloads.
+   */
+  getAtRestCipher(): AtRestCipher | null {
+    return this.atRestCipher;
+  }
+
+  /**
    * Walk the vault and count files in each on-disk state — used by the
    * settings UI so the user can see "12 plaintext, 230 encrypted" before
    * deciding whether to migrate.
@@ -3717,6 +4004,15 @@ export default class VaultGuardPlugin extends Plugin {
         .setIcon("panel-right")
         .onClick(() => {
           void this.activateVaultGuardSidebar();
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Open AI chat")
+        .setIcon(VAULTGUARD_CHAT_ICON_ID)
+        .onClick(() => {
+          void this.activateVaultGuardChat();
         })
     );
 
@@ -8741,6 +9037,15 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private isOnline(): boolean {
     return this.connectionState.status === "online";
+  }
+
+  /**
+   * Public read-only view of the backend connection state, for UI surfaces
+   * (e.g. the AI Chat status footer) that want to display online/offline
+   * without reaching into the private connection-state machine.
+   */
+  isConnectedOnline(): boolean {
+    return this.isOnline();
   }
 
   // ─────────────────────────────────────────────────────────────────────────
