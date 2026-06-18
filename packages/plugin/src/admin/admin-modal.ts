@@ -284,7 +284,7 @@ export class AdminModal extends Modal {
       const visible =
         name.toLowerCase().includes(lowerQuery) ||
         email.toLowerCase().includes(lowerQuery);
-      (item as HTMLElement).style.display = visible ? "" : "none";
+      (item as HTMLElement).toggle(visible);
     });
   }
 

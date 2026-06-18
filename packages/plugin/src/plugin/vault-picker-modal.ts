@@ -65,7 +65,7 @@ export class VaultPickerModal extends Modal {
     });
 
     this.errorEl = contentEl.createDiv({ cls: "vaultguard-vault-picker-error" });
-    this.errorEl.style.display = "none";
+    this.errorEl.hide();
 
     // ── Existing vaults section ─────────────────────────────────────────
     contentEl.createEl("h3", {
@@ -167,9 +167,9 @@ export class VaultPickerModal extends Modal {
     if (!this.errorEl) return;
     if (message) {
       this.errorEl.setText(message);
-      this.errorEl.style.display = "";
+      this.errorEl.show();
     } else {
-      this.errorEl.style.display = "none";
+      this.errorEl.hide();
     }
   }
 

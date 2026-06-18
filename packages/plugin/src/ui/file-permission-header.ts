@@ -1068,12 +1068,12 @@ export class FilePermissionHeader {
       const levelSpinner = levelRow.createSpan({
         cls: "vaultguard-sb-spinner vaultguard-fh-popover-spinner",
       });
-      levelSpinner.style.display = "none";
+      levelSpinner.hide();
       setIcon(levelSpinner, "loader");
       levelSelect.addEventListener("change", async () => {
         const newLevel = levelSelect.value as AccessLevel;
         setControlBusy(levelSelect, true);
-        levelSpinner.style.display = "";
+        levelSpinner.show();
         try {
           // Server set-level returns the new effective level for the
           // principal. We don't drop it: patching the cache with that level
@@ -1099,7 +1099,7 @@ export class FilePermissionHeader {
           new Notice(`Failed to update permission: ${message}`);
           console.error(`[VaultGuard] upsertUserFileAccess(${userId} → ${newLevel}) on ${file.path}`, error);
           setControlBusy(levelSelect, false);
-          levelSpinner.style.display = "none";
+          levelSpinner.hide();
         }
       });
     } else {
@@ -1142,7 +1142,7 @@ export class FilePermissionHeader {
 
       // Edit name form — hidden by default, shown on button click
       const editForm = actionSection.createDiv({ cls: "vaultguard-fh-popover-edit-form" });
-      editForm.style.display = "none";
+      editForm.hide();
 
       const editInput = editForm.createEl("input", {
         cls: "vaultguard-fh-popover-edit-input",
@@ -1161,8 +1161,12 @@ export class FilePermissionHeader {
 
       editNameBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        const isVisible = editForm.style.display !== "none";
-        editForm.style.display = isVisible ? "none" : "flex";
+        const isVisible = editForm.isShown();
+        if (isVisible) {
+          editForm.hide();
+        } else {
+          editForm.setCssStyles({ display: "flex" });
+        }
         if (!isVisible) {
           editInput.focus();
           editInput.select();
@@ -1250,9 +1254,11 @@ export class FilePermissionHeader {
       top = rect.top - gap - 200;
     }
 
-    popover.style.top = `${top}px`;
-    popover.style.left = `${left}px`;
-    popover.style.width = `${popoverWidth}px`;
+    popover.setCssStyles({
+      top: `${top}px`,
+      left: `${left}px`,
+      width: `${popoverWidth}px`,
+    });
   }
 
   // ─── Panel Toggle ──────────────────────────────────────────────────

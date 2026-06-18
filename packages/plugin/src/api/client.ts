@@ -368,7 +368,7 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
 // in `extractAgentHeaders` (infrastructure/lambda/shared/utils.ts). We
 // cap at 128 chars so an oversized lease ID can't bloat every request.
 
-// eslint-disable-next-line no-control-regex
+// eslint-disable-next-line no-control-regex -- intentionally matches raw control characters (CR/LF/NUL..US/DEL) so they can be stripped from agent header values before they reach the wire
 const AGENT_FIELD_FORBIDDEN_RE = /[\r\n\x00-\x1f\x7f]/g;
 const AGENT_FIELD_MAX_LENGTH = 128;
 

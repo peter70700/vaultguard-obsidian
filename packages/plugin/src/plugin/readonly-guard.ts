@@ -260,7 +260,7 @@ export class ReadOnlyGuard {
     // relative` already, but set it defensively for any custom themes.
     const computed = getComputedStyle(viewContent);
     if (computed.position === "static") {
-      viewContent.style.position = "relative";
+      viewContent.setCssStyles({ position: "relative" });
     }
 
     const overlay = document.createElement("div");

@@ -448,8 +448,8 @@ export class FilePermissionPanel {
       this.draftPrincipalType = typeSelect.value as "user" | "role";
       const isRole = this.draftPrincipalType === "role";
       // Swap the free-text user input for the role dropdown (and vice versa).
-      principalInput.style.display = isRole ? "none" : "";
-      roleSelect.style.display = isRole ? "" : "none";
+      principalInput.toggle(!isRole);
+      roleSelect.toggle(isRole);
       this.draftPrincipalValue = isRole ? roleSelect.value : principalInput.value;
       this.draftLevel = levelSelect.value;
       this.syncSelectedUserFromDraft();
@@ -1235,7 +1235,7 @@ export class FilePermissionPanel {
     const availableWidth = Math.max(280, window.innerWidth - viewportMargin * 2);
     const panelWidth = Math.min(380, availableWidth);
 
-    this.panelEl.style.width = `${panelWidth}px`;
+    this.panelEl.setCssStyles({ width: `${panelWidth}px` });
 
     // Measure after width is applied so we can decide whether to place it
     // above or below the anchor based on available space.
@@ -1254,8 +1254,10 @@ export class FilePermissionPanel {
     );
     const maxHeight = Math.max(220, window.innerHeight - top - viewportMargin);
 
-    this.panelEl.style.top = `${top}px`;
-    this.panelEl.style.left = `${left}px`;
-    this.panelEl.style.maxHeight = `${maxHeight}px`;
+    this.panelEl.setCssStyles({
+      top: `${top}px`,
+      left: `${left}px`,
+      maxHeight: `${maxHeight}px`,
+    });
   }
 }

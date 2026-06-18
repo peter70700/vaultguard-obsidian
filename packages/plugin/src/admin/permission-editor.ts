@@ -161,7 +161,7 @@ class PermissionRuleModal extends Modal {
       inputEl.addClass("vaultguard-path-input");
 
       const suggestionsEl = container.createDiv({ cls: "vaultguard-path-suggestions" });
-      suggestionsEl.style.display = "none";
+      suggestionsEl.hide();
 
       inputEl.addEventListener("input", () => {
         const value = inputEl.value;
@@ -178,7 +178,7 @@ class PermissionRuleModal extends Modal {
       inputEl.addEventListener("blur", () => {
         // Delay hiding to allow click events on suggestions
         setTimeout(() => {
-          suggestionsEl.style.display = "none";
+          suggestionsEl.hide();
         }, 200);
       });
     });
@@ -217,11 +217,11 @@ class PermissionRuleModal extends Modal {
   ): void {
     container.empty();
     if (suggestions.length === 0) {
-      container.style.display = "none";
+      container.hide();
       return;
     }
 
-    container.style.display = "block";
+    container.setCssStyles({ display: "block" });
     for (const path of suggestions) {
       const item = container.createDiv({ cls: "vaultguard-suggestion-item" });
       const iconSpan = item.createSpan({ cls: "vaultguard-suggestion-icon" });
@@ -230,7 +230,7 @@ class PermissionRuleModal extends Modal {
       item.addEventListener("click", () => {
         this.selectedPath = path;
         textComponent.setValue(path);
-        container.style.display = "none";
+        container.hide();
       });
     }
   }

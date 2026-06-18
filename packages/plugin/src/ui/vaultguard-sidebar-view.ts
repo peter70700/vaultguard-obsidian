@@ -261,7 +261,7 @@ export class VaultGuardSidebarView extends ItemView {
     el.empty();
 
     if (!this.leaseExpiresAt) {
-      el.style.display = "none";
+      el.hide();
       return;
     }
 
@@ -269,7 +269,7 @@ export class VaultGuardSidebarView extends ItemView {
     const hoursLeft = Math.max(0, Math.floor(remaining / (1000 * 60 * 60)));
     const minutesLeft = Math.max(0, Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60)));
 
-    el.style.display = "";
+    el.show();
 
     if (remaining <= 0) {
       el.addClass("mod-critical");
@@ -283,7 +283,7 @@ export class VaultGuardSidebarView extends ItemView {
       el.removeClass("mod-critical");
       el.setText(`Offline access: ${hoursLeft}h ${minutesLeft}m remaining`);
     } else {
-      el.style.display = "none";
+      el.hide();
     }
   }
 
@@ -347,7 +347,7 @@ export class VaultGuardSidebarView extends ItemView {
       attr: { "aria-label": "Clear search", type: "button", title: "Clear search" },
     });
     setIcon(searchClear, "x");
-    searchClear.style.display = "none";
+    searchClear.hide();
     searchClear.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -357,7 +357,7 @@ export class VaultGuardSidebarView extends ItemView {
 
     searchInput.addEventListener("input", () => {
       const value = searchInput.value;
-      searchClear.style.display = value.length > 0 ? "" : "none";
+      searchClear.toggle(value.length > 0);
       if (this.searchDebounce !== null) window.clearTimeout(this.searchDebounce);
       this.searchDebounce = window.setTimeout(() => {
         this.searchDebounce = null;
@@ -466,7 +466,7 @@ export class VaultGuardSidebarView extends ItemView {
     if (this.searchInputEl) {
       this.searchInputEl.value = "";
       const clearBtn = this.searchInputEl.parentElement?.querySelector(".vaultguard-sb-search-clear") as HTMLElement | null;
-      if (clearBtn) clearBtn.style.display = "none";
+      if (clearBtn) clearBtn.hide();
     }
     if (this.searchDebounce !== null) {
       window.clearTimeout(this.searchDebounce);
@@ -490,7 +490,7 @@ export class VaultGuardSidebarView extends ItemView {
     if (this.searchInputEl) {
       this.searchInputEl.value = "";
       const clearBtn = this.searchInputEl.parentElement?.querySelector(".vaultguard-sb-search-clear") as HTMLElement | null;
-      if (clearBtn) clearBtn.style.display = "none";
+      if (clearBtn) clearBtn.hide();
     }
     if (this.searchDebounce !== null) {
       window.clearTimeout(this.searchDebounce);

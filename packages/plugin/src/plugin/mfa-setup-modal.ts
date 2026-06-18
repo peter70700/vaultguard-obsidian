@@ -117,7 +117,7 @@ export class MfaSetupModal extends Modal {
 
     // Error display
     const errorEl = contentEl.createDiv({ cls: "vaultguard-login-error" });
-    errorEl.style.display = "none";
+    errorEl.hide();
 
     // Buttons
     const actionRow = contentEl.createDiv({ cls: "vaultguard-login-actions" });
@@ -131,13 +131,13 @@ export class MfaSetupModal extends Modal {
       const code = codeInput.value.trim();
       if (!code || code.length !== 6) {
         errorEl.setText("Please enter the 6-digit code from your authenticator app.");
-        errorEl.style.display = "";
+        errorEl.show();
         return;
       }
 
       verifyBtn.setDisabled(true);
       verifyBtn.setButtonText("Verifying...");
-      errorEl.style.display = "none";
+      errorEl.hide();
 
       try {
         const result = await this.onVerify(code, this.session);
@@ -146,11 +146,11 @@ export class MfaSetupModal extends Modal {
           this.renderRecoveryCodesStep(result.session);
         } else {
           errorEl.setText("Verification failed. Please try again.");
-          errorEl.style.display = "";
+          errorEl.show();
         }
       } catch (error) {
         errorEl.setText(error instanceof Error ? error.message : "Verification failed");
-        errorEl.style.display = "";
+        errorEl.show();
       } finally {
         verifyBtn.setDisabled(false);
         verifyBtn.setButtonText("Verify & Enable");

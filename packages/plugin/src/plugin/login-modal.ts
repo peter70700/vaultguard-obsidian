@@ -102,7 +102,7 @@ export class LoginModal extends Modal {
 
     // Error display
     this.errorEl = contentEl.createDiv({ cls: "vaultguard-login-error" });
-    this.errorEl.style.display = "none";
+    this.errorEl.hide();
 
     // Form
     const form = contentEl.createDiv({ cls: "vaultguard-login-form" });
@@ -110,7 +110,7 @@ export class LoginModal extends Modal {
     // Organization slug field (hidden if already configured)
     this.orgSlugContainer = form.createDiv({ cls: "vaultguard-field-group" });
     if (this.currentOrgSlug || !this.requireOrgSlug) {
-      this.orgSlugContainer.style.display = "none";
+      this.orgSlugContainer.hide();
     }
     this.orgSlugContainer.createEl("label", { text: "Organization", cls: "vaultguard-field-label" });
     this.orgSlugContainer.createEl("span", {
@@ -160,7 +160,7 @@ export class LoginModal extends Modal {
 
     // MFA field (hidden by default)
     this.mfaContainer = form.createDiv({ cls: "vaultguard-field-group vaultguard-mfa-container" });
-    this.mfaContainer.style.display = "none";
+    this.mfaContainer.hide();
     this.mfaLabelEl = this.mfaContainer.createEl("label", { text: "MFA Code", cls: "vaultguard-field-label" });
     this.mfaHintEl = this.mfaContainer.createEl("span", {
       text: "Enter the 6-digit code from your authenticator app",
@@ -188,7 +188,7 @@ export class LoginModal extends Modal {
     // Passphrase field (hybrid-zk mode only)
     this.passphraseContainer = form.createDiv({ cls: "vaultguard-field-group vaultguard-passphrase-container" });
     if (this.encryptionMode !== 'hybrid-zk') {
-      this.passphraseContainer.style.display = "none";
+      this.passphraseContainer.hide();
     }
 
     if (this.isZkSetup) {
@@ -274,7 +274,7 @@ export class LoginModal extends Modal {
     this.showMfa = true;
     this.recoveryMode = false;
     if (this.mfaContainer) {
-      this.mfaContainer.style.display = "";
+      this.mfaContainer.show();
     }
     this.applyMfaModeUi();
     this.showError("");
@@ -336,9 +336,9 @@ export class LoginModal extends Modal {
     this.errorEl.classList.remove("vaultguard-login-success");
     if (message) {
       this.errorEl.setText(message);
-      this.errorEl.style.display = "";
+      this.errorEl.show();
     } else {
-      this.errorEl.style.display = "none";
+      this.errorEl.hide();
     }
   }
 
@@ -449,28 +449,28 @@ export class LoginModal extends Modal {
 
     // Error / success display
     const errorEl = contentEl.createDiv({ cls: "vaultguard-login-error" });
-    errorEl.style.display = "none";
+    errorEl.hide();
 
     const successEl = contentEl.createDiv({ cls: "vaultguard-reset-success" });
-    successEl.style.display = "none";
+    successEl.hide();
 
     const showResetError = (msg: string) => {
       if (msg) {
         errorEl.setText(msg);
-        errorEl.style.display = "";
-        successEl.style.display = "none";
+        errorEl.show();
+        successEl.hide();
       } else {
-        errorEl.style.display = "none";
+        errorEl.hide();
       }
     };
 
     const showResetSuccess = (msg: string) => {
       if (msg) {
         successEl.setText(msg);
-        successEl.style.display = "";
-        errorEl.style.display = "none";
+        successEl.show();
+        errorEl.hide();
       } else {
-        successEl.style.display = "none";
+        successEl.hide();
       }
     };
 
@@ -505,7 +505,7 @@ export class LoginModal extends Modal {
           await this.onForgotPassword!(email);
           showResetSuccess("If an account exists with this email, a reset code has been sent. Check your inbox.");
           // Show the confirmation fields
-          confirmSection.style.display = "";
+          confirmSection.show();
           setTimeout(() => codeInput.focus(), 50);
         } catch (err) {
           showResetError(err instanceof Error ? err.message : "Failed to send reset code.");
@@ -519,7 +519,7 @@ export class LoginModal extends Modal {
 
     // Confirmation section (hidden until code is sent)
     const confirmSection = form.createDiv({ cls: "vaultguard-reset-confirm-section" });
-    confirmSection.style.display = "none";
+    confirmSection.hide();
 
     // Code field
     const codeGroup = confirmSection.createDiv({ cls: "vaultguard-field-group" });
@@ -646,7 +646,7 @@ export class LoginModal extends Modal {
       this.showMfa = false;
       this.mfaCode = "";
       if (this.mfaInputEl) this.mfaInputEl.value = "";
-      if (this.mfaContainer) this.mfaContainer.style.display = "none";
+      if (this.mfaContainer) this.mfaContainer.hide();
       this.applyMfaModeUi();
       this.submitBtn?.setButtonText("Sign In");
       this.showError("");
@@ -657,7 +657,7 @@ export class LoginModal extends Modal {
           "Recovery code accepted. Sign in again with your password to set up a new authenticator."
         );
         this.errorEl.classList.add("vaultguard-login-success");
-        this.errorEl.style.display = "";
+        this.errorEl.show();
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Recovery failed.";

@@ -1084,7 +1084,7 @@ function extractAgentHeaders(
     const target = name.toLowerCase();
     for (const [k, v] of Object.entries(event.headers)) {
       if (k.toLowerCase() === target && typeof v === 'string') {
-        // eslint-disable-next-line no-control-regex
+        // eslint-disable-next-line no-control-regex -- intentionally matches raw control characters (CR/LF/NUL..US/DEL) so header-injection bytes are stripped from agent header values
         const cleaned = v.replace(/[\r\n\x00-\x1f\x7f]/g, '').trim().slice(0, 128);
         return cleaned || undefined;
       }

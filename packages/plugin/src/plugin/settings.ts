@@ -217,7 +217,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * tally and status reflect what's actually on disk.
    */
   private renderAtRestSection(containerEl: HTMLElement): void {
-    containerEl.createEl("h2", { text: "Local at-rest encryption" });
+    new Setting(containerEl).setName("Local at-rest encryption").setHeading();
     const atRestDesc = Platform.isMobileApp
       ? "Vault files on this device are encrypted on disk with a per-device key kept in this app's secure storage. Without VaultGuard Sync running, the files on disk are ciphertext — useful if your phone backs up app data to iCloud / Google Drive."
       : "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard Sync running, opening files in Finder shows ciphertext.";
@@ -443,7 +443,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private renderCurrentVaultSettings(containerEl: HTMLElement, session: UserSession | null): void {
-    containerEl.createEl("h2", { text: "Vault settings" });
+    new Setting(containerEl).setName("Vault settings").setHeading();
     const sectionEl = containerEl.createDiv({ cls: "vaultguard-current-vault-settings" });
 
     if (!session) {
@@ -584,10 +584,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       });
     }
 
-    sectionEl.createEl("h3", {
-      text: "Available vaults",
-      cls: "vaultguard-current-vault-heading",
-    });
+    new Setting(sectionEl).setName("Available vaults").setHeading();
 
     if (vaultListError) {
       new Setting(sectionEl)
@@ -654,10 +651,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     rootEl: HTMLElement,
     session: UserSession
   ): void {
-    sectionEl.createEl("h3", {
-      text: "Create vault",
-      cls: "vaultguard-current-vault-heading",
-    });
+    new Setting(sectionEl).setName("Create vault").setHeading();
 
     if (!this.isOrgAdmin(session)) {
       new Setting(sectionEl)
@@ -773,10 +767,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     const canEdit = this.canManageVault(session, memberRole);
     const canArchive = this.isOrgAdmin(session);
 
-    sectionEl.createEl("h3", {
-      text: "Current vault options",
-      cls: "vaultguard-current-vault-heading",
-    });
+    new Setting(sectionEl).setName("Current vault options").setHeading();
 
     if (!canEdit) {
       new Setting(sectionEl)
@@ -904,10 +895,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     vault: VaultRecord,
     memberRole: VaultMemberRole | null
   ): void {
-    sectionEl.createEl("h3", {
-      text: "Vault members",
-      cls: "vaultguard-current-vault-heading",
-    });
+    new Setting(sectionEl).setName("Vault members").setHeading();
 
     const membersEl = sectionEl.createDiv({ cls: "vaultguard-vault-members" });
     membersEl.createDiv({
@@ -1226,7 +1214,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     containerEl.addClass("vaultguard-settings-tab");
 
     // ── Header ──────────────────────────────────────────────────────────────
-    containerEl.createEl("h1", { text: "VaultGuard Sync" });
+    new Setting(containerEl).setName("VaultGuard Sync").setHeading();
     containerEl.createEl("p", {
       text: "Enterprise-grade vault security with permission-aware encrypted cloud sync.",
       cls: "setting-item-description",
@@ -1236,7 +1224,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     const session = this.plugin.getSession();
     const isManualMode = this.plugin.settings.manualConfig ?? false;
     if (session) {
-      containerEl.createEl("h2", { text: "Account" });
+      new Setting(containerEl).setName("Account").setHeading();
 
       new Setting(containerEl)
         .setName("Logged in as")
@@ -1307,7 +1295,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             })
         );
     } else {
-      containerEl.createEl("h2", { text: "Account" });
+      new Setting(containerEl).setName("Account").setHeading();
 
       new Setting(containerEl)
         .setName("Not logged in")
@@ -1349,7 +1337,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     this.renderCurrentVaultSettings(containerEl, session);
 
     // ── Connection Settings ─────────────────────────────────────────────────
-    containerEl.createEl("h2", { text: "Connection", attr: { id: "vaultguard-connection-section" } });
+    new Setting(containerEl)
+      .setName("Connection")
+      .setHeading()
+      .settingEl.setAttribute("id", "vaultguard-connection-section");
 
     new Setting(containerEl)
       .setName("Connected to")
@@ -1610,7 +1601,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
 
     // ── Sync Settings ───────────────────────────────────────────────────────
-    containerEl.createEl("h2", { text: "Synchronization" });
+    new Setting(containerEl).setName("Synchronization").setHeading();
     const orgPolicy = this.plugin.getOrgPolicySettings();
     if (orgPolicy) {
       const policyDescription =
@@ -1745,7 +1736,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
 
     // ── Security Settings ───────────────────────────────────────────────────
-    containerEl.createEl("h2", { text: "Security" });
+    new Setting(containerEl).setName("Security").setHeading();
 
     new Setting(containerEl)
       .setName("Cache encryption strength")
@@ -1799,7 +1790,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
 
     // ── Display Settings ────────────────────────────────────────────────────
-    containerEl.createEl("h2", { text: "Display" });
+    new Setting(containerEl).setName("Display").setHeading();
 
     new Setting(containerEl)
       .setName("Show permission indicators")
@@ -1838,7 +1829,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     this.renderAgentBridgeSection(containerEl);
 
     // ── Advanced Settings ───────────────────────────────────────────────────
-    containerEl.createEl("h2", { text: "Advanced" });
+    new Setting(containerEl).setName("Advanced").setHeading();
 
     new Setting(containerEl)
       .setName("Max retry attempts")
@@ -1885,7 +1876,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
 
     // ── Danger Zone ─────────────────────────────────────────────────────────
-    containerEl.createEl("h2", { text: "Danger Zone" });
+    new Setting(containerEl).setName("Danger Zone").setHeading();
     containerEl.createEl("p", {
       text: "These actions cannot be undone.",
       cls: "setting-item-description mod-warning",
@@ -1994,7 +1985,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * every active lease, rotate one token, or revoke one lease.
    */
   private renderAgentBridgeSection(containerEl: HTMLElement): void {
-    containerEl.createEl("h2", { text: "Agent bridge connections (Desktop only.)" });
+    new Setting(containerEl).setName("Agent bridge connections (Desktop only.)").setHeading();
 
     // Agent bridge needs a local HTTP server (Node `http` module). That's
     // only reachable in desktop Obsidian's renderer. On mobile we surface
@@ -2064,10 +2055,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     this.renderLatestAgentBridgeReveal(containerEl);
     this.renderAgentBridgeSkillRow(containerEl);
 
-    containerEl.createEl("h3", {
-      text: "Current leases",
-      cls: "vaultguard-current-vault-heading",
-    });
+    new Setting(containerEl).setName("Current leases").setHeading();
 
     if (activeLeases.length === 0) {
       const empty = containerEl.createDiv({ cls: "setting-item-description" });
@@ -2468,7 +2456,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     opts: { title: string; body: string; copyLabel: string }
   ): void {
     const wrapper = parent.createDiv({ cls: "vaultguard-agent-bridge-copy-block" });
-    wrapper.createEl("h4", { text: opts.title });
+    wrapper.createDiv({ text: opts.title, cls: "vaultguard-agent-bridge-copy-title" });
     const codeBox = wrapper.createEl("pre", {
       cls: "vaultguard-agent-bridge-connection",
     });

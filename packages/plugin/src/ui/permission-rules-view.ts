@@ -358,8 +358,8 @@ export class PermissionRulesView {
     });
 
     const applyPrincipalVisibility = () => {
-      userSetting.settingEl.style.display = form.principalType === "user" ? "" : "none";
-      roleSetting.settingEl.style.display = form.principalType === "role" ? "" : "none";
+      userSetting.settingEl.toggle(form.principalType === "user");
+      roleSetting.settingEl.toggle(form.principalType === "role");
     };
     applyPrincipalVisibility();
 

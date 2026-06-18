@@ -4393,9 +4393,10 @@ button .vaultguard-btn-spinner:only-child {
   margin-top: 12px;
 }
 
-.vaultguard-agent-bridge-copy-block h4 {
+.vaultguard-agent-bridge-copy-title {
   margin: 0 0 4px;
   font-size: 13px;
+  font-weight: var(--font-bold, 700);
 }
 
 .vaultguard-modal-hint {

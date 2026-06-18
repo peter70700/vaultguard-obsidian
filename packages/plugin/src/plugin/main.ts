@@ -13,7 +13,6 @@
  */
 
 import { Notice, Plugin, Platform, TFile, TFolder, TAbstractFile, Menu, normalizePath, addIcon, requestUrl, RequestUrlResponse, EventRef } from "obsidian";
-import pluginStyles from "../../styles.css";
 import { VaultGuardSettingTab, DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
 import { AgentBridgeLeaseModal } from "./agent-bridge-modal";
@@ -224,7 +223,6 @@ interface RemoteFileContentResponse {
  */
 export default class VaultGuardPlugin extends Plugin {
   /** Runtime stylesheet fallback for installs where Obsidian misses styles.css. */
-  private runtimeStyleEl: HTMLStyleElement | null = null;
 
   /** Plugin settings persisted to disk */
   settings: VaultGuardSettings = DEFAULT_SETTINGS;
@@ -587,8 +585,6 @@ export default class VaultGuardPlugin extends Plugin {
   async onload(): Promise<void> {
     this.log("Loading VaultGuard plugin...");
 
-    this.injectRuntimeStyles();
-
     // Load persisted settings
     await this.loadSettings();
 
@@ -810,8 +806,10 @@ export default class VaultGuardPlugin extends Plugin {
       this.fileExplorerDecorations = null;
     }
 
-    // Detach VaultGuard sidebar view
-    this.app.workspace.detachLeavesOfType(VAULTGUARD_VIEW_TYPE);
+    // Note: VaultGuard sidebar leaves are intentionally NOT detached here.
+    // Obsidian persists leaf placement, and detaching on unload resets the
+    // view to its default location the next time the plugin loads, discarding
+    // any spot the user moved it to.
 
     // Remove status bar
     if (this.statusBarEl) {
@@ -819,35 +817,7 @@ export default class VaultGuardPlugin extends Plugin {
       this.statusBarEl = null;
     }
 
-    this.removeRuntimeStyles();
-
     this.log("VaultGuard plugin unloaded.");
-  }
-
-  private injectRuntimeStyles(): void {
-    if (typeof document === "undefined") {
-      return;
-    }
-
-    const styleId = "vaultguard-runtime-styles";
-    const existing = document.getElementById(styleId);
-
-    if (existing instanceof HTMLStyleElement) {
-      existing.textContent = pluginStyles;
-      this.runtimeStyleEl = existing;
-      return;
-    }
-
-    const styleEl = document.createElement("style");
-    styleEl.id = styleId;
-    styleEl.textContent = pluginStyles;
-    document.head.appendChild(styleEl);
-    this.runtimeStyleEl = styleEl;
-  }
-
-  private removeRuntimeStyles(): void {
-    this.runtimeStyleEl?.remove();
-    this.runtimeStyleEl = null;
   }
 
   private registerInviteProtocolHandler(): void {
@@ -2793,7 +2763,7 @@ export default class VaultGuardPlugin extends Plugin {
       "VaultGuard: Vault connected. Reload Obsidian so every file shows everyone who has access to it."
     );
     const actions = frag.createDiv();
-    actions.style.marginTop = "8px";
+    actions.setCssStyles({ marginTop: "8px" });
     const reloadBtn = actions.createEl("button", { text: "Reload now" });
     reloadBtn.addEventListener("click", () => {
       // "Reload app without saving" — re-runs the full startup (session
@@ -10315,14 +10285,6 @@ export default class VaultGuardPlugin extends Plugin {
     return btoa(binary);
   }
 
-  /**
-   * Gets a unique device identifier for audit logging.
-   * @returns A persistent device ID string
-   */
-  private getDeviceId(): string {
-    // Use a simple hash of platform info as device identifier
-    return `obsidian-${navigator.userAgent.slice(0, 32).replace(/\s/g, "_")}`;
-  }
 
   /**
    * Checks if an error is a network/connectivity error.
