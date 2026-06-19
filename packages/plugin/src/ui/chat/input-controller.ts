@@ -331,7 +331,7 @@ export class InputController {
     const fileInput = bar.createEl("input", {
       attr: { type: "file", accept: "image/*", multiple: "true" },
     });
-    fileInput.style.display = "none";
+    fileInput.hide();
     fileInput.addEventListener("change", () => {
       const files = fileInput.files;
       if (files) Array.from(files).forEach((f) => void this.addImageFile(f));
@@ -446,10 +446,10 @@ export class InputController {
 
   private autoGrow(): void {
     const ta = this.textarea;
-    ta.style.height = "auto";
+    ta.setCssStyles({ height: "auto" });
     const maxHeight = MAX_ROWS * LINE_HEIGHT_PX;
-    ta.style.height = `${Math.min(ta.scrollHeight, maxHeight)}px`;
-    ta.style.overflowY = ta.scrollHeight > maxHeight ? "auto" : "hidden";
+    ta.setCssStyles({ height: `${Math.min(ta.scrollHeight, maxHeight)}px` });
+    ta.setCssStyles({ overflowY: ta.scrollHeight > maxHeight ? "auto" : "hidden" });
   }
 }
 
