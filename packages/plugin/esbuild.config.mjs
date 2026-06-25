@@ -1,9 +1,16 @@
 import esbuild from "esbuild";
 import process from "process";
 import { existsSync, mkdirSync } from "fs";
-import { builtinModules } from "module";
+import { builtinModules, createRequire } from "module";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
+
+// Resolve runtime deps wherever they actually live. In a flat install that's
+// <root>/node_modules; in the public monorepo's npm workspaces it's hoisted to
+// the workspace root. Hardcoding <root>/node_modules/<dep> broke the monorepo
+// release build (jszip is hoisted above packages/plugin) — require.resolve walks
+// the node_modules chain and finds it in either layout.
+const requireFromConfig = createRequire(import.meta.url);
 
 // Node built-ins are available in Electron's CJS runtime — keep them external so
 // esbuild doesn't try to bundle/polyfill them. The Tier-2 AI-chat streaming path
@@ -31,7 +38,10 @@ const rootDir = dirname(fileURLToPath(import.meta.url));
 
 const safeDependencyAliases = {
   immediate: join(rootDir, "src", "shims", "immediate.cjs"),
-  jszip: join(rootDir, "node_modules", "jszip", "lib", "index.js"),
+  // require.resolve("jszip") → its package "main" (lib/index.js), resolved from
+  // wherever jszip is installed (flat OR workspace-hoisted), so the monorepo
+  // release build doesn't look under packages/plugin/node_modules.
+  jszip: requireFromConfig.resolve("jszip"),
   setimmediate: join(rootDir, "src", "shims", "setimmediate.cjs"),
 };
 
