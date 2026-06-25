@@ -16,6 +16,7 @@ const HEADER_ICON_CLS = "vaultguard-chat-tool-icon";
 const SECTION_CLS = "vaultguard-chat-tool-section";
 const SECTION_LABEL_CLS = "vaultguard-chat-tool-section-label";
 const CODE_CLS = "vaultguard-chat-tool-code";
+const TOOL_COPY_CLS = "vaultguard-chat-tool-copy";
 const ERROR_CLS = "is-error";
 const PENDING_CLS = "is-pending";
 
@@ -26,7 +27,17 @@ const PRIMARY_ARG: Record<string, string> = {
   vaultguard_read: "path",
   vaultguard_apply_patch: "path",
   vaultguard_create: "path",
+  vaultguard_delete: "path",
+  vaultguard_rename: "path",
   vaultguard_graph: "op",
+  vaultguard_access: "op",
+  vaultguard_audit: "path",
+  vaultguard_files: "op",
+  vaultguard_share: "op",
+  vaultguard_membership: "op",
+  vaultguard_ask_user: "question",
+  vaultguard_import_list: "path",
+  vaultguard_import_read: "path",
 };
 
 /**
@@ -63,6 +74,13 @@ function prettyJson(value: unknown): string {
   }
 }
 
+function hasDisplayableArgs(value: unknown): boolean {
+  if (value == null) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value as Record<string, unknown>).length > 0;
+  return String(value).trim().length > 0;
+}
+
 // A result `content` is JSON for ok results, a plain message for errors. Pretty-
 // print JSON when it parses; otherwise show the raw string.
 function formatResultContent(content: string): string {
@@ -75,6 +93,60 @@ function formatResultContent(content: string): string {
     }
   }
   return content;
+}
+
+/**
+ * Copy-to-clipboard affordance for expanded tool cards. Kept local to this
+ * renderer because tool calls copy a structured transcript, not markdown.
+ */
+function addToolCopyButton(host: HTMLElement, getText: () => string, label: string): HTMLElement {
+  const btn = host.createSpan({
+    cls: "vaultguard-chat-copy-btn clickable-icon",
+    attr: { "aria-label": label, title: label },
+  });
+  setIcon(btn, "copy");
+  btn.addEventListener("click", (evt) => {
+    evt.stopPropagation();
+    const text = getText();
+    if (!text) return;
+    void navigator.clipboard.writeText(text).then(
+      () => {
+        setIcon(btn, "check");
+        window.setTimeout(() => setIcon(btn, "copy"), 1200);
+      },
+      () => {
+        /* clipboard denied — leave the icon unchanged */
+      },
+    );
+  });
+  return btn;
+}
+
+function renderCopyableCode(parent: HTMLElement, text: string, copyLabel: string): HTMLElement {
+  const pre = parent.createEl("pre", { cls: CODE_CLS });
+  pre.addClass("vaultguard-chat-code-pre");
+  pre.createEl("code", { text });
+  addToolCopyButton(pre, () => text, copyLabel).addClass("vaultguard-chat-code-copy");
+  return pre;
+}
+
+/** Format the full expanded tool card as copy-pasteable transcript text. */
+export function formatToolCallCopyText(tool: string, input: unknown, result: ToolResult | null): string {
+  const sections = [`Tool: ${tool}`];
+
+  if (hasDisplayableArgs(input)) {
+    sections.push("", "Arguments:", prettyJson(input));
+  }
+
+  if (!result) {
+    sections.push("", "Result:", "Running...");
+  } else if (classifyResult(result) === "error") {
+    sections.push("", "Result (error):", result.content || "The tool call failed.");
+  } else {
+    sections.push("", "Result:", formatResultContent(result.content));
+  }
+
+  return sections.join("\n");
 }
 
 export interface ToolCallCard {
@@ -90,6 +162,7 @@ export interface ToolCallCard {
 export function renderToolCall(parent: HTMLElement, tool: string, input: unknown): ToolCallCard {
   const collapsible: Collapsible = createCollapsible(parent, { open: false, extraClass: CARD_CLS });
   collapsible.root.addClass(PENDING_CLS);
+  let currentResult: ToolResult | null = null;
 
   const arg = primaryArg(tool, input);
   collapsible.setLabel(arg ? `${tool} · ${arg}` : tool);
@@ -98,21 +171,30 @@ export function renderToolCall(parent: HTMLElement, tool: string, input: unknown
   setIcon(icon, "wrench");
   // Keep the icon visually first inside the header label area.
   collapsible.header.prepend(icon);
+  addToolCopyButton(
+    collapsible.header,
+    () => formatToolCallCopyText(tool, input, currentResult),
+    "Copy tool usage",
+  ).addClass(TOOL_COPY_CLS);
 
-  // Args section.
-  const argsSection = collapsible.body.createDiv({ cls: SECTION_CLS });
-  argsSection.createDiv({ cls: SECTION_LABEL_CLS, text: "Arguments" });
-  argsSection.createEl("pre", { cls: CODE_CLS }).createEl("code", { text: prettyJson(input) });
-
-  // Result section — populated by setResult.
+  // Result first: for Claude Code MCP calls the input is often `{}`, while the
+  // useful audit payload is the result. Keep pending cards informative too.
   const resultSection = collapsible.body.createDiv({ cls: SECTION_CLS });
   resultSection.createDiv({ cls: SECTION_LABEL_CLS, text: "Result" });
   const resultBody = resultSection.createDiv();
   resultBody.createSpan({ text: "Running…", cls: "vaultguard-chat-tool-pending-text" });
 
+  // Args section. Omit empty `{}` inputs so expanded cards don't look blank.
+  if (hasDisplayableArgs(input)) {
+    const argsSection = collapsible.body.createDiv({ cls: SECTION_CLS });
+    argsSection.createDiv({ cls: SECTION_LABEL_CLS, text: "Arguments" });
+    renderCopyableCode(argsSection, prettyJson(input), "Copy arguments");
+  }
+
   return {
     root: collapsible.root,
     setResult: (result: ToolResult) => {
+      currentResult = result;
       collapsible.root.removeClass(PENDING_CLS);
       resultBody.empty();
       if (classifyResult(result) === "error") {
@@ -125,10 +207,9 @@ export function renderToolCall(parent: HTMLElement, tool: string, input: unknown
         collapsible.setOpen(true);
       } else {
         collapsible.root.removeClass(ERROR_CLS);
-        resultBody.createEl("pre", { cls: CODE_CLS }).createEl("code", {
-          text: formatResultContent(result.content),
-        });
+        renderCopyableCode(resultBody, formatResultContent(result.content), "Copy result");
       }
+      collapsible.refreshLayout();
     },
   };
 }

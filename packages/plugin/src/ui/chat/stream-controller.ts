@@ -76,7 +76,8 @@ export class StreamController {
     if (this.bubble && this.streamEl) {
       this.streamEl.remove();
       this.streamEl = null;
-      if (this.text) this.bubble.appendMarkdown(this.text);
+      const rendered = this.text ? this.bubble.appendMarkdown(this.text) : false;
+      if (!rendered && !this.bubble.getRawText()) this.bubble.root.remove();
     }
     // Reset per-block state; a following block (e.g. after a tool call) starts a
     // fresh bubble.

@@ -1,7 +1,7 @@
-// Status footer for the chat panel (AI-CHAT-PANEL.md §9.7). Shows the current
-// model (clickable → cycle through the configured list), the connection state,
-// and per-turn / running-session usage with a $ estimate from the §4 price
-// table. Surfacing cost builds trust and catches a stuck agentic loop early.
+// Status footer for the chat panel (AI-CHAT-PANEL.md §9.7). Shows compact,
+// independently-clickable model / effort / permission chips, the connection
+// state, and per-turn token usage. The footer deliberately does not show a
+// running dollar session cost.
 //
 // Self-contained: it talks to the view only through the `onCycleModel` callback
 // and the `recordUsage` / `setModel` / `setConnection` setters. No filesystem,
@@ -10,10 +10,13 @@
 import { setIcon } from "obsidian";
 
 import type { AnthropicUsage } from "./anthropic-client";
-import { modelLabel } from "./models";
+import { compactModelLabel, effortLabel, permissionModeStatusLabel } from "./models";
+import type { AiChatPermissionMode, AnthropicEffort } from "../../types";
 
 const FOOTER_CLS = "vaultguard-chat-status";
 const MODEL_CLS = "vaultguard-chat-status-model";
+const EFFORT_CLS = "vaultguard-chat-status-effort";
+const PERMISSION_CLS = "vaultguard-chat-status-permission";
 const CONN_CLS = "vaultguard-chat-status-conn";
 const USAGE_CLS = "vaultguard-chat-status-usage";
 
@@ -54,12 +57,6 @@ export function usageCostUsd(model: string, usage: AnthropicUsage | undefined): 
   return inputCost + outputCost;
 }
 
-function formatUsd(amount: number): string {
-  if (amount === 0) return "$0.00";
-  if (amount < 0.01) return `$${amount.toFixed(4)}`;
-  return `$${amount.toFixed(2)}`;
-}
-
 function formatUsageLine(usage: AnthropicUsage): string {
   const parts: string[] = [];
   const cacheRead = usage.cache_read_input_tokens ?? 0;
@@ -73,40 +70,81 @@ function formatUsageLine(usage: AnthropicUsage): string {
 }
 
 export interface StatusPanelCallbacks {
-  /** Click on the model chip — open the model / effort picker menu. */
+  /** Click on the model chip — open the model picker menu. */
   onModelMenu(evt: MouseEvent): void;
+  /** Click on the effort chip — open the thinking-effort picker menu. */
+  onEffortMenu(evt: MouseEvent): void;
+  /** Click on the permission chip — open the AI Chat permission picker menu. */
+  onPermissionMenu(evt: MouseEvent): void;
+}
+
+export function statusModelLabel(model: string): string {
+  return compactModelLabel(model).replace(/^Claude\s+/i, "");
+}
+
+export function statusEffortLabel(effort: AnthropicEffort): string {
+  const label = effortLabel(effort);
+  return label === "Extra high" ? "X-high" : label;
+}
+
+export function statusPermissionLabel(permissionMode: AiChatPermissionMode): string {
+  return permissionModeStatusLabel(permissionMode);
 }
 
 export class StatusPanel {
   private readonly modelEl: HTMLElement;
   private readonly modelLabelEl: HTMLElement;
+  private readonly effortEl: HTMLElement;
+  private readonly effortLabelEl: HTMLElement;
+  private readonly permissionEl: HTMLElement;
+  private readonly permissionLabelEl: HTMLElement;
   private readonly connEl: HTMLElement;
   private readonly usageEl: HTMLElement;
   private sessionCostUsd = 0;
   private model: string;
+  private effort: AnthropicEffort;
+  private permissionMode: AiChatPermissionMode;
 
   constructor(
     parent: HTMLElement,
     model: string,
+    effort: AnthropicEffort,
+    permissionMode: AiChatPermissionMode,
     private readonly callbacks: StatusPanelCallbacks,
   ) {
     this.model = model;
+    this.effort = effort;
+    this.permissionMode = permissionMode;
 
     const footer = parent.createDiv({ cls: FOOTER_CLS });
 
-    this.modelEl = footer.createSpan({
-      cls: `${MODEL_CLS} clickable-icon`,
-      attr: { "aria-label": "Switch model", title: "Switch model / effort" },
-    });
+    this.modelEl = this.createChip(footer, MODEL_CLS, "Switch model", (evt) =>
+      this.callbacks.onModelMenu(evt),
+    );
     this.modelLabelEl = this.modelEl.createSpan({ cls: `${MODEL_CLS}-label` });
-    const chevron = this.modelEl.createSpan({ cls: `${MODEL_CLS}-chevron` });
-    setIcon(chevron, "chevron-down");
-    this.modelEl.addEventListener("click", (evt) => this.callbacks.onModelMenu(evt));
+    this.addChevron(this.modelEl);
 
-    this.connEl = footer.createSpan({ cls: CONN_CLS });
+    this.effortEl = this.createChip(footer, EFFORT_CLS, "Switch thinking effort", (evt) =>
+      this.callbacks.onEffortMenu(evt),
+    );
+    this.effortLabelEl = this.effortEl.createSpan({ cls: `${EFFORT_CLS}-label` });
+    this.addChevron(this.effortEl);
+
+    this.permissionEl = this.createChip(footer, PERMISSION_CLS, "Switch AI Chat permissions", (evt) =>
+      this.callbacks.onPermissionMenu(evt),
+    );
+    this.permissionLabelEl = this.permissionEl.createSpan({ cls: `${PERMISSION_CLS}-label` });
+    this.addChevron(this.permissionEl);
+
     this.usageEl = footer.createSpan({ cls: USAGE_CLS });
+    this.connEl = footer.createSpan({
+      cls: CONN_CLS,
+      attr: { "aria-label": "Connection status", title: "Offline" },
+    });
 
     this.renderModel();
+    this.renderEffort();
+    this.renderPermission();
     this.setConnection(false);
     this.renderUsage(null);
   }
@@ -116,8 +154,20 @@ export class StatusPanel {
     this.renderModel();
   }
 
+  setEffort(effort: AnthropicEffort): void {
+    this.effort = effort;
+    this.renderEffort();
+  }
+
+  setPermissionMode(permissionMode: AiChatPermissionMode): void {
+    this.permissionMode = permissionMode;
+    this.renderPermission();
+  }
+
   setConnection(online: boolean): void {
-    this.connEl.setText(online ? "● online" : "○ offline");
+    this.connEl.setText("●");
+    this.connEl.setAttribute("aria-label", online ? "Online" : "Offline");
+    this.connEl.setAttribute("title", online ? "Online" : "Offline");
     this.connEl.toggleClass("is-online", online);
     this.connEl.toggleClass("is-offline", !online);
   }
@@ -151,19 +201,44 @@ export class StatusPanel {
   }
 
   private renderModel(): void {
-    // Show the friendly label for configured models; subscription mode passes a
-    // pre-formatted string (e.g. "Claude subscription · max") which falls
-    // through modelLabel() unchanged.
-    this.modelLabelEl.setText(modelLabel(this.model));
+    const label = statusModelLabel(this.model);
+    this.modelLabelEl.setText(label);
+    this.modelEl.setAttribute("title", `Model: ${label}`);
+  }
+
+  private renderEffort(): void {
+    const label = statusEffortLabel(this.effort);
+    this.effortLabelEl.setText(label);
+    this.effortEl.setAttribute("title", `Thinking effort: ${label}`);
+  }
+
+  private renderPermission(): void {
+    const label = statusPermissionLabel(this.permissionMode);
+    this.permissionLabelEl.setText(label);
+    this.permissionEl.setAttribute("title", `AI Chat permissions: ${label}`);
   }
 
   private renderUsage(usage: AnthropicUsage | null): void {
-    const cost = formatUsd(this.sessionCostUsd);
-    if (usage) {
-      this.usageEl.setText(`${formatUsageLine(usage)} · ${cost} session`);
-    } else {
-      this.usageEl.setText(`${cost} session`);
-    }
+    this.usageEl.setText(usage ? formatUsageLine(usage) : "");
+  }
+
+  private createChip(
+    parent: HTMLElement,
+    cls: string,
+    label: string,
+    onClick: (evt: MouseEvent) => void,
+  ): HTMLElement {
+    const chip = parent.createSpan({
+      cls: `vaultguard-chat-status-chip ${cls} clickable-icon`,
+      attr: { "aria-label": label, title: label },
+    });
+    chip.addEventListener("click", onClick);
+    return chip;
+  }
+
+  private addChevron(chip: HTMLElement): void {
+    const chevron = chip.createSpan({ cls: "vaultguard-chat-status-chip-chevron" });
+    setIcon(chevron, "chevron-down");
   }
 }
 

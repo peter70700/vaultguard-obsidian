@@ -220,6 +220,20 @@ export interface AuditLogEntry {
   metadata?: Record<string, unknown>;
 }
 
+/** Metadata-only vault overview (no content/keys). Mirrors the files-Lambda. */
+export interface VaultOverviewResponse {
+  vaultId: string;
+  generatedAt: string;
+  fileCount: number;
+  folderCount: number;
+  totalSizeBytes: number;
+  maxDepth: number;
+  latestModified: string | null;
+  extensions: { extension: string; count: number; totalSizeBytes: number }[];
+  largestFiles: { path: string; name?: string; size: number; lastModified: string }[];
+  isTruncated: boolean;
+}
+
 export interface AuditLogPageResponse {
   entries: AuditLogEntry[];
   count: number;
@@ -641,6 +655,42 @@ export class VaultGuardApiClient {
     return this.request("GET", `${this.vaultBase()}/files/${encodeURIComponent(path)}/history`);
   }
 
+  /**
+   * Lists soft-deleted files (current S3 head is a delete marker). Admin-only
+   * server-side, and per-row filtered to paths the caller can read. Returns
+   * the delete-marker version id + deletion timestamp so a file can be restored.
+   */
+  async getDeletedFiles(): Promise<
+    { path: string; deleteMarkerVersionId: string; deletedAt: string }[]
+  > {
+    const response = await this.request<{
+      files: { path: string; deleteMarkerVersionId: string; deletedAt: string }[];
+    }>("GET", `${this.vaultBase()}/files/deleted`);
+    return response.files ?? [];
+  }
+
+  /**
+   * Restores a soft-deleted file by removing its current S3 delete marker,
+   * re-promoting the prior version. Admin + write-permission gated server-side.
+   * The restored file re-appears locally on the next sync pull.
+   */
+  async restoreDeletedFile(
+    path: string
+  ): Promise<{ path: string; versionId: string; restoredFrom: string }> {
+    return this.request(
+      "POST",
+      `${this.vaultBase()}/files/${encodeURIComponent(path)}/restore-delete`
+    );
+  }
+
+  /**
+   * Metadata-only vault overview (file/folder counts, total size, largest
+   * files, extension breakdown). Never reads object bodies; admin-only.
+   */
+  async getVaultOverview(): Promise<VaultOverviewResponse> {
+    return this.request<VaultOverviewResponse>("GET", `${this.vaultBase()}/overview`);
+  }
+
   // ─── Permission Operations (vault-scoped) ───────────────────────────
 
   async getPermissions(path?: string): Promise<PermissionRule[]> {
@@ -673,6 +723,7 @@ export class VaultGuardApiClient {
     role?: string | null;
     pathPattern: string;
     level: "none" | "read" | "write" | "admin";
+    priority?: number;
   }): Promise<{
     decision: "create" | "update" | "delete" | "noop";
     level: "none" | "read" | "write" | "admin";
@@ -825,6 +876,8 @@ export class VaultGuardApiClient {
   async getAuditLogPage(filters: {
     search?: string;
     action?: string;
+    path?: string;
+    outcome?: AuditLogEntry["outcome"];
     dateFrom?: string;
     dateTo?: string;
     cursor?: string | null;
@@ -833,6 +886,8 @@ export class VaultGuardApiClient {
     const params = new URLSearchParams();
     if (filters.search) params.set("search", filters.search);
     if (filters.action && filters.action !== "all") params.set("action", filters.action);
+    if (filters.path) params.set("path", filters.path);
+    if (filters.outcome) params.set("outcome", filters.outcome);
     if (filters.dateFrom) params.set("startDate", filters.dateFrom);
     if (filters.dateTo) params.set("endDate", filters.dateTo);
     if (filters.cursor) params.set("cursor", filters.cursor);

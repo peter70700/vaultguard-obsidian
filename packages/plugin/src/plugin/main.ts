@@ -16,7 +16,7 @@ import { Notice, Plugin, Platform, TFile, TFolder, TAbstractFile, Menu, normaliz
 import { VaultGuardSettingTab, DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
 import { AgentBridgeLeaseModal } from "./agent-bridge-modal";
-import { WriteConfirmModal } from "../ui/chat/render/write-confirm-modal";
+import { AGENT_BRIDGE_CONFIRM_LABELS, WriteConfirmModal } from "../ui/chat/render/write-confirm-modal";
 import {
   ConversationStore,
   type ConversationStorageAdapter,
@@ -48,6 +48,7 @@ import { FilePermissionHeader } from "../ui/file-permission-header";
 import { ReadOnlyGuard } from "./readonly-guard";
 import { PermissionStore } from "./permission-store";
 import { UpdateChecker } from "./update-checker";
+import { SyncDiagnostics } from "./sync-diagnostics";
 import { AtRestCipher, AtRestStorage } from "../crypto/at-rest-cipher";
 import { SafeStorageLike, probeSafeStorage } from "../crypto/safe-storage";
 import { PathPermissionsModal } from "../ui/path-permissions-modal";
@@ -56,12 +57,28 @@ import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
 import { VaultGuardSidebarView, VAULTGUARD_VIEW_TYPE } from "../ui/vaultguard-sidebar-view";
 import { registerChatDebugCommand } from "../ui/chat/chat-debug-command";
 import { VaultGuardChatView, VAULTGUARD_CHAT_VIEW_TYPE } from "../ui/chat/chat-view";
+import {
+  PermissionsGraphView,
+  VAULTGUARD_GRAPH_VIEW_TYPE,
+  type PermissionsGraphDataSource,
+  type PermissionsGraphDataset,
+} from "../ui/graph/permissions-graph-view";
 import { findClaudeBinary } from "../ui/chat/claude-cli/claude-detector";
-import type { VaultGuardSidebarViewConfig } from "../ui/vaultguard-sidebar-view";
+import type {
+  VaultGuardSidebarAuthState,
+  VaultGuardSidebarViewConfig,
+} from "../ui/vaultguard-sidebar-view";
+// sd4: the gated source-read tool's fs surface + the converters back the
+// in-app-chat /import-knowledge agent. The standalone sd2 importer (command,
+// ribbon, batch-confirm modal, 1:1 path mapping) was retired in favor of this.
+import { makeImportSourceFs } from "../ui/import/local-file-importer";
+import { classifyExtension, dispatchConvert } from "../ui/import/converters/dispatch";
 import {
   AgentBridgeLeaseInput,
   AgentBridgeLeaseSecret,
   AgentBridgeLeaseSummary,
+  AgentBridgeAskUserHandler,
+  AgentBridgeConfirmPausedHandler,
   AgentBridgePersistenceAdapter,
   AgentBridgeServerInfo,
   AgentBridgeToolSurface,
@@ -129,6 +146,13 @@ const AUTH_REQUIRED_NOTICE_THROTTLE_MS = 5 * 1000;
 
 /** Minimum spacing between repeated connection-lost notices */
 const CONNECTION_LOST_NOTICE_THROTTLE_MS = 30 * 1000;
+
+/**
+ * Maximum age of a deletion tombstone (30 days). Tombstones older than this
+ * are pruned on load so a path that never reconciles cannot grow the set
+ * unbounded.
+ */
+const DELETION_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Plugin log prefix for console output */
 const LOG_PREFIX = "[VaultGuard]";
@@ -221,6 +245,18 @@ interface RemoteFileContentResponse {
   content: string;
   encoding?: string;
   decrypted?: boolean;
+}
+
+/**
+ * On-disk shape of the LAK-encrypted permissions-graph cache envelope. Stamped
+ * with the owning userId so it's never surfaced to a different signed-in user.
+ */
+interface PersistedPermissionsGraphCache {
+  // Bumped to 2 when the dataset gained per-folder access summaries; v1 envelopes
+  // are rejected so old caches can't mask the folder-permission feature.
+  version: 2;
+  userId: string;
+  entries: Record<string, { fetchedAt: number; data: PermissionsGraphDataset }>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -408,6 +444,17 @@ export default class VaultGuardPlugin extends Plugin {
   /** Status bar element reference */
   private statusBarEl: HTMLElement | null = null;
 
+  /** Primary VaultGuard shield ribbon button, used for persistent auth status. */
+  private vaultGuardRibbonEl: HTMLElement | null = null;
+  private vaultGuardChatRibbonEl: HTMLElement | null = null;
+  private vaultGuardGraphRibbonEl: HTMLElement | null = null;
+
+  /**
+   * Last explicit logout reason for persistent UI surfaces. Notices disappear;
+   * this keeps the status bar/sidebar honest until the next successful login.
+   */
+  private lastLogoutAuthState: VaultGuardSidebarAuthState | null = null;
+
   /** Original vault adapter methods (saved for restoration on unload) */
   private originalAdapterMethods: {
     read: ((normalizedPath: string) => Promise<string>) | null;
@@ -462,6 +509,14 @@ export default class VaultGuardPlugin extends Plugin {
    * would double-fire every marker upload/delete; this flag stops that.
    */
   private folderLifecycleListenersRegistered = false;
+
+  /**
+   * Always-on, secret-free breadcrumb recorder for the startup/sync control
+   * flow (DX4-DIAG). Pure additive instrumentation: every `.record(...)` call
+   * is a standalone statement that changes no branch/return/timer behavior.
+   * Surfaced read-only via the `vaultguard-sync-diagnostics` command.
+   */
+  private syncDiagnostics = new SyncDiagnostics();
 
   /**
    * Last wall-clock millisecond a focus-triggered sync fired. Used to debounce
@@ -600,6 +655,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   async onload(): Promise<void> {
     this.log("Loading VaultGuard plugin...");
+    this.syncDiagnostics.record("onload.start", { mobile: Platform.isMobileApp });
 
     // Register the ribbon buttons SYNCHRONOUSLY, up front, before the first
     // `await`. Ribbon buttons created *after* an await can be appended after
@@ -609,17 +665,34 @@ export default class VaultGuardPlugin extends Plugin {
     // command palette. The chat button uses a STOCK lucide icon, so its glyph is
     // always present at first paint (a custom `addIcon` icon can lose that race).
     addIcon("vaultguard-shield", VAULTGUARD_ICON);
-    this.addRibbonIcon("vaultguard-shield", "VaultGuard", (evt: MouseEvent) => {
+    this.vaultGuardRibbonEl = this.addRibbonIcon("vaultguard-shield", "VaultGuard", (evt: MouseEvent) => {
       this.showVaultGuardMenu(evt);
     });
+    this.updateRibbonAuthIndicator();
 
     // AI Chat ribbon entry. TODO(ai-chat-feature-gate): no server `aiChat` flag
     // yet — always present for now; the view shows a connect state and makes no
     // model call until the user stores a key or uses a logged-in Claude Code
     // subscription (§11).
-    this.addRibbonIcon(VAULTGUARD_CHAT_ICON_ID, "VaultGuard Chat", () => {
+    this.vaultGuardChatRibbonEl = this.addRibbonIcon(VAULTGUARD_CHAT_ICON_ID, "VaultGuard Chat", () => {
       void this.activateVaultGuardChat();
     });
+
+    // Permissions Graph ribbon entry — desktop-only v1 (cytoscape canvas
+    // interaction + sidebar real estate). On mobile we skip the ribbon entirely,
+    // matching the agent-bridge command's desktop gate. The view itself shows a
+    // connect empty state and makes no network call until signed in + online.
+    if (!Platform.isMobileApp) {
+      this.vaultGuardGraphRibbonEl = this.addRibbonIcon("git-fork", "VaultGuard Permissions", () => {
+        void this.activatePermissionsGraph();
+      });
+    }
+    this.updateRibbonAuthIndicator();
+
+    // (sd4) The sd2 "Import local files" ribbon was retired. Importing is now an
+    // agent-driven chat slash command (/import-knowledge) inside the AI chat
+    // panel — the agent surveys the picked folder through a gated, sandboxed
+    // source-read tool and builds an organized KB, rather than dumping files 1:1.
 
     // Load persisted settings
     await this.loadSettings();
@@ -682,6 +755,22 @@ export default class VaultGuardPlugin extends Plugin {
     // adds a single AES-GCM decrypt (a few ms).
     await this.restoreSession();
 
+    // Wire the folder-lifecycle vault listeners NOW, unconditionally, decoupled
+    // from sync-engine init. This is the fix for folder deletes never reaching
+    // the server: registration used to live only inside initializeSyncEngine(),
+    // which is not guaranteed to run on every session (e.g. when the binding is
+    // already reconciled and restoreServerSession never reaches it), so the
+    // per-child `vault.on('delete')` listeners were silently never wired and
+    // folder/child deletes were never propagated. The listener bodies all
+    // self-guard on `if (!this.settings.serverVaultId || !this.session) return;`
+    // and the method is idempotent (folderLifecycleListenersRegistered), so it
+    // is safe to call here at load time AND from initializeSyncEngine().
+    this.syncDiagnostics.record("onload.registerFolderListenersEarly", {
+      hasSession: !!this.session,
+      hasServerVaultId: !!this.settings.serverVaultId,
+    });
+    this.registerFolderLifecycleListeners();
+
     // Capabilities are public metadata. Refresh them in the background so
     // manual/self-hosted installs and restored sessions don't temporarily
     // fall back to the historic Pro UI after a restart.
@@ -726,7 +815,11 @@ export default class VaultGuardPlugin extends Plugin {
 
     // Register the VaultGuard sidebar view
     this.registerView(VAULTGUARD_VIEW_TYPE, (leaf) => {
-      const view = new VaultGuardSidebarView(leaf);
+      const view = new VaultGuardSidebarView(leaf, {
+        getAuthState: () => this.getSidebarAuthState(),
+        onLogin: () => this.handleLogin(),
+        onOpenSettings: () => this.openVaultGuardSettings(),
+      });
       if (this.sidebarViewConfig) {
         view.configure(this.sidebarViewConfig);
       }
@@ -744,6 +837,14 @@ export default class VaultGuardPlugin extends Plugin {
     this.registerView(
       VAULTGUARD_CHAT_VIEW_TYPE,
       (leaf) => new VaultGuardChatView(leaf, this),
+    );
+
+    // Permissions Graph view (desktop-only; the ribbon/command gate on
+    // Platform.isMobileApp). Registered unconditionally so a workspace restore
+    // of a previously-open leaf rehydrates correctly.
+    this.registerView(
+      VAULTGUARD_GRAPH_VIEW_TYPE,
+      (leaf) => new PermissionsGraphView(leaf, this),
     );
 
     // Phase 9: subscribe the sidebar to the unified permission bus. One
@@ -830,6 +931,7 @@ export default class VaultGuardPlugin extends Plugin {
 
     // Clear sensitive data from memory
     this.clearSensitiveData();
+    this.setGlobalAuthChromeState(false);
 
     // Remove file permission header
     if (this.filePermissionHeader) {
@@ -1023,6 +1125,10 @@ export default class VaultGuardPlugin extends Plugin {
       makeVaultGraph: (graphDeps) => new VaultGraph(this.app, graphDeps),
       readText: (path) => this.interceptedRead(path),
       writeText: (path, content) => this.interceptedWrite(path, content),
+      // Destructive ops route through the same permission-checked, audited,
+      // at-rest-safe interceptors the manual file explorer uses.
+      deleteFile: (path) => this.interceptedDelete(path),
+      renameFile: (oldPath, newPath) => this.interceptedRename(oldPath, newPath),
       confirmWrite: (request) => this.confirmAgentBridgeWrite(request),
       log: (message) => this.log(message),
       emitAudit: (action, resourcePath, metadata) =>
@@ -1037,8 +1143,141 @@ export default class VaultGuardPlugin extends Plugin {
         this.apiClient
           ? this.apiClient.withAgentContext(agentName, leaseId, fn)
           : fn(),
+      // Backend permission/membership queries for the in-app chat's
+      // vaultguard_access tool. Delegates to the authenticated API client
+      // (requestUrl underneath); fails closed if the client is not yet ready.
+      queryAccess: {
+        getPathAccess: (path) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.getPathAccess(path);
+        },
+        getBatchPathAccess: (paths) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.getBatchPathAccess(paths);
+        },
+        getUserPermissions: (userId) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.getUserPermissions(userId);
+        },
+        listPermissionRules: (pathFilter) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.getPermissions(pathFilter);
+        },
+        listVaultMembers: (vaultId) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.listVaultMembers(vaultId);
+        },
+        // Audit-log read for the in-app chat's vaultguard_audit tool. The backend
+        // gates the log to vault admins and clamps the window to retention.
+        queryAudit: async (filters) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          const page = await this.apiClient.getAuditLogPage(filters);
+          return { entries: page.entries, count: page.count, nextCursor: page.nextCursor };
+        },
+        // File lifecycle & recovery for the in-app chat's vaultguard_files tool.
+        // Each is backend-gated (history needs read; deleted/overview/restore are
+        // admin); restore runs inside withAgentContext so its audit row is
+        // attributed to the chat agent.
+        getFileHistory: (path) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.getFileHistory(path);
+        },
+        getDeletedFiles: () => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.getDeletedFiles();
+        },
+        restoreDeletedFile: (path) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.restoreDeletedFile(path);
+        },
+        getVaultOverview: () => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.getVaultOverview();
+        },
+        // Share-link management for the in-app chat's vaultguard_share tool. The
+        // backend re-authorizes each op and gates the feature to Pro.
+        listShares: () => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.listShares();
+        },
+        createShare: (input) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.createShare(input);
+        },
+        revokeShare: (shareId) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.revokeShare(shareId);
+        },
+        // Vault-membership management for the in-app chat's vaultguard_membership
+        // tool. listOrgUsers (org-admin gated) resolves a person for op=add; the
+        // membership mutations are re-authorized as vault-admin server-side.
+        listOrgUsers: () => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.listUsers();
+        },
+        addVaultMember: (vaultId, userId, role) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.addVaultMember(vaultId, userId, role);
+        },
+        removeVaultMember: (vaultId, userId) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.removeVaultMember(vaultId, userId);
+        },
+        updateVaultMember: (vaultId, userId, role) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.updateVaultMember(vaultId, userId, role);
+        },
+        // Permission mutation for the in-app chat's vaultguard_set_permission
+        // tool. Runs inside withAgentContext so the backend permissions.set-level
+        // audit row is attributed to the chat agent; the backend remains the sole
+        // authority (vault-admin / file-admin) and rejects unauthorized changes.
+        setPermissionLevel: (input) => {
+          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+          return this.apiClient.setPermissionLevel(input);
+        },
+      },
+      // Gated source-read provider for the in-app chat's /import-knowledge tools.
+      // Desktop-only — makeImportSourceFs() returns null on mobile / non-Electron
+      // hosts, so the vaultguard_import_* tools fail closed there. The bridge owns
+      // the sandbox guard (realpath + prefix); this provider only does raw reads.
+      importFs: makeImportSourceFs(),
+      // sd2 converters back the source → text step. Pure + offline (no network).
+      importConvert: (input) => dispatchConvert(input),
+      importClassify: (ext) => classifyExtension(ext),
+      askUser: async (request) => this.askUserInVaultGuardChat(request),
+      confirmWritePaused: async (request) => this.pauseConfirmInVaultGuardChat(request),
       persistence: this.makeAgentBridgePersistenceAdapter(),
     });
+  }
+
+  private async askUserInVaultGuardChat(
+    request: Parameters<AgentBridgeAskUserHandler>[0],
+  ) {
+    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
+    for (const leaf of leaves) {
+      if (leaf.view instanceof VaultGuardChatView) {
+        this.app.workspace.revealLeaf(leaf);
+        return leaf.view.askUserFromAgent(request);
+      }
+    }
+    throw new Error("VaultGuard AI Chat is not open to answer this question.");
+  }
+
+  // Non-blocking confirmation: render an Approve/Deny card in the open chat view
+  // (which persists it + applies the action on approval) and return immediately.
+  // Mirrors askUserInVaultGuardChat. Fails closed if no chat view is open so the
+  // bridge surfaces a clear error instead of silently dropping the change.
+  private async pauseConfirmInVaultGuardChat(
+    request: Parameters<AgentBridgeConfirmPausedHandler>[0],
+  ): Promise<void> {
+    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
+    for (const leaf of leaves) {
+      if (leaf.view instanceof VaultGuardChatView) {
+        this.app.workspace.revealLeaf(leaf);
+        return leaf.view.confirmWriteFromAgent(request);
+      }
+    }
+    throw new Error("VaultGuard AI Chat is not open to confirm this change.");
   }
 
   /**
@@ -1172,6 +1411,51 @@ export default class VaultGuardPlugin extends Plugin {
 
   async createAgentBridgeLease(input: AgentBridgeLeaseInput = {}): Promise<AgentBridgeLeaseSecret> {
     return this.ensureAgentBridge().createLease(input);
+  }
+
+  /**
+   * Arm the bridge's gated import session for /import-knowledge: registers the
+   * picked folder as the ONLY root the chat's vaultguard_import_* tools may read
+   * under (read-only, realpath-sandboxed). Returns the canonicalized root.
+   * Throws on mobile / non-Electron (no import fs provider) or an invalid folder.
+   */
+  async beginAgentBridgeImportSession(absRoot: string): Promise<string> {
+    return this.ensureAgentBridge().beginImportSession(absRoot);
+  }
+
+  /** Clear the bridge import session so the gated source-read tools go inert. */
+  endAgentBridgeImportSession(): void {
+    if (!this.agentBridge) return;
+    this.agentBridge.endImportSession();
+  }
+
+  /** True when the bridge currently has an import session armed. Lets the chat
+   * re-arm a remembered source root only when the singleton bridge isn't already
+   * pointed at it (e.g. after a reload, resume, or import-tab switch). */
+  hasActiveAgentBridgeImportSession(): boolean {
+    return this.agentBridge?.hasActiveImportSession() ?? false;
+  }
+
+  /**
+   * Pre-flight write-capability check for /import-knowledge. Probes the
+   * effective permission for a representative NEW note path — exactly what
+   * `vaultguard_create` will hit — so the chat can fail fast with a clear
+   * message instead of running the whole survey and only discovering the
+   * account is read-only at create time (where the denial is thrown before
+   * the confirm modal). Read-only; the probe path is never created.
+   *
+   * Fail-OPEN: returns `true` when the result is inconclusive (no session or a
+   * probe error) so a transient hiccup never wrongly blocks an import — the
+   * per-write permission gate remains the real enforcement.
+   */
+  async canCreateVaultNotes(): Promise<boolean> {
+    if (!this.session) return true;
+    try {
+      const level = await this.getEffectivePermission("Clients/_vaultguard-import-probe.md");
+      return level >= PermissionLevel.WRITE;
+    } catch {
+      return true;
+    }
   }
 
   rotateAgentBridgeLeaseToken(leaseId: string): AgentBridgeLeaseSecret {
@@ -1384,7 +1668,18 @@ export default class VaultGuardPlugin extends Plugin {
 
   private async confirmAgentBridgeWrite(request: {
     lease: AgentBridgeLeaseSummary;
-    operation: "create" | "apply_patch";
+    operation:
+      | "create"
+      | "apply_patch"
+      | "delete"
+      | "rename"
+      | "set_permission"
+      | "restore"
+      | "share_create"
+      | "share_revoke"
+      | "member_add"
+      | "member_remove"
+      | "member_set_role";
     path: string;
     preview: string;
   }): Promise<boolean> {
@@ -1409,8 +1704,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     // Headless fallback (tests / no-DOM hosts): keep the prior text confirm.
-    const operationLabel =
-      request.operation === "create" ? "create" : "patch";
+    const operationLabel = AGENT_BRIDGE_CONFIRM_LABELS[request.operation] ?? "patch";
     const message =
       `VaultGuard Sync: Agent "${request.lease.agentName}" wants to ${operationLabel} "${request.path}".\n\n` +
       `Scope: ${request.lease.scopes.join(", ")}\n` +
@@ -1441,13 +1735,42 @@ export default class VaultGuardPlugin extends Plugin {
     this.persistedSessions = this.normalizePersistedSessions(data.storedSessions);
     const { storedSessions: _storedSessions, ...settingsData } = data;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, settingsData);
+    this.settings.defaultConflictResolution = this.normalizeConflictStrategy(
+      this.settings.defaultConflictResolution
+    );
     this.settings.excludedPaths = this.withRequiredExcludedPaths(this.settings.excludedPaths);
     this.settings.apiEndpoint = normalizeVaultGuardApiBaseUrl(this.settings.apiEndpoint);
     this.configuredApiEndpoint = this.settings.apiEndpoint;
     this.serverEdition = this.normalizeServerEdition(this.settings.serverEdition);
     this.serverFeatures = this.normalizeServerFeatures(this.settings.serverFeatures);
 
+    // Initialize the tombstone map for legacy data.json that predates the field,
+    // then prune any entries older than the TTL (or with malformed timestamps).
+    // Do NOT saveSettings here — the next normal save persists the pruned set.
+    if (!this.settings.deletionTombstones) this.settings.deletionTombstones = {};
+    this.pruneDeletionTombstones();
+
     this.derivedBindingId = await this.computeDerivedVaultBindingId();
+  }
+
+  /**
+   * Coerce a persisted conflict-resolution strategy to one the plugin
+   * actually implements. The "merge" option (an unfinished three-way
+   * auto-merge that was never wired into either conflict path) was removed;
+   * a previously-saved "merge" — or any unknown value — falls back to
+   * DUPLICATE, the safest automatic resolution because it keeps both copies
+   * and never discards the user's local edit.
+   */
+  private normalizeConflictStrategy(value: unknown): ConflictResolutionStrategy {
+    switch (value) {
+      case ConflictResolutionStrategy.ASK_USER:
+      case ConflictResolutionStrategy.KEEP_LOCAL:
+      case ConflictResolutionStrategy.KEEP_REMOTE:
+      case ConflictResolutionStrategy.DUPLICATE:
+        return value;
+      default:
+        return ConflictResolutionStrategy.DUPLICATE;
+    }
   }
 
   private normalizeServerEdition(value: unknown): ServerEdition | null {
@@ -1985,6 +2308,141 @@ export default class VaultGuardPlugin extends Plugin {
       callback: () => this.performSync({ userInitiated: true, forceCatchup: true }),
     });
 
+    // ── TEMPORARY DEBUG (260623-dpc) — remove after root-causing the
+    // /import-knowledge "no WRITE permission for new files" denials. Read-only:
+    // surfaces the live permission state that decides whether the AgentBridge
+    // create() gate (agent-bridge.ts requireWritablePath) allows a brand-new
+    // path. Mutates nothing; probing a path only triggers a normal permission
+    // check. Desktop+mobile safe (no Node FS).
+    //
+    // Dev-build-only (260625-gg7): registered ONLY in non-production builds.
+    // esbuild substitutes the `process.env.NODE_ENV` literal (define in
+    // esbuild.config.mjs) → in a production build this becomes
+    // `if ("production" !== "production")` = `if (false)` and minify's DCE drops
+    // the whole block, so this command is absent from shipped main.js. vitest
+    // (NODE_ENV != "production") and dev builds keep it.
+    if (process.env.NODE_ENV !== "production") {
+      this.addCommand({
+        id: "vaultguard-debug-import-permission-state",
+        name: "VaultGuard (debug): Show import permission state",
+        callback: async () => {
+          const levelName = (l: PermissionLevel | undefined): string =>
+            l === undefined ? "<uncached>" : `${PermissionLevel[l] ?? "?"} (${l})`;
+
+          const rootSeed = this.permissionStore.getCachedPermission("");
+          const probePaths = ["test-notes-1/probe.md", "Clients/probe.md"];
+          const probed: string[] = [];
+          for (const p of probePaths) {
+            try {
+              const lvl = await this.getEffectivePermission(p);
+              probed.push(
+                `  ${p} → ${levelName(lvl)}${lvl >= PermissionLevel.WRITE ? " ✅ can create" : " ❌ create blocked"}`
+              );
+            } catch (err) {
+              probed.push(`  ${p} → ERROR ${String(err)}`);
+            }
+          }
+
+          const isAdminOwner = this.session?.role === "admin" || this.session?.role === "owner";
+          const rootWriteCapable = rootSeed !== undefined && rootSeed >= PermissionLevel.WRITE;
+          const report = [
+            "VaultGuard import permission diagnostic (260623-dpc)",
+            `session: ${this.session ? "present" : "NONE (not logged in)"}`,
+            `session.role (org): ${this.session?.role ?? "—"}`,
+            `session.roles: ${this.session?.roles?.join(", ") || "—"}`,
+            `session.vaultMemberRole (per-vault): ${this.session?.vaultMemberRole ?? "—"}`,
+            `admin/owner short-circuit: ${isAdminOwner ? "YES → every path resolves ADMIN" : "no"}`,
+            `vaultLeaseDenied (limited-access): ${this.vaultLeaseDenied}`,
+            `placeholderPaths.size: ${this.placeholderPaths.size}`,
+            `serverVaultId: ${this.settings.serverVaultId ? "set" : "MISSING"}`,
+            `root "" cache seed: ${levelName(rootSeed)}${rootWriteCapable ? " (write-capable baseline)" : " (NOT write-capable for new paths)"}`,
+            "new-path probes (what /import-knowledge create() hits):",
+            ...probed,
+          ].join("\n");
+
+          // console.log (not this.log) so it prints regardless of debugLogging.
+          console.log(`${LOG_PREFIX} ${report}`);
+          // timeout 0 → Notice stays until dismissed so the user can read/copy it.
+          new Notice(report, 0);
+        },
+      });
+    }
+
+    // Sync diagnostics (DX4-DIAG) — DEVELOPER-ONLY diagnostic command.
+    // Registered ONLY in dev builds: it is DEAD-CODE-ELIMINATED from the
+    // PRODUCTION bundle. esbuild substitutes the `process.env.NODE_ENV` literal
+    // (define in esbuild.config.mjs) so in a production build the guard becomes
+    // `if ("production" !== "production")` = `if (false)` and minify strips the
+    // whole branch — shipped main.js contains neither this command nor its id
+    // string. vitest (NODE_ENV != "production") and dev builds keep it.
+    //
+    // This is a DEV/PROD BUILD FLAG, NOT an EDITION flag. The "one binary /
+    // Cloud == Community parity" constraint (CLAUDE.md) is preserved: the SAME
+    // production bundle ships to BOTH Cloud and Community, and neither gets this
+    // command. The dev/prod axis is orthogonal to the pro/community axis.
+    //
+    // When it IS present (dev), it is read-only and emits ONLY a whitelisted,
+    // secret-free snapshot (no tokens / DEK / raw session; userId masked to 8
+    // chars), so the copied report is always safe to paste. It surfaces the
+    // startup/sync breadcrumb trace recorded by `this.syncDiagnostics` to
+    // investigate why initializeSyncEngine() may not run on a session restore.
+    // Mutates nothing; desktop + mobile safe (no Node FS).
+    if (process.env.NODE_ENV !== "production") {
+      this.addCommand({
+        id: "vaultguard-sync-diagnostics",
+        name: "VaultGuard: Copy sync diagnostics",
+        callback: async () => {
+          // WHITELIST ONLY — insertion order is the report's State-section order.
+          // SECURITY: never include this.session raw, access/id/refresh tokens,
+          // this.keyLease.key, or any DEK. Only booleans / counts / IDs /
+          // timestamps below. keyLeaseExpiry is the lease's ISO expiry string
+          // (not the key); serverVaultId is a vault UUID (not a secret).
+          const state: Record<string, unknown> = {
+            pluginVersion: this.manifest.version,
+            platform: Platform.isMobileApp ? "mobile" : "desktop",
+            connectionStatus: this.connectionState.status,
+            sessionPresent: !!this.session,
+            userId: this.session?.userId ? this.session.userId.slice(0, 8) : "—",
+            roles: this.session?.roles?.join(", ") || "—",
+            vaultMemberRole: this.session?.vaultMemberRole ?? "—",
+            serverVaultId: this.settings.serverVaultId || "—",
+            bindingReconciledVaultId: this.settings.bindingReconciledVaultId ?? "—",
+            orgSlug: this.settings.orgSlug || "—",
+            folderLifecycleListenersRegistered: this.folderLifecycleListenersRegistered,
+            syncTimerAlive: !!this.syncTimer,
+            syncIntervalSec: this.settings.syncInterval,
+            keyLeasePresent: !!this.keyLease,
+            keyLeaseExpiry: this.keyLease?.expiresAt ?? "—",
+            vaultLeaseDenied: this.vaultLeaseDenied,
+            lastSync: this.syncState.lastSync ?? "—",
+            lastSyncTimestampSetting: this.settings.lastSyncTimestamp ?? "—",
+            offlineQueueLength: this.offlineQueue.length,
+            deletionTombstonesCount: Object.keys(this.settings.deletionTombstones ?? {}).length,
+            placeholderPathsCount: this.placeholderPaths.size,
+          };
+
+          const report = this.syncDiagnostics.buildReport(state);
+
+          // console.log (not this.log) so it prints regardless of debugLogging,
+          // exactly like the existing read-only diagnostic above.
+          console.log(`${LOG_PREFIX} ${report}`);
+
+          // Copy defensively — clipboard failure must NOT throw out of the
+          // callback (mirrors chat-view.ts / settings.ts guards). The console.log
+          // already happened, so the report stays recoverable either way.
+          try {
+            if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+              await navigator.clipboard.writeText(report);
+            }
+          } catch (err) {
+            this.logError("Sync diagnostics: clipboard copy failed", err);
+          }
+
+          new Notice("VaultGuard: Sync diagnostics copied to clipboard + console.", 5000);
+        },
+      });
+    }
+
     // Share-link lifecycle: list active links and revoke leaked ones. On
     // Community Edition the command opens a Pro-upsell modal instead of the
     // share-management modal — same compiled binary, show-but-block UX.
@@ -2227,6 +2685,15 @@ export default class VaultGuardPlugin extends Plugin {
             });
         });
 
+        menu.addItem((item) => {
+          item
+            .setTitle(`VaultGuard Sync: Explain ${label} permissions`)
+            .setIcon("circle-help")
+            .onClick(() => {
+              this.showPathPermissionsModal(path, isFolder, true);
+            });
+        });
+
         // "Copy share link" — files only, any vault member can mint a link
         // since the link itself grants nothing without team membership. On
         // Community Edition this opens a Pro-upsell modal explaining the
@@ -2271,6 +2738,20 @@ export default class VaultGuardPlugin extends Plugin {
       },
     });
 
+    // Permissions Graph command — desktop-only, requires a connected vault.
+    // Mirrors the agent-bridge command gate (returns false on mobile so the
+    // palette doesn't surface a broken entry).
+    this.addCommand({
+      id: "vaultguard-open-permissions-graph",
+      name: "VaultGuard: Open permissions graph",
+      checkCallback: (checking: boolean) => {
+        if (Platform.isMobileApp) return false;
+        const ready = !!this.session && !!this.settings.serverVaultId;
+        if (checking) return ready;
+        void this.activatePermissionsGraph();
+      },
+    });
+
     // Previous chats — open the panel and surface the saved-conversation list.
     this.addCommand({
       id: "vaultguard-chat-history",
@@ -2280,16 +2761,28 @@ export default class VaultGuardPlugin extends Plugin {
       },
     });
 
-    // New chat in its own tab — lets several conversations stay open at once
-    // (stacked in the right sidebar). The + button inside the panel still
-    // resets the current chat in place; this opens a separate tab.
+    // New chat tab — keeps one Obsidian chat panel open and creates an
+    // in-panel conversation tab instead of spawning standalone chat leaves.
     this.addCommand({
       id: "vaultguard-chat-new-tab",
-      name: "VaultGuard Chat: New chat (new tab)",
+      name: "VaultGuard Chat: New chat tab",
       callback: () => {
         void this.openNewVaultGuardChatTab();
       },
     });
+
+    this.addCommand({
+      id: "vaultguard-chat-copy-dom-debug-report",
+      name: "VaultGuard Chat: Copy DOM debug report",
+      callback: () => {
+        void this.copyVaultGuardChatDomDebugReport();
+      },
+    });
+
+    // (sd4) The sd2 standalone "import-knowledge" command was retired. Importing
+    // is now /import-knowledge inside the AI chat panel: an executable chat slash
+    // command that arms a gated, sandboxed source-read tool and lets the agent
+    // survey the picked folder and synthesize an organized KB (see VaultGuardChatView).
 
     // The headless debug harness stays useful for proving the tool path, but the
     // chat view above is the real entry now. It remains invisible unless
@@ -2315,20 +2808,184 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Open a brand-new VaultGuard AI Chat conversation in its OWN right-sidebar
-   * tab, leaving any already-open chats untouched. `getRightLeaf(false)` creates
-   * a new leaf stacked as a tab (not a split); the `fresh` state tells the view
-   * to start blank instead of restoring the most-recent conversation.
+   * Open (or reveal) the VaultGuard Permissions graph as a tab in the main
+   * editor area (like Obsidian's own Graph view), not the right sidebar.
+   */
+  private async activatePermissionsGraph(): Promise<void> {
+    const existing = this.app.workspace.getLeavesOfType(VAULTGUARD_GRAPH_VIEW_TYPE);
+    if (existing.length > 0) {
+      this.app.workspace.revealLeaf(existing[0]);
+      return;
+    }
+
+    // A main-area tab — `getLeaf("tab")` opens in the centre workspace.
+    const leaf = this.app.workspace.getLeaf("tab");
+    if (leaf) {
+      await leaf.setViewState({ type: VAULTGUARD_GRAPH_VIEW_TYPE, active: true });
+      this.app.workspace.revealLeaf(leaf);
+    }
+  }
+
+  /**
+   * Data source for the Permissions graph view. Delegates every call to the
+   * authenticated API client (requestUrl underneath) and fails closed if the
+   * client is not ready — mirroring the agent-bridge `queryAccess` wiring. The
+   * view makes NO HTTP request of its own; the backend is the sole authority
+   * (requireVaultMember + empty-principals scoping), so this never widens what
+   * the signed-in user can see.
+   */
+  getPermissionsGraphDataSource(): PermissionsGraphDataSource {
+    return {
+      listVaultMembers: (vaultId) => {
+        if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+        return this.apiClient.listVaultMembers(vaultId);
+      },
+      getPermissions: () => {
+        if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+        return this.apiClient.getPermissions();
+      },
+      getUserPermissions: (userId) => {
+        if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+        return this.apiClient.getUserPermissions(userId);
+      },
+      getBatchPathAccess: (paths) => {
+        if (!this.apiClient) throw new Error("VaultGuard is not connected.");
+        return this.apiClient.getBatchPathAccess(paths);
+      },
+      getAllFilePaths: () =>
+        this.app.vault.getFiles().map((file) => this.normalizeVaultPath(file.path)),
+    };
+  }
+
+  // ─── Permissions-graph data cache ───────────────────────────────────────────
+  //
+  // Two layers: a fast in-memory map, and a disk envelope encrypted with the LAK
+  // (AtRestCipher) so the cached permissions map survives a restart yet stays
+  // opaque to a forensic disk image — exactly like the agent-leases envelope.
+  // Keyed by vaultId and stamped with the session userId, so a different user
+  // signing in never reads the previous user's (viewer-scoped) map. Refreshed
+  // past the TTL, on the view's explicit Refresh, or on logout.
+  private permissionsGraphCache = new Map<
+    string,
+    { data: PermissionsGraphDataset; fetchedAt: number }
+  >();
+  private static readonly PERMISSIONS_GRAPH_CACHE_TTL_MS = 30 * 60_000;
+
+  private permissionsGraphCachePath(): string {
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    return `.obsidian/plugins/${pluginId}/permissions-graph.cache`;
+  }
+
+  private isPermissionsGraphCacheFresh(fetchedAt: number): boolean {
+    return Date.now() - fetchedAt <= VaultGuardPlugin.PERMISSIONS_GRAPH_CACHE_TTL_MS;
+  }
+
+  /** In-memory cached dataset for a vault, or null if absent/expired. */
+  getPermissionsGraphCache(vaultId: string): PermissionsGraphDataset | null {
+    const entry = this.permissionsGraphCache.get(vaultId);
+    if (!entry) return null;
+    if (!this.isPermissionsGraphCacheFresh(entry.fetchedAt)) {
+      this.permissionsGraphCache.delete(vaultId);
+      return null;
+    }
+    return entry.data;
+  }
+
+  /**
+   * Cached dataset for a vault, checking memory first then the encrypted disk
+   * envelope (hydrating memory on a disk hit). Returns null when nothing fresh
+   * exists for the current user.
+   */
+  async loadPersistedPermissionsGraphCache(vaultId: string): Promise<PermissionsGraphDataset | null> {
+    const mem = this.getPermissionsGraphCache(vaultId);
+    if (mem) return mem;
+
+    if (!this.atRestCipher?.isReady()) return null;
+    const readBin = this.originalAdapterMethods.readBinary;
+    if (!readBin) return null;
+
+    const path = this.permissionsGraphCachePath();
+    try {
+      if (!(await this.app.vault.adapter.exists(path))) return null;
+      const cipherBytes = await readBin(path);
+      const plaintext = await this.atRestCipher.decryptString(cipherBytes);
+      const env = JSON.parse(plaintext) as PersistedPermissionsGraphCache;
+      if (!env || env.version !== 2) return null;
+      // Belongs to a different user → never surface it.
+      if (env.userId !== (this.session?.userId ?? "")) return null;
+      const entry = env.entries?.[vaultId];
+      if (!entry || !this.isPermissionsGraphCacheFresh(entry.fetchedAt)) return null;
+      this.permissionsGraphCache.set(vaultId, { data: entry.data, fetchedAt: entry.fetchedAt });
+      return entry.data;
+    } catch (err) {
+      this.logError("Failed to read permissions-graph cache", err);
+      return null;
+    }
+  }
+
+  async setPermissionsGraphCache(vaultId: string, data: PermissionsGraphDataset): Promise<void> {
+    this.permissionsGraphCache.set(vaultId, { data, fetchedAt: Date.now() });
+    await this.persistPermissionsGraphCache().catch((err) =>
+      this.logError("Failed to persist permissions-graph cache", err),
+    );
+  }
+
+  /** Write the fresh in-memory entries to the encrypted disk envelope. */
+  private async persistPermissionsGraphCache(): Promise<void> {
+    if (!this.atRestCipher?.isReady()) return;
+    const writeBin = this.originalAdapterMethods.writeBinary;
+    if (!writeBin) return;
+    const userId = this.session?.userId ?? "";
+    if (!userId) return;
+
+    const entries: PersistedPermissionsGraphCache["entries"] = {};
+    for (const [vid, entry] of this.permissionsGraphCache.entries()) {
+      if (this.isPermissionsGraphCacheFresh(entry.fetchedAt)) {
+        entries[vid] = { fetchedAt: entry.fetchedAt, data: entry.data };
+      }
+    }
+
+    const env: PersistedPermissionsGraphCache = { version: 2, userId, entries };
+    const path = this.permissionsGraphCachePath();
+    await this.ensureParentFoldersForPath(path);
+    const cipher = await this.atRestCipher.encryptString(JSON.stringify(env));
+    await writeBin(path, cipher);
+  }
+
+  /** Drop one vault's cache, or all of it when called with no argument. */
+  invalidatePermissionsGraphCache(vaultId?: string): void {
+    if (vaultId) {
+      this.permissionsGraphCache.delete(vaultId);
+      void this.persistPermissionsGraphCache().catch(() => {});
+    } else {
+      this.permissionsGraphCache.clear();
+      void this.deletePermissionsGraphCacheFile().catch(() => {});
+    }
+  }
+
+  private async deletePermissionsGraphCacheFile(): Promise<void> {
+    try {
+      const path = this.permissionsGraphCachePath();
+      if (await this.app.vault.adapter.exists(path)) {
+        await this.app.vault.adapter.remove(path);
+      }
+    } catch (err) {
+      this.logError("Failed to delete permissions-graph cache", err);
+    }
+  }
+
+  /**
+   * Open a brand-new VaultGuard AI Chat conversation as an in-panel tab. This
+   * deliberately reuses/reveals the single chat view so users do not end up
+   * with several standalone Obsidian chat leaves racing each other.
    */
   async openNewVaultGuardChatTab(): Promise<void> {
-    const leaf = this.app.workspace.getRightLeaf(false);
-    if (!leaf) return;
-    await leaf.setViewState({
-      type: VAULTGUARD_CHAT_VIEW_TYPE,
-      active: true,
-      state: { fresh: true },
-    });
-    this.app.workspace.revealLeaf(leaf);
+    await this.activateVaultGuardChat();
+    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
+    const view = leaves[0]?.view;
+    if (view instanceof VaultGuardChatView) {
+      view.openFreshChatTab();
+    }
   }
 
   /** Open the chat panel and pop the previous-chats picker. */
@@ -2339,6 +2996,18 @@ export default class VaultGuardPlugin extends Plugin {
     if (view instanceof VaultGuardChatView) {
       view.showHistoryPicker();
     }
+  }
+
+  /** Copy a point-in-time DOM/CSS snapshot for diagnosing invisible chat rows. */
+  private async copyVaultGuardChatDomDebugReport(): Promise<void> {
+    await this.activateVaultGuardChat();
+    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
+    const view = leaves[0]?.view;
+    if (view instanceof VaultGuardChatView) {
+      await view.copyDomDebugReport();
+      return;
+    }
+    new Notice("VaultGuard Chat: open the chat panel before copying a DOM debug report.");
   }
 
   /**
@@ -2404,6 +3073,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
     if (!storedSession) {
       this.log("No stored session found.");
+      this.syncDiagnostics.record("restoreSession.noStoredSession");
       if (Platform.isMobileApp && this.settings.debugLogging) {
         new Notice(
           "VaultGuard diag: no stored session — login required",
@@ -2429,6 +3099,8 @@ export default class VaultGuardPlugin extends Plugin {
     // The user is "logged in" as long as we have a refresh token.
     // Token refresh happens in background from onload.
     this.session = storedSession;
+    this.syncDiagnostics.record("restoreSession.sessionRestored");
+    this.clearLogoutAuthState();
     this.initializeApiClientFromSession(storedSession);
 
     // Wave 2 issue A (1.0.31): seed vaultMemberRole from the stored
@@ -2846,6 +3518,7 @@ export default class VaultGuardPlugin extends Plugin {
       roles: sessionRoles,
       createdAt: new Date().toISOString(),
     };
+    this.clearLogoutAuthState();
     // POST /auth/session no longer issues a key lease — leases are vault-scoped
     // and are requested explicitly via /auth/key-lease/scoped after the vault
     // binding is resolved. This eliminates the org-wide DEK that used to leak
@@ -2915,6 +3588,7 @@ export default class VaultGuardPlugin extends Plugin {
       // flip online because the API is reachable and other endpoints
       // (sidebar, audit, share-link mgmt) continue to work without a DEK.
       this.setConnectionStatus("online");
+      this.syncDiagnostics.record("initializeSyncEngine.invoke", { caller: "login" });
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed (non-blocking)", err);
       });
@@ -3502,7 +4176,9 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private async resumeStoredSession(): Promise<void> {
+    this.syncDiagnostics.record("resumeStoredSession.enter", { hasSession: !!this.session });
     if (!this.session) {
+      this.syncDiagnostics.record("resumeStoredSession.return.noSession");
       return;
     }
 
@@ -3520,9 +4196,11 @@ export default class VaultGuardPlugin extends Plugin {
           `Stored session token refresh deferred: ${refreshResult.message}`
         );
         this.notifySessionRestoreDegraded(refreshResult.message);
+        this.syncDiagnostics.record("resumeStoredSession.return.refreshDeferred");
         return;
       }
       if (!this.session) {
+        this.syncDiagnostics.record("resumeStoredSession.return.noSessionAfterRefresh");
         return;
       }
       session = this.session;
@@ -3567,6 +4245,9 @@ export default class VaultGuardPlugin extends Plugin {
           e
         )
       );
+      this.syncDiagnostics.record("resumeStoredSession.restoreServerSessionThrew", {
+        message: err instanceof Error ? err.message : String(err),
+      });
       throw err;
     }
   }
@@ -3597,6 +4278,10 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private async restoreServerSession(session: UserSession): Promise<void> {
+    this.syncDiagnostics.record("restoreServerSession.enter", {
+      hasSessionId: !!session.sessionId,
+      hasServerVaultId: !!this.settings.serverVaultId,
+    });
     let leaseResponse: ApiResponse<{
       keyLease: KeyLease;
       orgSettings?: OrgSettingsResponse;
@@ -3621,6 +4306,7 @@ export default class VaultGuardPlugin extends Plugin {
 
     if (leaseResponse?.success && leaseResponse.data) {
       this.session = session;
+      this.clearLogoutAuthState();
       // GET /auth/key-lease?vaultId=... returns the vault-scoped lease.
       this.keyLease = this.normalizeKeyLease(leaseResponse.data.keyLease);
       this.applyOrgSettings(leaseResponse.data.orgSettings ?? this.orgSettings);
@@ -3634,6 +4320,7 @@ export default class VaultGuardPlugin extends Plugin {
         role: this.derivePrimaryRole({}, serverSession.roles ?? session.roles),
         roles: serverSession.roles?.length ? serverSession.roles : session.roles,
       };
+      this.clearLogoutAuthState();
       // /auth/session no longer issues a key lease — leases are vault-scoped
       // and requested explicitly via ensureVaultScopedKeyLease() below.
       this.keyLease = null;
@@ -3663,6 +4350,10 @@ export default class VaultGuardPlugin extends Plugin {
         // sync would race on null state and emit misleading "Connection
         // restored" + "Sync skipped" log lines back-to-back.
         if (leaseResult === "logged-out" || !this.session) {
+          this.syncDiagnostics.record("restoreServerSession.return.leaseGate", {
+            leaseResult,
+            hasSession: !!this.session,
+          });
           return;
         }
         // "limited" (403) is fine — session still valid, keyLease still null,
@@ -3682,8 +4373,14 @@ export default class VaultGuardPlugin extends Plugin {
     // until the vault-scoped lease is in place. Otherwise queued writes
     // could be re-encrypted under the org-wide DEK and become unreadable.
     this.setConnectionStatus("online");
+    this.syncDiagnostics.record("restoreServerSession.online");
 
+    this.syncDiagnostics.record("restoreServerSession.syncTimerDecision", {
+      syncTimerAlreadySet: !!this.syncTimer,
+      willInit: !this.syncTimer,
+    });
     if (!this.syncTimer) {
+      this.syncDiagnostics.record("initializeSyncEngine.invoke", { caller: "restoreServerSession" });
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed (non-blocking)", err);
       });
@@ -4120,6 +4817,52 @@ export default class VaultGuardPlugin extends Plugin {
     return message;
   }
 
+  private getSidebarAuthState(): VaultGuardSidebarAuthState | null {
+    if (this.session) {
+      return null;
+    }
+
+    return this.lastLogoutAuthState;
+  }
+
+  private clearLogoutAuthState(): void {
+    this.lastLogoutAuthState = null;
+    this.updateRibbonAuthIndicator();
+  }
+
+  private rememberLogoutAuthState(noticeMessage: string): void {
+    const reason = this.formatLogoutReason(noticeMessage);
+    const accessRevoked =
+      this.isUserAccessRevokedMessage(reason) ||
+      reason.toLowerCase().includes("access revoked");
+    const inactivityLock = reason.toLowerCase().includes("inactivity");
+
+    this.lastLogoutAuthState = {
+      title: accessRevoked
+        ? "Access revoked"
+        : inactivityLock
+          ? "Session locked"
+          : "Logged out",
+      message: accessRevoked
+        ? "Your VaultGuard session was cleared because access changed."
+        : inactivityLock
+          ? "VaultGuard locked your session after inactivity."
+          : "VaultGuard is no longer connected to your account.",
+      detail: reason,
+      icon: accessRevoked ? "shield-x" : inactivityLock ? "lock" : "log-out",
+      tone: accessRevoked ? "danger" : "warning",
+      actionLabel: "Log in again",
+    };
+    this.updateRibbonAuthIndicator();
+  }
+
+  private formatLogoutReason(noticeMessage: string): string {
+    const withoutPrefix = noticeMessage
+      .replace(/^VaultGuard Sync:\s*/i, "")
+      .trim();
+    return withoutPrefix || "Session ended.";
+  }
+
   private loginRequiredActionText(
     action: "open" | "browse" | "edit" | "delete" | "sync" | "view permissions",
     target: string
@@ -4166,6 +4909,7 @@ export default class VaultGuardPlugin extends Plugin {
   async switchServerVault(): Promise<boolean> {
     const changed = await this.promptVaultBinding();
     if (changed && this.settings.serverVaultId && this.session) {
+      this.syncDiagnostics.record("initializeSyncEngine.invoke", { caller: "switchServerVault" });
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed after vault switch", err);
       });
@@ -4176,6 +4920,7 @@ export default class VaultGuardPlugin extends Plugin {
   async bindServerVault(result: { vaultId: string; name: string; slug: string }): Promise<boolean> {
     const changed = await this.applyVaultBinding(result);
     if (changed && this.settings.serverVaultId && this.session) {
+      this.syncDiagnostics.record("initializeSyncEngine.invoke", { caller: "bindServerVault" });
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed after vault binding update", err);
       });
@@ -4751,6 +5496,8 @@ export default class VaultGuardPlugin extends Plugin {
    * and optionally wipes local cache.
    */
   async forceLogout(noticeMessage = "VaultGuard Sync: Logged out successfully."): Promise<void> {
+    this.rememberLogoutAuthState(noticeMessage);
+
     try {
       if (this.session) {
         await this.apiRequest("POST", "/auth/logout", {
@@ -4773,11 +5520,16 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     this.session = null;
+    this.updateRibbonAuthIndicator();
+    this.sidebarViewConfig = null;
     this.keyLease = null;
     this.vaultLeaseDenied = false;
     this.lastLimitedAccessNoticeAt = 0;
     this.lastSessionDegradedNoticeAt = 0;
     this.orgSettings = null;
+    // Drop cached permission-graph data so a different user signing in next
+    // never sees the previous session's (viewer-scoped) graph.
+    this.invalidatePermissionsGraphCache();
     this.stopSyncTimer();
     this.stopKeyRenewalMonitor();
     this.stopHeartbeatMonitor();
@@ -4794,6 +5546,7 @@ export default class VaultGuardPlugin extends Plugin {
     // header. Server-confirmed because forceLogout is the authoritative
     // teardown signal.
     this.permissionStore.emit("changed", { serverConfirmed: true });
+    this.reloadVaultGuardSidebar();
     new Notice(noticeMessage);
   }
 
@@ -6120,6 +6873,13 @@ export default class VaultGuardPlugin extends Plugin {
       );
     }
 
+    // Tombstone the local removal up front (the point we commit to deleting
+    // locally): if the remote DELETE below is deferred (manual/offline) or is
+    // interrupted before it confirms, the tombstone survives a restart / re-bind
+    // so reconciliation cannot resurrect the file. A confirmed server DELETE
+    // (success or 404) clears it again immediately.
+    this.recordDeletionTombstone(path);
+
     try {
       // In manual mode, defer remote deletes until the user runs a sync explicitly.
       if (this.shouldUploadChangesImmediately() && this.isOnline()) {
@@ -6128,7 +6888,10 @@ export default class VaultGuardPlugin extends Plugin {
           this.vaultPath(`/files/${encodeURIComponent(path)}`)
         );
 
-        if (!response.success) {
+        if (response.success || response.error?.statusCode === 404) {
+          // Success or already-gone == done — clear the tombstone for this path.
+          this.clearDeletionTombstone(path);
+        } else {
           if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
             throw new Error(response.error.message);
           }
@@ -6478,6 +7241,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async initializeSyncEngine(): Promise<void> {
     this.log("Initializing sync engine...");
+    this.syncDiagnostics.record("initializeSyncEngine.enter");
 
     // Restore lastSync from persisted settings so a fresh process does not
     // pull every server file (and silently overwrite local edits) on startup.
@@ -6490,11 +7254,15 @@ export default class VaultGuardPlugin extends Plugin {
     // lastSyncTimestamp = epoch causes every server file to come back as
     // "created" and silently overwrite same-named local files.
     const vaultId = this.settings.serverVaultId;
+    this.syncDiagnostics.record("initializeSyncEngine.reconcileDecision", {
+      willReconcile: !!vaultId && this.settings.bindingReconciledVaultId !== vaultId,
+    });
     if (vaultId && this.settings.bindingReconciledVaultId !== vaultId) {
       try {
         const reconciled = await this.performInitialReconciliation();
         if (!reconciled) {
           this.log("Initial reconciliation declined or aborted — sync engine will not start.");
+          this.syncDiagnostics.record("initializeSyncEngine.return.reconcileDeclined");
           return;
         }
       } catch (err) {
@@ -6504,6 +7272,7 @@ export default class VaultGuardPlugin extends Plugin {
             err instanceof Error ? err.message : "Unknown error"
           }. Sync paused — open the sidebar to retry.`
         );
+        this.syncDiagnostics.record("initializeSyncEngine.return.reconcileFailed");
         return;
       }
     }
@@ -6512,12 +7281,15 @@ export default class VaultGuardPlugin extends Plugin {
     // are mirrored via the adapter interceptors; folders need vault events
     // because Obsidian doesn't expose mkdir/rmdir on the adapter pattern we
     // intercept, and S3 needs an explicit marker for empty-folder survival.
+    this.syncDiagnostics.record("initializeSyncEngine.reachedRegisterListeners");
     this.registerFolderLifecycleListeners();
 
     // Perform initial sync
+    this.syncDiagnostics.record("initializeSyncEngine.reachedPerformSync");
     await this.performSync();
 
     // Start periodic sync timer
+    this.syncDiagnostics.record("initializeSyncEngine.reachedStartTimer");
     this.startSyncTimer();
 
     this.log("Sync engine initialized.");
@@ -6531,8 +7303,12 @@ export default class VaultGuardPlugin extends Plugin {
    * two PUT/DELETE round-trips for every direct file op.
    */
   private registerFolderLifecycleListeners(): void {
-    if (this.folderLifecycleListenersRegistered) return;
+    if (this.folderLifecycleListenersRegistered) {
+      this.syncDiagnostics.record("registerFolderLifecycleListeners.alreadyRegistered");
+      return;
+    }
     this.folderLifecycleListenersRegistered = true;
+    this.syncDiagnostics.record("registerFolderLifecycleListeners.registered");
 
     this.registerEvent(
       this.app.vault.on("create", (file: TAbstractFile) => {
@@ -6548,8 +7324,14 @@ export default class VaultGuardPlugin extends Plugin {
       this.app.vault.on("delete", (file: TAbstractFile) => {
         if (!(file instanceof TFolder)) return;
         if (!this.settings.serverVaultId || !this.session) return;
-        void this.deleteFolderMarker(file.path).catch((err) =>
-          this.logError(`Folder delete: marker for "${file.path}" failed`, err)
+        // Defense-in-depth: even though the per-child file listener below also
+        // fires for each contained note, a deleted folder does a server-side
+        // PREFIX sweep so any child whose per-file event was missed (or that
+        // was already orphaned by an earlier missed event) is still removed.
+        // deleteFolderContentsOnServer() also removes the folder marker, so we
+        // do NOT separately call deleteFolderMarker() here.
+        void this.deleteFolderContentsOnServer(file.path).catch((err) =>
+          this.logError(`Folder delete: server cleanup for "${file.path}" failed`, err)
         );
       })
     );
@@ -6667,15 +7449,42 @@ export default class VaultGuardPlugin extends Plugin {
    * only path that fires for child files of a deleted folder.
    */
   private async syncFileDeleteToServer(path: string): Promise<void> {
-    if (!this.isOnline()) return;
     const normalized = this.normalizeVaultPath(path);
-    if (!normalized || this.isFolderMarkerPath(normalized)) return;
+    // Empty / folder-marker / excluded paths never reach the server, so they
+    // must never be queued or tombstoned. (recordDeletionTombstone +
+    // queueOfflineOperation's flush also opt out, but guarding here keeps the
+    // offline queue clean and avoids a no-op tombstone write.)
+    if (!normalized || this.isFolderMarkerPath(normalized) || this.isPathExcluded(normalized)) {
+      return;
+    }
+
+    // Layer 1 (symmetric with interceptedDelete): when offline, do NOT silently
+    // drop the delete — tombstone it and enqueue an offline delete so it is
+    // re-attempted on reconnect. This is the path that fires for child files of
+    // a deleted folder.
+    if (!this.isOnline()) {
+      this.recordDeletionTombstone(normalized);
+      this.queueOfflineOperation("delete", normalized);
+      return;
+    }
 
     const response = await this.apiRequest(
       "DELETE",
       this.vaultPath(`/files/${encodeURIComponent(normalized)}`)
     );
-    if (!response.success && response.error?.statusCode !== 404) {
+    if (response.success || response.error?.statusCode === 404) {
+      // Success or already-gone == done.
+      this.clearDeletionTombstone(normalized);
+    } else if (response.error?.statusCode === 0) {
+      // Transient network failure — mirror interceptedDelete: mark offline,
+      // tombstone, and queue for retry.
+      this.setConnectionStatus("offline");
+      this.recordDeletionTombstone(normalized);
+      this.queueOfflineOperation("delete", normalized);
+    } else {
+      // Other non-404 failure (5xx, recoverable permission state, etc.):
+      // tombstone first so it is retried later rather than lost, then log.
+      this.recordDeletionTombstone(normalized);
       this.logError(
         `Delete sync: DELETE "${normalized}" failed`,
         new Error(response.error?.message ?? "unknown")
@@ -6807,6 +7616,14 @@ export default class VaultGuardPlugin extends Plugin {
         const normalized = this.normalizeVaultPath(path);
         if (this.isPathExcluded(normalized)) continue;
         if (this.isFolderMarkerPath(normalized)) continue;
+        // Layer 3 guard (limited-access): a path THIS client deleted locally
+        // must not reappear as a VG1 placeholder after a re-bind. Delete it on
+        // the server (clearing the tombstone on success/404) and skip the
+        // placeholder write entirely.
+        if (this.isPathTombstoned(normalized)) {
+          await this.deleteTombstonedServerPath(normalized);
+          continue;
+        }
         await this.ensureParentFoldersForPath(normalized);
         await this.writePlainToDisk(normalized, ""); // 36-byte VG1 placeholder
         this.placeholderPaths.add(normalized);
@@ -6868,10 +7685,23 @@ export default class VaultGuardPlugin extends Plugin {
 
     let downloaded = 0;
     let downloadFailed = 0;
+    let deletedOnServer = 0;
     for (const path of serverOnly) {
+      const normalized = this.normalizeVaultPath(path);
+      // Layer 3 guard: if THIS client previously deleted this path locally, a
+      // re-bind must not re-download the still-live server copy. Delete it on
+      // the server instead (clearing the tombstone on success/404). On failure
+      // the tombstone stays for retryOutstandingDeletions, and we skip the
+      // download so the deletion intent is never overridden.
+      if (this.isPathTombstoned(normalized)) {
+        if (await this.deleteTombstonedServerPath(normalized)) {
+          deletedOnServer += 1;
+        }
+        continue;
+      }
       try {
         await this.applyRemoteChange({
-          path: this.normalizeVaultPath(path),
+          path: normalized,
           size: 0,
         });
         downloaded += 1;
@@ -6970,6 +7800,7 @@ export default class VaultGuardPlugin extends Plugin {
       `${uploaded} uploaded`,
       `${conflictsResolved} conflicts resolved`,
     ];
+    if (deletedOnServer > 0) summaryParts.push(`${deletedOnServer} removed on server`);
     if (foldersDownloaded > 0) summaryParts.push(`${foldersDownloaded} folders mirrored locally`);
     if (foldersUploaded > 0) summaryParts.push(`${foldersUploaded} folders preserved`);
     if (sameContent.size > 0) {
@@ -7406,6 +8237,159 @@ export default class VaultGuardPlugin extends Plugin {
     return segments.join("/");
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Deletion tombstones (path-only, persisted)
+  //
+  // A tombstone records that THIS client initiated a local delete of a path so
+  // the server-side DELETE can be re-attempted across restarts / transient
+  // offline windows, and so initial reconciliation never resurrects a
+  // locally-deleted file. SECURITY: tombstones are path → ISO timestamp only.
+  // The in-memory offlineQueue (whose `write` ops carry plaintext content in
+  // `op.data`) is NEVER persisted; only this path map rides settings → saveData.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Record a tombstone for a locally-deleted path. No-ops for empty, excluded,
+   * or folder-marker paths (those never reach the server, so they must never be
+   * tombstoned or retried). Persists fire-and-forget.
+   */
+  private recordDeletionTombstone(path: string): void {
+    const normalized = this.normalizeVaultPath(path);
+    if (!normalized) return;
+    if (this.isPathExcluded(normalized)) return;
+    if (this.isFolderMarkerPath(normalized)) return;
+    if (!this.settings.deletionTombstones) this.settings.deletionTombstones = {};
+    this.settings.deletionTombstones[normalized] = new Date().toISOString();
+    this.log(`Recorded deletion tombstone for "${normalized}".`);
+    void this.saveSettings().catch((error) => {
+      this.logError("Failed to persist deletion tombstone", error);
+    });
+  }
+
+  /**
+   * Clear a tombstone once the server confirms the delete (success or 404 =
+   * already-gone), or rejects it permanently (401/403). No-op if absent.
+   */
+  private clearDeletionTombstone(path: string): void {
+    const normalized = this.normalizeVaultPath(path);
+    if (!normalized) return;
+    if (!this.settings.deletionTombstones) return;
+    if (this.settings.deletionTombstones[normalized] === undefined) return;
+    delete this.settings.deletionTombstones[normalized];
+    this.log(`Cleared deletion tombstone for "${normalized}".`);
+    void this.saveSettings().catch((error) => {
+      this.logError("Failed to persist deletion tombstone removal", error);
+    });
+  }
+
+  /** True if a tombstone exists for the given (normalized) path. */
+  private isPathTombstoned(path: string): boolean {
+    const normalized = this.normalizeVaultPath(path);
+    if (!normalized) return false;
+    return Boolean(this.settings.deletionTombstones?.[normalized]);
+  }
+
+  /**
+   * Drop tombstones older than DELETION_TOMBSTONE_TTL_MS (and any malformed /
+   * unparseable timestamps). Called once at the end of loadSettings; does NOT
+   * save — the next normal save persists the pruned set.
+   */
+  private pruneDeletionTombstones(): void {
+    const tombstones = this.settings.deletionTombstones;
+    if (!tombstones) return;
+    const now = Date.now();
+    for (const [path, deletedAt] of Object.entries(tombstones)) {
+      const ts = Date.parse(deletedAt);
+      if (Number.isNaN(ts) || now - ts > DELETION_TOMBSTONE_TTL_MS) {
+        delete tombstones[path];
+      }
+    }
+  }
+
+  /**
+   * Re-attempt any outstanding tombstoned deletes against the server. Wired
+   * into performSync Phase 1 (after the offline-queue flush). A server DELETE
+   * needs no key lease; gating it with the existing flush keeps one
+   * well-understood entry point. Success / 404 clears the tombstone; a
+   * transient (statusCode 0) failure marks offline and stops (retry next
+   * online); 401/403 clears it (the server decided).
+   */
+  private async retryOutstandingDeletions(): Promise<void> {
+    if (!this.session || !this.settings.serverVaultId || !this.isOnline()) return;
+    const tombstones = this.settings.deletionTombstones;
+    if (!tombstones) return;
+    const paths = Object.keys(tombstones);
+    if (paths.length === 0) return;
+
+    for (const path of paths) {
+      const normalized = this.normalizeVaultPath(path);
+      if (!normalized) {
+        this.clearDeletionTombstone(path);
+        continue;
+      }
+      if (this.isPathExcluded(normalized) || this.isFolderMarkerPath(normalized)) {
+        this.clearDeletionTombstone(normalized);
+        continue;
+      }
+      const response = await this.apiRequest(
+        "DELETE",
+        this.vaultPath(`/files/${encodeURIComponent(normalized)}`)
+      );
+      if (response.success || response.error?.statusCode === 404) {
+        this.clearDeletionTombstone(normalized);
+        continue;
+      }
+      if (response.error?.statusCode === 0) {
+        // Transient — stop and retry on the next online sync.
+        this.setConnectionStatus("offline");
+        return;
+      }
+      if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
+        // The server permanently rejected the delete — do not loop forever.
+        this.clearDeletionTombstone(normalized);
+        continue;
+      }
+      // Other failures (5xx etc.): leave the tombstone in place to retry later.
+      this.logError(
+        `Deletion retry: DELETE "${normalized}" failed`,
+        new Error(response.error?.message ?? "unknown")
+      );
+    }
+  }
+
+  /**
+   * Layer 3 reconciliation guard: issue a server-side DELETE for a tombstoned
+   * serverOnly path (so a re-bind does not resurrect a locally-deleted file)
+   * and clear the tombstone on success/404. On other failures the tombstone is
+   * left in place to retry via retryOutstandingDeletions. Returns true on a
+   * settled delete (the caller should skip downloading/placeholdering the path).
+   * `normalized` must be a vault-relative path with no leading slash.
+   */
+  private async deleteTombstonedServerPath(normalized: string): Promise<boolean> {
+    if (!normalized) return false;
+    try {
+      const response = await this.apiRequest(
+        "DELETE",
+        this.vaultPath(`/files/${encodeURIComponent(normalized)}`)
+      );
+      if (response.success || response.error?.statusCode === 404) {
+        this.clearDeletionTombstone(normalized);
+        this.log(`Reconciliation: deleted tombstoned server path "${normalized}".`);
+        return true;
+      }
+      this.logError(
+        `Reconciliation: server delete of tombstoned path "${normalized}" failed`,
+        new Error(response.error?.message ?? "unknown")
+      );
+    } catch (err) {
+      this.logError(
+        `Reconciliation: server delete of tombstoned path "${normalized}" threw`,
+        err
+      );
+    }
+    return false;
+  }
+
   /**
    * Composes the marker file path the plugin writes to keep `folderPath`
    * alive on the server. Always normalised, never with a leading slash.
@@ -7521,6 +8505,86 @@ export default class VaultGuardPlugin extends Plugin {
         new Error(response.error?.message ?? "unknown")
       );
     }
+  }
+
+  /**
+   * Defense-in-depth folder delete: enumerate every server object under the
+   * deleted folder's prefix and remove each one, then drop the folder marker.
+   *
+   * The per-child `vault.on('delete')` listener is the primary propagation
+   * path, but it is event-driven and was historically coupled to a sync-init
+   * step that did not always run — leaving children orphaned (live in S3) so
+   * they re-downloaded on the next pull. This routine closes that gap and also
+   * cleans up children that were already orphaned by an earlier missed event.
+   *
+   * Enumeration reuses `POST /files/sync` with a `prefix` (an epoch
+   * lastSyncTimestamp + empty fileChecksums makes the server return every
+   * object under the prefix as a delta). Each non-marker child is removed via
+   * `syncFileDeleteToServer`, which carries the full DELETE + tombstone +
+   * offline-retry semantics (so a transient failure is retried later rather
+   * than lost). Marker deltas (this folder's and any sub-folders') are removed
+   * via `deleteFolderMarker`. Honors vault-scoping (`vaultPath`/`apiRequest` →
+   * `requestUrl`), `isPathExcluded`, and `isFolderMarkerPath`.
+   */
+  private async deleteFolderContentsOnServer(folderPath: string): Promise<void> {
+    if (!this.session || !this.settings.serverVaultId) return;
+    const normalized = this.normalizeVaultPath(folderPath);
+    if (!normalized) return;
+
+    // When offline we cannot enumerate the server side; fall back to removing
+    // just the marker (which itself tombstones/queues nothing — markers never
+    // do). The per-child listener's offline branch already tombstoned each
+    // child it saw, and retryOutstandingDeletions() will flush those on
+    // reconnect, so children are not lost.
+    if (!this.isOnline()) {
+      await this.deleteFolderMarker(normalized);
+      return;
+    }
+
+    // Trailing slash so we match only objects INSIDE this folder, never a
+    // sibling whose name merely shares the prefix (e.g. "Notes" vs "Notes2").
+    const prefix = `${normalized}/`;
+
+    let childPaths: string[] = [];
+    try {
+      const inventory = await this.apiRequest<{
+        deltas: Array<{ path: string; action: string }>;
+      }>("POST", this.vaultPath("/files/sync"), {
+        lastSyncTimestamp: new Date(0).toISOString(),
+        fileChecksums: {},
+        prefix,
+      });
+      if (inventory.success && inventory.data?.deltas) {
+        childPaths = inventory.data.deltas.map((d) => d.path);
+      } else if (inventory.error?.statusCode === 0) {
+        // Transient — treat as offline: drop the marker and let the per-child
+        // tombstones (recorded by the file listener) retry on reconnect.
+        this.setConnectionStatus("offline");
+        await this.deleteFolderMarker(normalized);
+        return;
+      }
+    } catch (err) {
+      this.logError(`Folder delete: could not enumerate "${normalized}" on server`, err);
+    }
+
+    for (const rawPath of childPaths) {
+      const childNormalized = this.normalizeVaultPath(rawPath);
+      if (!childNormalized) continue;
+      if (this.isPathExcluded(childNormalized)) continue;
+      if (this.isFolderMarkerPath(childNormalized)) {
+        // A marker delta is a (sub-)folder's sentinel. Remove via the marker
+        // path so it is not tombstoned/retried like a real file.
+        const subFolder = this.folderPathFromMarkerPath(childNormalized);
+        await this.deleteFolderMarker(subFolder);
+        continue;
+      }
+      // syncFileDeleteToServer owns the DELETE + tombstone + offline-queue
+      // semantics; reusing it keeps deletion behavior in exactly one place.
+      await this.syncFileDeleteToServer(childNormalized);
+    }
+
+    // Finally remove the deleted folder's own marker.
+    await this.deleteFolderMarker(normalized);
   }
 
   /**
@@ -7761,18 +8825,21 @@ export default class VaultGuardPlugin extends Plugin {
         ? this.showLoginRequiredNotice("sync")
         : "VaultGuard Sync: Sync skipped — not logged in.";
       this.log(message);
+      this.syncDiagnostics.record("performSync.skipped", { reason: "notLoggedIn" });
       return;
     }
     if (!this.isOnline()) {
       const message = "VaultGuard Sync: Sync skipped — offline.";
       this.log(message);
       if (userInitiated) new Notice(message);
+      this.syncDiagnostics.record("performSync.skipped", { reason: "offline" });
       return;
     }
     if (!this.settings.serverVaultId) {
       const message = "VaultGuard Sync: Sync skipped — this folder is not bound to a server vault yet.";
       this.log(message);
       if (userInitiated) new Notice(message);
+      this.syncDiagnostics.record("performSync.skipped", { reason: "noVault" });
       return;
     }
 
@@ -7780,6 +8847,7 @@ export default class VaultGuardPlugin extends Plugin {
       const message = "VaultGuard Sync: A sync is already in progress.";
       this.log(message);
       if (userInitiated) new Notice(message);
+      this.syncDiagnostics.record("performSync.skipped", { reason: "alreadySyncing" });
       return;
     }
 
@@ -7805,12 +8873,19 @@ export default class VaultGuardPlugin extends Plugin {
 
     try {
       this.syncState.status = "syncing";
+      this.syncDiagnostics.record("performSync.start", { userInitiated });
       this.updateStatusBar();
 
       // Phase 1: Upload queued offline operations
       const offlineQueueSizeBefore = this.offlineQueue.length;
       if (canUploadEncryptedContent) {
         await this.flushOfflineQueue();
+        // Layer 2: re-attempt any outstanding tombstoned deletes that never
+        // reached the server (e.g. a folder-child delete dropped while offline
+        // before this fix, or a delete that failed transiently). A server
+        // DELETE needs no key lease, but gating it with the flush keeps one
+        // well-understood entry point. Cleared on success/404.
+        await this.retryOutstandingDeletions();
       } else if (offlineQueueSizeBefore > 0) {
         this.log(
           `Sync: ${offlineQueueSizeBefore} queued operation(s) kept pending because no encryption key lease is available.`
@@ -7945,8 +9020,15 @@ export default class VaultGuardPlugin extends Plugin {
           if (this.originalAdapterMethods.remove) {
             try {
               await this.originalAdapterMethods.remove(normalizedPath);
-            } catch {
-              // File may already be gone locally.
+            } catch (err) {
+              // A not-found error is expected and benign — the file was
+              // already gone locally. Anything else (read-only FS, disk
+              // error, locked file) is a real failure that the delete
+              // silently dropped, so surface it instead of swallowing.
+              const msg = err instanceof Error ? err.message : String(err);
+              if (!/enoent|no such file|does not exist|not found/i.test(msg)) {
+                this.logError(`Sync: failed to delete "${normalizedPath}" locally`, err);
+              }
             }
           }
           continue;
@@ -8009,11 +9091,16 @@ export default class VaultGuardPlugin extends Plugin {
           new Notice(`VaultGuard Sync: Sync complete — ${summaryParts.join(", ")}.`);
         }
       }
+      this.syncDiagnostics.record("performSync.done", { ok: true });
     } catch (error) {
       this.syncState.status = "error";
       this.syncState.lastError =
         error instanceof Error ? error.message : "Unknown sync error";
       this.logError("Sync failed", error);
+      this.syncDiagnostics.record("performSync.done", {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
 
       if (userInitiated) {
         new Notice(
@@ -8286,10 +9373,12 @@ export default class VaultGuardPlugin extends Plugin {
     const syncMode = this.getEffectiveSyncMode();
     if (syncMode === "manual") {
       this.log("Sync timer disabled by organization manual-sync policy.");
+      this.syncDiagnostics.record("startSyncTimer.skipped", { reason: "manual" });
       return;
     }
     if (this.syncTimerPaused) {
       this.log("Sync timer kept paused (window hidden / offline).");
+      this.syncDiagnostics.record("startSyncTimer.skipped", { reason: "paused" });
       return;
     }
 
@@ -8307,6 +9396,7 @@ export default class VaultGuardPlugin extends Plugin {
     }, delay);
 
     this.log(`Sync timer scheduled in ${Math.round(delay / 1000)}s (mode: ${syncMode}).`);
+    this.syncDiagnostics.record("startSyncTimer.scheduled", { delayMs: delay, syncMode });
   }
 
   /** Cancels the next scheduled sync, if any. */
@@ -8936,6 +10026,25 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     this.updateStatusBar();
+
+    // Populate any open Permissions graph that was waiting on connectivity.
+    // The "online" flip is deferred until the first sync, so a panel opened on
+    // launch renders its offline empty state first; re-render it on the
+    // offline→online edge so it loads without the user reopening it.
+    if (status === "online" && previousStatus !== "online") {
+      this.refreshPermissionsGraph();
+    }
+  }
+
+  /** Re-render every open Permissions graph view (e.g. after coming online). */
+  private refreshPermissionsGraph(): void {
+    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_GRAPH_VIEW_TYPE);
+    for (const leaf of leaves) {
+      const view = leaf.view;
+      if (view instanceof PermissionsGraphView) {
+        void view.refresh();
+      }
+    }
   }
 
   private notifyConnectionLost(): void {
@@ -9132,7 +10241,11 @@ export default class VaultGuardPlugin extends Plugin {
               "DELETE",
               this.vaultPath(`/files/${encodeURIComponent(op.path)}`)
             );
+            // Returns on success / 404 / 401 / 403 (throws on other failures,
+            // leaving the tombstone in place to retry). Any return means the
+            // server has settled this delete — clear its tombstone.
             this.assertOfflineFlushResponse(response, op);
+            this.clearDeletionTombstone(op.path);
             break;
           }
         }
@@ -9609,9 +10722,17 @@ export default class VaultGuardPlugin extends Plugin {
    * level chips stay in sync with rule edits made anywhere else.
    */
   private reloadVaultGuardSidebar(): void {
+    this.sidebarViewConfig = this.createSidebarViewConfig();
     const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_VIEW_TYPE);
     for (const leaf of leaves) {
-      const view = leaf.view as VaultGuardSidebarView | undefined;
+      const view = leaf.view as
+        | (VaultGuardSidebarView & {
+            configure?: (cfg: VaultGuardSidebarViewConfig | null) => void;
+          })
+        | undefined;
+      if (view?.configure) {
+        view.configure(this.sidebarViewConfig);
+      }
       if (view?.reload) {
         void view.reload();
       }
@@ -9710,6 +10831,71 @@ export default class VaultGuardPlugin extends Plugin {
   // UI Methods
   // ─────────────────────────────────────────────────────────────────────────
 
+  private setGlobalAuthChromeState(loggedIn: boolean): void {
+    if (typeof document === "undefined") {
+      return;
+    }
+    document.body.toggleClass("vaultguard-auth-logged-in", loggedIn);
+  }
+
+  private updateRibbonAuthIndicator(): void {
+    const shieldEl = this.vaultGuardRibbonEl;
+    const ribbonEls = [
+      this.vaultGuardRibbonEl,
+      this.vaultGuardChatRibbonEl,
+      this.vaultGuardGraphRibbonEl,
+    ].filter((el): el is HTMLElement => Boolean(el));
+    this.setGlobalAuthChromeState(Boolean(this.session));
+    if (ribbonEls.length === 0) {
+      return;
+    }
+
+    if (!this.session) {
+      for (const el of ribbonEls) {
+        el.removeClass("vaultguard-ribbon-auth-logged-in");
+      }
+      const detail =
+        this.lastLogoutAuthState?.detail ??
+        this.lastLogoutAuthState?.message ??
+        "Not logged in";
+      if (shieldEl) {
+        shieldEl.addClass("vaultguard-ribbon-auth-logged-out");
+        shieldEl.setAttr("aria-label", "VaultGuard Sync: logged out");
+        shieldEl.setAttr(
+          "title",
+          `VaultGuard Sync: ${detail}. Click to log in or open settings.`
+        );
+      }
+      this.vaultGuardChatRibbonEl?.setAttr("aria-label", "VaultGuard Chat");
+      this.vaultGuardChatRibbonEl?.setAttr("title", "VaultGuard Chat");
+      this.vaultGuardGraphRibbonEl?.setAttr("aria-label", "VaultGuard Permissions");
+      this.vaultGuardGraphRibbonEl?.setAttr("title", "VaultGuard Permissions");
+      return;
+    }
+
+    for (const el of ribbonEls) {
+      el.addClass("vaultguard-ribbon-auth-logged-in");
+      el.removeClass("vaultguard-ribbon-auth-logged-out");
+    }
+    shieldEl?.setAttr("aria-label", "VaultGuard Sync");
+    shieldEl?.setAttr(
+      "title",
+      `VaultGuard Sync: connected${
+        this.session.email ? ` as ${this.session.email}` : ""
+      }.`
+    );
+    this.vaultGuardChatRibbonEl?.setAttr("aria-label", "VaultGuard Chat");
+    this.vaultGuardChatRibbonEl?.setAttr(
+      "title",
+      "VaultGuard Chat: connected."
+    );
+    this.vaultGuardGraphRibbonEl?.setAttr("aria-label", "VaultGuard Permissions");
+    this.vaultGuardGraphRibbonEl?.setAttr(
+      "title",
+      "VaultGuard Permissions: connected."
+    );
+  }
+
   /**
    * Updates the status bar with current auth and connection state.
    */
@@ -9719,12 +10905,25 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     if (!this.session) {
-      this.statusBarEl.setText("VaultGuard Sync: Not logged in");
+      if (this.lastLogoutAuthState) {
+        this.statusBarEl.setText("VaultGuard Sync: Logged out");
+        this.statusBarEl.setAttr(
+          "title",
+          `${this.lastLogoutAuthState.title}: ${this.lastLogoutAuthState.detail ?? this.lastLogoutAuthState.message}`
+        );
+      } else {
+        this.statusBarEl.setText("VaultGuard Sync: Not logged in");
+        this.statusBarEl.setAttr(
+          "title",
+          "VaultGuard Sync is not connected. Log in to enable cloud sync."
+        );
+      }
       return;
     }
 
     if (this.permissionWarmupInFlight > 0) {
       this.statusBarEl.setText("VaultGuard Sync ↻ Loading permissions...");
+      this.statusBarEl.setAttr("title", "VaultGuard Sync is loading file permissions.");
       return;
     }
 
@@ -9740,6 +10939,12 @@ export default class VaultGuardPlugin extends Plugin {
       : "Offline";
 
     this.statusBarEl.setText(`VaultGuard Sync ${connectionIcon} ${statusText}`);
+    this.statusBarEl.setAttr(
+      "title",
+      `VaultGuard Sync: ${statusText}${
+        this.session.email ? ` as ${this.session.email}` : ""
+      }`
+    );
   }
 
   /**
@@ -9793,7 +10998,7 @@ export default class VaultGuardPlugin extends Plugin {
    * list every rule, add / edit / delete with principal dropdowns, level,
    * priority, and expiry). Distinct from the per-file controls in the header.
    */
-  showPermissionRulesModal(): void {
+  showPermissionRulesModal(initialSearch?: string): void {
     if (!this.session) {
       this.showLoginRequiredNotice("view permissions");
       return;
@@ -9815,7 +11020,7 @@ export default class VaultGuardPlugin extends Plugin {
       this.apiClient,
       "permissions",
       null,
-      this.createAdminModalContext()
+      this.createAdminModalContext(initialSearch)
     );
     modal.open();
   }
@@ -9834,7 +11039,7 @@ export default class VaultGuardPlugin extends Plugin {
     );
   }
 
-  private createAdminModalContext() {
+  private createAdminModalContext(permissionsInitialSearch?: string) {
     return {
       orgId: this.settings.organizationId,
       orgSlug: this.settings.orgSlug,
@@ -9849,6 +11054,7 @@ export default class VaultGuardPlugin extends Plugin {
           }
         : undefined,
       features: this.serverFeatures ?? undefined,
+      permissionsInitialSearch,
       onPermissionsChanged: () => this.notifyPermissionRulesChanged(),
     };
   }
@@ -9937,7 +11143,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Shows permissions for a specific file or folder path in a dedicated modal.
    * Displays who has access, current user's level, and admin controls.
    */
-  private showPathPermissionsModal(path: string, isFolder: boolean): void {
+  private showPathPermissionsModal(path: string, isFolder: boolean, initialExplain = false): void {
     if (!this.session || !this.apiClient) {
       if (!this.session) {
         this.showLoginRequiredNotice("view permissions");
@@ -9962,6 +11168,7 @@ export default class VaultGuardPlugin extends Plugin {
       // opted in.
       allowAdminPerFileRestrictions:
         this.orgSettings?.allowAdminPerFileRestrictions === true,
+      initialExplain,
       onRulesChanged: () => {
         // Phase 9: full invalidation via the bus. Rules edited from the
         // modal can include glob patterns (e.g. deleting an inherited
@@ -9970,6 +11177,7 @@ export default class VaultGuardPlugin extends Plugin {
         // bus subscriptions handle the surface invalidations.
         this.permissionStore.emit("changed", { serverConfirmed: true });
       },
+      onOpenRulesOverview: (filter) => this.showPermissionRulesModal(filter),
     });
     modal.open();
   }

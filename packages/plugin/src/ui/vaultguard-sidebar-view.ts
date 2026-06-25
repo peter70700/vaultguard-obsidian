@@ -62,10 +62,26 @@ export interface VaultGuardSidebarViewConfig {
   onOpenSettings?: () => void;
 }
 
+export interface VaultGuardSidebarAuthState {
+  title: string;
+  message: string;
+  detail?: string;
+  icon?: string;
+  tone?: "neutral" | "warning" | "danger";
+  actionLabel?: string;
+}
+
+export interface VaultGuardSidebarViewOptions {
+  getAuthState?: () => VaultGuardSidebarAuthState | null;
+  onLogin?: () => void;
+  onOpenSettings?: () => void;
+}
+
 // ─── View Class ────────────────────────────────────────────────────────────
 
 export class VaultGuardSidebarView extends ItemView {
   private config: VaultGuardSidebarViewConfig | null = null;
+  private options: VaultGuardSidebarViewOptions;
   private ruleCache: Map<string, ViewCacheEntry> = new Map();
   private accessCache: Map<string, { summary: PathAccessSummary; fetchedAt: number }> = new Map();
   private filterLevel: string = "all";
@@ -96,14 +112,15 @@ export class VaultGuardSidebarView extends ItemView {
   private searchInputEl: HTMLInputElement | null = null;
   private searchDebounce: number | null = null;
 
-  constructor(leaf: WorkspaceLeaf) {
+  constructor(leaf: WorkspaceLeaf, options: VaultGuardSidebarViewOptions = {}) {
     super(leaf);
+    this.options = options;
   }
 
   /**
    * Inject configuration after construction (since Obsidian controls instantiation).
    */
-  configure(config: VaultGuardSidebarViewConfig): void {
+  configure(config: VaultGuardSidebarViewConfig | null): void {
     this.config = config;
   }
 
@@ -170,29 +187,66 @@ export class VaultGuardSidebarView extends ItemView {
 
     if (!this.contentEl_) return;
 
+    if (!this.config) {
+      this.contentEl_.empty();
+      this.renderNotLoggedIn(this.contentEl_);
+      return;
+    }
+
     // If we previously showed "not logged in", rebuild the full shell
-    if (this.config && !this.contentEl_.querySelector(".vaultguard-sb-list")) {
+    if (!this.contentEl_.querySelector(".vaultguard-sb-list")) {
       this.contentEl_.empty();
       this.renderShell(this.contentEl_);
     }
 
-    if (this.config) {
-      await this.loadEntries();
-    }
+    await this.loadEntries();
   }
 
   // ─── Shell Rendering ──────────────────────────────────────────────────
 
   private renderNotLoggedIn(container: HTMLElement): void {
+    const authState = this.options.getAuthState?.() ?? null;
+    const isLoggedOut = Boolean(authState);
     const header = container.createDiv({ cls: "vaultguard-sb-header" });
     const titleRow = header.createDiv({ cls: "vaultguard-sb-title-row" });
     const titleIcon = titleRow.createSpan({ cls: "vaultguard-sb-title-icon" });
     setIcon(titleIcon, "vaultguard-shield");
     titleRow.createSpan({ cls: "vaultguard-sb-title-text", text: "VaultGuard Files" });
 
-    const emptyState = container.createDiv({ cls: "vaultguard-sb-empty" });
+    const emptyState = container.createDiv({
+      cls: isLoggedOut
+        ? `vaultguard-sb-empty vaultguard-sb-auth-state vaultguard-sb-auth-state-${authState?.tone ?? "warning"}`
+        : "vaultguard-sb-empty",
+    });
     const icon = emptyState.createDiv({ cls: "vaultguard-sb-empty-icon" });
-    setIcon(icon, "lock");
+    setIcon(icon, authState?.icon ?? "lock");
+
+    if (authState) {
+      emptyState.createEl("h3", { text: authState.title });
+      emptyState.createEl("p", { text: authState.message });
+      if (authState.detail) {
+        emptyState.createEl("p", {
+          text: authState.detail,
+          cls: "vaultguard-sb-empty-hint",
+        });
+      }
+
+      if (this.options.onLogin) {
+        const loginBtn = emptyState.createEl("button", {
+          cls: "vaultguard-sb-empty-action vaultguard-sb-empty-action-primary",
+          text: authState.actionLabel ?? "Log in",
+        });
+        loginBtn.addEventListener("click", () => this.options.onLogin?.());
+      } else if (this.options.onOpenSettings) {
+        const settingsBtn = emptyState.createEl("button", {
+          cls: "vaultguard-sb-empty-action vaultguard-sb-empty-action-primary",
+          text: "Open settings",
+        });
+        settingsBtn.addEventListener("click", () => this.options.onOpenSettings?.());
+      }
+      return;
+    }
+
     emptyState.createEl("p", {
       text: "Log in to VaultGuard to see file permissions and sharing status.",
     });

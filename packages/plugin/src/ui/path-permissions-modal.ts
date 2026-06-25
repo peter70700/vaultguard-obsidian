@@ -22,6 +22,13 @@ import {
 } from "../api/client";
 import { PermissionEditor } from "../admin/permission-editor";
 import {
+  explainAccess,
+  type ExplainAction,
+  type ExplainRule,
+  type ExplainTrace,
+  type ExplainVaultRole,
+} from "./graph/permission-explain";
+import {
   buildAccessUserMap,
   findExactAccessUserMatch,
   formatAccessUserRole,
@@ -46,7 +53,11 @@ interface PathPermissionsConfig {
   currentUserRole: string;
   /** See FilePermissionHeader.HeaderContext.allowAdminPerFileRestrictions. */
   allowAdminPerFileRestrictions?: boolean;
+  /** Open with an explanation expanded instead of requiring the user to click Explain first. */
+  initialExplain?: boolean;
   onRulesChanged?: () => void;
+  /** Opens the vault-wide rules overview, optionally filtered to this path. */
+  onOpenRulesOverview?: (filter: string) => void;
 }
 
 export class PathPermissionsModal extends Modal {
@@ -65,6 +76,7 @@ export class PathPermissionsModal extends Modal {
   private canManage = false;
   private currentUserLevel: "none" | "read" | "write" | "admin" = "none";
   private accessSummary: PathAccessSummary | null = null;
+  private explainedPrincipalId: string | null = null;
   private permissionEditor: PermissionEditor;
 
   constructor(cfg: PathPermissionsConfig) {
@@ -95,6 +107,7 @@ export class PathPermissionsModal extends Modal {
       this.rules = this.canManage
         ? await this.cfg.apiClient.getPermissions(this.cfg.path).catch(() => [])
         : [];
+      this.seedInitialExplanation();
       this.permissionsLoaded = true;
       this.render();
     } catch (error) {
@@ -226,6 +239,7 @@ export class PathPermissionsModal extends Modal {
   }
 
   private renderEffectiveAccessRow(container: HTMLElement, principal: PathAccessPrincipal): void {
+    const canonicalUserId = this.resolveCanonicalUserId(principal.userId);
     const row = container.createDiv({ cls: "vaultguard-pp-row vaultguard-pp-row-effective" });
 
     const avatarEl = row.createDiv({ cls: "vaultguard-pp-avatar" });
@@ -265,13 +279,26 @@ export class PathPermissionsModal extends Modal {
           setControlBusy(select, false);
         }
       });
-      return;
+    } else {
+      const badge = levelEl.createSpan({
+        cls: `vaultguard-fh-badge vaultguard-fh-badge-${principal.level}`,
+      });
+      badge.setText(this.formatLevel(principal.level));
     }
 
-    const badge = levelEl.createSpan({
-      cls: `vaultguard-fh-badge vaultguard-fh-badge-${principal.level}`,
+    const explainBtn = levelEl.createEl("button", {
+      cls: "vaultguard-pp-explain-btn",
+      text: this.explainedPrincipalId === canonicalUserId ? "Hide" : "Explain",
+      attr: { type: "button" },
     });
-    badge.setText(this.formatLevel(principal.level));
+    explainBtn.addEventListener("click", () => {
+      this.explainedPrincipalId = this.explainedPrincipalId === canonicalUserId ? null : canonicalUserId;
+      this.render();
+    });
+
+    if (this.explainedPrincipalId === canonicalUserId) {
+      this.renderPrincipalExplanation(container, principal);
+    }
   }
 
   private renderRuleRow(container: HTMLElement, rule: PermissionRule): void {
@@ -605,18 +632,39 @@ export class PathPermissionsModal extends Modal {
 
     updateQuickList();
 
-    // Also offer the full rule editor for advanced use
     const advancedRow = section.createDiv({ cls: "vaultguard-pp-advanced" });
-    advancedRow.createEl("button", {
-      cls: "vaultguard-pp-advanced-btn",
-      text: "Advanced rule editor...",
-      attr: { type: "button" },
-    }).addEventListener("click", () => {
+    this.createAdvancedActionButton(advancedRow, "sliders-horizontal", "Advanced rule editor", () => {
       const rulePath = this.toRulePath(this.cfg.path);
       this.permissionEditor.showAddRuleForPath(rulePath, async () => {
         await this.refresh();
       });
     });
+    this.createAdvancedActionButton(advancedRow, "list-filter", "Permission rules overview", () => {
+      const filter = this.rulesOverviewFilter();
+      if (!this.cfg.onOpenRulesOverview) {
+        new Notice("Permission rules overview is not available here.");
+        return;
+      }
+      this.close();
+      this.cfg.onOpenRulesOverview(filter);
+    });
+  }
+
+  private createAdvancedActionButton(
+    container: HTMLElement,
+    icon: string,
+    label: string,
+    onClick: () => void
+  ): HTMLElement {
+    const button = container.createEl("button", {
+      cls: "vaultguard-pp-advanced-btn",
+      attr: { type: "button" },
+    });
+    const iconEl = button.createSpan({ cls: "vaultguard-pp-advanced-icon" });
+    setIcon(iconEl, icon);
+    button.createSpan({ cls: "vaultguard-pp-advanced-label", text: label });
+    button.addEventListener("click", onClick);
+    return button;
   }
 
   // ─── Refresh ───────────────────────────────────────────────────────
@@ -709,6 +757,7 @@ export class PathPermissionsModal extends Modal {
       this.rules = this.canManage
         ? await this.cfg.apiClient.getPermissions(this.cfg.path).catch(() => [])
         : [];
+      this.seedInitialExplanation();
       this.permissionsLoaded = true;
       this.render();
       this.cfg.onRulesChanged?.();
@@ -786,6 +835,13 @@ export class PathPermissionsModal extends Modal {
     if (!p.startsWith("/")) p = "/" + p;
     if (this.cfg.isFolder && !p.endsWith("/")) p += "/";
     return p;
+  }
+
+  private rulesOverviewFilter(): string {
+    const normalized = this.cfg.path.replace(/^\/+/, "").replace(/\/+$/, "");
+    if (this.cfg.isFolder) return normalized;
+    const slashIndex = normalized.lastIndexOf("/");
+    return slashIndex > 0 ? normalized.slice(0, slashIndex) : normalized;
   }
 
   private resolveMyLevel(): string {
@@ -953,6 +1009,166 @@ export class PathPermissionsModal extends Modal {
   private userLabel(userId: string): string {
     const user = this.userMap.get(userId);
     return user ? getAccessUserDisplayName(user) : userId;
+  }
+
+  private seedInitialExplanation(): void {
+    if (!this.cfg.initialExplain || this.explainedPrincipalId) return;
+    const principals = this.normalizeAccessPrincipals(this.accessSummary?.principals ?? []);
+    if (principals.length === 0) return;
+    const currentUser = principals.find(
+      (principal) => this.resolveCanonicalUserId(principal.userId) === this.cfg.currentUserId
+    );
+    const target = currentUser ?? principals[0];
+    this.explainedPrincipalId = this.resolveCanonicalUserId(target.userId);
+  }
+
+  private renderPrincipalExplanation(container: HTMLElement, principal: PathAccessPrincipal): void {
+    const explanation = this.explainPrincipalAccess(principal);
+    const panel = container.createDiv({ cls: "vaultguard-pp-explain-panel" });
+    panel.createDiv({
+      cls: "vaultguard-pp-explain-title",
+      text: `Why ${this.accessPrincipalLabel(principal)} has ${this.formatLevel(principal.level)}`,
+    });
+    panel.createDiv({ cls: "vaultguard-pp-explain-headline", text: explanation.headline });
+
+    if (!this.canManage) {
+      panel.createDiv({
+        cls: "vaultguard-pp-explain-note",
+        text: "The backend effective level is authoritative. Full rule traces are only shown to users who can manage this path.",
+      });
+    }
+
+    const badges = panel.createDiv({ cls: "vaultguard-pp-explain-badges" });
+    badges.createSpan({
+      cls: `vaultguard-fh-badge vaultguard-fh-badge-${principal.level}`,
+      text: this.formatLevel(principal.level),
+    });
+    badges.createSpan({
+      cls: "vaultguard-pp-explain-badge",
+      text: `via ${explanation.trace.decidedBy}`,
+    });
+
+    const list = panel.createEl("ul", { cls: "vaultguard-pp-explain-steps" });
+    for (const step of explanation.trace.steps) {
+      list.createEl("li", { text: step });
+    }
+  }
+
+  private explainPrincipalAccess(principal: PathAccessPrincipal): {
+    headline: string;
+    trace: ExplainTrace;
+  } {
+    const action = this.actionToExplain(principal.level);
+    const role = this.roleForPrincipal(principal);
+    const trace = explainAccess({
+      userId: this.resolveCanonicalUserId(principal.userId),
+      role,
+      orgRoles: this.orgRolesForPrincipal(principal),
+      path: this.toRulePath(this.cfg.path),
+      action,
+      rules: this.rulesForPrincipal(principal, role),
+      ...(this.shouldCompareServerLevel(principal.level, action) ? { serverLevel: principal.level } : {}),
+    });
+
+    return {
+      headline: this.explainHeadline(principal, trace, action),
+      trace,
+    };
+  }
+
+  private explainHeadline(
+    principal: PathAccessPrincipal,
+    trace: ExplainTrace,
+    action: ExplainAction
+  ): string {
+    if (trace.decidedBy === "adminBypass") {
+      return "Admin bypass grants full access before per-file rules are consulted.";
+    }
+
+    if (principal.level === "read") {
+      if (trace.decidedBy === "rule" && trace.winningRuleId) {
+        const rule = this.rules.find((candidate) => candidate.id === trace.winningRuleId);
+        return rule?.effect === "deny"
+          ? `Read only because the winning rule on ${rule.pathPattern} blocks editing.`
+          : `Read access is allowed by the winning rule on ${rule?.pathPattern ?? "this path"}.`;
+      }
+      return `Read only because no matching rule grants editing beyond the ${this.roleForPrincipal(principal)} vault role.`;
+    }
+
+    if (trace.decidedBy === "roleBaseline") {
+      if (principal.level === "none") {
+        return `No access because no matching rule or ${this.roleForPrincipal(principal)} vault role grants read.`;
+      }
+      return `${this.formatLevel(principal.level)} comes from the ${this.roleForPrincipal(principal)} vault role; no matching ${this.actionLabel(action)} rule changed it.`;
+    }
+
+    const rule = trace.winningRuleId ? this.rules.find((candidate) => candidate.id === trace.winningRuleId) : null;
+    if (rule) {
+      const verb = rule.effect === "deny" ? "blocks" : "grants";
+      return `${this.formatLevel(principal.level)} because the rule on ${rule.pathPattern} ${verb} ${this.actionLabel(action)}.`;
+    }
+
+    return `${this.formatLevel(principal.level)} according to the backend effective-access check.`;
+  }
+
+  private rulesForPrincipal(principal: PathAccessPrincipal, role: ExplainVaultRole): ExplainRule[] {
+    const canonicalUserId = this.resolveCanonicalUserId(principal.userId);
+    return this.rules
+      .filter((rule) => {
+        if (rule.userId === "*") return true;
+        if (rule.role) return rule.role === role;
+        return this.resolveCanonicalUserId(rule.userId) === canonicalUserId;
+      })
+      .map((rule) => ({
+        id: rule.id,
+        userId: rule.userId,
+        role: rule.role,
+        pathPattern: rule.pathPattern,
+        actions: rule.actions,
+        effect: rule.effect,
+        priority: rule.priority,
+        expiresAt: rule.expiresAt,
+      }));
+  }
+
+  private roleForPrincipal(principal: PathAccessPrincipal): ExplainVaultRole {
+    const role = principal.role ?? this.userMap.get(principal.userId)?.role;
+    return role === "admin" || role === "editor" || role === "viewer" ? role : "viewer";
+  }
+
+  private orgRolesForPrincipal(principal: PathAccessPrincipal): string[] {
+    const roles: string[] = [];
+    if (principal.userId === this.cfg.currentUserId) {
+      roles.push(this.cfg.currentUserRole);
+    }
+    return roles.filter((role) => role === "admin" || role === "owner" || role === "vault-admin");
+  }
+
+  private actionToExplain(level: string): ExplainAction {
+    switch (level) {
+      case "admin": return "admin";
+      case "write": return "write";
+      case "read": return "write";
+      default: return "read";
+    }
+  }
+
+  private shouldCompareServerLevel(level: string, action: ExplainAction): boolean {
+    return (
+      (level === "admin" && action === "admin") ||
+      (level === "write" && action === "write") ||
+      (level === "none" && action === "read")
+    );
+  }
+
+  private actionLabel(action: ExplainAction): string {
+    switch (action) {
+      case "admin": return "permission-management";
+      case "write": return "editing";
+      case "delete": return "delete";
+      case "list": return "list";
+      case "read": return "read";
+    }
   }
 
   private accessPrincipalLabel(principal: PathAccessPrincipal): string {

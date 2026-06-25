@@ -314,6 +314,11 @@ export class FileExplorerDecorations {
       await this.fetchAccessForPaths(pathsToFetch);
     }
 
+    // Pre-compute which folders have at least one accessible descendant among
+    // the currently-rendered rows. A folder is only collapsed on no-access
+    // when nothing readable sits under it — see shouldHideItem.
+    const foldersWithAccessibleDescendant = this.collectFoldersWithAccessibleDescendant(itemPaths);
+
     // Guard: set flag so observer ignores our own DOM mutations
     this.isDecorating = true;
     try {
@@ -321,13 +326,16 @@ export class FileExplorerDecorations {
         const cachedEntry = this.cache.get(path);
         const entry = cachedEntry ?? this.fallbackEntry();
 
-        // Only file rows are hidden on an explicit no-access result. Folder
-        // path checks are not reliable enough to collapse folder rows:
-        // Obsidian only renders expanded descendants into the DOM, so a
-        // collapsed folder can look like it has no accessible children even
-        // when it contains readable files. Keeping folders visible prevents
-        // an entire vault tree from disappearing.
-        const shouldHide = cachedEntry ? this.shouldHideItem(isFile, cachedEntry) : false;
+        // Files hide on any cached no-access result. Folders hide only when
+        // the backend authoritatively reports no access AND no descendant we
+        // can see grants access — Obsidian only renders expanded descendants
+        // into the DOM, so the descendant guard keeps an expanded subtree
+        // visible while still collapsing a folder the user genuinely can't
+        // enter. Requiring a backend-sourced level keeps a cold/offline cache
+        // from making the whole tree disappear.
+        const shouldHide = cachedEntry
+          ? this.shouldHideItem(isFile, cachedEntry, foldersWithAccessibleDescendant.has(path))
+          : false;
         item.classList.toggle(HIDDEN_CLS, shouldHide);
 
         this.applyDecoration(item, entry);
@@ -335,6 +343,28 @@ export class FileExplorerDecorations {
     } finally {
       this.isDecorating = false;
     }
+  }
+
+  /**
+   * Returns the set of folder paths that have at least one accessible
+   * (read/write/admin) descendant among the supplied rows. Walks each
+   * accessible row's ancestor chain so a readable file or folder keeps every
+   * folder above it visible. Used by `shouldHideItem` to avoid collapsing a
+   * folder whose subtree the user can actually open into.
+   */
+  private collectFoldersWithAccessibleDescendant(
+    itemPaths: Array<{ path: string }>
+  ): Set<string> {
+    const folders = new Set<string>();
+    for (const { path } of itemPaths) {
+      const level = this.cache.get(path)?.level;
+      if (!level || level === "none" || level === "unknown") continue;
+      const segments = path.split("/");
+      for (let i = 1; i < segments.length; i++) {
+        folders.add(segments.slice(0, i).join("/"));
+      }
+    }
+    return folders;
   }
 
   private needsFetch(path: string): boolean {
@@ -452,8 +482,18 @@ export class FileExplorerDecorations {
     }
   }
 
-  private shouldHideItem(isFile: boolean, entry: DecorationCacheEntry): boolean {
-    return entry.level === "none" && isFile;
+  private shouldHideItem(
+    isFile: boolean,
+    entry: DecorationCacheEntry,
+    hasAccessibleDescendant: boolean
+  ): boolean {
+    if (entry.level !== "none") return false;
+    if (isFile) return true;
+    // Folder: collapse only on an authoritative (backend-sourced) no-access
+    // result and only when nothing readable sits beneath it. A cold/offline
+    // cache resolves folders to a non-backend "none", so this never makes the
+    // whole tree vanish before the backend has actually answered.
+    return entry.source === "backend" && !hasAccessibleDescendant;
   }
 
   private fallbackEntry(): DecorationCacheEntry {

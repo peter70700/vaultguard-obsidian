@@ -19,9 +19,9 @@
  * injected via `PermissionStoreConfig` so Vitest can instantiate the store
  * with mocks (see `tests/permission-store.test.ts`).
  *
- * Stubs `sweepLeavesAfterWarm` and `detachLeafWithNotice` are declared here
- * so Plan 09-02 can wire them from main.ts without touching the class surface;
- * Plan 09-03 fills the bodies.
+ * `sweepLeavesAfterWarm` and `detachLeafWithNotice` are wired from main.ts
+ * (warm-up calls the sweep directly, bypassing the bus) without callers
+ * needing to reach into the class internals.
  */
 
 import { App, Events, Notice, WorkspaceLeaf } from "obsidian";
@@ -81,10 +81,10 @@ interface CacheEntry {
 /** Unified per-entry TTL (D-09). Matches existing header/sidebar caches. */
 const CACHE_TTL_MS = 60_000;
 
-/** Per-path debounce window for "Access revoked" Notice (D-19). Used by Plan 09-03. */
+/** Per-path debounce window for "Access revoked" Notice (D-19). */
 const NOTICE_DEBOUNCE_MS = 5_000;
 
-/** Yield to the event loop every N leaves during sweep (D-18). Used by Plan 09-03. */
+/** Yield to the event loop every N leaves during sweep (D-18). */
 const LEAF_SWEEP_YIELD_BATCH = 50;
 
 /**
@@ -138,10 +138,10 @@ export class PermissionStore extends Events {
     return this.warmupPromise;
   }
 
-  /** D-15: NONE-streak counter for the 2-consecutive-local-NONE debounce. Used by Plan 09-03. */
+  /** D-15: NONE-streak counter for the 2-consecutive-local-NONE debounce. */
   private noneStreak: Map<string, number> = new Map();
 
-  /** D-19: per-path Notice timestamp for 5s debounce. Used by Plan 09-03. */
+  /** D-19: per-path Notice timestamp for 5s debounce. */
   private lastNoticeAt: Map<string, number> = new Map();
 
   /** D-12: one-time feature-detect of undocumented metadataCache.deletePath. */
@@ -389,7 +389,7 @@ export class PermissionStore extends Events {
    * Public emit — surfaces and main.ts call sites use this to fan out an
    * invalidation. Payload `{ path }` scopes the change; omitting `path`
    * means "all paths". `serverConfirmed: true` marks the signal as
-   * authoritative (D-17 — used by Plan 09-03 for immediate leaf detach).
+   * authoritative (D-17 — drives immediate leaf detach).
    *
    * Internally delegates to `Events.trigger` so registered `on('changed')`
    * listeners fire synchronously.
@@ -434,7 +434,7 @@ export class PermissionStore extends Events {
     this.invalidate();
   }
 
-  // ── Startup leaf sweep stub (filled in Plan 09-03) ─────────────────────────
+  // ── Startup leaf sweep ─────────────────────────────────────────────────────
 
   /**
    * Startup leaf-restore filter (R-09-06, D-20, D-21).
@@ -451,7 +451,7 @@ export class PermissionStore extends Events {
     await this.sweepLeaves(true);
   }
 
-  // ── Private: change handler (metadataCache purge + leaf sweep stub) ────────
+  // ── Private: change handler (metadataCache purge + leaf detach) ────────────
 
   /**
    * Fires from the self-subscription on every `emit('changed', ...)`.
@@ -474,7 +474,7 @@ export class PermissionStore extends Events {
    * walk-up answer the long tail; only paths with explicit cached entries
    * beyond root might disagree with the root level and need re-probe.
    *
-   * Plan 09-03 will add the leaf-detach branch here.
+   * The leaf-detach branch runs via `sweepLeaves` (called below).
    */
   private async handleChanged(
     path: string | undefined,
@@ -623,7 +623,7 @@ export class PermissionStore extends Events {
     }
   }
 
-  // ── Private: leaf detach stub (filled in Plan 09-03) ───────────────────────
+  // ── Private: leaf detach ───────────────────────────────────────────────────
 
   /**
    * Detach a workspace leaf and fire a debounced "Access revoked" Notice.

@@ -6,12 +6,13 @@
 //
 // ENCRYPTION BOUNDARY (non-negotiable): the spawned `claude` reaches vault
 // content ONLY through VaultGuard's AgentBridge MCP server (localhost,
-// lease-scoped, permission-checked, confirmWrite diff-gated). We lock that down
+// lease-scoped, permission-checked, writeMode-gated). We lock that down
 // with:
 //   - --strict-mcp-config + a single HTTP MCP entry (no .mcp.json / CLAUDE.md
 //     discovery), and we spawn in a FRESH EMPTY temp cwd so there is no project
 //     context to discover.
-//   - --allowedTools = the six mcp__vaultguard__* tools only.
+//   - --allowedTools = the mcp__vaultguard__* tools only (incl. the gated
+//     import_list / import_read, which stay server-gated — see mcp-config.ts).
 //   - --permission-mode dontAsk denies anything unlisted with no interactive
 //     prompt. We intentionally do not pass --disallowedTools because built-in
 //     tool names vary across CLI versions and can cause false launch failures.
@@ -31,8 +32,10 @@ import { Platform } from "obsidian";
 import {
   VAULTGUARD_MCP_TOOL_NAMES,
   buildMcpConfig,
+  buildVaultGuardCliSystemPrompt,
   serializeMcpConfig,
 } from "./mcp-config";
+import type { AiChatPermissionMode } from "../../../types";
 
 const LOG_PREFIX = "[VaultGuard Chat]";
 
@@ -51,6 +54,8 @@ export interface ClaudeCliHandlers {
   onToolResult?(name: string, result: { content: string; isError: boolean }): void;
   /** Terminal result for the turn: cost (USD) + the session id to resume. */
   onResult?(info: { costUsd?: number; sessionId?: string }): void;
+  /** Transport progress/status from the Claude CLI (not assistant transcript). */
+  onStatus?(message: string): void;
   /** A fatal error (non-zero exit, error result subtype, or stderr). */
   onError?(message: string): void;
 }
@@ -62,6 +67,7 @@ export type ClaudeStreamParsed =
   | { kind: "init"; sessionId?: string; model?: string }
   | { kind: "text_delta"; text: string }
   | { kind: "thinking_delta"; text: string }
+  | { kind: "status"; message: string }
   | { kind: "tool_use"; name: string; input: unknown }
   | { kind: "tool_result"; name: string; content: string; isError: boolean }
   | { kind: "result"; isError: boolean; costUsd?: number; sessionId?: string; text?: string; subtype?: string };
@@ -76,6 +82,8 @@ interface RawLine {
   is_error?: boolean;
   total_cost_usd?: number;
   result?: string;
+  status?: string;
+  text?: string;
   // stream_event wrapper
   event?: {
     type?: string;
@@ -83,7 +91,7 @@ interface RawLine {
     delta?: { type?: string; text?: string; thinking?: string };
   };
   // assistant message wrapper (full assembled message)
-  message?: { content?: Array<{ type?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean }> };
+  message?: { content?: Array<{ type?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean }> } | string;
   // tool_result lines (when surfaced at top level by some versions)
   tool_use_id?: string;
   content?: unknown;
@@ -96,13 +104,15 @@ interface RawLine {
  * unparseable lines.
  */
 export function parseClaudeStreamLine(line: string): ClaudeStreamParsed {
-  const trimmed = line.trim();
+  const trimmed = cleanClaudeCliText(line);
   if (!trimmed) return { kind: "ignore" };
 
   let raw: RawLine;
   try {
     raw = JSON.parse(trimmed) as RawLine;
   } catch {
+    const status = normalizeClaudeStatus(trimmed);
+    if (status) return { kind: "status", message: status };
     return { kind: "ignore" };
   }
 
@@ -111,6 +121,8 @@ export function parseClaudeStreamLine(line: string): ClaudeStreamParsed {
       if (raw.subtype === "init") {
         return { kind: "init", sessionId: raw.session_id, model: raw.model };
       }
+      const status = normalizeClaudeStatus(firstString(raw.status, raw.text, raw.message));
+      if (status) return { kind: "status", message: status };
       return { kind: "ignore" };
     }
 
@@ -119,6 +131,8 @@ export function parseClaudeStreamLine(line: string): ClaudeStreamParsed {
       if (!ev) return { kind: "ignore" };
       if (ev.type === "content_block_delta") {
         if (ev.delta?.type === "text_delta" && typeof ev.delta.text === "string") {
+          const status = normalizeClaudeStatus(ev.delta.text);
+          if (status) return { kind: "status", message: status };
           return { kind: "text_delta", text: ev.delta.text };
         }
         if (ev.delta?.type === "thinking_delta" && typeof ev.delta.thinking === "string") {
@@ -138,7 +152,8 @@ export function parseClaudeStreamLine(line: string): ClaudeStreamParsed {
 
     case "user": {
       // Tool results come back as a `user` turn carrying tool_result blocks.
-      const blocks = raw.message?.content;
+      const blocks =
+        raw.message && typeof raw.message === "object" ? raw.message.content : undefined;
       if (Array.isArray(blocks)) {
         for (const b of blocks) {
           if (b?.type === "tool_result") {
@@ -169,6 +184,51 @@ export function parseClaudeStreamLine(line: string): ClaudeStreamParsed {
     default:
       return { kind: "ignore" };
   }
+}
+
+const ANSI_OSC_RE = /\x1B\][\s\S]*?(?:\x07|\x1B\\)/g;
+const ANSI_CSI_RE = /\x1B(?:\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])/g;
+const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
+export function cleanClaudeCliText(text: string): string {
+  return text
+    .replace(ANSI_OSC_RE, "")
+    .replace(ANSI_CSI_RE, "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(CONTROL_RE, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string") return value;
+  }
+  return "";
+}
+
+export function normalizeClaudeStatus(text: string): string {
+  const cleaned = cleanClaudeCliText(text);
+  if (!cleaned) return "";
+  const hasSpinnerPrefix = /^[✽✳✶✷✸✹✺✻✼✢*•●○◐◓◑◒⠁-⣿]\s+/.test(cleaned);
+  const withoutPrefix = cleaned.replace(/^[✽✳✶✷✸✹✺✻✼✢*•●○◐◓◑◒⠁-⣿]\s+/, "");
+  const hasProgressMetrics =
+    /\((?=[^)]*(?:tokens?|tok|[↓↑]|\d+\s*(?:h|m|s)))[^)]*\)\s*$/i.test(withoutPrefix);
+  const looksLikeCliStatus =
+    hasProgressMetrics &&
+    (hasSpinnerPrefix ||
+      /\b(?:manifesting|thinking|working|pondering|processing|compacting|reading|searching|using|running)\b/i.test(
+        withoutPrefix,
+      ));
+  return looksLikeCliStatus ? withoutPrefix : "";
+}
+
+function splitCliFrames(buffer: string): { frames: string[]; remainder: string } {
+  const parts = buffer.split(/\r\n|\n|\r/g);
+  return {
+    frames: parts.slice(0, -1),
+    remainder: parts.at(-1) ?? "",
+  };
 }
 
 function stringifyToolContent(content: unknown): string {
@@ -259,6 +319,7 @@ export interface ClaudeCliClientConfig {
   mcpUrl: string;
   leaseToken: string;
   model: string;
+  permissionMode?: AiChatPermissionMode;
   // Injected for tests; production resolves Node modules itself.
   deps?: ClientNodeDeps;
 }
@@ -313,7 +374,7 @@ export class ClaudeCliClient {
           cwd,
           // Inherit PATH/HOME so `claude` finds its keychain + config; we do NOT
           // set any Anthropic token. No --bare, so OAuth/keychain auth is used.
-          env: typeof process !== "undefined" ? process.env : undefined,
+          env: this.buildChildEnv(),
           // No stdin (/dev/null). `claude -p` otherwise waits ~3s for piped
           // stdin and logs a "no stdin data received" warning before proceeding.
           stdio: ["ignore", "pipe", "pipe"],
@@ -327,6 +388,7 @@ export class ClaudeCliClient {
       let settled = false;
       let stderrBuf = "";
       let stdoutRemainder = "";
+      let stderrRemainder = "";
       let sawResult = false;
       let resultWasError = false;
       let sawTextDelta = false;
@@ -348,28 +410,43 @@ export class ClaudeCliClient {
       };
       if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
+      const handleStdoutFrame = (line: string): void => {
+        const parsed = parseClaudeStreamLine(line);
+        if (parsed.kind === "text_delta") sawTextDelta = true;
+        if (parsed.kind === "result" && parsed.text && !sawTextDelta) {
+          handlers.onTextDelta?.(parsed.text);
+          sawTextDelta = true;
+        }
+        this.dispatch(parsed, handlers);
+        if (parsed.kind === "result") {
+          sawResult = true;
+          resultWasError = parsed.isError;
+        }
+      };
+
+      const handleStderrFrame = (line: string): void => {
+        const cleaned = cleanClaudeCliText(line);
+        if (!cleaned) return;
+        const status = normalizeClaudeStatus(cleaned);
+        if (status) {
+          handlers.onStatus?.(status);
+          return;
+        }
+        stderrBuf += `${stderrBuf ? "\n" : ""}${cleaned}`;
+      };
+
       child.stdout?.on("data", (chunk) => {
         stdoutRemainder += chunk.toString();
-        const lines = stdoutRemainder.split("\n");
-        // Keep the last (possibly partial) line in the buffer.
-        stdoutRemainder = lines.pop() ?? "";
-        for (const line of lines) {
-          const parsed = parseClaudeStreamLine(line);
-          if (parsed.kind === "text_delta") sawTextDelta = true;
-          if (parsed.kind === "result" && parsed.text && !sawTextDelta) {
-            handlers.onTextDelta?.(parsed.text);
-            sawTextDelta = true;
-          }
-          this.dispatch(parsed, handlers);
-          if (parsed.kind === "result") {
-            sawResult = true;
-            resultWasError = parsed.isError;
-          }
-        }
+        const split = splitCliFrames(stdoutRemainder);
+        stdoutRemainder = split.remainder;
+        for (const line of split.frames) handleStdoutFrame(line);
       });
 
       child.stderr?.on("data", (chunk) => {
-        stderrBuf += chunk.toString();
+        stderrRemainder += chunk.toString();
+        const split = splitCliFrames(stderrRemainder);
+        stderrRemainder = split.remainder;
+        for (const line of split.frames) handleStderrFrame(line);
       });
 
       child.on("error", (err) => {
@@ -381,17 +458,10 @@ export class ClaudeCliClient {
       child.on("close", (code) => {
         // Flush any trailing buffered line.
         if (stdoutRemainder.trim()) {
-          const parsed = parseClaudeStreamLine(stdoutRemainder);
-          if (parsed.kind === "text_delta") sawTextDelta = true;
-          if (parsed.kind === "result" && parsed.text && !sawTextDelta) {
-            handlers.onTextDelta?.(parsed.text);
-            sawTextDelta = true;
-          }
-          this.dispatch(parsed, handlers);
-          if (parsed.kind === "result") {
-            sawResult = true;
-            resultWasError = parsed.isError;
-          }
+          handleStdoutFrame(stdoutRemainder);
+        }
+        if (stderrRemainder.trim()) {
+          handleStderrFrame(stderrRemainder);
         }
         signal?.removeEventListener("abort", onAbort);
 
@@ -424,6 +494,9 @@ export class ClaudeCliClient {
       case "thinking_delta":
         handlers.onThinkingDelta?.(parsed.text);
         break;
+      case "status":
+        handlers.onStatus?.(parsed.message);
+        break;
       case "tool_use":
         handlers.onToolCall?.(parsed.name, parsed.input);
         break;
@@ -446,6 +519,14 @@ export class ClaudeCliClient {
     }
   }
 
+  // Child env: inherit the parent's PATH/HOME so `claude` finds its keychain
+  // and config. ask_user returns a paused marker immediately in MCP mode, so
+  // approvals no longer depend on MCP_TOOL_TIMEOUT.
+  private buildChildEnv(): NodeJS.ProcessEnv | undefined {
+    if (typeof process === "undefined") return undefined;
+    return { ...process.env };
+  }
+
   // Build the argv. NOTE: NOT --bare (keeps subscription keychain auth).
   private buildArgs(text: string): string[] {
     const mcpJson = serializeMcpConfig(buildMcpConfig(this.config.mcpUrl, this.config.leaseToken));
@@ -459,15 +540,22 @@ export class ClaudeCliClient {
       "--strict-mcp-config",
       "--mcp-config",
       mcpJson,
-      // Allow ONLY our six MCP tools. Combined with --permission-mode dontAsk
-      // (deny anything not in the allow-list) this blocks every built-in
-      // file/bash/web tool WITHOUT enumerating them — robust across CLI
-      // versions (enumerating --disallowedTools broke when a built-in name like
-      // "MultiEdit" didn't exist in the installed claude).
+      // Allow ONLY our mcp__vaultguard__* tools (incl. the gated import_*, which
+      // stay server-gated). Combined with --permission-mode dontAsk (deny
+      // anything not in the allow-list) this blocks every built-in file/bash/web
+      // tool WITHOUT enumerating them — robust across CLI versions (enumerating
+      // --disallowedTools broke when a built-in name like "MultiEdit" didn't
+      // exist in the installed claude).
       "--allowedTools",
       ...VAULTGUARD_MCP_TOOL_NAMES,
       "--permission-mode",
       "dontAsk",
+      // Steer the model to the mcp__vaultguard__* tools and forbid the native
+      // Write/Edit/Read/Bash tools it would otherwise reach for (which dontAsk
+      // denies, producing the confusing "Write tool denied" reply). See
+      // VAULTGUARD_CLI_SYSTEM_PROMPT for the full rationale.
+      "--append-system-prompt",
+      buildVaultGuardCliSystemPrompt(this.config.permissionMode),
       "--model",
       this.config.model,
     ];

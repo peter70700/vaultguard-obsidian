@@ -273,6 +273,33 @@ describe("VaultGuardApiClient surface", () => {
     });
   });
 
+  it("forwards priority in the setPermissionLevel request body", async () => {
+    const client = makeClient();
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(200, {
+      decision: "create",
+      level: "read",
+      inheritedLevel: "write",
+      rule: null,
+    }));
+
+    await client.setPermissionLevel({
+      userId: "user-1",
+      pathPattern: "/docs/a.md",
+      level: "read",
+      priority: 77,
+    });
+
+    expect(mockRequestUrl.mock.calls[0]![0].url).toBe(
+      "https://api.vaultguard.test/vaults/vault-abc/permissions"
+    );
+    expect(JSON.parse(mockRequestUrl.mock.calls[0]![0].body as string)).toMatchObject({
+      userId: "user-1",
+      pathPattern: "/docs/a.md",
+      level: "read",
+      priority: 77,
+    });
+  });
+
   it("maps audit, org settings, and recovery endpoints correctly", async () => {
     const client = makeClient();
 

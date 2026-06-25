@@ -638,6 +638,35 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     ).toHaveLength(1);
   });
 
+  it("migrates the removed 'merge' conflict strategy to DUPLICATE on load", async () => {
+    const plugin = makePlugin();
+    // A user who previously selected the (now-removed) "Attempt auto-merge"
+    // option has "merge" persisted. It was never implemented in either
+    // conflict path, so coerce it to the safest automatic strategy.
+    plugin.loadData = vi.fn().mockResolvedValue({
+      orgSlug: "acme",
+      defaultConflictResolution: "merge",
+    });
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.loadSettings();
+
+    expect(plugin.settings.defaultConflictResolution).toBe("duplicate");
+  });
+
+  it("preserves a valid persisted conflict strategy on load", async () => {
+    const plugin = makePlugin();
+    plugin.loadData = vi.fn().mockResolvedValue({
+      orgSlug: "acme",
+      defaultConflictResolution: "keep_local",
+    });
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.loadSettings();
+
+    expect(plugin.settings.defaultConflictResolution).toBe("keep_local");
+  });
+
   it("restores persisted Community Edition feature flags on load", async () => {
     const plugin = makePlugin();
     plugin.loadData = vi.fn().mockResolvedValue({
@@ -1836,6 +1865,121 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
         },
       })
     );
+  });
+
+  it("clears stale sidebar auth config and keeps the logout reason visible", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: null,
+      error: null,
+      requestId: "req-1",
+    });
+    plugin.clearStoredSession = vi.fn().mockResolvedValue(undefined);
+    plugin.revokeAgentBridgeLeasesForSessionEnd = vi.fn().mockResolvedValue(undefined);
+    const sidebarView = {
+      configure: vi.fn(),
+      reload: vi.fn().mockResolvedValue(undefined),
+    };
+    plugin.app.workspace.getLeavesOfType = vi.fn(() => [{ view: sidebarView }]);
+
+    await plugin.forceLogout("VaultGuard Sync: Session expired. Please log in again.");
+
+    expect(plugin.session).toBeNull();
+    expect(plugin.lastLogoutAuthState).toMatchObject({
+      title: "Logged out",
+      detail: "Session expired. Please log in again.",
+      actionLabel: "Log in again",
+    });
+    expect(plugin.sidebarViewConfig).toBeNull();
+    expect(sidebarView.configure).toHaveBeenCalledWith(null);
+    expect(sidebarView.reload).toHaveBeenCalled();
+    expect(mockNotice).toHaveBeenCalledWith(
+      "VaultGuard Sync: Session expired. Please log in again."
+    );
+  });
+
+  it("uses the status bar to show durable logged-out feedback", () => {
+    const plugin = makePlugin();
+    const statusBarEl = {
+      setText: vi.fn(),
+      setAttr: vi.fn(),
+    };
+    plugin.statusBarEl = statusBarEl;
+    plugin.updateStatusBar = Object.getPrototypeOf(plugin).updateStatusBar.bind(plugin);
+    plugin.rememberLogoutAuthState(
+      "VaultGuard Sync: Session locked after 15 minutes of inactivity."
+    );
+
+    plugin.updateStatusBar();
+
+    expect(statusBarEl.setText).toHaveBeenCalledWith("VaultGuard Sync: Logged out");
+    expect(statusBarEl.setAttr).toHaveBeenCalledWith(
+      "title",
+      expect.stringContaining("Session locked after 15 minutes of inactivity.")
+    );
+  });
+
+  it("marks the shield when logged out and all VaultGuard ribbon icons when signed in", () => {
+    const plugin = makePlugin();
+    const priorDocument = globalThis.document;
+    const bodyToggleClass = vi.fn();
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { body: { toggleClass: bodyToggleClass } },
+    });
+    const makeRibbonEl = () => ({
+      addClass: vi.fn(),
+      removeClass: vi.fn(),
+      setAttr: vi.fn(),
+    });
+    const shieldRibbonEl = makeRibbonEl();
+    const chatRibbonEl = makeRibbonEl();
+    const graphRibbonEl = makeRibbonEl();
+    plugin.vaultGuardRibbonEl = shieldRibbonEl;
+    plugin.vaultGuardChatRibbonEl = chatRibbonEl;
+    plugin.vaultGuardGraphRibbonEl = graphRibbonEl;
+    plugin.lastLogoutAuthState = {
+      title: "Logged out",
+      message: "VaultGuard is no longer connected.",
+      detail: "Session expired. Please log in again.",
+      icon: "log-out",
+      tone: "warning",
+      actionLabel: "Log in again",
+    };
+
+    try {
+      plugin.updateRibbonAuthIndicator();
+
+      expect(bodyToggleClass).toHaveBeenCalledWith("vaultguard-auth-logged-in", false);
+      expect(shieldRibbonEl.addClass).toHaveBeenCalledWith("vaultguard-ribbon-auth-logged-out");
+      expect(chatRibbonEl.addClass).not.toHaveBeenCalledWith("vaultguard-ribbon-auth-logged-out");
+      expect(graphRibbonEl.addClass).not.toHaveBeenCalledWith("vaultguard-ribbon-auth-logged-out");
+      expect(shieldRibbonEl.setAttr).toHaveBeenCalledWith(
+        "title",
+        expect.stringContaining("Session expired. Please log in again.")
+      );
+
+      plugin.session = makeSession();
+      plugin.updateRibbonAuthIndicator();
+
+      expect(bodyToggleClass).toHaveBeenCalledWith("vaultguard-auth-logged-in", true);
+      for (const el of [shieldRibbonEl, chatRibbonEl, graphRibbonEl]) {
+        expect(el.addClass).toHaveBeenCalledWith("vaultguard-ribbon-auth-logged-in");
+        expect(el.removeClass).toHaveBeenCalledWith("vaultguard-ribbon-auth-logged-out");
+      }
+      expect(shieldRibbonEl.setAttr).toHaveBeenCalledWith(
+        "title",
+        expect.stringContaining("connected as test@example.com")
+      );
+    } finally {
+      Object.defineProperty(globalThis, "document", {
+        configurable: true,
+        value: priorDocument,
+      });
+    }
   });
 
   it("short-circuits performSync when the cursor matches the last seen revision", async () => {

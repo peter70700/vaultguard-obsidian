@@ -732,7 +732,14 @@ async function handleUpdatePermission(
     }
     updates.userId = canonicalUserId;
   }
-  if (body.role !== undefined) updates.role = body.role;
+  // Normalize an empty/whitespace role to null so it is treated as "no role"
+  // (a user-targeted rule). `role` is the hash key of the role-index GSI, which
+  // rejects null/empty keys — the update-expression builder below routes a null
+  // role into a REMOVE clause, mirroring how handleCreatePermission strips a
+  // null role before PutItem.
+  if (body.role !== undefined) {
+    updates.role = typeof body.role === 'string' && body.role.trim() ? body.role : null;
+  }
   if (body.expiresAt !== undefined) {
     updates.expiresAt = typeof body.expiresAt === 'string' ? body.expiresAt : null;
   }
@@ -791,18 +798,33 @@ async function handleUpdatePermission(
 
   updates.updatedAt = new Date().toISOString();
 
-  // Build update expression
-  const updateExpression = 'SET ' + Object.keys(updates)
-    .map((key, i) => `#k${i} = :v${i}`)
-    .join(', ');
-
+  // Build the update expression. A null `role` must be REMOVEd, not
+  // `SET role = null`: role is the role-index GSI hash key and DynamoDB rejects
+  // a null/empty key value with a ValidationException (which surfaced to the
+  // client as "Internal server error" when editing a user-targeted rule). Every
+  // other field — including a null expiresAt, which is a plain attribute — is a
+  // normal SET.
   const expressionAttributeNames: Record<string, string> = {};
   const expressionAttributeValues: Record<string, unknown> = {};
+  const setClauses: string[] = [];
+  const removeClauses: string[] = [];
 
   Object.keys(updates).forEach((key, i) => {
     expressionAttributeNames[`#k${i}`] = key;
-    expressionAttributeValues[`:v${i}`] = updates[key];
+    if (key === 'role' && updates[key] === null) {
+      removeClauses.push(`#k${i}`);
+    } else {
+      setClauses.push(`#k${i} = :v${i}`);
+      expressionAttributeValues[`:v${i}`] = updates[key];
+    }
   });
+
+  // updatedAt is always present, so there is always at least one SET clause and
+  // ExpressionAttributeValues is never empty.
+  const updateExpression = [
+    setClauses.length ? `SET ${setClauses.join(', ')}` : '',
+    removeClauses.length ? `REMOVE ${removeClauses.join(', ')}` : '',
+  ].filter(Boolean).join(' ');
 
   await docClient.send(
     new UpdateCommand({
@@ -1329,6 +1351,10 @@ async function handleSetLevel(
   if (!['none', 'read', 'write', 'admin'].includes(level)) {
     return formatError(400, `Invalid level: '${level}'`, requestId);
   }
+  const requestedPriority = parseOptionalPriority(body.priority);
+  if (requestedPriority === null) {
+    return formatError(400, 'priority must be a non-negative whole number', requestId);
+  }
   if (!role && userId !== '*') {
     const canonicalUserId = await canonicalizeRuleUserId(userId, vault.orgId);
     if (!canonicalUserId) {
@@ -1378,6 +1404,133 @@ async function handleSetLevel(
       : !rule.role && rule.userId === userId;
     return samePath && samePrincipal;
   }) ?? null;
+
+  // Aggregate principals (`*` and role rules) do not have one inherited level:
+  // every matching vault member can inherit a different baseline from their
+  // membership role and direct rules. For these targets, write the group rule
+  // shape directly so "all users -> read" means a read-only cap and "all
+  // users -> none" means an explicit deny-all. The per-user inherited-level
+  // pipeline below remains the canonical path for individual users.
+  if (userId === '*' || role) {
+    const aggregateMutation = aggregateLevelMutation(level);
+    const actions = aggregateMutation.actions;
+    const effect = aggregateMutation.effect;
+    const now = new Date().toISOString();
+
+    await authorizePermissionMutation(
+      user, vault, pathPattern,
+      { userId, role, actions, effect },
+      existing ?? undefined
+    );
+
+    let resultRule: PermissionRule;
+    let decision: 'update' | 'create';
+
+    if (existing) {
+      const updates: Record<string, unknown> = {
+        actions,
+        effect,
+        updatedAt: now,
+      };
+      if (requestedPriority !== undefined) {
+        updates.priority = requestedPriority;
+      }
+      const updateExpression = 'SET ' + Object.keys(updates)
+        .map((_, i) => `#k${i} = :v${i}`)
+        .join(', ');
+      const expressionAttributeNames: Record<string, string> = {};
+      const expressionAttributeValues: Record<string, unknown> = {};
+      Object.keys(updates).forEach((key, i) => {
+        expressionAttributeNames[`#k${i}`] = key;
+        expressionAttributeValues[`:v${i}`] = updates[key];
+      });
+      await docClient.send(
+        new UpdateCommand({
+          TableName: PERMISSIONS_TABLE,
+          Key: { pk: existing.id, sk: RULE_SK },
+          UpdateExpression: updateExpression,
+          ExpressionAttributeNames: expressionAttributeNames,
+          ExpressionAttributeValues: expressionAttributeValues,
+        })
+      );
+      resultRule = { ...existing, actions, effect, ...(requestedPriority !== undefined ? { priority: requestedPriority } : {}), updatedAt: now };
+      decision = 'update';
+    } else {
+      const ruleId = generateId();
+      const rule: PermissionRule = {
+        id: ruleId,
+        orgId: vault.orgId,
+        vaultId: vault.vaultId,
+        userId,
+        role,
+        pathPattern,
+        actions,
+        effect,
+        priority: requestedPriority ?? calculatePriority(pathPattern),
+        createdAt: now,
+        updatedAt: now,
+        createdBy: user.userId,
+      };
+      const item: Record<string, unknown> = { ...rule, pk: ruleId, sk: RULE_SK };
+      if (item.role === null) delete item.role;
+      await docClient.send(
+        new PutCommand({
+          TableName: PERMISSIONS_TABLE,
+          Item: item,
+        })
+      );
+      resultRule = rule;
+      decision = 'create';
+    }
+
+    await revokeOverlappingLeases(
+      pathPattern,
+      userId,
+      role,
+      user.userId,
+      vault.orgId,
+      vault.vaultId
+    );
+    await recordVaultActivity({
+      orgId: vault.orgId,
+      vaultId: vault.vaultId,
+      action: 'permission_changed',
+      path: pathPattern,
+      actorUserId: user.userId,
+    });
+    await logAudit({
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      action: 'permissions.set-level',
+      resourcePath: `/vaults/${vault.vaultId}/permissions/set-level`,
+      outcome: 'success',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: {
+        decision,
+        ruleId: resultRule.id,
+        pathPattern,
+        targetUserId: userId,
+        role,
+        level,
+        inheritedLevel: level,
+        actions,
+        effect,
+        aggregatePrincipal: true,
+        aggregateInheritedLevel: 'mixed',
+        priority: resultRule.priority,
+      },
+    });
+
+    return formatSuccess(200, {
+      decision,
+      level,
+      inheritedLevel: level,
+      rule: resultRule,
+    }, requestId);
+  }
 
   // 2. Compute the principal's INHERITED level on this path — what would
   //    they have if no exact rule on this path existed? This drives the
@@ -1538,6 +1691,9 @@ async function handleSetLevel(
       effect,
       updatedAt: now,
     };
+    if (requestedPriority !== undefined) {
+      updates.priority = requestedPriority;
+    }
     const updateExpression = 'SET ' + Object.keys(updates)
       .map((_, i) => `#k${i} = :v${i}`)
       .join(', ');
@@ -1556,7 +1712,7 @@ async function handleSetLevel(
         ExpressionAttributeValues: expressionAttributeValues,
       })
     );
-    resultRule = { ...existing, actions, effect, updatedAt: now };
+    resultRule = { ...existing, actions, effect, ...(requestedPriority !== undefined ? { priority: requestedPriority } : {}), updatedAt: now };
     decision = 'update';
   } else {
     const ruleId = generateId();
@@ -1569,7 +1725,7 @@ async function handleSetLevel(
       pathPattern,
       actions,
       effect,
-      priority: calculatePriority(pathPattern),
+      priority: requestedPriority ?? calculatePriority(pathPattern),
       createdAt: now,
       updatedAt: now,
       createdBy: user.userId,
@@ -1621,6 +1777,7 @@ async function handleSetLevel(
       inheritedLevel,
       actions,
       effect,
+      priority: resultRule.priority,
     },
   });
 
@@ -1689,6 +1846,22 @@ function levelToActions(level: PathAccessLevel): PermissionAction[] {
     case 'write': return ['read', 'write', 'delete', 'list'];
     case 'read': return ['read', 'list'];
     default: return [];
+  }
+}
+
+function aggregateLevelMutation(level: PathAccessLevel): {
+  actions: PermissionAction[];
+  effect: 'allow' | 'deny';
+} {
+  switch (level) {
+    case 'none':
+      return { actions: ['read', 'list', 'write', 'delete', 'admin'], effect: 'deny' };
+    case 'read':
+      return { actions: ['write', 'delete', 'admin'], effect: 'deny' };
+    case 'write':
+      return { actions: ['read', 'write', 'delete', 'list'], effect: 'allow' };
+    case 'admin':
+      return { actions: ['read', 'write', 'delete', 'admin', 'list'], effect: 'allow' };
   }
 }
 
@@ -2179,6 +2352,17 @@ function calculatePriority(pathPattern: string): number {
   }
 
   return Math.max(priority, 1);
+}
+
+function parseOptionalPriority(value: unknown): number | undefined | null {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  const priority = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(priority) || priority < 0) {
+    return null;
+  }
+  return priority;
 }
 
 /**

@@ -774,12 +774,23 @@ function defaultMemberPermissionRuleId(vaultId: string, userId: string): string 
   return `${DEFAULT_MEMBER_RULE_SOURCE}#${vaultId}#${userId}`;
 }
 
+/**
+ * Canonical action set granted by each vault role's default `/**` member rule.
+ * MUST stay in sync with the other definitions of these levels:
+ *   - `VAULT_ROLE_DEFAULT_ACTIONS` in shared/utils.ts (evaluatePermission's
+ *     membership-baseline fallback)
+ *   - `levelToActions('write')` in permissions/handler.ts (set-level endpoint)
+ *   - `actionsForOrgRole` in users/handler.ts (invite-time seeding)
+ * `editor` includes `delete`: a write-level member may delete their own files,
+ * so the persisted rule must grant it directly rather than leaning on the
+ * membership-baseline fallback.
+ */
 function actionsForVaultRole(role: VaultMemberRole): PermissionAction[] {
   switch (role) {
     case 'admin':
       return ['read', 'write', 'delete', 'admin', 'list'];
     case 'editor':
-      return ['read', 'write', 'list'];
+      return ['read', 'write', 'delete', 'list'];
     case 'viewer':
     default:
       return ['read', 'list'];

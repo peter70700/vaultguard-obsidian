@@ -12,6 +12,7 @@
 import { type App, type Component, MarkdownRenderer, setIcon } from "obsidian";
 
 import type { AnthropicImageBlock } from "../anthropic-client";
+import { stripChatThematicBreaks } from "../message-utils";
 
 const MSG_CLS = "vaultguard-chat-message";
 const USER_CLS = "vaultguard-chat-message-user";
@@ -22,7 +23,7 @@ export interface AssistantBubble {
   root: HTMLElement;
   bubble: HTMLElement;
   /** Append (and markdown-render) more assistant text into this bubble. */
-  appendMarkdown(md: string): void;
+  appendMarkdown(md: string): boolean;
   /** The full raw markdown accumulated so far (drives the copy-message action). */
   getRawText(): string;
 }
@@ -66,18 +67,95 @@ function decorateCodeBlocks(chunk: HTMLElement): void {
   });
 }
 
+function hasMeaningfulRenderedContent(el: HTMLElement): boolean {
+  if ((el.textContent ?? "").trim()) return true;
+  return Boolean(el.querySelector("img, video, audio, canvas, svg, pre, code, table, ul, ol"));
+}
+
+function removeChatRules(el: HTMLElement): void {
+  // Literal HTML <hr> can bypass the markdown-line sanitizer; remove it from
+  // assistant/error bubbles so divider-only chunks do not become stacked rules.
+  el.querySelectorAll("hr").forEach((hr) => hr.remove());
+}
+
+function removeEmptyAssistantShellFrom(child: HTMLElement): void {
+  const bubble = child.closest(`.${BUBBLE_CLS}`) as HTMLElement | null;
+  if (!bubble || hasMeaningfulRenderedContent(bubble)) return;
+  const root = bubble.closest(`.${MSG_CLS}.${ASSISTANT_CLS}`) as HTMLElement | null;
+  if (root && !root.classList.contains(PENDING_CLS)) root.remove();
+}
+
+/**
+ * Render assistant/error markdown without ever leaving an empty styled shell.
+ *
+ * The chat view streams plain text first, then finalizes via Obsidian's async
+ * MarkdownRenderer. If that render rejects or yields no visible content, the
+ * user must still see the text instead of a border/background-only line.
+ */
+export function renderMarkdownWithFallback(
+  host: HTMLElement,
+  app: App,
+  component: Component,
+  sourcePath: string,
+  markdown: string,
+): void {
+  host.empty();
+
+  const fallback = host.createDiv({
+    cls: "vaultguard-chat-md-fallback",
+    text: markdown,
+  });
+  const renderTarget = host.createDiv({ cls: "vaultguard-chat-md-render-target" });
+  renderTarget.style.display = "none";
+
+  void MarkdownRenderer.render(app, markdown, renderTarget, sourcePath, component).then(
+    () => {
+      removeChatRules(renderTarget);
+      decorateCodeBlocks(renderTarget);
+
+      if (!hasMeaningfulRenderedContent(renderTarget)) {
+        const parent = host.parentElement;
+        host.remove();
+        if (parent instanceof HTMLElement) removeEmptyAssistantShellFrom(parent);
+        return;
+      }
+
+      fallback.remove();
+      while (renderTarget.firstChild) {
+        host.appendChild(renderTarget.firstChild);
+      }
+      renderTarget.remove();
+      decorateCodeBlocks(host);
+    },
+    () => {
+      renderTarget.remove();
+    },
+  );
+}
+
 const PENDING_CLS = "vaultguard-chat-pending";
 
 export interface PendingIndicator {
   /** Remove the placeholder bubble from the list. */
   remove(): void;
+  /** Re-append to the end of the parent so it stays pinned below new content. */
+  moveToEnd(): void;
+  /** Replace the visible activity label with transport-specific progress text. */
+  setLabel(text: string): void;
+  /**
+   * Toggle the "paused, waiting on a human answer" state. When on, the label
+   * reads "Waiting for your answer…" and the animated dots freeze; when off, it
+   * reverts to the working state so a resumed turn looks live again.
+   */
+  setWaiting(waiting: boolean): void;
 }
 
 /**
- * Render an assistant-aligned "thinking…" placeholder the moment a turn starts,
- * so the user gets immediate feedback before the first token (Tier-1) or first
- * delta (Tier-2) lands. The caller removes it as soon as real content renders.
- * Pure DOM; touches no filesystem and no vault content.
+ * Render an assistant-aligned "Working…" indicator. Shown the moment a turn
+ * starts (immediate feedback before the first token/delta) and kept for the
+ * whole turn as a persistent activity signal — the caller pins it to the bottom
+ * via {@link PendingIndicator.moveToEnd} as bubbles/tool cards append, and
+ * removes it when the turn ends. Pure DOM; touches no filesystem, no vault.
  */
 export function renderPendingIndicator(parent: HTMLElement): PendingIndicator {
   const root = parent.createDiv({ cls: `${MSG_CLS} ${ASSISTANT_CLS} ${PENDING_CLS}` });
@@ -86,8 +164,22 @@ export function renderPendingIndicator(parent: HTMLElement): PendingIndicator {
   dots.createSpan({ cls: "vaultguard-chat-pending-dot" });
   dots.createSpan({ cls: "vaultguard-chat-pending-dot" });
   dots.createSpan({ cls: "vaultguard-chat-pending-dot" });
+  const label = bubble.createSpan({ cls: "vaultguard-chat-pending-label", text: "Working…" });
+  let waiting = false;
   return {
     remove: () => root.remove(),
+    moveToEnd: () => parent.appendChild(root),
+    // Ignore transport status updates while paused on a human answer so a
+    // late-arriving "Working…" doesn't clobber the waiting label.
+    setLabel: (text: string) => {
+      if (waiting) return;
+      label.setText(text.trim() || "Working…");
+    },
+    setWaiting: (next: boolean) => {
+      waiting = next;
+      root.toggleClass("is-waiting", next);
+      label.setText(next ? "Waiting for your answer…" : "Working…");
+    },
   };
 }
 
@@ -121,26 +213,32 @@ export function renderUserMessage(
   // Plain text — preserve newlines, never interpret markdown.
   if (text) bubble.createDiv({ cls: "vaultguard-chat-bubble-text", text });
 
-  if (actions) {
+  const canCopyPrompt = text.length > 0;
+  if (actions || canCopyPrompt) {
     const tools = root.createDiv({ cls: "vaultguard-chat-user-actions" });
-    const editBtn = tools.createSpan({
-      cls: "clickable-icon",
-      attr: { "aria-label": "Edit message", title: "Edit message" },
-    });
-    setIcon(editBtn, "pencil");
-    editBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      actions.onEdit();
-    });
-    const delBtn = tools.createSpan({
-      cls: "clickable-icon",
-      attr: { "aria-label": "Delete message", title: "Delete message and everything after" },
-    });
-    setIcon(delBtn, "trash");
-    delBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      actions.onDelete();
-    });
+    if (canCopyPrompt) {
+      addCopyButton(tools, () => text, "Copy prompt");
+    }
+    if (actions) {
+      const editBtn = tools.createSpan({
+        cls: "clickable-icon",
+        attr: { "aria-label": "Edit message", title: "Edit message" },
+      });
+      setIcon(editBtn, "pencil");
+      editBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        actions.onEdit();
+      });
+      const delBtn = tools.createSpan({
+        cls: "clickable-icon",
+        attr: { "aria-label": "Delete message", title: "Delete message and everything after" },
+      });
+      setIcon(delBtn, "trash");
+      delBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        actions.onDelete();
+      });
+    }
   }
 
   return root;
@@ -163,9 +261,15 @@ export function renderAssistantMessage(
   const bubble = root.createDiv({ cls: BUBBLE_CLS });
   let raw = "";
 
-  const appendMarkdown = (md: string): void => {
-    const text = md;
-    if (!text) return;
+  const appendMarkdown = (md: string): boolean => {
+    // Drop stray markdown thematic breaks (Claude separates "working…" narration
+    // steps with `---`, which Obsidian renders as full-width <hr> noise). A block
+    // that sanitises to nothing (whitespace / separators only) renders no chunk.
+    const text = stripChatThematicBreaks(md);
+    if (!text) {
+      if (!raw && !hasMeaningfulRenderedContent(bubble)) root.remove();
+      return false;
+    }
     // Track the raw markdown so the copy-message action yields source text, not
     // rendered HTML. Blocks are joined with a blank line so paragraphs/code
     // fences don't run together.
@@ -173,9 +277,8 @@ export function renderAssistantMessage(
     // Each chunk renders into its own wrapper so successive onText calls stack
     // cleanly without re-parsing earlier content.
     const chunk = bubble.createDiv({ cls: "vaultguard-chat-md-chunk" });
-    void MarkdownRenderer.render(app, text, chunk, sourcePath, component).then(() =>
-      decorateCodeBlocks(chunk),
-    );
+    renderMarkdownWithFallback(chunk, app, component, sourcePath, text);
+    return true;
   };
 
   // Hover action: copy the whole assistant message as markdown.

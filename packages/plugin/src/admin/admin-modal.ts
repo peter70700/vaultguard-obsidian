@@ -48,6 +48,8 @@ type AdminModalContext = {
   /** Called after a vault-access rule changes so the plugin can refresh the
    *  file header, file-explorer decorations, and sidebar. */
   onPermissionsChanged?: () => void;
+  /** Optional initial filter for the Vault access rules overview. */
+  permissionsInitialSearch?: string;
 };
 type PermissionAccessSummary = {
   pathLabel: string;
@@ -305,6 +307,7 @@ export class AdminModal extends Modal {
           vaultRole: this.context.currentUser?.vaultRole,
         },
         onChanged: this.context.onPermissionsChanged,
+        initialSearch: this.context.permissionsInitialSearch,
       });
       view.mount();
       return;

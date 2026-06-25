@@ -1,6 +1,6 @@
 {
   "name": "vaultguard-sync",
-  "version": "1.0.35",
+  "version": "1.0.36",
   "description": "Enterprise vault security with permission-aware encrypted cloud sync for Obsidian",
   "main": "main.js",
   "scripts": {
@@ -25,7 +25,10 @@
   "license": "SEE LICENSE IN LICENSE",
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",
+    "@types/cytoscape": "^3.31.0",
     "@types/node": "^20.11.0",
+    "@types/papaparse": "^5.5.2",
+    "@types/turndown": "^5.0.6",
     "@vitest/coverage-v8": "^4.1.5",
     "esbuild": "^0.28.0",
     "obsidian": "^1.4.0",
@@ -35,6 +38,11 @@
     "vitest": "^4.1.5"
   },
   "dependencies": {
-    "qrcode-generator": "^2.0.4"
+    "cytoscape": "^3.34.0",
+    "mammoth": "^1.12.0",
+    "papaparse": "^5.5.4",
+    "qrcode-generator": "^2.0.4",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
   }
 }

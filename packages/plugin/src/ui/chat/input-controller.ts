@@ -5,8 +5,8 @@
 //  - auto-grow textarea, capped at ~6 lines
 //  - Enter = send, Shift+Enter = newline
 //  - Esc = cancel a running turn (when busy)
-//  - slash commands: built-in `/clear`, `/model <id>`, plus user-defined prompt
-//    templates resolved via the resolveTemplate callback
+//  - command palette: built-in `/clear`, `/model <id>`, `$` skills, plus
+//    user-defined prompt templates resolved via the resolveTemplate callback
 //  - `@`-mention note picker (candidates supplied by the view; metadata only)
 //  - optional image attachments (button + paste), desktop/API-key only
 
@@ -25,7 +25,93 @@ const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "
 
 export type SlashCommand =
   | { kind: "clear" }
+  | { kind: "history" }
+  | { kind: "new-tab" }
+  | { kind: "regenerate" }
+  | { kind: "import-knowledge"; arg: string }
+  | { kind: "format-vault"; arg: string }
   | { kind: "model"; model: string };
+
+export type PromptCommandPrefix = "/" | "$";
+
+export interface SlashCommandSuggestion {
+  /** Command name without the leading slash/dollar prefix. */
+  name: string;
+  /** One-line hint shown in the dropdown. */
+  description: string;
+  /** Optional argument hint, e.g. "<model-id>". */
+  argumentHint?: string;
+  /** Trigger character. Slash commands use `/`; skills use `$`. */
+  prefix?: PromptCommandPrefix;
+  /** Text inserted when selected. Defaults to `<prefix><name> `. */
+  replacement?: string;
+  /** Built-ins render before skills/templates and cannot be shadowed. */
+  source: "built-in" | "skill" | "template";
+}
+
+export const BUILT_IN_SLASH_COMMANDS: ReadonlyArray<SlashCommandSuggestion> = [
+  {
+    name: "clear",
+    description: "Start a new conversation in the current tab.",
+    source: "built-in",
+  },
+  {
+    name: "new",
+    description: "Alias for /clear.",
+    source: "built-in",
+  },
+  {
+    name: "new-tab",
+    description: "Open a fresh numbered chat tab.",
+    source: "built-in",
+  },
+  {
+    name: "history",
+    description: "Open previous chats.",
+    source: "built-in",
+  },
+  {
+    name: "regenerate",
+    description: "Regenerate the last response.",
+    source: "built-in",
+  },
+  {
+    name: "import-knowledge",
+    description: "Import a local folder: the agent surveys it and builds an organized vault KB.",
+    argumentHint: "[focus, structure, or what to skip]",
+    source: "built-in",
+  },
+  {
+    name: "format-vault",
+    description: "Plan and apply Obsidian Markdown formatting across visible vault documents.",
+    argumentHint: "[scope or style]",
+    source: "built-in",
+  },
+  {
+    name: "format-documents",
+    description: "Alias for /format-vault.",
+    argumentHint: "[scope or style]",
+    source: "built-in",
+  },
+  {
+    name: "format-all-documents",
+    description: "Alias for /format-vault.",
+    argumentHint: "[scope or style]",
+    source: "built-in",
+  },
+  {
+    name: "model",
+    description: "Switch model for future replies.",
+    argumentHint: "<model-id>",
+    source: "built-in",
+  },
+];
+
+export const RESERVED_SLASH_COMMAND_NAMES = new Set(
+  BUILT_IN_SLASH_COMMANDS.flatMap((cmd) =>
+    cmd.name === "new" ? [cmd.name, "clear"] : [cmd.name],
+  ),
+);
 
 export interface MentionCandidate {
   /** Vault-relative path, e.g. "project-x/Plan.md" — what gets injected + read. */
@@ -64,16 +150,18 @@ export interface InputControllerCallbacks {
   /** An unrecognized slash command (so the view can surface a notice). */
   onUnknownSlash?(raw: string): void;
   /**
-   * Resolve a non-built-in slash command as a user-defined prompt template.
+   * Resolve a non-built-in slash command or `$` skill as a prompt template.
    * Returns the expanded prompt to send, or null if no template matches `name`.
    */
-  resolveTemplate?(name: string, arg: string): string | null;
+  resolveTemplate?(name: string, arg: string, prefix: PromptCommandPrefix): string | null;
   /**
    * Resolve note candidates for an `@`-mention query (the view supplies these
    * from the Obsidian vault file list — metadata only, never file content, so
    * the at-rest boundary is untouched). Omit to disable @-mentions.
    */
   getMentionCandidates?(query: string): MentionCandidate[];
+  /** Slash-command suggestions for the dropdown; built-ins are added by default. */
+  getSlashCommands?(): SlashCommandSuggestion[];
 }
 
 const MENTION_LIMIT = 8;
@@ -81,6 +169,13 @@ const MENTION_LIMIT = 8;
 export type ParsedSlash =
   | SlashCommand
   | { kind: "unknown"; raw: string; name: string; arg: string };
+
+export interface ParsedPromptInvocation {
+  prefix: PromptCommandPrefix;
+  raw: string;
+  name: string;
+  arg: string;
+}
 
 /**
  * Parse a leading-slash line into a SlashCommand. Returns null for non-slash
@@ -98,7 +193,20 @@ export function parseSlash(text: string): ParsedSlash | null {
 
   switch (name) {
     case "clear":
+    case "new":
       return { kind: "clear" };
+    case "new-tab":
+      return { kind: "new-tab" };
+    case "history":
+      return { kind: "history" };
+    case "regenerate":
+      return { kind: "regenerate" };
+    case "import-knowledge":
+      return { kind: "import-knowledge", arg };
+    case "format-vault":
+    case "format-documents":
+    case "format-all-documents":
+      return { kind: "format-vault", arg };
     case "model":
       if (!arg) return { kind: "unknown", raw: trimmed, name, arg };
       return { kind: "model", model: arg };
@@ -107,10 +215,63 @@ export function parseSlash(text: string): ParsedSlash | null {
   }
 }
 
+export function parsePromptInvocation(text: string): ParsedPromptInvocation | null {
+  const trimmed = text.trim();
+  const prefix = trimmed.startsWith("$") ? "$" : trimmed.startsWith("/") ? "/" : null;
+  if (!prefix) return null;
+  const [cmd, ...rest] = trimmed.slice(1).split(/\s+/);
+  const name = cmd.trim().toLowerCase();
+  if (!name) return null;
+  return {
+    prefix,
+    raw: trimmed,
+    name,
+    arg: rest.join(" ").trim(),
+  };
+}
+
+export function filterSlashCommands(
+  query: string,
+  commands: ReadonlyArray<SlashCommandSuggestion>,
+): SlashCommandSuggestion[] {
+  const q = query.trim().toLowerCase();
+  const seen = new Set<string>();
+  return commands
+    .filter((cmd) => {
+      const name = cmd.name.trim().replace(/^\/+/, "");
+      if (!name) return false;
+      const key = name.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      if (!q) return true;
+      return (
+        key.includes(q) ||
+        cmd.description.toLowerCase().includes(q) ||
+        cmd.argumentHint?.toLowerCase().includes(q)
+      );
+    })
+    .sort((a, b) => {
+      if (a.source !== b.source) return sourceRank(a.source) - sourceRank(b.source);
+      return a.name.localeCompare(b.name);
+    });
+}
+
+function sourceRank(source: SlashCommandSuggestion["source"]): number {
+  if (source === "built-in") return 0;
+  if (source === "skill") return 1;
+  return 2;
+}
+
 export class InputController {
   private readonly textarea: HTMLTextAreaElement;
   private readonly sendBtn: HTMLButtonElement;
   private busy = false;
+
+  // Slash-command suggestion state.
+  private readonly slashPopup: HTMLElement;
+  private slashItems: SlashCommandSuggestion[] = [];
+  private slashActive = -1;
+  private slashAtIndex = -1;
 
   // @-mention suggestion state.
   private readonly mentionPopup: HTMLElement;
@@ -131,6 +292,9 @@ export class InputController {
     this.enableImages = options.enableImages === true;
     const bar = parent.createDiv({ cls: BAR_CLS });
 
+    this.slashPopup = bar.createDiv({ cls: "vaultguard-chat-slash-popup" });
+    this.slashPopup.hide();
+
     this.mentionPopup = bar.createDiv({ cls: "vaultguard-chat-mention-popup" });
     this.mentionPopup.hide();
 
@@ -142,7 +306,7 @@ export class InputController {
     this.textarea = bar.createEl("textarea", {
       cls: TEXTAREA_CLS,
       attr: {
-        placeholder: "Ask about your vault…  (Enter to send, Shift+Enter for newline)",
+        placeholder: "Ask about your vault...",
         rows: "1",
         spellcheck: "true",
       },
@@ -158,11 +322,17 @@ export class InputController {
 
     this.textarea.addEventListener("input", () => {
       this.autoGrow();
+      this.updateSlashCommands();
       this.updateMentions();
     });
     this.textarea.addEventListener("keydown", (evt) => this.onKeyDown(evt));
     // Defer hide so a mouse click on a suggestion still registers.
-    this.textarea.addEventListener("blur", () => window.setTimeout(() => this.hideMentions(), 120));
+    this.textarea.addEventListener("blur", () =>
+      window.setTimeout(() => {
+        this.hideMentions();
+        this.hideSlashCommands();
+      }, 120),
+    );
     if (this.enableImages) {
       this.textarea.addEventListener("paste", (evt) => this.onPaste(evt));
     }
@@ -184,6 +354,7 @@ export class InputController {
     this.sendBtn.toggleClass("is-busy", busy);
     this.sendBtn.setAttribute("aria-label", busy ? "Stop" : "Send");
     if (busy) this.hideMentions();
+    if (busy) this.hideSlashCommands();
   }
 
   isBusy(): boolean {
@@ -228,6 +399,29 @@ export class InputController {
       }
     }
 
+    if (this.isSlashOpen()) {
+      if (evt.key === "ArrowDown") {
+        evt.preventDefault();
+        this.moveSlash(1);
+        return;
+      }
+      if (evt.key === "ArrowUp") {
+        evt.preventDefault();
+        this.moveSlash(-1);
+        return;
+      }
+      if ((evt.key === "Enter" || evt.key === "Tab") && !evt.isComposing) {
+        evt.preventDefault();
+        this.acceptSlash(this.slashActive);
+        return;
+      }
+      if (evt.key === "Escape") {
+        evt.preventDefault();
+        this.hideSlashCommands();
+        return;
+      }
+    }
+
     if (evt.key === "Escape" && this.busy) {
       evt.preventDefault();
       this.callbacks.onCancel();
@@ -237,6 +431,107 @@ export class InputController {
       evt.preventDefault();
       if (!this.busy) this.submit();
     }
+  }
+
+  // ─── Slash-command suggestions ────────────────────────────────────────────
+
+  private isSlashOpen(): boolean {
+    return this.slashItems.length > 0 && !this.slashPopup.hidden;
+  }
+
+  private updateSlashCommands(): void {
+    if (this.busy) {
+      this.hideSlashCommands();
+      return;
+    }
+
+    const value = this.textarea.value;
+    const caret = this.textarea.selectionStart ?? value.length;
+    const upto = value.slice(0, caret);
+    const match = /(^|\s)([/$])([^\s/$]*)$/.exec(upto);
+    if (!match) {
+      this.hideSlashCommands();
+      return;
+    }
+
+    this.slashAtIndex = match.index + match[1].length;
+    const prefix = match[2] as PromptCommandPrefix;
+    const query = match[3] ?? "";
+    const custom = this.callbacks.getSlashCommands?.() ?? [];
+    const commands = [...BUILT_IN_SLASH_COMMANDS, ...custom].filter(
+      (cmd) => (cmd.prefix ?? "/") === prefix,
+    );
+    this.slashItems = filterSlashCommands(query, commands).slice(0, 10);
+    if (this.slashItems.length === 0) {
+      this.hideSlashCommands();
+      return;
+    }
+    this.slashActive = 0;
+    this.renderSlashCommands();
+  }
+
+  private renderSlashCommands(): void {
+    this.slashPopup.empty();
+    this.slashItems.forEach((item, i) => {
+      const row = this.slashPopup.createDiv({
+        cls: "vaultguard-chat-slash-item" + (i === this.slashActive ? " is-active" : ""),
+      });
+      const line = row.createDiv({ cls: "vaultguard-chat-slash-line" });
+      const prefix = item.prefix ?? "/";
+      line.createSpan({ cls: "vaultguard-chat-slash-name", text: `${prefix}${item.name}` });
+      if (item.argumentHint) {
+        line.createSpan({ cls: "vaultguard-chat-slash-hint", text: item.argumentHint });
+      }
+      line.createSpan({
+        cls: `vaultguard-chat-slash-source is-${item.source}`,
+        text: item.source === "built-in" ? "built-in" : item.source,
+      });
+      row.createDiv({ cls: "vaultguard-chat-slash-desc", text: item.description });
+      row.addEventListener("mousedown", (evt) => {
+        evt.preventDefault();
+        this.acceptSlash(i);
+      });
+      row.addEventListener("mouseenter", () => {
+        this.slashActive = i;
+        this.renderSlashCommands();
+      });
+    });
+    this.hideMentions();
+    this.slashPopup.show();
+  }
+
+  private moveSlash(delta: number): void {
+    if (this.slashItems.length === 0) return;
+    const n = this.slashItems.length;
+    this.slashActive = (this.slashActive + delta + n) % n;
+    this.renderSlashCommands();
+  }
+
+  private acceptSlash(index: number): void {
+    const item = this.slashItems[index];
+    if (!item || this.slashAtIndex < 0) {
+      this.hideSlashCommands();
+      return;
+    }
+    const value = this.textarea.value;
+    const caret = this.textarea.selectionStart ?? value.length;
+    const before = value.slice(0, this.slashAtIndex);
+    const after = value.slice(caret);
+    const replacement = item.replacement ?? `${item.prefix ?? "/"}${item.name} `;
+    this.textarea.value = before + replacement + after;
+    const newCaret = (before + replacement).length;
+    this.textarea.setSelectionRange(newCaret, newCaret);
+    this.hideSlashCommands();
+    this.autoGrow();
+    this.textarea.focus();
+  }
+
+  private hideSlashCommands(): void {
+    this.slashItems = [];
+    this.slashActive = -1;
+    this.slashAtIndex = -1;
+    this.slashPopup.empty();
+    this.slashPopup.hide();
   }
 
   // ─── @-mention suggestions ─────────────────────────────────────────────────
@@ -268,6 +563,7 @@ export class InputController {
       return;
     }
     this.mentionActive = 0;
+    this.hideSlashCommands();
     this.renderMentions();
   }
 
@@ -420,7 +716,7 @@ export class InputController {
       if (slash) {
         if (slash.kind === "unknown") {
           // Try a user-defined prompt template before declaring it unknown.
-          const expanded = this.callbacks.resolveTemplate?.(slash.name, slash.arg);
+          const expanded = this.callbacks.resolveTemplate?.(slash.name, slash.arg, "/");
           if (expanded != null) {
             if (this.callbacks.canSubmit?.(expanded) === false) return;
             this.clear();
@@ -432,6 +728,24 @@ export class InputController {
         } else {
           this.clear();
           this.callbacks.onSlash(slash);
+        }
+        return;
+      }
+
+      const invocation = parsePromptInvocation(text);
+      if (invocation?.prefix === "$") {
+        const expanded = this.callbacks.resolveTemplate?.(
+          invocation.name,
+          invocation.arg,
+          invocation.prefix,
+        );
+        if (expanded != null) {
+          if (this.callbacks.canSubmit?.(expanded) === false) return;
+          this.clear();
+          this.callbacks.onSubmit(expanded);
+        } else {
+          this.clear();
+          this.callbacks.onUnknownSlash?.(invocation.raw);
         }
         return;
       }

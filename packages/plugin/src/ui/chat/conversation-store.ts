@@ -11,6 +11,7 @@
 // one-time debug log and chat continues uninterrupted.
 
 import type { AnthropicConversationMessage } from "./anthropic-client";
+import type { AgentBridgeAskUserArgs } from "../../plugin/agent-bridge";
 
 const LOG_PREFIX = "[VaultGuard Chat]";
 const ENVELOPE_SUFFIX = ".json.envelope";
@@ -46,6 +47,48 @@ export interface Conversation {
   createdAt: number;
   updatedAt: number;
   messages: AnthropicConversationMessage[];
+  pendingUserQuestion?: PendingUserQuestion | null;
+  // Queue of deferred Approve/Deny confirmations (currently set_permission only).
+  // The model issues several set_permission calls in ONE turn; each returns a
+  // paused marker immediately and its action lands here. The chat view shows them
+  // as a single batched Approve-all/Deny-all card and the plugin applies them on
+  // approval — decoupled from the (likely already-ended) turn. Persisted
+  // (LAK-encrypted) so pending approvals survive a reload.
+  pendingConfirmations?: PendingConfirmationAction[] | null;
+  /**
+   * Absolute path of the local source folder armed for this conversation's
+   * `/import-knowledge` session, if any. Persisted (LAK-encrypted, like the rest
+   * of the conversation) so the import survives reloads / resumes: the chat view
+   * re-arms the bridge import session from this on load and before each turn,
+   * instead of the session silently vanishing ("expired") after the first turn.
+   */
+  importSourceRoot?: string | null;
+}
+
+// A deferred confirmation attached to a paused question. When present, the
+// paused card is an Approve/Deny confirmation for a sensitive action (currently
+// only set_permission) rather than a free-text question: on approval the PLUGIN
+// applies the action via the AgentBridge surface, decoupled from the chat turn
+// (which has already ended — the MCP tool returned a paused marker immediately
+// rather than blocking on the modal and timing out). Persisted with the
+// conversation (LAK-encrypted) so the pending approval survives a reload.
+export interface PendingConfirmationAction {
+  operation: "set_permission";
+  leaseId: string;
+  // Human-readable summary shown in the card and the resume message.
+  preview: string;
+  setPermission: {
+    userId?: string;
+    role?: string;
+    pathPattern: string;
+    level: "none" | "read" | "write" | "admin";
+  };
+}
+
+export interface PendingUserQuestion {
+  id: string;
+  createdAt: number;
+  request: AgentBridgeAskUserArgs;
 }
 
 export interface ConversationMeta {
@@ -199,41 +242,70 @@ export function defaultTitle(firstUserText: string): string {
   return words.length > 0 ? words : "New chat";
 }
 
-// ─── Per-leaf chat-tab state (multi-tab support) ─────────────────────────────
+// ─── In-panel chat-tab state ─────────────────────────────────────────────────
 //
-// A VaultGuardChatView leaf persists which conversation it is showing in its
-// Obsidian view state (workspace.json) so multiple chat tabs each restore their
-// OWN conversation. Only the non-secret conversation id travels here; the
-// conversation CONTENT stays LAK-encrypted in ConversationStore.
+// VaultGuard keeps one Obsidian chat view and lets that view own multiple
+// conversation tabs internally. Only non-secret conversation ids travel in
+// workspace.json; conversation content stays LAK-encrypted in ConversationStore.
 
 export interface ChatLeafState {
-  /** The conversation this leaf is bound to (null/absent → not yet chosen). */
+  /** Legacy single-conversation state from older builds. */
   conversationId?: string | null;
-  /** Set when the leaf was opened explicitly as a brand-new chat tab. */
+  /** Legacy "new Obsidian tab" flag from older builds. */
   fresh?: boolean;
+  /** Active in-panel conversation tab. */
+  activeConversationId?: string | null;
+  /** Open in-panel conversation tabs. */
+  openConversationIds?: unknown;
+  /** Whether a fresh unsaved tab should be restored. */
+  hasFreshTab?: boolean;
 }
 
 export type InitialConversation =
-  | { mode: "load"; id: string }
-  | { mode: "fresh" }
-  | { mode: "recent" };
+  | { mode: "load"; id: string; openIds: string[]; hasFreshTab: boolean }
+  | { mode: "fresh"; openIds: string[]; hasFreshTab: boolean }
+  | { mode: "recent"; openIds: string[]; hasFreshTab: boolean };
+
+function uniqueConversationIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of ids) {
+    if (typeof id !== "string" || id.length === 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
 
 /**
- * Decide which conversation a freshly-opened chat leaf should show, from its
- * persisted view state. Pure (no Obsidian) so it is unit-testable:
- *   - a non-empty conversationId → load that specific conversation (a restored
- *     tab; takes precedence over `fresh` so a re-opened tab keeps its chat);
- *   - else `fresh === true` → start blank (user opened a new chat tab);
- *   - else → restore the most-recent conversation (legacy single-panel open,
- *     and the upgrade path for a pre-existing tab with no persisted id).
+ * Decide which conversation a freshly-opened chat view should show. Pure
+ * (no Obsidian) so it is unit-testable:
+ *   - activeConversationId wins when present;
+ *   - legacy conversationId is accepted for upgrades;
+ *   - fresh / hasFreshTab restores a blank in-panel tab;
+ *   - otherwise restore the most recent conversation.
  */
 export function pickInitialConversation(
   state: ChatLeafState | null | undefined,
 ): InitialConversation {
-  const id = state?.conversationId;
-  if (typeof id === "string" && id.length > 0) return { mode: "load", id };
-  if (state?.fresh === true) return { mode: "fresh" };
-  return { mode: "recent" };
+  const openIds = uniqueConversationIds(state?.openConversationIds);
+  const activeId =
+    typeof state?.activeConversationId === "string" && state.activeConversationId.length > 0
+      ? state.activeConversationId
+      : typeof state?.conversationId === "string" && state.conversationId.length > 0
+        ? state.conversationId
+        : null;
+  if (activeId) {
+    const existingIndex = openIds.indexOf(activeId);
+    if (existingIndex >= 0) openIds.splice(existingIndex, 1);
+    openIds.unshift(activeId);
+  }
+  const hasFreshTab = state?.hasFreshTab === true || state?.fresh === true;
+
+  if (activeId) return { mode: "load", id: activeId, openIds, hasFreshTab };
+  if (hasFreshTab) return { mode: "fresh", openIds, hasFreshTab };
+  return { mode: "recent", openIds, hasFreshTab };
 }
 
 export { ENVELOPE_SUFFIX };

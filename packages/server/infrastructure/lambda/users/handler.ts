@@ -1611,13 +1611,17 @@ function defaultMemberPermissionRuleId(vaultId: string, userId: string): string 
 }
 
 /**
- * Mirrors `actionsForVaultRole` in vaults/handler.ts for editor and viewer.
+ * Mirrors `actionsForVaultRole` in vaults/handler.ts for editor and viewer
+ * (the canonical action sets — see also `VAULT_ROLE_DEFAULT_ACTIONS` in
+ * shared/utils.ts and `levelToActions('write')` in permissions/handler.ts;
+ * keep all four in sync). `editor` includes `delete`: a write-level member
+ * may delete their own files, so the seeded rule must grant it directly.
  * Admin role is intentionally not handled here — admins are not auto-added
  * to vaults at invite time (the inviting admin chooses which vaults to
  * attach them to manually).
  */
 function actionsForOrgRole(role: 'editor' | 'viewer'): PermissionAction[] {
-  if (role === 'editor') return ['read', 'write', 'list'];
+  if (role === 'editor') return ['read', 'write', 'delete', 'list'];
   return ['read', 'list'];
 }
 

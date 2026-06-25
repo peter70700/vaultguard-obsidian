@@ -20,7 +20,7 @@ import {
 } from "../types";
 import type { AnthropicEffort } from "../types";
 import { AnthropicKeyStore } from "../ui/chat/api-key-store";
-import { AI_CHAT_MODELS, AI_CHAT_EFFORTS } from "../ui/chat/models";
+import { AI_CHAT_MODELS, AI_CHAT_EFFORTS, AI_CHAT_PERMISSION_MODES } from "../ui/chat/models";
 import {
   getClaudeAuthStatus,
   type ClaudeAuthStatus,
@@ -83,7 +83,9 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   // On by default for live token-by-token feedback. Desktop-only; mobile always
   // falls back to the Tier-1 requestUrl path (see chat-view streamingEnabled()).
   aiChatStreaming: true,
+  aiChatPermissionMode: "confirm",
   aiChatProvider: "apiKey",
+  deletionTombstones: {},
 };
 
 
@@ -372,6 +374,25 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           });
       });
 
+    // ── Permissions ────────────────────────────────────────────────────────
+    new Setting(containerEl)
+      .setName("AI Chat permissions")
+      .setDesc(
+        "Choose whether AI-created writes need a manual diff confirmation. Skip mode is for trusted sessions; " +
+          "VaultGuard still enforces vault scope, hidden-path blocks, and your server-side file permissions.",
+      )
+      .addDropdown((dropdown) => {
+        for (const mode of AI_CHAT_PERMISSION_MODES) {
+          dropdown.addOption(mode.id, mode.label);
+        }
+        dropdown
+          .setValue(this.plugin.settings.aiChatPermissionMode)
+          .onChange(async (value) => {
+            this.plugin.settings.aiChatPermissionMode = value === "skip" ? "skip" : "confirm";
+            await this.plugin.saveSettings();
+          });
+      });
+
     // ── Custom instructions (appended to the system prompt; API-key mode) ────
     new Setting(containerEl)
       .setName("Custom instructions")
@@ -396,9 +417,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   /**
-   * Editor for user-defined slash-command prompt templates. Each row is a
-   * command name + prompt body; `{{input}}` in the body is replaced with any
-   * text the user types after the command. Built-ins (/clear, /model) cannot be
+   * Editor for user-defined chat prompt templates. Each row is a command name +
+   * prompt body; `{{input}}` in the body is replaced with any text the user
+   * types after the command. Optional frontmatter can set description,
+   * argument-hint, and `kind: skill` (shown under `$`). Built-ins cannot be
    * shadowed — that is enforced in the chat input parser, not here.
    */
   private renderPromptTemplates(containerEl: HTMLElement): void {
@@ -407,8 +429,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Prompt templates")
       .setDesc(
-        "Reusable slash commands for the chat input. Type the command (e.g. /summarize) to expand " +
-          "its prompt; use {{input}} where text typed after the command should go.",
+        "Reusable chat commands and skills. Use /summarize for normal templates, or add " +
+          "frontmatter with kind: skill to show a template as $name. Built-in Obsidian skills " +
+          "such as $format-note and $frontmatter are available automatically.",
       )
       .addButton((btn) =>
         btn
@@ -427,7 +450,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       const setting = new Setting(containerEl).setClass("vaultguard-chat-template-row");
       setting.addText((text) =>
         text
-          .setPlaceholder("command (no slash)")
+          .setPlaceholder("name (no / or $)")
           .setValue(tpl.name)
           .onChange(async (value) => {
             const next = [...(this.plugin.settings.aiChatPromptTemplates ?? [])];
@@ -437,7 +460,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           }),
       );
       setting.addTextArea((ta) => {
-        ta.setPlaceholder("Prompt body — use {{input}} for trailing text");
+        ta.setPlaceholder("Prompt body — use {{input}}; optional frontmatter: description, argument-hint, kind: skill");
         ta.setValue(tpl.prompt);
         ta.inputEl.rows = 2;
         ta.onChange(async (value) => {
@@ -2086,10 +2109,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           .addOption(
             ConflictResolutionStrategy.DUPLICATE,
             "Create duplicate file"
-          )
-          .addOption(
-            ConflictResolutionStrategy.MERGE,
-            "Attempt auto-merge (markdown)"
           )
           .setValue(this.plugin.settings.defaultConflictResolution)
           .onChange(async (value) => {

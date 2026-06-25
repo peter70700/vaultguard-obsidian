@@ -20,6 +20,11 @@ const banner = `/*
 */`;
 
 const prod = process.argv[2] === "production";
+// One-shot dev build (`node esbuild.config.mjs dev`): builds once and exits 0,
+// unlike no-arg `npm run dev` which watches. Resolves NODE_ENV to "development"
+// (same as watch), so the dev-only diagnostic commands stay in this output —
+// used by `install:plugin:dev` to put a diagnostics-enabled build in the vault.
+const devBuild = process.argv[2] === "dev";
 
 // Ensure output directory exists
 if (!existsSync("./dist")) {
@@ -65,6 +70,10 @@ const context = await esbuild.context({
 });
 
 if (prod) {
+  await context.rebuild();
+  process.exit(0);
+} else if (devBuild) {
+  // One-shot dev build (not a watcher) — exits 0 so install:plugin:dev can chain.
   await context.rebuild();
   process.exit(0);
 } else {

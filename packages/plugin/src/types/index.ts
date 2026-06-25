@@ -121,8 +121,6 @@ export enum ConflictResolutionStrategy {
   KEEP_REMOTE = "keep_remote",
   /** Create a duplicate file with conflict suffix */
   DUPLICATE = "duplicate",
-  /** Attempt automatic three-way merge (markdown only) */
-  MERGE = "merge",
   /** Defer resolution to the user via UI prompt */
   ASK_USER = "ask_user",
 }
@@ -264,6 +262,8 @@ export type AuditAction =
   | "bridge.tool_invoked"
   | "bridge.session_bound"
   | "bridge.session_unbound"
+  | "bridge.import_session_started"
+  | "bridge.import_session_ended"
   | "bridge.skill_installed"
   | "bridge.skill_uninstalled";
 
@@ -422,6 +422,15 @@ export interface VaultGuardSettings {
    */
   lastSyncTimestamp?: string;
   /**
+   * Path-only deletion tombstones (vault-relative normalized path -> ISO
+   * deletedAt). Records that a local delete was initiated so it can be
+   * re-attempted on the server after a restart or transient-offline window,
+   * and so initial reconciliation does not resurrect a locally-deleted file.
+   * CONTAINS NO FILE CONTENT — never store the offline queue (which carries
+   * plaintext write payloads) here.
+   */
+  deletionTombstones?: Record<string, string>;
+  /**
    * Local-only opt-out list. Files whose vault-relative path matches any
    * entry are kept off the sync wire entirely: never uploaded, never pulled
    * from the server, never deleted remotely. Each entry is either an exact
@@ -488,6 +497,15 @@ export interface VaultGuardSettings {
    */
   aiChatStreaming: boolean;
   /**
+   * AI Chat action permission mode.
+   * - "confirm": default/recommended; writes and deletes show the in-app diff
+   *   confirmation modal before touching disk.
+   * - "skip": mint the ephemeral chat lease with writeMode "allow", so writes
+   *   proceed without per-action prompts while still enforcing vault scope,
+   *   exclusions, and the user's server-side file permissions.
+   */
+  aiChatPermissionMode: AiChatPermissionMode;
+  /**
    * Which AI Chat transport to use:
    *   "subscription" — drive the official Claude Code CLI with the user's own
    *      Claude Pro/Max login (desktop only; the plugin never touches the
@@ -511,24 +529,29 @@ export interface VaultGuardSettings {
    */
   aiChatSystemPrompt?: string;
   /**
-   * User-defined slash-command prompt templates (e.g. `/summarize`). Each maps a
+   * User-defined AI chat prompt templates (e.g. `/summarize`). Each maps a
    * command name to a prompt body; an `{{input}}` placeholder is substituted with
    * any text typed after the command (omit it and that text is appended instead).
-   * Built-ins (`/clear`, `/model`) always take precedence and cannot be shadowed.
+   * Optional YAML frontmatter supports `description`, `argument-hint`, and
+   * `kind: skill` (shown under `$`). Built-ins (`/clear`, `/model`) always take
+   * precedence and cannot be shadowed.
    */
   aiChatPromptTemplates?: ChatPromptTemplate[];
 }
 
 /** A user-defined slash-command prompt template for the AI Chat panel. */
 export interface ChatPromptTemplate {
-  /** Command name without the leading slash, e.g. "summarize". */
+  /** Command name without the leading slash/dollar prefix, e.g. "summarize". */
   name: string;
-  /** Prompt body; supports {{input}} (text after the command) substitution. */
+  /** Prompt body; supports {{input}} substitution and optional YAML metadata. */
   prompt: string;
 }
 
 /** AI Chat transport selection. */
 export type AiChatProvider = "subscription" | "apiKey";
+
+/** AI Chat write-confirmation behavior. */
+export type AiChatPermissionMode = "confirm" | "skip";
 
 /** Adaptive-thinking effort levels accepted by the Anthropic Messages API. */
 export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
