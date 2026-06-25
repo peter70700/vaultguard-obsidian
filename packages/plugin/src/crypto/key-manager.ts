@@ -459,7 +459,7 @@ export class KeyManager {
       this.lastServerContact = Date.now();
       this.heartbeatFailures = 0;
       return this.encryptionKey!;
-    } catch (error) {
+    } catch {
       // If we cannot reach the server, check grace period
       if (this.isWithinGracePeriod()) {
         return this.encryptionKey!;

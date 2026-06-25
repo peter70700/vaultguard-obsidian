@@ -5,7 +5,7 @@
  * Encrypted cache format: [IV (12 bytes)][Auth Tag (16 bytes)][Encrypted Content]
  */
 
-import { EncryptionKey, EncryptedPayload } from '../types';
+import { EncryptionKey } from '../types';
 
 const IV_LENGTH = 12;
 const AUTH_TAG_LENGTH = 16;
@@ -88,7 +88,7 @@ export class EncryptionEngine {
         combined
       );
       return new TextDecoder().decode(decrypted);
-    } catch (error) {
+    } catch {
       throw new Error(
         'Decryption failed: invalid key or corrupted data. ' +
         'The file may have been tampered with or the key has been revoked.'
@@ -129,10 +129,8 @@ export class EncryptionEngine {
    * Overwrites key buffers with zeros before releasing references.
    */
   wipeKeys(): void {
-    for (const key of this.activeKeys) {
-      // CryptoKey objects are opaque, but we clear our reference
-      // The actual key material is managed by the browser's crypto subsystem
-    }
+    // CryptoKey objects are opaque; the key material is managed by the browser's
+    // crypto subsystem, so clearing references is the only wipe available here.
     this.activeKeys = [];
   }
 

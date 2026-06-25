@@ -80,6 +80,7 @@ function makePlugin() {
   plugin.app = {
     appId: "test-app-id",
     vault: {
+      configDir: ".obsidian",
       adapter: {
         getBasePath: () => "/Users/test/VaultGuard Test Vault",
       },
@@ -90,6 +91,22 @@ function makePlugin() {
       getLeavesOfType: vi.fn(() => []),
     },
     metadataCache: {},
+    loadLocalStorage: vi.fn((key: string) => {
+      const raw = localStorage.getItem(key);
+      if (raw === null) return null;
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return raw;
+      }
+    }),
+    saveLocalStorage: vi.fn((key: string, data: unknown | null) => {
+      if (data === null) {
+        localStorage.removeItem(key);
+      } else {
+        localStorage.setItem(key, JSON.stringify(data));
+      }
+    }),
   };
   plugin.settings = {
     ...DEFAULT_SETTINGS,
@@ -213,7 +230,12 @@ function ensureTestWindow(): Record<string, unknown> {
   if (typeof globalThis.window === "undefined") {
     vi.stubGlobal("window", {});
   }
-  return globalThis.window as unknown as Record<string, unknown>;
+  const testWindow = globalThis.window as unknown as Record<string, unknown>;
+  testWindow.setTimeout = (...args: Parameters<typeof setTimeout>) => setTimeout(...args);
+  testWindow.clearTimeout = (...args: Parameters<typeof clearTimeout>) => clearTimeout(...args);
+  testWindow.setInterval = (...args: Parameters<typeof setInterval>) => setInterval(...args);
+  testWindow.clearInterval = (...args: Parameters<typeof clearInterval>) => clearInterval(...args);
+  return testWindow;
 }
 
 function makeKeyLease() {
@@ -1475,6 +1497,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     plugin.app = {
       vault: {
+        configDir: ".obsidian",
         adapter: {
           exists: vi.fn(async (path: string) => existingPaths.has(path)),
         },
@@ -1520,6 +1543,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     plugin.app = {
       vault: {
+        configDir: ".obsidian",
         adapter: {
           exists: vi.fn(async (path: string) => existingPaths.has(path)),
         },
@@ -1589,6 +1613,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     plugin.app = {
       vault: {
+        configDir: ".obsidian",
         adapter: {
           exists: vi.fn(async () => false),
         },

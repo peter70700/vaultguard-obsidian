@@ -241,6 +241,20 @@ export interface AuditLogPageResponse {
   lastEvaluatedKey?: Record<string, unknown> | null;
 }
 
+export interface ReEncryptionJob {
+  status: string;
+  processedFiles?: number;
+  totalFiles?: number;
+  failedFiles?: number;
+  startedAt?: string;
+  completedAt?: string;
+  errors?: string[];
+}
+
+export interface ReEncryptionJobStatusResponse {
+  job?: ReEncryptionJob | null;
+}
+
 export interface PermissionCheckEntry {
   allowed: boolean;
   userId: string;
@@ -317,6 +331,8 @@ export interface QueuedRequest {
 type ConnectionStatus = "online" | "offline" | "degraded";
 type ConnectionListener = (status: ConnectionStatus) => void;
 type HttpResponse = RequestUrlResponse;
+type TimeoutHandle = number;
+type IntervalHandle = number;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -398,7 +414,7 @@ export class VaultGuardApiClient {
   private connectionStatus: ConnectionStatus = "offline";
   private connectionListeners: Set<ConnectionListener> = new Set();
   private offlineQueue: QueuedRequest[] = [];
-  private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private healthCheckTimer: IntervalHandle | null = null;
   private refreshPromise: Promise<AuthTokens | null> | null = null;
   private resolvedBaseUrl: string | null = null;
   private baseUrlResolutionPromise: Promise<string> | null = null;
@@ -478,14 +494,14 @@ export class VaultGuardApiClient {
 
   private startHealthCheck(): void {
     this.stopHealthCheck();
-    this.healthCheckTimer = setInterval(async () => {
+    this.healthCheckTimer = window.setInterval(async () => {
       await this.checkHealth();
     }, this.config.healthCheckIntervalMs);
   }
 
   private stopHealthCheck(): void {
     if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer);
+      window.clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
     }
   }
@@ -1015,7 +1031,7 @@ export class VaultGuardApiClient {
     return this.request("POST", "/re-encryption/trigger", { targetUserId });
   }
 
-  async getReEncryptionJobStatus(jobId: string): Promise<{ job: Record<string, unknown> }> {
+  async getReEncryptionJobStatus(jobId: string): Promise<ReEncryptionJobStatusResponse> {
     return this.request("GET", `/re-encryption/${jobId}`);
   }
 
@@ -1052,7 +1068,8 @@ export class VaultGuardApiClient {
         await this.handleErrorResponse(response);
       }
 
-      return response.json as T;
+      const data: unknown = response.json;
+      return data as T;
     });
   }
 
@@ -1412,20 +1429,20 @@ export class VaultGuardApiClient {
   }
 
   private async withTimeout<T>(promise: Promise<T>): Promise<T> {
-    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let timeoutId: TimeoutHandle | null = null;
 
     try {
       return await Promise.race([
         promise,
         new Promise<T>((_, reject) => {
-          timeoutId = setTimeout(() => {
+          timeoutId = window.setTimeout(() => {
             reject(new Error("Request timeout"));
           }, this.config.requestTimeoutMs);
         }),
       ]);
     } finally {
       if (timeoutId) {
-        clearTimeout(timeoutId);
+        window.clearTimeout(timeoutId);
       }
     }
   }
@@ -1481,7 +1498,8 @@ export class VaultGuardApiClient {
     }
 
     try {
-      return response.json as T;
+      const data: unknown = response.json;
+      return data as T;
     } catch {
       throw new VaultGuardError(
         `The API returned an unexpected response (not valid JSON). Status: ${response.status}`,
@@ -1526,6 +1544,8 @@ export class VaultGuardApiClient {
   }
 
   private sleep(ms: number): Promise<void> {
+    // Bare setTimeout — the API client is deliberately node-safe (no browser
+    // globals; see the Networking Rule) so it works in tests and any host.
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 

@@ -290,6 +290,11 @@ const Platform = {
   isSafari: false,
 };
 
+Object.defineProperty(globalThis, 'activeDocument', {
+  configurable: true,
+  get: () => (globalThis as { document?: Document }).document,
+});
+
 vi.mock('obsidian', () => ({
   requestUrl: vi.fn(),
   Notice: vi.fn(),

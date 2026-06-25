@@ -54,11 +54,6 @@ function getElectronRequire(): ((id: string) => unknown) | null {
     return w.require as (id: string) => unknown;
   }
 
-  const g = globalThis as unknown as { require?: unknown };
-  if (typeof g.require === "function") {
-    return g.require as (id: string) => unknown;
-  }
-
   try {
     const scopedRequire = require;
     if (typeof scopedRequire === "function") {

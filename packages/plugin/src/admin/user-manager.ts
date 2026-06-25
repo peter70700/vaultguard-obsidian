@@ -2,8 +2,6 @@ import {
   App,
   Modal,
   Setting,
-  DropdownComponent,
-  TextComponent,
   ButtonComponent,
   Notice,
   setIcon,

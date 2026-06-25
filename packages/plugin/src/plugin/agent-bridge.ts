@@ -570,6 +570,7 @@ export interface AccessQueryProvider {
 interface AgentBridgeDeps {
   getSession(): UserSession | null;
   getServerVaultId(): string;
+  getVaultConfigDir?: () => string;
   getAllFilePaths(): string[];
   fileExists(path: string): Promise<boolean>;
   ensureParentFolders(path: string): Promise<void>;
@@ -719,7 +720,6 @@ const IMPORT_READ_MAX_BYTES = 1024 * 1024;
 const IMPORT_SKIP_NAMES = new Set([
   ".git",
   "node_modules",
-  ".obsidian",
   ".trash",
   ".DS_Store",
   "__pycache__",
@@ -3005,7 +3005,14 @@ export class VaultGuardAgentBridge {
       const sorted = [...dirEntries].sort((a, b) => a.name.localeCompare(b.name));
       const subDirs: string[] = [];
       for (const entry of sorted) {
-        if (entry.name.startsWith(".") || IMPORT_SKIP_NAMES.has(entry.name)) continue;
+        const configDirName = this.deps.getVaultConfigDir?.().split("/").filter(Boolean).pop();
+        if (
+          entry.name.startsWith(".") ||
+          IMPORT_SKIP_NAMES.has(entry.name) ||
+          (configDirName !== undefined && entry.name === configDirName)
+        ) {
+          continue;
+        }
         const childAbs = fs.join(dirAbs, entry.name);
         // Sandbox re-check on every child: a symlink entry is canonicalized and
         // rejected if it escapes the root.
@@ -3420,14 +3427,27 @@ export class VaultGuardAgentBridge {
   }
 
   private summarizeLease(lease: AgentBridgeLease): AgentBridgeLeaseSummary {
-    const {
-      expiresAtMs: _expiresAtMs,
-      token: _token,
-      sessionUserId: _sessionUserId,
-      sessionVaultId: _sessionVaultId,
-      ...summary
-    } = lease;
-    return { ...summary, scopes: [...summary.scopes], tools: [...summary.tools] };
+    return {
+      leaseId: lease.leaseId,
+      agentName: lease.agentName,
+      scopes: [...lease.scopes],
+      allowRead: lease.allowRead,
+      writeMode: lease.writeMode,
+      allowAccessQueries: lease.allowAccessQueries,
+      allowImportRead: lease.allowImportRead,
+      allowUserInteraction: lease.allowUserInteraction,
+      allowPermissionWrites: lease.allowPermissionWrites,
+      allowAuditQueries: lease.allowAuditQueries,
+      allowFileHistory: lease.allowFileHistory,
+      allowShareManagement: lease.allowShareManagement,
+      allowMembershipWrites: lease.allowMembershipWrites,
+      createdAt: lease.createdAt,
+      expiresAt: lease.expiresAt,
+      persistent: lease.persistent,
+      maxReadBytes: lease.maxReadBytes,
+      maxSearchResults: lease.maxSearchResults,
+      tools: [...lease.tools],
+    };
   }
 
   private summarizeLeaseWithSecret(lease: AgentBridgeLease): AgentBridgeLeaseSecret {
@@ -3567,6 +3587,9 @@ export class VaultGuardAgentBridge {
 
   private loadNodeHttp(): NodeHttpModule {
     const maybeWindow = typeof window !== "undefined" ? (window as unknown as Record<string, unknown>) : {};
+    // Electron's renderer exposes CommonJS `require` as a global, not always on
+    // `window`. Keep both probes so the bridge HTTP/MCP server loads in Obsidian
+    // (and stays unit-testable via a globalThis.require shim).
     const maybeGlobal = globalThis as unknown as Record<string, unknown>;
     const req =
       typeof maybeWindow.require === "function"
@@ -3743,7 +3766,7 @@ export class VaultGuardAgentBridge {
         version: "1",
       },
       instructions:
-        "VaultGuard exposes the user's Obsidian vault through these tools only: list, search, read, apply_patch, create, delete, rename, graph, and any extra tools explicitly listed for this lease such as ask_user or import_read/import_list. They are the ONLY way to touch vault content — do NOT use any built-in Write/Edit/Read/Bash/Glob/Grep/AskUserQuestion tools and never suggest running a terminal command; those are disabled here and bypass the vault's encryption or chat interaction flow. All paths are vault-relative (there is no working directory): use create to make a new note, apply_patch to edit one (read it first so the diff matches), delete to remove one, rename to move/rename one. Hidden files (.obsidian, .trash, ...) are blocked. Writes/deletes obey the lease writeMode (deny / confirm / allow); a confirmation prompt can appear in confirm mode and is expected, not an error. Prefer graph (related/neighbors/tag) to find a small candidate set, then read only the few files that matter. If ask_user is listed, use it when you need clarification, approval, or a choice from the user before continuing. In MCP mode ask_user returns status=paused_for_user after the question is displayed; stop the turn at that point and wait for the user's later chat reply instead of reporting a timeout or repeating the options in prose.",
+        "VaultGuard exposes the user's Obsidian vault through these tools only: list, search, read, apply_patch, create, delete, rename, graph, and any extra tools explicitly listed for this lease such as ask_user or import_read/import_list. They are the ONLY way to touch vault content — do NOT use any built-in Write/Edit/Read/Bash/Glob/Grep/AskUserQuestion tools and never suggest running a terminal command; those are disabled here and bypass the vault's encryption or chat interaction flow. All paths are vault-relative (there is no working directory): use create to make a new note, apply_patch to edit one (read it first so the diff matches), delete to remove one, rename to move/rename one. Hidden files and Obsidian config/plugin-state paths are blocked. Writes/deletes obey the lease writeMode (deny / confirm / allow); a confirmation prompt can appear in confirm mode and is expected, not an error. Prefer graph (related/neighbors/tag) to find a small candidate set, then read only the few files that matter. If ask_user is listed, use it when you need clarification, approval, or a choice from the user before continuing. In MCP mode ask_user returns status=paused_for_user after the question is displayed; stop the turn at that point and wait for the user's later chat reply instead of reporting a timeout or repeating the options in prose.",
     };
   }
 

@@ -2,6 +2,8 @@ import esbuild from "esbuild";
 import process from "process";
 import { existsSync, mkdirSync } from "fs";
 import { builtinModules } from "module";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 // Node built-ins are available in Electron's CJS runtime — keep them external so
 // esbuild doesn't try to bundle/polyfill them. The Tier-2 AI-chat streaming path
@@ -25,6 +27,24 @@ const prod = process.argv[2] === "production";
 // (same as watch), so the dev-only diagnostic commands stay in this output —
 // used by `install:plugin:dev` to put a diagnostics-enabled build in the vault.
 const devBuild = process.argv[2] === "dev";
+const rootDir = dirname(fileURLToPath(import.meta.url));
+
+const safeDependencyAliases = {
+  immediate: join(rootDir, "src", "shims", "immediate.cjs"),
+  jszip: join(rootDir, "node_modules", "jszip", "lib", "index.js"),
+  setimmediate: join(rootDir, "src", "shims", "setimmediate.cjs"),
+};
+
+const safeDependencyAliasPlugin = {
+  name: "vaultguard-safe-dependency-aliases",
+  setup(build) {
+    for (const [moduleName, replacement] of Object.entries(safeDependencyAliases)) {
+      build.onResolve({ filter: new RegExp(`^${moduleName}(?:/.*)?$`) }, () => ({
+        path: replacement,
+      }));
+    }
+  },
+};
 
 // Ensure output directory exists
 if (!existsSync("./dist")) {
@@ -60,6 +80,7 @@ const context = await esbuild.context({
     ".md": "text",
   },
   logLevel: "info",
+  plugins: [safeDependencyAliasPlugin],
   sourcemap: prod ? false : "inline",
   treeShaking: true,
   outfile: "main.js",

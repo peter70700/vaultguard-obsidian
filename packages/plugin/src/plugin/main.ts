@@ -16,7 +16,7 @@ import { Notice, Plugin, Platform, TFile, TFolder, TAbstractFile, Menu, normaliz
 import { VaultGuardSettingTab, DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
 import { AgentBridgeLeaseModal } from "./agent-bridge-modal";
-import { AGENT_BRIDGE_CONFIRM_LABELS, WriteConfirmModal } from "../ui/chat/render/write-confirm-modal";
+import { WriteConfirmModal } from "../ui/chat/render/write-confirm-modal";
 import {
   ConversationStore,
   type ConversationStorageAdapter,
@@ -24,7 +24,7 @@ import {
 import { BindingReconciliationModal, ReconciliationDecision, ReconciliationPlan } from "./binding-reconciliation-modal";
 import { ShareManagementModal } from "./share-management-modal";
 import { PluginAllowlistModal, PluginAllowlistPrompt } from "./plugin-allowlist-modal";
-import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, cognitoSetUserMfaPreference, vaultguardForgotPassword, vaultguardConfirmReset, vaultguardVerifyRecoveryCode, devServerLogin, isLocalDevAuth, CognitoAuthResult } from "./cognito-auth";
+import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, vaultguardForgotPassword, vaultguardConfirmReset, vaultguardVerifyRecoveryCode, devServerLogin, isLocalDevAuth, CognitoAuthResult } from "./cognito-auth";
 import { MfaSetupModal } from "./mfa-setup-modal";
 import { deriveConnectionConfigFromTokenPayload } from "./session-config";
 import { AdminModal } from "../admin/admin-modal";
@@ -50,7 +50,7 @@ import { PermissionStore } from "./permission-store";
 import { UpdateChecker } from "./update-checker";
 import { SyncDiagnostics } from "./sync-diagnostics";
 import { AtRestCipher, AtRestStorage } from "../crypto/at-rest-cipher";
-import { SafeStorageLike, probeSafeStorage } from "../crypto/safe-storage";
+import { probeSafeStorage } from "../crypto/safe-storage";
 import { PathPermissionsModal } from "../ui/path-permissions-modal";
 import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
@@ -115,12 +115,18 @@ import {
   ConnectionStatus,
   PermissionLevel,
   FileMetadata,
-  AuditEvent,
   AuditAction,
   SyncConflict,
   ConflictResolutionStrategy,
   ApiResponse,
 } from "../types";
+
+function getActiveObsidianDocument(): Document | null {
+  if (typeof activeDocument !== "undefined") {
+    return activeDocument;
+  }
+  return null;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -220,7 +226,7 @@ interface ProtectedSessionEnvelope {
   v: 1;
   // "electron-safe-storage": desktop, sealed by Electron's safeStorage (OS keystore).
   // "at-rest-cipher": mobile / safeStorage-less hosts, sealed by AtRestCipher (AES-GCM
-  // with the LAK whose own KEK falls back to a localStorage-stored AES key — same
+  // with the LAK whose own KEK falls back to a vault-scoped AES key — same
   // security ceiling as the local at-rest encryption of vault content).
   storage: "electron-safe-storage" | "at-rest-cipher";
   ciphertext: string;
@@ -323,7 +329,7 @@ export default class VaultGuardPlugin extends Plugin {
    * identifiers (filesystem path / Obsidian appId / vault name).
    *
    * This replaces the old `settings.vaultBindingId` UUID, which was unsafe:
-   * Electron's localStorage is shared across every Obsidian vault window,
+   * Electron's legacy browser storage is shared across every Obsidian vault window,
    * but the UUID lived inside the vault's own `data.json`. Duplicating a
    * vault folder propagated the same UUID, causing two vaults to read and
    * write the same `vaultguard-session:<id>` key — whichever account logged
@@ -514,7 +520,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Always-on, secret-free breadcrumb recorder for the startup/sync control
    * flow (DX4-DIAG). Pure additive instrumentation: every `.record(...)` call
    * is a standalone statement that changes no branch/return/timer behavior.
-   * Surfaced read-only via the `vaultguard-sync-diagnostics` command.
+   * Surfaced read-only via the `sync-diagnostics` command.
    */
   private syncDiagnostics = new SyncDiagnostics();
 
@@ -1110,6 +1116,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.agentBridge = new VaultGuardAgentBridge({
       getSession: () => this.session,
       getServerVaultId: () => this.settings.serverVaultId,
+      getVaultConfigDir: () => this.normalizeVaultPath(this.app.vault.configDir),
       getAllFilePaths: () =>
         this.app.vault
           .getFiles()
@@ -1289,7 +1296,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private makeAgentBridgePersistenceAdapter(): AgentBridgePersistenceAdapter | null {
     const pluginId = this.manifest?.id ?? "vaultguard-sync";
-    const PATH = `.obsidian/plugins/${pluginId}/agent-leases.envelope`;
+    const PATH = this.vaultConfigPath("plugins", pluginId, "agent-leases.envelope");
     return {
       readEnvelope: async (): Promise<string | null> => {
         if (!this.atRestCipher?.isReady()) return null;
@@ -1336,7 +1343,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   /**
    * Build a ConversationStore for the chat panel, backed by the plugin's own
-   * config dir (`.obsidian/plugins/<id>/chat/`, which is `isPathExcluded` —
+   * config dir (`<configDir>/plugins/<id>/chat/`, which is `isPathExcluded` —
    * plugin data, not vault content) and LAK-encrypted via AtRestCipher. Mirrors
    * the agent-leases envelope mechanism: binary read/write through the raw
    * adapter, but ONLY for the plugin's own excluded chat dir.
@@ -1349,7 +1356,7 @@ export default class VaultGuardPlugin extends Plugin {
     if (!cipher) return null;
 
     const pluginId = this.manifest?.id ?? "vaultguard-sync";
-    const DIR = `.obsidian/plugins/${pluginId}/chat`;
+    const DIR = this.vaultConfigPath("plugins", pluginId, "chat");
     const adapter: ConversationStorageAdapter = {
       exists: async (name) => {
         try {
@@ -1518,13 +1525,10 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private getSkillInstallerDeps(): SkillInstallerDeps | null {
     const maybeWindow = typeof window !== "undefined" ? (window as unknown as Record<string, unknown>) : {};
-    const maybeGlobal = globalThis as unknown as Record<string, unknown>;
     const req =
       typeof maybeWindow.require === "function"
         ? (maybeWindow.require as NodeRequire)
-        : typeof maybeGlobal.require === "function"
-          ? (maybeGlobal.require as NodeRequire)
-          : null;
+        : null;
     if (!req) return null;
     try {
       const fs = req("fs") as SkillInstallerDeps["fs"];
@@ -1611,13 +1615,10 @@ export default class VaultGuardPlugin extends Plugin {
     }
     const maybeWindow =
       typeof window !== "undefined" ? (window as unknown as Record<string, unknown>) : {};
-    const maybeGlobal = globalThis as unknown as Record<string, unknown>;
     const req =
       typeof maybeWindow.require === "function"
         ? (maybeWindow.require as NodeRequire)
-        : typeof maybeGlobal.require === "function"
-          ? (maybeGlobal.require as NodeRequire)
-          : null;
+        : null;
     if (!req) {
       throw new Error("Node child_process is unavailable in this runtime.");
     }
@@ -1703,18 +1704,8 @@ export default class VaultGuardPlugin extends Plugin {
       });
     }
 
-    // Headless fallback (tests / no-DOM hosts): keep the prior text confirm.
-    const operationLabel = AGENT_BRIDGE_CONFIRM_LABELS[request.operation] ?? "patch";
-    const message =
-      `VaultGuard Sync: Agent "${request.lease.agentName}" wants to ${operationLabel} "${request.path}".\n\n` +
-      `Scope: ${request.lease.scopes.join(", ")}\n` +
-      `Lease expires: ${request.lease.expiresAt}\n\n` +
-      `Preview:\n${request.preview}\n\nAllow this write?`;
-
-    if (typeof window !== "undefined" && typeof window.confirm === "function") {
-      return window.confirm(message);
-    }
-
+    // Headless fallback (tests / no-DOM hosts): fail closed without a native
+    // blocking dialog.
     return false;
   }
 
@@ -1733,8 +1724,8 @@ export default class VaultGuardPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const data = ((await this.loadData()) ?? {}) as VaultGuardPluginData;
     this.persistedSessions = this.normalizePersistedSessions(data.storedSessions);
-    const { storedSessions: _storedSessions, ...settingsData } = data;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, settingsData);
+    delete data.storedSessions;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
     this.settings.defaultConflictResolution = this.normalizeConflictStrategy(
       this.settings.defaultConflictResolution
     );
@@ -2389,8 +2380,8 @@ export default class VaultGuardPlugin extends Plugin {
     // Mutates nothing; desktop + mobile safe (no Node FS).
     if (process.env.NODE_ENV !== "production") {
       this.addCommand({
-        id: "vaultguard-sync-diagnostics",
-        name: "VaultGuard: Copy sync diagnostics",
+        id: "sync-diagnostics",
+        name: "Copy sync diagnostics",
         callback: async () => {
           // WHITELIST ONLY — insertion order is the report's State-section order.
           // SECURITY: never include this.session raw, access/id/refresh tokens,
@@ -2477,7 +2468,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Main plugin menu
     this.addCommand({
       id: "open-menu",
-      name: "Open VaultGuard Sync Menu",
+      name: "Open sync menu",
       callback: () => this.showVaultGuardMenu(),
     });
 
@@ -2508,7 +2499,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Direct settings entry point
     this.addCommand({
       id: "open-settings",
-      name: "Open VaultGuard Sync Settings",
+      name: "Open settings",
       callback: () => this.openVaultGuardSettings(),
     });
 
@@ -2529,7 +2520,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Open VaultGuard Files sidebar
     this.addCommand({
       id: "files-panel",
-      name: "Open VaultGuard Sync Files Panel",
+      name: "Open files panel",
       callback: () => this.activateVaultGuardSidebar(),
     });
 
@@ -2873,7 +2864,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   private permissionsGraphCachePath(): string {
     const pluginId = this.manifest?.id ?? "vaultguard-sync";
-    return `.obsidian/plugins/${pluginId}/permissions-graph.cache`;
+    return this.vaultConfigPath("plugins", pluginId, "permissions-graph.cache");
   }
 
   private isPermissionsGraphCacheFresh(fetchedAt: number): boolean {
@@ -3051,7 +3042,7 @@ export default class VaultGuardPlugin extends Plugin {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Restores session from localStorage. On desktop the safeStorage envelope
+   * Restores session from Obsidian vault-local storage. On desktop the safeStorage envelope
    * decrypts synchronously; on mobile (or any host with no safeStorage) we
    * fall through to the AtRestCipher-sealed envelope, which is async. Total
    * cost on mobile is one AES-GCM decrypt — a few milliseconds.
@@ -3403,46 +3394,48 @@ export default class VaultGuardPlugin extends Plugin {
             code
           );
         },
-        onComplete: async (result) => {
-          try {
-            // Respond to the MFA_SETUP challenge to finish authentication
-            const challengeResult = await cognitoRespondToChallenge(
-              cfg.cognitoUserPoolId,
-              cfg.cognitoClientId,
-              "MFA_SETUP",
-              result.session,
-              {
-                USERNAME: credentials.email,
-              }
-            );
+        onComplete: (result) => {
+          void (async () => {
+            try {
+              // Respond to the MFA_SETUP challenge to finish authentication
+              const challengeResult = await cognitoRespondToChallenge(
+                cfg.cognitoUserPoolId,
+                cfg.cognitoClientId,
+                "MFA_SETUP",
+                result.session,
+                {
+                  USERNAME: credentials.email,
+                }
+              );
 
-            // If Cognito now asks for the TOTP code (common after setup)
-            if (challengeResult.challengeName === "SOFTWARE_TOKEN_MFA") {
-              // Re-authenticate since we need a fresh MFA code
-              this.pendingChallengeSession = challengeResult.session ?? null;
+              // If Cognito now asks for the TOTP code (common after setup)
+              if (challengeResult.challengeName === "SOFTWARE_TOKEN_MFA") {
+                // Re-authenticate since we need a fresh MFA code
+                this.pendingChallengeSession = challengeResult.session ?? null;
+                new Notice("VaultGuard Sync: MFA enabled! Please log in again with your authenticator code.");
+                resolve();
+                return;
+              }
+
+              // MFA setup complete and tokens returned — finish login first so
+              // the session is established, then push the recovery code hashes
+              // to the backend using the now-active session token.
+              if (challengeResult.tokens.idToken) {
+                await this.completeLogin(challengeResult, credentials.email);
+                await this.storeRecoveryCodes(
+                  credentials.email,
+                  result.recoveryCodes,
+                  challengeResult.tokens.idToken
+                );
+                new Notice("VaultGuard Sync: MFA enabled and logged in successfully.");
+              }
+              resolve();
+            } catch {
+              // MFA was set up but challenge completion failed — user can log in with MFA next time
               new Notice("VaultGuard Sync: MFA enabled! Please log in again with your authenticator code.");
               resolve();
-              return;
             }
-
-            // MFA setup complete and tokens returned — finish login first so
-            // the session is established, then push the recovery code hashes
-            // to the backend using the now-active session token.
-            if (challengeResult.tokens.idToken) {
-              await this.completeLogin(challengeResult, credentials.email);
-              await this.storeRecoveryCodes(
-                credentials.email,
-                result.recoveryCodes,
-                challengeResult.tokens.idToken
-              );
-              new Notice("VaultGuard Sync: MFA enabled and logged in successfully.");
-            }
-            resolve();
-          } catch (error) {
-            // MFA was set up but challenge completion failed — user can log in with MFA next time
-            new Notice("VaultGuard Sync: MFA enabled! Please log in again with your authenticator code.");
-            resolve();
-          }
+          })();
         },
       });
       modal.open();
@@ -3511,14 +3504,17 @@ export default class VaultGuardPlugin extends Plugin {
       idPayload,
       sessionRoles
     );
+    const idSub = this.readConfigString(idPayload, "sub");
+    const idName = this.readConfigString(idPayload, "name");
+    const idEmail = this.readConfigString(idPayload, "email");
 
-    this.session = {
+    const session: UserSession = {
       sessionId: serverSession.sessionId,
-      userId: serverSession.userId || idPayload.sub || "",
+      userId: serverSession.userId || idSub,
       organizationId:
         derivedConfig.organizationId || this.getEffectiveConfig().organizationId,
-      displayName: idPayload.name || serverSession.email || idPayload.email || email,
-      email: serverSession.email || idPayload.email || email,
+      displayName: idName || serverSession.email || idEmail || email,
+      email: serverSession.email || idEmail || email,
       accessToken: authResult.tokens.accessToken,
       idToken: authResult.tokens.idToken,
       refreshToken: authResult.tokens.refreshToken,
@@ -3527,6 +3523,7 @@ export default class VaultGuardPlugin extends Plugin {
       roles: sessionRoles,
       createdAt: new Date().toISOString(),
     };
+    this.session = session;
     this.clearLogoutAuthState();
     // POST /auth/session no longer issues a key lease — leases are vault-scoped
     // and are requested explicitly via /auth/key-lease/scoped after the vault
@@ -3545,23 +3542,23 @@ export default class VaultGuardPlugin extends Plugin {
     // spurious "Organization not found" error every login.
     if (
       !this.settings.manualConfig &&
-      this.session.organizationId &&
+      session.organizationId &&
       !isLocalDevAuth(this.getEffectiveConfig().cognitoUserPoolId)
     ) {
       try {
-        await this.resolveOrgConfig(this.session.organizationId, { silent: true });
+        await this.resolveOrgConfig(session.organizationId, { silent: true });
       } catch (err) {
         this.logError("Cloud org config refresh after login failed", err);
       }
     }
 
     this.rebuildApiClient();
-    this.initializeApiClientFromSession(this.session);
+    this.initializeApiClientFromSession(session);
 
-    await this.persistSession(this.session);
+    await this.persistSession(session);
     this.startKeyRenewalMonitor();
     this.startHeartbeatMonitor();
-    new Notice(`VaultGuard Sync: Logged in as ${this.session.displayName}`);
+    new Notice(`VaultGuard Sync: Logged in as ${session.displayName}`);
 
     // Vault binding gate: every Obsidian local folder must be tied to one
     // server-side vault. Defer sync engine boot — and the "online" status
@@ -3724,8 +3721,9 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private offerReloadForAccessList(): void {
     // No DOM outside the Electron runtime (e.g. unit tests) — nothing to show.
-    if (typeof document === "undefined") return;
-    const frag = document.createDocumentFragment();
+    const doc = getActiveObsidianDocument();
+    if (!doc) return;
+    const frag = doc.createDocumentFragment();
     frag.appendText(
       "VaultGuard: Vault connected. Reload Obsidian so every file shows everyone who has access to it."
     );
@@ -3744,17 +3742,18 @@ export default class VaultGuardPlugin extends Plugin {
   /**
    * Decodes a JWT payload without verification (verification happens server-side).
    */
-  private decodeJwtPayload(token: string): Record<string, any> {
+  private decodeJwtPayload(token: string): Record<string, unknown> {
     try {
       const payload = token.split(".")[1];
       const decoded = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
-      return JSON.parse(decoded);
+      const parsed: unknown = JSON.parse(decoded);
+      return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
     } catch {
       return {};
     }
   }
 
-  private deriveFallbackRoles(idPayload: Record<string, any>): string[] {
+  private deriveFallbackRoles(idPayload: Record<string, unknown>): string[] {
     const groupClaim = idPayload["cognito:groups"];
     if (Array.isArray(groupClaim)) {
       return groupClaim.filter((value): value is string => typeof value === "string");
@@ -3769,7 +3768,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private derivePrimaryRole(
-    idPayload: Record<string, any>,
+    idPayload: Record<string, unknown>,
     roles: string[]
   ): UserSession["role"] {
     const candidates = [
@@ -5113,7 +5112,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Walks the cached plugin allowlist and prompts the user (one modal at a
    * time) to enable each plugin that is already present locally.
    *
-   * `.obsidian/plugins/` is local-only (see `isPathExcluded`), so the bundle
+   * The Obsidian plugin config folder is local-only (see `isPathExcluded`), so the bundle
    * bytes do NOT flow through VaultGuard sync — the user installs each
    * allowlisted plugin themselves via Obsidian's community plugin browser,
    * and this method handles only the consent + enable step. If a SHA-256 was
@@ -5176,7 +5175,7 @@ export default class VaultGuardPlugin extends Plugin {
         continue;
       }
 
-      const pluginRoot = `.obsidian/plugins/${entry.pluginId}`;
+      const pluginRoot = this.vaultConfigPath("plugins", entry.pluginId);
       const mainPath = `${pluginRoot}/main.js`;
       const manifestPath = `${pluginRoot}/manifest.json`;
 
@@ -5244,7 +5243,7 @@ export default class VaultGuardPlugin extends Plugin {
 
       try {
         if (pluginManager?.loadManifests) {
-          // Force Obsidian to re-scan .obsidian/plugins so it sees the newly
+          // Force Obsidian to re-scan its plugin config folder so it sees the newly
           // synced files. Without this, enablePluginAndSave throws because
           // the manifest cache is stale.
           await pluginManager.loadManifests();
@@ -5465,10 +5464,13 @@ export default class VaultGuardPlugin extends Plugin {
 
   private registerSessionActivityTracking(): void {
     const recordActivity = () => this.noteSessionActivity();
+    const doc = getActiveObsidianDocument();
 
-    this.registerDomEvent(document, "mousedown", recordActivity);
-    this.registerDomEvent(document, "keydown", recordActivity);
-    this.registerDomEvent(document, "touchstart", recordActivity);
+    if (doc) {
+      this.registerDomEvent(doc, "mousedown", recordActivity);
+      this.registerDomEvent(doc, "keydown", recordActivity);
+      this.registerDomEvent(doc, "touchstart", recordActivity);
+    }
     this.registerDomEvent(window, "focus", recordActivity);
   }
 
@@ -5668,6 +5670,8 @@ export default class VaultGuardPlugin extends Plugin {
       // Fallback: poll every 60s if the event API isn't present on this
       // Obsidian build. registerInterval scopes the timer to plugin lifetime
       // so it's auto-cleared on unload.
+      // window.setInterval returns a number (what registerInterval expects);
+      // this path is renderer-only, so window is always present here.
       this.registerInterval(
         window.setInterval(() => this.renderObsidianSyncNotice(), 60_000)
       );
@@ -5696,7 +5700,7 @@ export default class VaultGuardPlugin extends Plugin {
     // settings clearer. The plugin folder is already in `isPathExcluded`,
     // so this file never participates in vault sync.
     const pluginId = this.manifest?.id ?? "vaultguard-sync";
-    const envelopePath = `.obsidian/plugins/${pluginId}/lak.envelope`;
+    const envelopePath = this.vaultConfigPath("plugins", pluginId, "lak.envelope");
     const adapter = this.app.vault.adapter;
 
     // One-time envelope migration after a plugin-id rename. If no envelope
@@ -5711,7 +5715,7 @@ export default class VaultGuardPlugin extends Plugin {
       if (!currentExists) {
         const priorIds = PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION[pluginId] ?? [];
         for (const priorId of priorIds) {
-          const priorPath = `.obsidian/plugins/${priorId}/lak.envelope`;
+          const priorPath = this.vaultConfigPath("plugins", priorId, "lak.envelope");
           try {
             if (!(await adapter.exists(priorPath))) continue;
             const priorBlob = await adapter.read(priorPath);
@@ -5727,7 +5731,7 @@ export default class VaultGuardPlugin extends Plugin {
               envelopeMigrationFailureReason =
                 `Found an at-rest envelope under the previous plugin id (${priorId}) but could not copy it into the current plugin folder (${pluginId}): ${
                   writeErr instanceof Error ? writeErr.message : String(writeErr)
-                }. Your encrypted files have NOT been overwritten — close Obsidian, copy ".obsidian/plugins/${priorId}/lak.envelope" to ".obsidian/plugins/${pluginId}/lak.envelope" manually, and reopen.`;
+                }. Your encrypted files have NOT been overwritten — close Obsidian, copy "${priorPath}" to "${envelopePath}" manually, and reopen.`;
               break;
             }
           } catch (readErr) {
@@ -5767,6 +5771,16 @@ export default class VaultGuardPlugin extends Plugin {
         } catch (err) {
           this.logError(`Removing at-rest envelope at ${envelopePath} failed`, err);
         }
+      },
+      loadFallbackKek: async () => {
+        const value: unknown = this.app.loadLocalStorage("vaultguard.at-rest.kek.v1");
+        return typeof value === "string" && value.length > 0 ? value : null;
+      },
+      saveFallbackKek: async (kekBase64: string) => {
+        this.app.saveLocalStorage("vaultguard.at-rest.kek.v1", kekBase64);
+      },
+      clearFallbackKek: async () => {
+        this.app.saveLocalStorage("vaultguard.at-rest.kek.v1", null);
       },
     };
 
@@ -5828,7 +5842,7 @@ export default class VaultGuardPlugin extends Plugin {
       }
       if (method === "localstorage-fallback" && !Platform.isMobileApp) {
         new Notice(
-          "VaultGuard Sync: at-rest encryption is using the localStorage fallback (OS keychain unavailable). Files in Finder are encrypted, but a full Electron-profile theft can recover the key. See docs/AT-REST-ENCRYPTION.md.",
+          "VaultGuard Sync: at-rest encryption is using the vault-local fallback (OS keychain unavailable). Files in Finder are encrypted, but a full Electron-profile theft can recover the key. See docs/AT-REST-ENCRYPTION.md.",
           10000
         );
       }
@@ -5860,8 +5874,10 @@ export default class VaultGuardPlugin extends Plugin {
     try {
       const tally = await this.tallyAtRestState();
       if (tally.plaintext === 0) return;
+      const doc = getActiveObsidianDocument();
+      if (!doc) return;
       const notice = new Notice("", 0);
-      const frag = document.createDocumentFragment();
+      const frag = doc.createDocumentFragment();
       const strong = frag.createEl("strong");
       strong.setText("VaultGuard Sync: at-rest encryption ready. ");
       frag.appendText(
@@ -5898,8 +5914,10 @@ export default class VaultGuardPlugin extends Plugin {
    * (no timeout) because ignoring it leaves the vault unreadable.
    */
   private showAtRestRecoveryBanner(reason: string): void {
+    const doc = getActiveObsidianDocument();
+    if (!doc) return;
     const notice = new Notice("", 0);
-    const frag = document.createDocumentFragment();
+    const frag = doc.createDocumentFragment();
     const strong = frag.createEl("strong");
     strong.setText("VaultGuard Sync: cannot read encrypted files on this device. ");
     frag.appendText(reason + " ");
@@ -5918,7 +5936,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Walk the entire vault and rewrite each file as at-rest ciphertext.
    *
    * Safe to invoke repeatedly — files that already start with the at-rest
-   * magic header are skipped. Excluded paths (.obsidian, .trash, plugin
+   * magic header are skipped. Excluded paths (config folder, trash, plugin
    * folder) are never touched. Used for a one-shot migration of legacy
    * plaintext vaults; ongoing writes are encrypted automatically by the
    * adapter interceptor.
@@ -6519,7 +6537,7 @@ export default class VaultGuardPlugin extends Plugin {
    * If the bytes on disk start with the at-rest magic header, decrypt with
    * the LAK. Otherwise, treat the bytes as legacy plaintext (UTF-8) and
    * return as-is — this is what makes lazy migration safe. Excluded paths
-   * (plugin self, .obsidian internals) are passed through unchanged because
+   * (plugin self, Obsidian internals) are passed through unchanged because
    * they were never encrypted.
    *
    * Internal plugin code (sync engine pulls, reconciliation, catch-up)
@@ -6537,7 +6555,8 @@ export default class VaultGuardPlugin extends Plugin {
   private isAtRestExcluded(path: string): boolean {
     const normalized = path.replace(/^\/+/, "");
     if (!normalized) return false;
-    if (normalized === ".obsidian" || normalized.startsWith(".obsidian/")) return true;
+    const configDir = this.normalizeVaultPath(this.app.vault.configDir);
+    if (normalized === configDir || normalized.startsWith(`${configDir}/`)) return true;
     if (normalized === ".trash" || normalized.startsWith(".trash/")) return true;
     return this.isPathExcluded(path);
   }
@@ -7171,7 +7190,14 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private normalizeVaultPath(path: string): string {
-    return normalizePath(path.replace(/^\/+/, ""));
+    // Defensive against a missing/undefined input (e.g. an unset
+    // `app.vault.configDir` in some hosts/tests) — coerce before stripping
+    // leading slashes so callers like isPathExcluded never throw.
+    return normalizePath(String(path ?? "").replace(/^\/+/, ""));
+  }
+
+  private vaultConfigPath(...parts: string[]): string {
+    return normalizePath([this.app.vault.configDir, ...parts].filter(Boolean).join("/"));
   }
 
   private toPermissionPath(path: string): string {
@@ -7186,16 +7212,18 @@ export default class VaultGuardPlugin extends Plugin {
    * local-only files that never touch the sync wire.
    *
    * Patterns are interpreted as either an exact path or a folder prefix.
-   * `.obsidian/workspace.json` matches that file only. `.obsidian/plugins`
+   * A config-dir workspace file pattern matches that file only. A plugin-dir pattern
    * matches the folder itself plus everything under it.
    */
   isPathExcluded(path: string): boolean {
     const normalized = this.normalizeVaultPath(path);
     if (!normalized) return false;
+    const configDir = this.normalizeVaultPath(this.app.vault.configDir);
+    if (normalized === configDir || normalized.startsWith(`${configDir}/`)) return true;
 
     // Hard-exclude every vault-root hidden entry (anything whose first path
     // segment starts with "."). By Obsidian/Unix convention these are system
-    // or plugin-state folders, never note content: `.obsidian/` (Obsidian's
+    // or plugin-state folders, never note content: the config directory (Obsidian's
     // own settings + every community plugin's bundle and data), `.trash/`,
     // `.git/`, and plugin sidecar folders like `.claudian/`, `.smart-env/`,
     // `.kanban/`. Other plugins read and write these directly through the
@@ -8707,9 +8735,12 @@ export default class VaultGuardPlugin extends Plugin {
       this.maybeRewarmOnFocus();
     };
 
+    const doc = getActiveObsidianDocument();
+
     this.registerDomEvent(window, "focus", trigger);
-    this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState === "visible") {
+    if (!doc) return;
+    this.registerDomEvent(doc, "visibilitychange", () => {
+      if (doc.visibilityState === "visible") {
         this.resumeSyncLoop("window visible");
         trigger();
       } else {
@@ -10862,10 +10893,11 @@ export default class VaultGuardPlugin extends Plugin {
   // ─────────────────────────────────────────────────────────────────────────
 
   private setGlobalAuthChromeState(loggedIn: boolean): void {
-    if (typeof document === "undefined") {
+    const doc = getActiveObsidianDocument();
+    if (!doc) {
       return;
     }
-    document.body.toggleClass("vaultguard-auth-logged-in", loggedIn);
+    doc.body.toggleClass("vaultguard-auth-logged-in", loggedIn);
   }
 
   private updateRibbonAuthIndicator(): void {
@@ -11279,7 +11311,7 @@ export default class VaultGuardPlugin extends Plugin {
   // Storage Helpers
   // ─────────────────────────────────────────────────────────────────────────
 
-  /** localStorage key prefix for per-vault session persistence. */
+  /** Vault-local storage key prefix for per-vault session persistence. */
   private static readonly SESSION_STORAGE_KEY_PREFIX = "vaultguard-session:";
 
   private buildPluginData(): VaultGuardPluginData {
@@ -11333,7 +11365,7 @@ export default class VaultGuardPlugin extends Plugin {
    *
    * All available identifiers are concatenated and hashed so the resulting
    * key is fixed-length, opaque, and never leaks the user's filesystem path
-   * into localStorage. If none are available we fall back to a random UUID
+   * into vault-local storage. If none are available we fall back to a random UUID
    * stored in `data.json`; that keeps non-standard/test hosts working, but
    * desktop Obsidian should always provide a runtime fingerprint.
    */
@@ -11381,7 +11413,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     // No usable runtime identifier — fall back to a random ID persisted only
-    // to data.json (per-vault on disk), which still avoids the localStorage
+    // to data.json (per-vault on disk), which still avoids the shared-storage
     // collision because each vault generates its own.
     if (!this.settings.vaultBindingId) {
       this.settings.vaultBindingId = VaultGuardPlugin.generateVaultBindingId();
@@ -11407,7 +11439,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   private removeStoredSessionKey(bindingId: string): void {
     try {
-      localStorage.removeItem(this.getSessionStorageKey(bindingId));
+      this.app.saveLocalStorage(this.getSessionStorageKey(bindingId), null);
     } catch {
       // Storage may be unavailable in tests or restricted renderer contexts.
     }
@@ -11443,7 +11475,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Mobile / safeStorage-less fallback: wrap the session via `AtRestCipher`.
    * Same security ceiling as the local at-rest encryption of vault content
    * (AES-256-GCM with the LAK, whose KEK either lives in the OS keystore on
-   * desktop or in localStorage on mobile). Returns `null` if the cipher
+   * desktop or in vault-local storage on mobile). Returns `null` if the cipher
    * isn't ready or encryption fails — the caller decides whether to warn.
    */
   private async protectSessionWithAtRest(
@@ -11548,9 +11580,9 @@ export default class VaultGuardPlugin extends Plugin {
     if (!bindingId) return null;
 
     try {
-      const raw = localStorage.getItem(this.getSessionStorageKey(bindingId));
+      const raw: unknown = this.app.loadLocalStorage(this.getSessionStorageKey(bindingId));
       if (raw) {
-        const session = this.unprotectStoredSession(JSON.parse(raw));
+        const session = this.unprotectStoredSession(raw);
         if (session) return session;
       }
     } catch {
@@ -11571,9 +11603,9 @@ export default class VaultGuardPlugin extends Plugin {
     if (!bindingId) return null;
 
     try {
-      const raw = localStorage.getItem(this.getSessionStorageKey(bindingId));
+      const raw: unknown = this.app.loadLocalStorage(this.getSessionStorageKey(bindingId));
       if (raw) {
-        const session = await this.unprotectAtRestSession(JSON.parse(raw));
+        const session = await this.unprotectAtRestSession(raw);
         if (session) return session;
       }
     } catch {
@@ -11584,12 +11616,12 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Persists a session to localStorage and Obsidian's plugin data store.
+   * Persists a session to Obsidian vault-local storage and the plugin data store.
    *
    * Write priority:
    *   1. Electron `safeStorage` (desktop — OS keystore-backed).
    *   2. `AtRestCipher` fallback (mobile / safeStorage-less hosts — same LAK
-   *      that encrypts vault content; on mobile its KEK lives in localStorage
+   *      that encrypts vault content; on mobile its KEK lives in vault-local storage
    *      since there's no OS keystore exposed to the renderer).
    *
    * If BOTH paths are unavailable we DO NOT touch existing on-disk state —
@@ -11627,12 +11659,9 @@ export default class VaultGuardPlugin extends Plugin {
 
     this.persistedSessions[bindingId] = protectedSession;
     try {
-      localStorage.setItem(
-        this.getSessionStorageKey(bindingId),
-        JSON.stringify(protectedSession)
-      );
+      this.app.saveLocalStorage(this.getSessionStorageKey(bindingId), protectedSession);
     } catch (error) {
-      this.logError("Failed to persist session to localStorage", error);
+      this.logError("Failed to persist session to Obsidian local storage", error);
     }
 
     try {
@@ -11644,7 +11673,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Clears the stored session from localStorage and Obsidian's plugin data
+   * Clears the stored session from vault-local storage and Obsidian's plugin data
    * store. This is the explicit-logout path and IS allowed to wipe — distinct
    * from `persistSession`'s no-silent-wipe rule on encryption failure.
    */

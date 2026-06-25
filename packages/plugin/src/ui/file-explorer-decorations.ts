@@ -336,7 +336,7 @@ export class FileExplorerDecorations {
         const shouldHide = cachedEntry
           ? this.shouldHideItem(isFile, cachedEntry, foldersWithAccessibleDescendant.has(path))
           : false;
-        item.classList.toggle(HIDDEN_CLS, shouldHide);
+        this.setItemHidden(item, shouldHide);
 
         this.applyDecoration(item, entry);
       }
@@ -406,6 +406,25 @@ export class FileExplorerDecorations {
     if (item.classList.contains("nav-folder-title")) return false;
     const owner = item.closest<HTMLElement>(".nav-file, .nav-folder");
     return Boolean(owner?.classList.contains("nav-file"));
+  }
+
+  private setItemHidden(item: HTMLElement, hidden: boolean): void {
+    item.classList.toggle(HIDDEN_CLS, hidden);
+    const row = this.getExplorerRowElement(item);
+    if (row && row !== item) {
+      row.classList.toggle(HIDDEN_CLS, hidden);
+    }
+  }
+
+  private getExplorerRowElement(item: HTMLElement): HTMLElement | null {
+    if (
+      item.classList.contains("nav-file") ||
+      item.classList.contains("nav-folder") ||
+      item.classList.contains("tree-item-self")
+    ) {
+      return item;
+    }
+    return item.closest<HTMLElement>(".nav-file, .nav-folder, .tree-item-self");
   }
 
   private applyDecoration(item: HTMLElement, data: DecorationCacheEntry): void {

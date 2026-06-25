@@ -289,9 +289,7 @@ interface ClientNodeDeps {
 function nodeRequire(): NodeRequire | null {
   const maybeWindow =
     typeof window !== "undefined" ? (window as unknown as Record<string, unknown>) : {};
-  const maybeGlobal = globalThis as unknown as Record<string, unknown>;
   if (typeof maybeWindow.require === "function") return maybeWindow.require as NodeRequire;
-  if (typeof maybeGlobal.require === "function") return maybeGlobal.require as NodeRequire;
   return null;
 }
 

@@ -5,9 +5,9 @@
  */
 
 import * as esbuild from "esbuild";
-import { mkdirSync, rmSync } from "fs";
-import { resolve, dirname } from "path";
-import { fileURLToPath } from "url";
+import { mkdirSync, rmSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

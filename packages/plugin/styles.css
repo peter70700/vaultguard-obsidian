@@ -16,8 +16,8 @@
 .modal.vaultguard-reconciliation-modal,
 .modal.vaultguard-vault-picker-modal,
 .modal.vaultguard-revoke-modal {
-  padding: 0 !important;
-  margin: 0 !important;
+  padding: 0;
+  margin: 0;
 }
 
 .modal.vaultguard-admin-modal .modal-content,
@@ -36,10 +36,10 @@
 .vaultguard-reconciliation-content,
 .vaultguard-vault-picker-content,
 .vaultguard-login-modal-content {
-  width: 100% !important;
-  max-width: 100% !important;
+  width: 100%;
+  max-width: 100%;
   box-sizing: border-box;
-  margin: 0 !important;
+  margin: 0;
 }
 
 .vaultguard-modal-title {
@@ -72,14 +72,14 @@
 }
 
 .modal.vaultguard-dialog-modal {
-  width: 560px !important;
-  max-width: calc(100vw - 32px) !important;
-  max-height: calc(100vh - 48px) !important;
+  width: 560px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
 }
 
 .modal.vaultguard-dialog-modal .modal-content,
 .vaultguard-dialog-content {
-  padding: 22px 24px 18px !important;
+  padding: 22px 24px 18px;
   overflow-x: hidden;
   overflow-y: auto;
   max-height: calc(100vh - 64px);
@@ -88,14 +88,14 @@
 /* ─── Admin Modal ───────────────────────────────────────────────────────── */
 
 .modal.vaultguard-admin-modal {
-  width: 1000px !important;
-  max-width: 94vw !important;
+  width: 1000px;
+  max-width: 94vw;
   max-height: 85vh;
 }
 
 .modal.vaultguard-admin-modal .modal-content,
 .vaultguard-admin-modal-content {
-  padding: 24px 28px 20px !important;
+  padding: 24px 28px 20px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -152,14 +152,14 @@
 /* ─── Ribbon Auth Indicator ──────────────────────────────────────────────── */
 
 .vaultguard-ribbon-auth-logged-in {
-  color: var(--vaultguard-ribbon-online, #8b5cf6) !important;
+  color: var(--vaultguard-ribbon-online, #8b5cf6);
   opacity: 1;
 }
 
 body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-files-view"] .workspace-tab-header-inner-icon,
 body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-chat-view"] .workspace-tab-header-inner-icon,
 body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permissions-graph"] .workspace-tab-header-inner-icon {
-  color: var(--vaultguard-ribbon-online, #8b5cf6) !important;
+  color: var(--vaultguard-ribbon-online, #8b5cf6);
 }
 
 body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-files-view"] .workspace-tab-header-inner-icon svg,
@@ -171,7 +171,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 
 .vaultguard-ribbon-auth-logged-out {
   position: relative;
-  color: var(--color-orange, #d98e04) !important;
+  color: var(--color-orange, #d98e04);
   opacity: 1;
 }
 
@@ -940,12 +940,12 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 /* ─── Permission Rule Modal ─────────────────────────────────────────────── */
 
 .modal.vaultguard-permission-rule-modal {
-  width: 600px !important;
-  max-width: 88vw !important;
+  width: 600px;
+  max-width: 88vw;
 }
 
 .modal.vaultguard-permission-rule-modal .modal-content {
-  padding: 24px 24px 20px !important;
+  padding: 24px 24px 20px;
 }
 
 .vaultguard-path-input {
@@ -1172,14 +1172,14 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 /* ─── Vault Picker Modal ───────────────────────────────────────────────── */
 
 .modal.vaultguard-vault-picker-modal {
-  width: 640px !important;
-  max-width: calc(100vw - 32px) !important;
-  max-height: calc(100vh - 48px) !important;
+  width: 640px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
 }
 
 .modal.vaultguard-vault-picker-modal .modal-content,
 .vaultguard-vault-picker-content {
-  padding: 24px 28px 22px !important;
+  padding: 24px 28px 22px;
   overflow-x: hidden;
   overflow-y: auto;
   max-height: calc(100vh - 64px);
@@ -1265,14 +1265,14 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 /* ─── Binding Reconciliation Modal ─────────────────────────────────────── */
 
 .modal.vaultguard-reconciliation-modal {
-  width: 640px !important;
-  max-width: calc(100vw - 32px) !important;
-  max-height: calc(100vh - 48px) !important;
+  width: 640px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
 }
 
 .modal.vaultguard-reconciliation-modal .modal-content,
 .vaultguard-reconciliation-content {
-  padding: 24px 28px 22px !important;
+  padding: 24px 28px 22px;
   overflow-x: hidden;
   overflow-y: auto;
   max-height: calc(100vh - 64px);
@@ -1354,14 +1354,14 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 /* ─── MFA Setup Modal ──────────────────────────────────────────────────── */
 
 .modal.vaultguard-mfa-setup-modal {
-  width: 520px !important;
-  max-width: calc(100vw - 32px) !important;
-  max-height: calc(100vh - 48px) !important;
+  width: 520px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
 }
 
 .modal.vaultguard-mfa-setup-modal .modal-content,
 .vaultguard-mfa-setup-content {
-  padding: 24px 28px 22px !important;
+  padding: 24px 28px 22px;
   overflow-x: hidden;
   overflow-y: auto;
   max-height: calc(100vh - 64px);
@@ -1466,7 +1466,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   .vaultguard-mfa-setup-content,
   .modal.vaultguard-dialog-modal .modal-content,
   .vaultguard-dialog-content {
-    padding: 20px 18px 18px !important;
+    padding: 20px 18px 18px;
   }
 
   .vaultguard-vault-picker-row {
@@ -1578,12 +1578,12 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 /* ─── Revoke Access Modal ───────────────────────────────────────────────── */
 
 .modal.vaultguard-revoke-modal {
-  width: 520px !important;
-  max-width: 88vw !important;
+  width: 520px;
+  max-width: 88vw;
 }
 
 .modal.vaultguard-revoke-modal .modal-content {
-  padding: 24px 24px 20px !important;
+  padding: 24px 24px 20px;
 }
 
 .vaultguard-danger-title {
@@ -1646,9 +1646,9 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 /* ─── Login Modal ───────────────────────────────────────────────────────── */
 
 .modal.vaultguard-login-modal {
-  width: 420px !important;
-  max-width: calc(100vw - 32px) !important;
-  max-height: calc(100vh - 48px) !important;
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
   display: flex;
   flex-direction: column;
 }
@@ -1661,7 +1661,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 
 .modal.vaultguard-login-modal .modal-content,
 .vaultguard-login-modal-content {
-  padding: 32px 28px 24px !important;
+  padding: 32px 28px 24px;
   overflow-x: hidden;
   overflow-y: auto;
   max-height: calc(100vh - 64px);
@@ -1750,7 +1750,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 }
 
 .vaultguard-field-input {
-  width: 100% !important;
+  width: 100%;
   min-height: 38px;
   padding: 9px 12px;
   border: 1px solid var(--background-modifier-border);
@@ -1781,7 +1781,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 }
 
 .vaultguard-mfa-input {
-  max-width: 180px !important;
+  max-width: 180px;
   text-align: center;
   font-size: 1.3em;
   letter-spacing: 0.35em;
@@ -1894,7 +1894,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 @media (max-width: 420px) {
   .modal.vaultguard-login-modal .modal-content,
   .vaultguard-login-modal-content {
-    padding: 28px 20px 20px !important;
+    padding: 28px 20px 20px;
   }
 
   .vaultguard-login-actions {
@@ -2738,11 +2738,11 @@ body.is-phone .vaultguard-fh-btn-icon svg {
 }
 
 body.is-phone .vaultguard-fh-popover {
-  left: 8px !important;
-  right: 8px !important;
-  width: auto !important;
-  top: auto !important;
-  bottom: 8px !important;
+  left: 8px;
+  right: 8px;
+  width: auto;
+  top: auto;
+  bottom: 8px;
   max-height: 70vh;
   overflow-y: auto;
 }
@@ -2761,7 +2761,7 @@ body.is-phone .vaultguard-fh-popover-inner {
 
    The popover is positioned inline by positionPopover() at a fixed 260px
    width, which is awkward on narrow viewports — we override with
-   !important to turn it into a bottom-anchored sheet.
+   to turn it into a bottom-anchored sheet.
 
    Keep this fallback touch-only. On macOS desktop, a narrow Obsidian window
    can also be <=600px wide, but it should keep the desktop header layout. */
@@ -2849,14 +2849,14 @@ body.is-phone .vaultguard-fh-popover-inner {
   }
 
   /* Bottom-sheet popover. positionPopover() in file-permission-header.ts
-     writes inline top/left/width on every open — !important is the only
+     writes inline top/left/width on every open — is the only
      way to override without touching TS. */
   .vaultguard-fh-popover {
-    left: 8px !important;
-    right: 8px !important;
-    width: auto !important;
-    top: auto !important;
-    bottom: 8px !important;
+    left: 8px;
+    right: 8px;
+    width: auto;
+    top: auto;
+    bottom: 8px;
     max-height: 70vh;
     overflow-y: auto;
   }
@@ -3274,19 +3274,19 @@ body.is-phone .vaultguard-fh-popover-inner {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 .modal.vaultguard-path-perms-modal {
-  width: 760px !important;
-  max-width: 94vw !important;
+  width: 760px;
+  max-width: 94vw;
   max-height: 84vh;
-  padding: 0 !important;
+  padding: 0;
 }
 
 .modal.vaultguard-path-perms-modal .modal-content,
 .vaultguard-path-perms-content {
-  width: 100% !important;
-  max-width: 100% !important;
+  width: 100%;
+  max-width: 100%;
   box-sizing: border-box;
-  margin: 0 !important;
-  padding: 20px 24px 16px !important;
+  margin: 0;
+  padding: 20px 24px 16px;
   overflow-y: auto;
 }
 
@@ -3783,14 +3783,14 @@ body.is-phone .vaultguard-fh-popover-inner {
 /* Files and folders the current user has no permission on are hidden
    from the explorer entirely. Folders are only hidden when no descendant
    grants access — otherwise we'd hide a folder containing accessible
-   children. The class is applied to .nav-file-title / .nav-folder-title;
-   hide the matching wrapper so the row collapses cleanly. */
-.nav-file:has(.nav-file-title.vaultguard-fe-hidden),
+   children. The class is applied to both the title and wrapper row so the row
+   collapses cleanly without broad relational selectors. */
+.nav-file.vaultguard-fe-hidden,
 .nav-file-title.vaultguard-fe-hidden,
-.nav-folder:has(> .nav-folder-title.vaultguard-fe-hidden),
+.nav-folder.vaultguard-fe-hidden,
 .nav-folder-title.vaultguard-fe-hidden,
 .workspace-leaf-content[data-type="file-explorer"] .tree-item-self.vaultguard-fe-hidden {
-  display: none !important;
+  display: none;
 }
 
 .vaultguard-fe-avatar-overflow {
@@ -4755,13 +4755,13 @@ button .vaultguard-btn-spinner:only-child {
 
 .modal.vaultguard-at-rest-recovery-modal,
 .modal.vaultguard-at-rest-restore-modal {
-  width: 560px !important;
-  max-width: calc(100vw - 32px) !important;
+  width: 560px;
+  max-width: calc(100vw - 32px);
 }
 
 .modal.vaultguard-at-rest-recovery-modal .modal-content,
 .modal.vaultguard-at-rest-restore-modal .modal-content {
-  padding: 24px !important;
+  padding: 24px;
   overflow-x: hidden;
 }
 
@@ -5344,15 +5344,12 @@ button .vaultguard-btn-spinner:only-child {
    nested wrapper) — a horizontal rule carries no meaning inside a chat
    transcript, so suppress every <hr> anywhere in the list. */
 .vaultguard-chat .vaultguard-chat-list hr {
-  display: none !important;
+  display: none;
 }
 /* A separator-/whitespace-only assistant block sanitises to nothing — hide the
    resulting empty bubble so it never shows as a stray box. */
 .vaultguard-chat-message-assistant .vaultguard-chat-bubble:empty {
   display: none;
-}
-.vaultguard-chat-message-assistant:not(.vaultguard-chat-pending):has(> .vaultguard-chat-bubble:empty) {
-  display: none !important;
 }
 
 /* Copy buttons (whole message + per code block) — reveal on hover */
@@ -5381,7 +5378,7 @@ button .vaultguard-btn-spinner:only-child {
   opacity: 0.85;
 }
 .vaultguard-chat-message-copy:hover {
-  opacity: 1 !important;
+  opacity: 1;
 }
 .vaultguard-chat-code-pre {
   position: relative;
@@ -5402,7 +5399,7 @@ button .vaultguard-btn-spinner:only-child {
   opacity: 0.85;
 }
 .vaultguard-chat-code-copy:hover {
-  opacity: 1 !important;
+  opacity: 1;
 }
 
 /* Persistent "Working…" indicator — animated dots + label, shown for the whole
@@ -5469,7 +5466,7 @@ button .vaultguard-btn-spinner:only-child {
   max-width: 100%;
 }
 .vaultguard-chat-collapsible > .vaultguard-chat-collapsible-header {
-  display: flex !important;
+  display: flex;
   align-items: center;
   gap: 6px;
   box-sizing: border-box;
@@ -5505,13 +5502,13 @@ button .vaultguard-btn-spinner:only-child {
   border-top: 1px solid var(--background-modifier-border);
 }
 .vaultguard-chat-collapsible.is-open {
-  height: auto !important;
+  height: auto;
   overflow: hidden;
 }
 .vaultguard-chat-collapsible.is-open > .vaultguard-chat-collapsible-body {
-  display: block !important;
-  visibility: visible !important;
-  height: auto !important;
+  display: block;
+  visibility: visible;
+  height: auto;
   min-height: 0;
   overflow: visible;
 }
@@ -5526,12 +5523,12 @@ button .vaultguard-btn-spinner:only-child {
   overflow: visible;
 }
 .vaultguard-chat-collapsible.vaultguard-chat-is-collapsed {
-  height: 32px !important;
+  height: 32px;
   min-height: 32px;
 }
 .vaultguard-chat-collapsible.vaultguard-chat-is-collapsed > .vaultguard-chat-collapsible-body,
 .vaultguard-chat-collapsible:not(.is-open) > .vaultguard-chat-collapsible-body {
-  display: none !important;
+  display: none;
 }
 
 /* Thinking block — dimmed */

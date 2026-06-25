@@ -71,6 +71,9 @@ function getElectronRequire(): ((id: string) => unknown) | null {
     return w.require as (id: string) => unknown;
   }
 
+  // Electron's renderer exposes CommonJS `require` as a global, not on `window`.
+  // Keep this fallback so the safeStorage probe works (and stays unit-testable
+  // via a globalThis.require shim).
   const g = globalThis as unknown as { require?: unknown };
   if (typeof g.require === "function") {
     return g.require as (id: string) => unknown;

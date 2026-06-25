@@ -8,7 +8,7 @@
  * 4. User must acknowledge saving the codes before closing
  */
 
-import { App, Modal, ButtonComponent, Notice } from "obsidian";
+import { App, Modal, ButtonComponent } from "obsidian";
 import qrcode from "qrcode-generator";
 import { createQrSvg } from "../ui/icons";
 
@@ -93,7 +93,7 @@ export class MfaSetupModal extends Modal {
       text: "Can't scan? Enter this secret manually:",
       cls: "vaultguard-mfa-manual-label",
     });
-    const secretDisplay = manualContainer.createEl("code", {
+    manualContainer.createEl("code", {
       text: this.formatSecret(this.secretCode),
       cls: "vaultguard-mfa-secret",
     });
@@ -104,7 +104,7 @@ export class MfaSetupModal extends Modal {
     copyBtn.addEventListener("click", () => {
       navigator.clipboard.writeText(this.secretCode);
       copyBtn.setText("Copied!");
-      setTimeout(() => copyBtn.setText("Copy"), 2000);
+      window.setTimeout(() => copyBtn.setText("Copy"), 2000);
     });
 
     // Verification code input
@@ -157,7 +157,7 @@ export class MfaSetupModal extends Modal {
       }
     });
 
-    setTimeout(() => codeInput.focus(), 50);
+    window.setTimeout(() => codeInput.focus(), 50);
   }
 
   /** Step 2: Show recovery codes, require acknowledgment */
@@ -191,7 +191,7 @@ export class MfaSetupModal extends Modal {
     copyAllBtn.addEventListener("click", () => {
       navigator.clipboard.writeText(this.recoveryCodes.join("\n"));
       copyAllBtn.setText("Copied!");
-      setTimeout(() => copyAllBtn.setText("Copy All Codes"), 2000);
+      window.setTimeout(() => copyAllBtn.setText("Copy All Codes"), 2000);
     });
 
     contentEl.createEl("p", {

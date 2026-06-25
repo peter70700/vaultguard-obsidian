@@ -53,11 +53,6 @@ export { SAAS_DEFAULTS };
  */
 
 export const DEFAULT_EXCLUDED_PATHS = [
-  ".obsidian/workspace.json",
-  ".obsidian/workspace-mobile.json",
-  ".obsidian/cache",
-  ".obsidian/plugins",
-  ".obsidian/community-plugins.json",
   ".trash",
 ] as const;
 
@@ -223,7 +218,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     const el = containerEl.createDiv({ cls: 'vaultguard-status-msg' });
     el.addClass(isError ? 'is-error' : 'is-success');
     el.setText(message);
-    setTimeout(() => el.remove(), 6000);
+    window.setTimeout(() => el.remove(), 6000);
   }
 
   /**
@@ -744,20 +739,22 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               description:
                 "This will rewrite every encrypted file in your vault back to plaintext. Anyone with disk access (or another logged-in user on this Mac) will then be able to read your notes through Finder. Re-enter your account password to confirm you're the one doing this.",
               onVerify: (pw) => this.plugin.verifyAccountPassword(pw),
-              onConfirmed: async () => {
-                button.setButtonText("Decrypting…").setDisabled(true);
-                try {
-                  await this.plugin.revertVaultFromAtRest();
-                  this.showStatus(containerEl, "Vault decryption pass complete.", false);
-                } catch (err) {
-                  this.showStatus(
-                    containerEl,
-                    `Decryption failed: ${(err as Error).message}`,
-                    true
-                  );
-                } finally {
-                  this.display();
-                }
+              onConfirmed: () => {
+                void (async () => {
+                  button.setButtonText("Decrypting…").setDisabled(true);
+                  try {
+                    await this.plugin.revertVaultFromAtRest();
+                    this.showStatus(containerEl, "Vault decryption pass complete.", false);
+                  } catch (err) {
+                    this.showStatus(
+                      containerEl,
+                      `Decryption failed: ${(err as Error).message}`,
+                      true
+                    );
+                  } finally {
+                    this.display();
+                  }
+                })();
               },
             }).open();
           });
@@ -780,17 +777,19 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               description:
                 "Anyone holding this code can decrypt every file on this device. Enter your account password to confirm before it's shown.",
               onVerify: (pw) => this.plugin.verifyAccountPassword(pw),
-              onConfirmed: async () => {
-                try {
-                  const code = await this.plugin.exportAtRestRecoveryCode();
-                  new AtRestRecoveryCodeModal(this.app, { code }).open();
-                } catch (err) {
-                  this.showStatus(
-                    containerEl,
-                    `Could not export recovery code: ${(err as Error).message}`,
-                    true
-                  );
-                }
+              onConfirmed: () => {
+                void (async () => {
+                  try {
+                    const code = await this.plugin.exportAtRestRecoveryCode();
+                    new AtRestRecoveryCodeModal(this.app, { code }).open();
+                  } catch (err) {
+                    this.showStatus(
+                      containerEl,
+                      `Could not export recovery code: ${(err as Error).message}`,
+                      true
+                    );
+                  }
+                })();
               },
             }).open();
           })
@@ -2118,19 +2117,23 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           })
       );
 
+    const configDir = this.app.vault.configDir;
+    const configWorkspacePath = `${configDir}/workspace.json`;
+    const configPluginsPath = `${configDir}/plugins`;
+
     const excludedPathsSetting = new Setting(containerEl)
       .setName("Excluded paths (local-only)")
       .setDesc(
         "One path per line. Files and folders matching these patterns are never uploaded, " +
         "downloaded, or deleted on the server — they stay on this device only. Use exact " +
-        "paths (e.g. .obsidian/workspace.json) or folder prefixes (e.g. .obsidian/plugins). " +
+        `paths (e.g. ${configWorkspacePath}) or folder prefixes (e.g. ${configPluginsPath}). ` +
         "This setting applies to this device only; it does not change the server vault."
       )
       .addTextArea((textArea) => {
         textArea.inputEl.rows = 6;
         textArea.inputEl.addClass("vaultguard-mono-textarea");
         textArea
-          .setPlaceholder(".obsidian/workspace.json\n.obsidian/plugins\n.trash")
+          .setPlaceholder(`${configWorkspacePath}\n${configPluginsPath}\n.trash`)
           .setValue((this.plugin.settings.excludedPaths ?? []).join("\n"))
           .onChange(async (value) => {
             this.plugin.settings.excludedPaths = value
@@ -2162,11 +2165,14 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               this.showStatus(containerEl, "No excluded paths configured.", true);
               return;
             }
-            const confirmed = window.confirm(
+            const confirmed = await this.showDestructiveConfirmation(
+              containerEl,
+              "PURGE FROM SERVER",
               "Delete every matching file from the shared server vault? " +
-              "Other members will lose these files on their next sync. " +
-              "Local copies on this device are kept.\n\n" +
-              `Patterns:\n${patterns.join("\n")}`
+                "Other members will lose these files on their next sync. " +
+                "Local copies on this device are kept.\n\n" +
+                `Patterns:\n${patterns.join("\n")}\n\n` +
+                "Type PURGE FROM SERVER to confirm."
             );
             if (!confirmed) return;
             try {

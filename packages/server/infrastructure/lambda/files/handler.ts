@@ -61,12 +61,10 @@ import {
   getVaultCursor,
   queryVaultActivity,
   UserContext,
-  PermissionAction,
   VaultRecord,
   VaultActivityRecord,
   AuthError,
   GetCommand,
-  PutCommand,
   QueryCommand,
 } from '../shared/utils';
 
@@ -190,18 +188,10 @@ function folderPathFromMarker(relativePath: string): string {
   return segments.join('/');
 }
 
-function permissionEvaluationOptions(user: UserContext): { userAliases: string[] } {
-  return { userAliases: user.email ? [user.email] : [] };
-}
-
 /**
- * Async variant of {@link permissionEvaluationOptions} that ALSO carries
- * the per-org `respectAdminBypass` flag. File operations call this so
- * that when `allowAdminPerFileRestrictions` is on, per-file deny rules
- * actually take effect on admins' reads/writes/deletes/lists — without
- * this flag the bypass in `evaluatePermission` would short-circuit
- * `allowed=true` for admins and the toggle would only affect what the UI
- * displays, not what the API enforces.
+ * Permission-evaluation options for file operations. Carries the per-org
+ * `respectAdminBypass` flag so that when `allowAdminPerFileRestrictions` is on,
+ * per-file deny rules actually take effect on admins' reads/writes/deletes/lists.
  */
 async function fileOpPermissionOptions(
   user: UserContext,

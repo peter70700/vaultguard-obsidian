@@ -30,7 +30,6 @@ import {
   authorizePermissionMutation,
   ruleLevelRank,
   shouldRespectAdminBypassFor,
-  requireOrgId,
   requireVaultMember,
   pathMatchesPattern,
   getVaultMembership,

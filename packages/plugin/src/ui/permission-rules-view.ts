@@ -1,4 +1,4 @@
-import { Notice, Setting } from "obsidian";
+import { App, ButtonComponent, Modal, Notice, Setting } from "obsidian";
 import {
   PathAccessPrincipal,
   PathAccessSummary,
@@ -50,6 +50,7 @@ export interface PermissionRulesCurrentUser {
 }
 
 export interface PermissionRulesViewOptions {
+  app: App;
   currentUser?: PermissionRulesCurrentUser;
   /** Optional search text to prefill when opening the rules overview. */
   initialSearch?: string;
@@ -81,6 +82,49 @@ function actionsForLevel(level: Level): PermissionMutationInput["actions"] {
       return ["read", "list"];
     case "none":
       return ["read", "write", "delete", "admin", "list"];
+  }
+}
+
+class PermissionRuleConfirmModal extends Modal {
+  private resolved = false;
+
+  constructor(
+    app: App,
+    private message: string,
+    private resolvePromise: (value: boolean) => void
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "Delete permission rule" });
+    contentEl.createEl("p", { text: this.message });
+
+    const buttons = contentEl.createDiv({ cls: "vaultguard-confirm-buttons" });
+    new ButtonComponent(buttons)
+      .setButtonText("Cancel")
+      .onClick(() => this.finish(false));
+    new ButtonComponent(buttons)
+      .setButtonText("Delete")
+      .setWarning()
+      .onClick(() => this.finish(true));
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.resolved) {
+      this.resolved = true;
+      this.resolvePromise(false);
+    }
+  }
+
+  private finish(value: boolean): void {
+    if (this.resolved) return;
+    this.resolved = true;
+    this.resolvePromise(value);
+    this.close();
   }
 }
 
@@ -195,6 +239,7 @@ interface PrincipalReason {
 }
 
 export class PermissionRulesView {
+  private app: App;
   private apiClient: VaultGuardApiClient;
   private container: HTMLElement;
   private currentUser: PermissionRulesCurrentUser;
@@ -218,8 +263,9 @@ export class PermissionRulesView {
   constructor(
     apiClient: VaultGuardApiClient,
     container: HTMLElement,
-    options: PermissionRulesViewOptions = {}
+    options: PermissionRulesViewOptions
   ) {
+    this.app = options.app;
     this.apiClient = apiClient;
     this.container = container;
     this.currentUser = options.currentUser ?? {};
@@ -693,7 +739,7 @@ export class PermissionRulesView {
       new Notice("You can't delete a rule that grants your own admin access — ask another admin.");
       return;
     }
-    const ok = window.confirm(
+    const ok = await this.confirmDelete(
       `Delete the ${this.principalLabel(rule)} rule on "${rule.pathPattern}"? This cannot be undone.`
     );
     if (!ok) return;
@@ -705,6 +751,12 @@ export class PermissionRulesView {
     } catch (err) {
       new Notice(`Failed to delete: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  private confirmDelete(message: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      new PermissionRuleConfirmModal(this.app, message, resolve).open();
+    });
   }
 
   // ─── Inline add / edit form ──────────────────────────────────────────────

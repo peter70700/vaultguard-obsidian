@@ -493,7 +493,7 @@ async function recoverOldDeks(userId: string, orgId: string): Promise<RecoveredD
             plaintextKey: Buffer.from(decryptResponse.Plaintext),
           });
         }
-      } catch (err) {
+      } catch {
         // KMS Decrypt may fail if the encryption context doesn't match
         // (e.g., older leases before scope was added). Try without scope.
         try {
@@ -524,39 +524,6 @@ async function recoverOldDeks(userId: string, orgId: string): Promise<RecoveredD
 
   console.info(`[REENCRYPTION] Recovered ${recovered.length} DEKs from ${leases.length} leases`);
   return recovered;
-}
-
-/**
- * Find the best matching old DEK for a given vault file path.
- * Uses scope specificity: most-specific matching scope wins.
- */
-function findDekForPath(vaultPath: string, deks: RecoveredDek[]): RecoveredDek | null {
-  let bestMatch: RecoveredDek | null = null;
-  let bestSpecificity = -1;
-
-  for (const dek of deks) {
-    if (pathMatchesPattern(vaultPath, dek.scope)) {
-      const specificity = getScopeSpecificity(dek.scope);
-      if (specificity > bestSpecificity) {
-        bestMatch = dek;
-        bestSpecificity = specificity;
-      }
-    }
-  }
-
-  return bestMatch;
-}
-
-function getScopeSpecificity(scope: string): number {
-  if (scope === '/**') return 0;
-  const segments = scope.split('/').filter(Boolean);
-  let score = segments.length * 10;
-  for (const seg of segments) {
-    if (seg === '**') score -= 8;
-    else if (seg === '*') score -= 5;
-    else if (seg.includes('*') || seg.includes('?')) score -= 3;
-  }
-  return score;
 }
 
 // ─── AES-256-GCM Operations ────────────────────────────────────────────────

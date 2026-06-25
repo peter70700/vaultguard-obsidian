@@ -21,10 +21,10 @@
  */
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import type { QueryCommandInput } from '@aws-sdk/lib-dynamodb';
 import {
   docClient,
   verifyActiveUser,
-  requireOrgId,
   logAudit,
   formatError,
   formatSuccess,
@@ -1258,7 +1258,7 @@ async function queryAuditIndex<T>(params: {
   let lastEvaluatedKey = params.cursor;
 
   do {
-    const request: Record<string, unknown> = {
+    const request: QueryCommandInput = {
       TableName: AUDIT_TABLE,
       IndexName: params.indexName,
       KeyConditionExpression: params.keyConditionExpression,
@@ -1279,7 +1279,7 @@ async function queryAuditIndex<T>(params: {
       request.ExclusiveStartKey = lastEvaluatedKey;
     }
 
-    const result = await docClient.send(new QueryCommand(request as any));
+    const result = await docClient.send(new QueryCommand(request));
     items.push(...((result.Items || []) as T[]));
     lastEvaluatedKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
   } while (items.length < params.limit && lastEvaluatedKey);
@@ -1302,7 +1302,7 @@ async function queryAllAuditEntries(params: {
   let lastEvaluatedKey: Record<string, unknown> | undefined;
 
   do {
-    const request: Record<string, unknown> = {
+    const request: QueryCommandInput = {
       TableName: AUDIT_TABLE,
       IndexName: params.indexName,
       KeyConditionExpression: params.keyConditionExpression,
@@ -1322,7 +1322,7 @@ async function queryAllAuditEntries(params: {
       request.ExclusiveStartKey = lastEvaluatedKey;
     }
 
-    const result = await docClient.send(new QueryCommand(request as any));
+    const result = await docClient.send(new QueryCommand(request));
     items.push(...((result.Items || []) as AuditEntry[]));
     lastEvaluatedKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
   } while (lastEvaluatedKey);
@@ -1341,7 +1341,7 @@ async function queryAlerts(params: {
   let lastEvaluatedKey = params.cursor;
 
   do {
-    const request: Record<string, unknown> = {
+    const request: QueryCommandInput = {
       TableName: ALERTS_TABLE,
       IndexName: 'orgId-index',
       KeyConditionExpression: 'orgId = :orgId',
@@ -1362,7 +1362,7 @@ async function queryAlerts(params: {
       request.ExclusiveStartKey = lastEvaluatedKey;
     }
 
-    const result = await docClient.send(new QueryCommand(request as any));
+    const result = await docClient.send(new QueryCommand(request));
     items.push(...((result.Items || []) as SecurityAlert[]));
     lastEvaluatedKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
   } while (items.length < params.limit && lastEvaluatedKey);

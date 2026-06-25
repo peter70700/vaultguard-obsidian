@@ -56,7 +56,7 @@ export class AtRestPasswordConfirmModal extends Modal {
     });
     input.placeholder = "Account password";
     input.autocomplete = "current-password";
-    setTimeout(() => input.focus(), 50);
+    window.setTimeout(() => input.focus(), 50);
 
     const status = contentEl.createDiv({ cls: "vaultguard-modal-status" });
 

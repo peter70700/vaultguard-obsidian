@@ -1,11 +1,11 @@
 {
   "name": "vaultguard-sync",
-  "version": "1.0.37",
+  "version": "1.0.38",
   "description": "Enterprise vault security with permission-aware encrypted cloud sync for Obsidian",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production && node scripts/check-release-bundle.mjs",
     "package": "npm run build && node scripts/package-plugin.mjs",
     "install:plugin": "npm run build && node scripts/install-plugin.mjs",
     "test": "vitest run",

@@ -62,7 +62,6 @@ import {
   LEASES_TABLE,
   ORGANIZATIONS_TABLE,
   PERMISSIONS_TABLE,
-  VAULTS_TABLE,
   VAULT_MEMBERS_TABLE,
   RECOVERY_CODES_TABLE,
   BatchWriteCommand,
@@ -1646,7 +1645,7 @@ async function seedDefaultVaultMembershipForInvitee(
   let failures = 0;
 
   // 1. List every vault in the org. Reuses the shared helper so a future
-  //    schema change to VAULTS_TABLE only needs to touch one place.
+  //    vault-table schema change only needs to touch one place.
   const vaults = await listVaultsForOrg(orgId);
   const nowIso = new Date().toISOString();
 

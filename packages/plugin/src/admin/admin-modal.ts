@@ -112,6 +112,10 @@ const AUDIT_ACTION_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "reencryption.completed", label: "Re-encryption Completed" },
 ];
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export class AdminModal extends Modal {
   private activeTab: TabId;
   private apiClient: VaultGuardApiClient;
@@ -151,32 +155,32 @@ export class AdminModal extends Modal {
   }
 
   onOpen(): void {
-    const { contentEl } = this;
-    contentEl.empty();
-    this.modalEl.addClass("vaultguard-admin-modal");
-    contentEl.addClass("vaultguard-admin-modal-content");
+    const contentEl = this.contentEl;
+    contentEl.replaceChildren();
+    this.modalEl.classList.add("vaultguard-admin-modal");
+    contentEl.classList.add("vaultguard-admin-modal-content");
 
     // Modal header
-    const header = contentEl.createDiv({ cls: "vaultguard-admin-header" });
-    header.createEl("h2", {
-      text: this.permissionsUserId
-        ? "VaultGuard - My Vault Access"
-        : "VaultGuard - Organization Admin",
-    });
+    const header = this.createDivElement(contentEl, "vaultguard-admin-header");
+    const title = contentEl.ownerDocument.createElement("h2");
+    title.textContent = this.permissionsUserId
+      ? "VaultGuard - My Vault Access"
+      : "VaultGuard - Organization Admin";
+    header.appendChild(title);
 
     // Connection status indicator (updates reactively)
-    this.statusEl = header.createDiv({ cls: "vaultguard-connection-status" });
+    this.statusEl = this.createDivElement(header, "vaultguard-connection-status");
     this.renderConnectionStatus(this.statusEl);
     this.unsubscribeConnection = this.apiClient.onConnectionStatusChange(() => {
       this.renderConnectionStatus(this.statusEl);
     });
 
     // Tab navigation
-    this.tabContainer = contentEl.createDiv({ cls: "vaultguard-tab-nav" });
+    this.tabContainer = this.createDivElement(contentEl, "vaultguard-tab-nav");
     this.renderTabs();
 
     // Content area
-    this.contentContainer = contentEl.createDiv({ cls: "vaultguard-tab-content" });
+    this.contentContainer = this.createDivElement(contentEl, "vaultguard-tab-content");
     this.renderActiveTab();
   }
 
@@ -185,9 +189,16 @@ export class AdminModal extends Modal {
       this.unsubscribeConnection();
       this.unsubscribeConnection = null;
     }
-    this.modalEl.removeClass("vaultguard-admin-modal");
-    this.contentEl.removeClass("vaultguard-admin-modal-content");
-    this.contentEl.empty();
+    this.modalEl.classList.remove("vaultguard-admin-modal");
+    this.contentEl.classList.remove("vaultguard-admin-modal-content");
+    this.contentEl.replaceChildren();
+  }
+
+  private createDivElement(parent: HTMLElement, className: string): HTMLDivElement {
+    const div = parent.ownerDocument.createElement("div");
+    div.className = className;
+    parent.appendChild(div);
+    return div;
   }
 
   private renderConnectionStatus(container: HTMLElement): void {
@@ -234,34 +245,40 @@ export class AdminModal extends Modal {
   }
 
   private renderActiveTab(): void {
-    this.contentContainer.empty();
+    this.contentContainer.replaceChildren();
 
     switch (this.activeTab) {
       case "users":
-        this.renderUsersTab();
+        void this.renderUsersTab().catch((error: unknown) => this.renderTabError(error));
         break;
       case "permissions":
-        this.renderPermissionsTab();
+        void this.renderPermissionsTab().catch((error: unknown) => this.renderTabError(error));
         break;
       case "audit":
-        this.renderAuditTab();
+        void this.renderAuditTab().catch((error: unknown) => this.renderTabError(error));
         break;
       case "recovery":
-        this.renderRecoveryTab();
+        void this.renderRecoveryTab().catch((error: unknown) => this.renderTabError(error));
         break;
       case "settings":
-        this.renderSettingsTab();
+        void this.renderSettingsTab().catch((error: unknown) => this.renderTabError(error));
         break;
     }
+  }
+
+  private renderTabError(error: unknown): void {
+    this.contentContainer.replaceChildren();
+    const errorEl = this.createDivElement(this.contentContainer, "vaultguard-error");
+    errorEl.textContent = `Failed to render ${this.activeTab}: ${errorMessage(error)}`;
   }
 
   // ─── Users Tab ───────────────────────────────────────────────────────
 
   private async renderUsersTab(): Promise<void> {
-    const container = this.contentContainer.createDiv({ cls: "vaultguard-users-tab" });
+    const container = this.createDivElement(this.contentContainer, "vaultguard-users-tab");
 
     // Toolbar
-    const toolbar = container.createDiv({ cls: "vaultguard-toolbar" });
+    const toolbar = this.createDivElement(container, "vaultguard-toolbar");
     new ButtonComponent(toolbar)
       .setButtonText("Invite User")
       .setCta()
@@ -273,7 +290,7 @@ export class AdminModal extends Modal {
     searchInput.inputEl.addClass("vaultguard-search-input");
 
     // User list
-    const userList = container.createDiv({ cls: "vaultguard-user-list" });
+    const userList = this.createDivElement(container, "vaultguard-user-list");
     await this.userManager.renderUserList(userList);
   }
 
@@ -300,6 +317,7 @@ export class AdminModal extends Modal {
     // panel. The per-user "My vault access" view keeps the read-only tree.
     if (!this.permissionsUserId) {
       const view = new PermissionRulesView(this.apiClient, container, {
+        app: this.app,
         currentUser: {
           id: this.context.currentUser?.id,
           orgRole: this.context.currentUser?.orgRole,
@@ -409,7 +427,7 @@ export class AdminModal extends Modal {
       container.empty();
       container.createDiv({
         cls: "vaultguard-error",
-        text: `Failed to load permissions: ${(error as Error).message}`,
+        text: `Failed to load permissions: ${errorMessage(error)}`,
       });
     }
   }
@@ -677,7 +695,7 @@ export class AdminModal extends Modal {
         new Notice("Permission rule deleted.");
         await this.renderPermissionTree(container);
       } catch (error) {
-        new Notice(`Failed to delete: ${(error as Error).message}`);
+        new Notice(`Failed to delete: ${errorMessage(error)}`);
       }
     }
   }
@@ -825,7 +843,7 @@ export class AdminModal extends Modal {
         }
       }
 
-      for (const entry of entries as AuditLogEntry[]) {
+      for (const entry of entries) {
         this.renderAuditEntry(list, entry, vaultRecord);
       }
 
@@ -844,7 +862,7 @@ export class AdminModal extends Modal {
       }
       container.createDiv({
         cls: "vaultguard-error",
-        text: `Failed to load audit log: ${(error as Error).message}`,
+        text: `Failed to load audit log: ${errorMessage(error)}`,
       });
     }
   }
@@ -987,7 +1005,8 @@ export class AdminModal extends Modal {
 
   private formatAuditJson(value: unknown): string {
     try {
-      return JSON.stringify(value, null, 2) ?? String(value);
+      const serialized = JSON.stringify(value, null, 2);
+      return typeof serialized === "string" ? serialized : String(value);
     } catch {
       return String(value);
     }
@@ -997,14 +1016,15 @@ export class AdminModal extends Modal {
     try {
       const csvBlob = await this.apiClient.exportAuditLogCsv(this.auditFilters);
       const url = URL.createObjectURL(csvBlob);
-      const a = document.createElement("a");
+      const doc = typeof activeDocument === "undefined" ? this.contentEl.ownerDocument : activeDocument;
+      const a = doc.createElement("a");
       a.href = url;
       a.download = `vaultguard-audit-log-${new Date().toISOString().split("T")[0]}.csv`;
       a.click();
       URL.revokeObjectURL(url);
       new Notice("Audit log exported.");
     } catch (error) {
-      new Notice(`Export failed: ${(error as Error).message}`);
+      new Notice(`Export failed: ${errorMessage(error)}`);
     }
   }
 
@@ -1030,13 +1050,16 @@ export class AdminModal extends Modal {
       cls: "setting-item-description",
     });
 
-    let targetUserInput: TextComponent | null = null;
+    let targetUserId = "";
     new Setting(container)
       .setName("Target User ID")
       .setDesc("The user ID of the revoked user whose files need re-encryption")
       .addText((text) => {
-        targetUserInput = text;
-        text.setPlaceholder("user-id-here");
+        text
+          .setPlaceholder("user-id-here")
+          .onChange((value) => {
+            targetUserId = value;
+          });
       });
 
     new Setting(container)
@@ -1047,7 +1070,7 @@ export class AdminModal extends Modal {
           .setButtonText("Trigger Re-encryption")
           .setWarning()
           .onClick(async () => {
-            const userId = targetUserInput?.getValue()?.trim();
+            const userId = targetUserId.trim();
             if (!userId) {
               new Notice("Please enter a target user ID.");
               return;
@@ -1069,10 +1092,10 @@ export class AdminModal extends Modal {
 
               // Show job status section
               if (data.jobId) {
-                this.renderJobStatus(container, data.jobId);
+                await this.renderJobStatus(container, data.jobId);
               }
             } catch (error) {
-              new Notice(`Failed to start re-encryption: ${(error as Error).message}`);
+              new Notice(`Failed to start re-encryption: ${errorMessage(error)}`);
             } finally {
               btn.setDisabled(false);
               btn.setButtonText("Trigger Re-encryption");
@@ -1083,22 +1106,25 @@ export class AdminModal extends Modal {
     // ── Job status check ─────────────────────────────────
     container.createEl("h4", { text: "Check Job Status" });
 
-    let jobIdInput: TextComponent | null = null;
+    let jobIdValue = "";
     new Setting(container)
       .setName("Job ID")
       .setDesc("Enter a re-encryption job ID to check its progress")
       .addText((text) => {
-        jobIdInput = text;
-        text.setPlaceholder("job-id-here");
+        text
+          .setPlaceholder("job-id-here")
+          .onChange((value) => {
+            jobIdValue = value;
+          });
       })
       .addButton((btn) =>
         btn.setButtonText("Check Status").onClick(async () => {
-          const jobId = jobIdInput?.getValue()?.trim();
+          const jobId = jobIdValue.trim();
           if (!jobId) {
             new Notice("Please enter a job ID.");
             return;
           }
-          this.renderJobStatus(container, jobId);
+          await this.renderJobStatus(container, jobId);
         })
       );
 
@@ -1119,20 +1145,23 @@ export class AdminModal extends Modal {
         "This action is logged and visible in the audit trail."
     );
 
-    let recoveryUserInput: TextComponent | null = null;
+    let recoveryUserId = "";
     new Setting(container)
       .setName("Recover User's Key")
       .setDesc("Enter the user ID to recover their wrapped master key")
       .addText((text) => {
-        recoveryUserInput = text;
-        text.setPlaceholder("user-id-here");
+        text
+          .setPlaceholder("user-id-here")
+          .onChange((value) => {
+            recoveryUserId = value;
+          });
       })
       .addButton((btn) =>
         btn
           .setButtonText("Initiate Recovery")
           .setWarning()
           .onClick(async () => {
-            const userId = recoveryUserInput?.getValue()?.trim();
+            const userId = recoveryUserId.trim();
             if (!userId) {
               new Notice("Please enter a user ID.");
               return;
@@ -1185,7 +1214,7 @@ export class AdminModal extends Modal {
                 });
               }
             } catch (error) {
-              new Notice(`Recovery failed: ${(error as Error).message}`);
+              new Notice(`Recovery failed: ${errorMessage(error)}`);
             }
           })
       );
@@ -1208,12 +1237,12 @@ export class AdminModal extends Modal {
         return;
       }
 
-      const status = job.status as string;
-      const processed = job.processedFiles as number || 0;
-      const total = job.totalFiles as number || 0;
-      const failed = job.failedFiles as number || 0;
+      const status = job.status;
+      const processed = job.processedFiles ?? 0;
+      const total = job.totalFiles ?? 0;
+      const failed = job.failedFiles ?? 0;
 
-      const statusBadge = statusEl.createSpan({
+      statusEl.createSpan({
         text: status.toUpperCase(),
         cls: `vaultguard-badge vaultguard-badge-${status === "completed" ? "success" : status === "failed" ? "error" : "warning"}`,
       });
@@ -1224,18 +1253,18 @@ export class AdminModal extends Modal {
 
       if (job.startedAt) {
         statusEl.createEl("p", {
-          text: `Started: ${new Date(job.startedAt as string).toLocaleString()}`,
+          text: `Started: ${new Date(job.startedAt).toLocaleString()}`,
           cls: "setting-item-description",
         });
       }
       if (job.completedAt) {
         statusEl.createEl("p", {
-          text: `Completed: ${new Date(job.completedAt as string).toLocaleString()}`,
+          text: `Completed: ${new Date(job.completedAt).toLocaleString()}`,
           cls: "setting-item-description",
         });
       }
 
-      const errors = job.errors as string[] || [];
+      const errors = job.errors ?? [];
       if (errors.length > 0) {
         const errSection = statusEl.createDiv({ cls: "vaultguard-job-errors" });
         errSection.createEl("strong", { text: `Errors (${errors.length}):` });
@@ -1251,7 +1280,7 @@ export class AdminModal extends Modal {
       }
     } catch (error) {
       statusEl.createEl("p", {
-        text: `Failed to fetch status: ${(error as Error).message}`,
+        text: `Failed to fetch status: ${errorMessage(error)}`,
         cls: "vaultguard-error",
       });
     }
@@ -1289,7 +1318,7 @@ export class AdminModal extends Modal {
 
       container.createDiv({
         cls: "vaultguard-error",
-        text: `Failed to load settings: ${(error as Error).message}`,
+        text: `Failed to load settings: ${errorMessage(error)}`,
       });
     }
   }
@@ -1544,7 +1573,7 @@ export class AdminModal extends Modal {
               new Notice("Organization settings saved.");
               this.renderActiveTab();
             } catch (error) {
-              new Notice(`Failed to save: ${(error as Error).message}`);
+              new Notice(`Failed to save: ${errorMessage(error)}`);
             } finally {
               btn.setDisabled(false);
               btn.setButtonText("Save Settings");
@@ -1565,7 +1594,7 @@ export class AdminModal extends Modal {
               new Notice("Settings reset to defaults.");
               this.renderActiveTab();
             } catch (error) {
-              new Notice(`Failed to reset: ${(error as Error).message}`);
+              new Notice(`Failed to reset: ${errorMessage(error)}`);
             } finally {
               btn.setDisabled(false);
               btn.setButtonText("Reset to Defaults");

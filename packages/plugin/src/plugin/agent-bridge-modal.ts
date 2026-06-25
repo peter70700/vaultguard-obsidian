@@ -302,7 +302,7 @@ export class AgentBridgeLeaseModal extends Modal {
         // confirm path resolves(true) above before the modal closes.
         // Use a microtask to make sure both callbacks are visible to
         // settle the promise exactly once.
-        setTimeout(() => resolve(false), 0);
+        window.setTimeout(() => resolve(false), 0);
       };
       modal.open();
     });
@@ -352,9 +352,10 @@ export class AgentBridgeLeaseModal extends Modal {
           window.setTimeout(() => copyBtn.setButtonText(opts.copyLabel), 2000);
         } catch {
           // Select the contents so the user can hit Cmd/Ctrl+C.
-          const range = document.createRange();
+          const doc = typeof activeDocument === "undefined" ? codeBox.ownerDocument : activeDocument;
+          const range = doc.createRange();
           range.selectNodeContents(codeBox);
-          const selection = window.getSelection();
+          const selection = doc.getSelection();
           selection?.removeAllRanges();
           selection?.addRange(range);
           new Notice(

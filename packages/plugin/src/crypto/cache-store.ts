@@ -5,7 +5,7 @@
  * Maintains an encrypted manifest mapping hashes to original paths and metadata.
  */
 
-import { CacheEntry, CacheManifest, EncryptionKey } from '../types';
+import { CacheManifest, EncryptionKey } from '../types';
 
 /** Metadata passed when caching a file. */
 interface CacheFileMetadata {

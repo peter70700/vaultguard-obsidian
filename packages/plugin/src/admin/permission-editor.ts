@@ -218,7 +218,7 @@ class PermissionRuleModal extends Modal {
 
       inputEl.addEventListener("blur", () => {
         // Delay hiding to allow click events on suggestions
-        setTimeout(() => {
+        window.setTimeout(() => {
           suggestionsEl.hide();
         }, 200);
       });

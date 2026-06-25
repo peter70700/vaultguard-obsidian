@@ -2626,7 +2626,7 @@ async function handleVerifyRecoveryCode(
         ConditionExpression: 'attribute_exists(codeHash)',
       })
     );
-  } catch (err) {
+  } catch {
     // ConditionalCheckFailedException → another request already consumed it.
     // Treat as a verification failure so the loser of the race re-tries.
     await logAudit({

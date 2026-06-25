@@ -6,10 +6,10 @@ import {
   readFileSync,
   unlinkSync,
   writeFileSync,
-} from "fs";
-import { dirname, join, resolve } from "path";
-import { fileURLToPath } from "url";
-import { homedir } from "os";
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(join(rootDir, "manifest.json"), "utf8"));
@@ -42,7 +42,7 @@ for (const vaultPath of vaultPaths) {
 
 writeFileSync(
   configPath,
-  JSON.stringify({ vaultPath: vaultPaths[0], vaultPaths }, null, 2) + "\n"
+  `${JSON.stringify({ vaultPath: vaultPaths[0], vaultPaths }, null, 2)}\n`
 );
 
 const vaultLabel = installedPluginDirs.length === 1 ? "vault" : "vaults";

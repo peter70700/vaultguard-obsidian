@@ -23,7 +23,6 @@ import {
   buildAccessUserMap,
   getAccessUserDisplayName,
   getAccessUserNameInitials,
-  getAccessUserMeta,
   formatAccessUserRole,
   formatAccessUserStatus,
   resolveAccessUserId,
@@ -1230,7 +1229,6 @@ export class FilePermissionHeader {
 
     // Store backdrop ref for cleanup
     popover.dataset.backdropId = "active";
-    const existingBackdrop = this.activePopover.previousElementSibling;
     // Cleanup function
     const originalClose = this.closePopover.bind(this);
     this.closePopover = () => {
@@ -1241,6 +1239,21 @@ export class FilePermissionHeader {
   }
 
   private positionPopover(popover: HTMLElement, anchor: HTMLElement): void {
+    const isMobileSheet =
+      document.body.classList.contains("is-phone") ||
+      window.matchMedia("(max-width: 600px) and (hover: none) and (pointer: coarse)").matches;
+
+    if (isMobileSheet) {
+      popover.setCssStyles({
+        top: "auto",
+        left: "8px",
+        right: "8px",
+        bottom: "8px",
+        width: "auto",
+      });
+      return;
+    }
+
     const rect = anchor.getBoundingClientRect();
     const gap = 6;
     const popoverWidth = 260;
@@ -1257,6 +1270,8 @@ export class FilePermissionHeader {
     popover.setCssStyles({
       top: `${top}px`,
       left: `${left}px`,
+      right: "auto",
+      bottom: "auto",
       width: `${popoverWidth}px`,
     });
   }

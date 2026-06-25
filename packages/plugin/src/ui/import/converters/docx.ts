@@ -16,13 +16,14 @@ import type { ConvertInput, ConvertResult } from "./types";
 
 /** Converter entry for `.docx` files. */
 export async function convertDocx(input: ConvertInput): Promise<ConvertResult> {
-  // mammoth wants a Node Buffer. Buffer.from(view) copies the bytes, which is
-  // fine for an import-time one-shot. We pass a Buffer view over the same
-  // backing memory where possible.
+  // Mammoth's Node entry reads `buffer`; its browser entry reads `arrayBuffer`.
+  // The Obsidian bundle can select either entry depending on esbuild package
+  // fields, so pass both views over the same bytes.
   const view = toUint8Array(input.bytes);
   const buffer = Buffer.from(view.buffer, view.byteOffset, view.byteLength);
+  const arrayBuffer = new Uint8Array(view).buffer;
 
-  const result = await convertToHtml({ buffer });
+  const result = await convertToHtml({ buffer, arrayBuffer });
   const html = result.value ?? "";
   const markdown = htmlToMarkdown(html);
 

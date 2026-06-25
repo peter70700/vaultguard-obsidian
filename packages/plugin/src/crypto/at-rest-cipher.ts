@@ -13,7 +13,7 @@
  *                 -> per-file ciphertext
  *
  * If `safeStorage.isEncryptionAvailable()` is false we degrade to a
- * device-local KEK persisted in Electron's localStorage. That still defeats
+ * device-local KEK persisted through Obsidian's vault-scoped storage. That still defeats
  * casual filesystem inspection of the vault folder, but anyone with the whole
  * Electron profile directory can recover the LAK. Documented in
  * `docs/AT-REST-ENCRYPTION.md`.
@@ -29,7 +29,6 @@ const HEADER_LEN = 8;     // 4 magic + 1 version + 3 reserved
 const NONCE_LEN = 12;     // AES-GCM standard
 const TAG_LEN = 16;       // AES-GCM auth tag (appended to ciphertext by WebCrypto)
 const KEY_LEN = 32;       // AES-256
-const FALLBACK_LS_KEY = "vaultguard.at-rest.kek.v1";
 
 /**
  * Storage hooks injected by the plugin. We deliberately don't import Obsidian
@@ -42,6 +41,12 @@ export interface AtRestStorage {
   saveWrappedLak(blob: string): Promise<void>;
   /** Remove the wrapped LAK blob entirely (on plugin disable / decrypt-and-leave). */
   clearWrappedLak(): Promise<void>;
+  /** Read the device-local fallback KEK, or null if none is provisioned. */
+  loadFallbackKek?(): Promise<string | null>;
+  /** Persist the device-local fallback KEK. */
+  saveFallbackKek?(kekBase64: string): Promise<void>;
+  /** Remove the device-local fallback KEK. */
+  clearFallbackKek?(): Promise<void>;
 }
 
 export type AtRestStatus =
@@ -80,7 +85,7 @@ export class AtRestCipher {
 
   /**
    * Initialize the cipher. On first call generates a fresh LAK; on subsequent
-   * loads, unwraps the persisted LAK using safeStorage (or the localStorage
+   * loads, unwraps the persisted LAK using safeStorage (or the vault-local
    * fallback). Returns true if the cipher is ready to encrypt/decrypt.
    */
   async init(): Promise<boolean> {
@@ -160,11 +165,9 @@ export class AtRestCipher {
     this.lock();
     await this.storage.clearWrappedLak();
     try {
-      if (typeof localStorage !== "undefined") {
-        localStorage.removeItem(FALLBACK_LS_KEY);
-      }
+      await this.storage.clearFallbackKek?.();
     } catch {
-      // localStorage unavailable in some hosts (tests) — ignore.
+      // Vault-local fallback storage unavailable in some hosts (tests) — ignore.
     }
     this.status = { kind: "uninitialized" };
   }
@@ -254,7 +257,7 @@ export class AtRestCipher {
    * Wrap raw LAK bytes for on-disk storage. Returns a base64 envelope that
    * includes a method tag so we know how to unwrap later. Format:
    *   "ss:<base64 safeStorage blob>"      (preferred path)
-   *   "ls:<nonce(12)>:<ciphertext>"        (localStorage-key fallback)
+   *   "ls:<nonce(12)>:<ciphertext>"        (vault-local fallback KEK)
    */
   private async wrapLak(lak: Uint8Array): Promise<string> {
     if (this.safeStorage) {
@@ -264,12 +267,12 @@ export class AtRestCipher {
         this.method = "safe-storage";
         return `ss:${this.bytesToBase64(buf)}`;
       } catch {
-        // fall through to localStorage fallback
+        // fall through to vault-local fallback
       }
     }
 
-    // Fallback: encrypt LAK with a per-device key kept in Electron's
-    // localStorage. Worse than safeStorage (the key sits next to the data on
+    // Fallback: encrypt LAK with a per-device key kept in vault-scoped
+    // local storage. Worse than safeStorage (the key sits next to the data on
     // disk for an attacker with the entire profile dir) but still defeats
     // bare filesystem inspection of the vault folder.
     const kek = await this.getOrCreateFallbackKek();
@@ -288,7 +291,6 @@ export class AtRestCipher {
         lak as BufferSource
       )
     );
-    this.method = "localstorage-fallback";
     return `ls:${this.bytesToBase64(nonce)}:${this.bytesToBase64(wrapped)}`;
   }
 
@@ -328,31 +330,32 @@ export class AtRestCipher {
           ct as BufferSource
         )
       );
-      this.method = "localstorage-fallback";
       return lak;
     }
     throw new Error("Unknown wrapped LAK envelope format.");
   }
 
   /**
-   * Read or generate the fallback KEK in localStorage. The key never leaves
+   * Read or generate the fallback KEK in vault-scoped storage. The key never leaves
    * the device's Electron profile, but unlike safeStorage it is not bound to
    * the OS keychain — see threat-model docs for the reduced guarantee.
    */
   private async getOrCreateFallbackKek(): Promise<Uint8Array> {
-    if (typeof localStorage === "undefined") {
+    if (!this.storage.loadFallbackKek || !this.storage.saveFallbackKek) {
       // Tests / headless: derive an ephemeral KEK that lives only in memory.
       // Files written with this mode aren't recoverable across restarts —
       // intentional, because there's no other persistence to bind to.
       this.method = "ephemeral";
       return crypto.getRandomValues(new Uint8Array(KEY_LEN));
     }
-    const existing = localStorage.getItem(FALLBACK_LS_KEY);
+    const existing = await this.storage.loadFallbackKek();
     if (existing) {
+      this.method = "localstorage-fallback";
       return this.base64ToBytes(existing);
     }
     const fresh = crypto.getRandomValues(new Uint8Array(KEY_LEN));
-    localStorage.setItem(FALLBACK_LS_KEY, this.bytesToBase64(fresh));
+    await this.storage.saveFallbackKek(this.bytesToBase64(fresh));
+    this.method = "localstorage-fallback";
     return fresh;
   }
 
