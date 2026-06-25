@@ -442,39 +442,83 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     ).toBe(false);
   });
 
-  it("marks the plugin offline when an API request exhausts network retries", async () => {
-    const plugin = makePlugin();
-    plugin.session = {
-      ...makeSession(),
-      tokenExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
-    };
-    plugin.connectionState.status = "online";
-    plugin.settings.apiEndpoint = "https://api.vaultguard.test";
-    plugin.resolvedApiEndpoint = "https://api.vaultguard.test";
-    plugin.settings.maxRetryAttempts = 1;
-    mockRequestUrl.mockResolvedValueOnce({
-      status: 0,
-      json: null,
-      text: "net::ERR_INTERNET_DISCONNECTED",
-      headers: {},
-    } as any);
+  it("marks the plugin offline when an API request exhausts network retries, then surfaces the debounced notice after the grace window", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = makePlugin();
+      plugin.session = {
+        ...makeSession(),
+        tokenExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      };
+      plugin.connectionState.status = "online";
+      plugin.settings.apiEndpoint = "https://api.vaultguard.test";
+      plugin.resolvedApiEndpoint = "https://api.vaultguard.test";
+      plugin.settings.maxRetryAttempts = 1;
+      mockRequestUrl.mockResolvedValueOnce({
+        status: 0,
+        json: null,
+        text: "net::ERR_INTERNET_DISCONNECTED",
+        headers: {},
+      } as any);
 
-    const response = await plugin.apiRequest("GET", "/vaults");
+      const response = await plugin.apiRequest("GET", "/vaults");
 
-    expect(response).toMatchObject({
-      success: false,
-      error: {
-        code: "NETWORK_ERROR",
-        statusCode: 0,
-      },
-    });
-    expect(plugin.connectionState.status).toBe("offline");
-    expect(plugin.scheduleConnectionRetry).toHaveBeenCalledOnce();
-    expect(
-      mockNotice.mock.calls.some(([message]) =>
-        String(message).includes("Connection lost")
-      )
-    ).toBe(true);
+      expect(response).toMatchObject({
+        success: false,
+        error: {
+          code: "NETWORK_ERROR",
+          statusCode: 0,
+        },
+      });
+      expect(plugin.connectionState.status).toBe("offline");
+      expect(plugin.scheduleConnectionRetry).toHaveBeenCalledOnce();
+
+      // Debounced: the alarming toast must NOT fire immediately — a transient
+      // blip might still recover within the grace window.
+      expect(
+        mockNotice.mock.calls.some(([message]) =>
+          String(message).includes("Connection lost")
+        )
+      ).toBe(false);
+
+      // Still offline when the grace window elapses → the toast fires once.
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(
+        mockNotice.mock.calls.some(([message]) =>
+          String(message).includes("Connection lost")
+        )
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("suppresses the connection-lost notice when connectivity returns within the grace window", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = makePlugin();
+      plugin.session = makeSession();
+      plugin.flushOfflineQueue = vi.fn().mockResolvedValue(undefined);
+      plugin.connectionState.status = "online";
+
+      // A transient blip flips the status offline...
+      plugin.setConnectionStatus("offline");
+      expect(plugin.connectionState.status).toBe("offline");
+
+      // ...then recovers before the 8s grace window elapses.
+      await vi.advanceTimersByTimeAsync(3_000);
+      plugin.setConnectionStatus("online");
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      // No alarming toast for a blip that self-healed.
+      expect(
+        mockNotice.mock.calls.some(([message]) =>
+          String(message).includes("Connection lost")
+        )
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not send a stale ID token to the backend when Cognito refresh fails", async () => {

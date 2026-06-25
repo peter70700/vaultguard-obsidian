@@ -1959,11 +1959,15 @@ export class VaultGuardChatView extends ItemView {
     if (!this.convo) {
       throw new Error("VaultGuard AI Chat has no active conversation to confirm into.");
     }
+    const src = request.action;
     const action: PendingConfirmationAction = {
-      operation: request.action.operation,
-      leaseId: request.action.leaseId,
-      preview: request.action.preview,
-      setPermission: { ...request.action.setPermission },
+      operation: src.operation,
+      leaseId: src.leaseId,
+      preview: src.preview,
+      ...(src.setPermission ? { setPermission: { ...src.setPermission } } : {}),
+      ...(src.share ? { share: { ...src.share } } : {}),
+      ...(src.membership ? { membership: { ...src.membership } } : {}),
+      ...(src.restore ? { restore: { ...src.restore } } : {}),
     };
     const queue = this.convo.pendingConfirmations ?? [];
     queue.push(action);
@@ -1991,11 +1995,9 @@ export class VaultGuardChatView extends ItemView {
     const lines = queue.map((a) => `• ${a.preview}`).join("\n");
     const request: AgentBridgeAskUserArgs = {
       question:
-        queue.length === 1
-          ? "Approve this permission change?"
-          : `Approve these ${queue.length} permission changes?`,
+        queue.length === 1 ? "Approve this action?" : `Approve these ${queue.length} actions?`,
       context:
-        `${lines}\n\nRequested by the AI assistant. Approving applies them on the ` +
+        `${lines}\n\nRequested by the AI assistant. Approving runs them on the ` +
         "server (re-authorized as you and audited); denying changes nothing.",
       options: [
         { id: "approve", label: queue.length === 1 ? "Approve" : "Approve all", value: "approve" },
@@ -2045,7 +2047,7 @@ export class VaultGuardChatView extends ItemView {
 
     if (!approved) {
       await this.handleSubmit(
-        `The user DENIED the following permission change(s); do not retry them, ask what they'd prefer:\n` +
+        `The user DENIED the following action(s); do not retry them, ask what they'd prefer:\n` +
           queue.map((a) => `- ${a.preview}`).join("\n"),
       );
       return;
@@ -2059,8 +2061,10 @@ export class VaultGuardChatView extends ItemView {
         // Prefer the CURRENT chat lease (survives a reload that minted a new
         // one); fall back to the lease captured when the card was shown.
         const leaseId = this.leaseId ?? action.leaseId;
-        await surface.applyConfirmedSetPermission(leaseId, action.setPermission);
-        applied.push(action.preview);
+        // Returns a human-readable summary (for a share create, includes the URL)
+        // so the model can relay the exact result to the user.
+        const summary = await surface.applyConfirmedMutation(leaseId, action);
+        applied.push(summary);
       } catch (e) {
         failed.push(`${action.preview} — ${(e as Error).message}`);
       }
@@ -2069,7 +2073,7 @@ export class VaultGuardChatView extends ItemView {
     const parts: string[] = [];
     if (applied.length > 0) {
       parts.push(
-        `The user APPROVED and VaultGuard applied these permission change(s):\n` +
+        `The user APPROVED and VaultGuard applied these action(s):\n` +
           applied.map((p) => `- ${p}`).join("\n"),
       );
     }
@@ -2080,7 +2084,8 @@ export class VaultGuardChatView extends ItemView {
       );
     }
     parts.push(
-      "Do not call set_permission again for these. Confirm what was done to the user concisely.",
+      "Do not repeat these actions. Confirm what was done to the user concisely; " +
+        "if a share link was created, give the user its full URL.",
     );
     await this.handleSubmit(parts.join("\n\n"));
   }

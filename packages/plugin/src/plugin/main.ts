@@ -154,6 +154,17 @@ const AUTH_REQUIRED_NOTICE_THROTTLE_MS = 5 * 1000;
 const CONNECTION_LOST_NOTICE_THROTTLE_MS = 30 * 1000;
 
 /**
+ * Grace window before the "Connection lost" notice is shown. A transient blip
+ * (one status-0 requestUrl, a momentary browser `offline` event on Wi-Fi/cell
+ * handoff) flips status offline and self-heals within ~1s; firing the alarming
+ * "working offline" toast immediately on every such hiccup is a false alarm.
+ * The notice is scheduled this far out and cancelled the instant connectivity
+ * returns (setConnectionStatus("online")), so only a sustained outage notifies.
+ * The status-bar indicator still reflects the brief offline state immediately.
+ */
+const CONNECTION_LOST_NOTICE_GRACE_MS = 8 * 1000;
+
+/**
  * Maximum age of a deletion tombstone (30 days). Tombstones older than this
  * are pruned on load so a path that never reconciles cannot grow the set
  * unbounded.
@@ -538,6 +549,9 @@ export default class VaultGuardPlugin extends Plugin {
   /** Last time a connection-lost Notice was shown, used to avoid retry-loop toast storms */
   private lastConnectionLostNoticeAt: number | null = null;
 
+  /** Pending debounced connection-lost Notice; cancelled if connectivity returns within the grace window. */
+  private connectionLostNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
   /**
    * Tracks whether we've already warned the user this run that the OS keystore
    * is unreachable (so we'd otherwise be forced to log them in again on every
@@ -912,6 +926,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.stopKeyRenewalMonitor();
     this.stopHeartbeatMonitor();
     this.stopConnectionRetry();
+    this.cancelConnectionLostNotice();
     this.stopAutoLockTimer();
     if (this.updateChecker) {
       this.updateChecker.stop();
@@ -2434,6 +2449,21 @@ export default class VaultGuardPlugin extends Plugin {
       });
     }
 
+    // Dev-only: actively probe the backend to explain WHY the connection went
+    // offline. setConnectionStatus("offline") is set from ~6 call sites but the
+    // reason is never recorded on connectionState, so neither "Status" nor
+    // "sync-diagnostics" can say what dropped it. This re-runs the probe live
+    // (raw requestUrl, NOT apiRequest — so it doesn't mutate status and mask
+    // the result) and classifies the failure. NODE_ENV-gated so esbuild DCE
+    // strips it from the released bundle.
+    if (process.env.NODE_ENV !== "production") {
+      this.addCommand({
+        id: "diagnose-connection",
+        name: "Diagnose connection (probe backend)",
+        callback: async () => this.runConnectionDiagnostics(),
+      });
+    }
+
     // Share-link lifecycle: list active links and revoke leaked ones. On
     // Community Edition the command opens a Pro-upsell modal instead of the
     // share-management modal — same compiled binary, show-but-block UX.
@@ -2762,13 +2792,18 @@ export default class VaultGuardPlugin extends Plugin {
       },
     });
 
-    this.addCommand({
-      id: "vaultguard-chat-copy-dom-debug-report",
-      name: "VaultGuard Chat: Copy DOM debug report",
-      callback: () => {
-        void this.copyVaultGuardChatDomDebugReport();
-      },
-    });
+    // Dev-only: dumps chat-panel DOM geometry to the clipboard for diagnosing
+    // layout bugs (thin/empty rows). NODE_ENV-gated so esbuild DCE strips it
+    // from the released bundle — it must never appear in a user's palette.
+    if (process.env.NODE_ENV !== "production") {
+      this.addCommand({
+        id: "vaultguard-chat-copy-dom-debug-report",
+        name: "VaultGuard Chat: Copy DOM debug report",
+        callback: () => {
+          void this.copyVaultGuardChatDomDebugReport();
+        },
+      });
+    }
 
     // (sd4) The sd2 standalone "import-knowledge" command was retired. Importing
     // is now /import-knowledge inside the AI chat panel: an executable chat slash
@@ -2776,9 +2811,13 @@ export default class VaultGuardPlugin extends Plugin {
     // survey the picked folder and synthesize an organized KB (see VaultGuardChatView).
 
     // The headless debug harness stays useful for proving the tool path, but the
-    // chat view above is the real entry now. It remains invisible unless
-    // settings.debugLogging is on (checkCallback guard).
-    registerChatDebugCommand(this);
+    // chat view above is the real entry now. NODE_ENV-gated so esbuild DCE strips
+    // it (and the chat-debug-command module) from the released bundle; in dev
+    // builds it additionally stays invisible unless settings.debugLogging is on
+    // (its own checkCallback guard).
+    if (process.env.NODE_ENV !== "production") {
+      registerChatDebugCommand(this);
+    }
   }
 
   /**
@@ -8708,6 +8747,150 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Dev-only active connection diagnostic. The "Connection lost" toast only
+   * tells the user an online→offline transition happened; it never says why,
+   * because setConnectionStatus("offline") is called from ~6 sites without
+   * recording a reason. This re-runs the cheapest authenticated probe
+   * (GET /vaults) using a RAW requestUrl — deliberately NOT apiRequest, which
+   * would itself flip connection status and hide the real result — then
+   * classifies the outcome into a plain-language verdict (unreachable / auth
+   * rejected / stale-flag / server error). Secret-free: only booleans, counts,
+   * IDs, status codes, and error messages are ever emitted.
+   */
+  private async runConnectionDiagnostics(): Promise<void> {
+    // Dev-only. The early return collapses to `if (true) return;` under the
+    // production NODE_ENV define, so esbuild DCE drops the whole body (and its
+    // verdict strings) from the released bundle — the command that calls this
+    // is itself stripped, so this method is never reachable in prod anyway.
+    if (process.env.NODE_ENV === "production") return;
+
+    const lines: string[] = [
+      `VaultGuard v${this.manifest.version} — connection diagnostics`,
+    ];
+
+    const configuredBase = normalizeVaultGuardApiBaseUrl(
+      this.getEffectiveConfig().apiEndpoint
+    );
+    const hostOf = (urlStr: string): string => {
+      try {
+        return new URL(urlStr).host;
+      } catch {
+        return urlStr || "(none)";
+      }
+    };
+
+    lines.push(`Connection status: ${this.connectionState.status}`);
+    lines.push(`Failed attempts: ${this.connectionState.failedAttempts}`);
+    lines.push(`Next retry at: ${this.connectionState.nextRetryAt ?? "—"}`);
+    lines.push(`Last connected: ${this.connectionState.lastConnected ?? "—"}`);
+    lines.push(`Last latency: ${this.connectionState.latencyMs ?? "—"}ms`);
+    lines.push(`Session present: ${this.session ? "yes" : "no"}`);
+    lines.push(`Server vault bound: ${this.settings.serverVaultId ? "yes" : "no"}`);
+    lines.push(`Configured API host: ${hostOf(configuredBase)}`);
+    lines.push(
+      `Resolved API endpoint: ${this.resolvedApiEndpoint ?? "(not yet resolved)"}`
+    );
+
+    if (!this.session) {
+      lines.push(
+        "Verdict: No session — offline is expected (logged out). Log in first."
+      );
+      this.emitConnectionDiagnostics(lines);
+      return;
+    }
+
+    if (this.isSessionTokenExpiring(this.session)) {
+      lines.push(
+        "WARNING: session token is expiring/expired — a refresh is needed (this alone can flip offline)."
+      );
+    }
+
+    // Live raw probe. Bypasses apiRequest on purpose so it does not call
+    // setConnectionStatus and mask whatever is actually happening right now.
+    let base = "";
+    try {
+      base = await this.getResolvedApiEndpoint(this.session.idToken);
+    } catch (err) {
+      lines.push(
+        `Verdict: ENDPOINT RESOLUTION FAILED — ${(err as Error)?.name ?? "Error"}: ${(err as Error)?.message ?? String(err)}.`
+      );
+      this.emitConnectionDiagnostics(lines);
+      return;
+    }
+
+    const url = `${base}/vaults`;
+    const headers: Record<string, string> = {};
+    if (this.session.idToken) {
+      headers["Authorization"] = this.session.idToken;
+    }
+    const sessionHeaderSent = !!this.session.sessionId;
+    if (sessionHeaderSent) {
+      headers["X-VaultGuard-Session-Id"] = this.session.sessionId;
+    }
+    lines.push(`Session header sent: ${sessionHeaderSent ? "yes" : "no"}`);
+
+    const startedAt = Date.now();
+    try {
+      const response = await this.requestWithTimeout(
+        requestUrl({ url, method: "GET", headers, throw: false })
+      );
+      const latency = Date.now() - startedAt;
+      const status = response.status;
+      lines.push(`Probe: GET ${url} → ${status} (${latency}ms)`);
+
+      if (status === 0) {
+        lines.push(
+          `Verdict: BACKEND UNREACHABLE — network/DNS/TLS failure (${this.describeNetworkFailureResponse(response)}). Check internet and that ${hostOf(base)} resolves.`
+        );
+      } else if (status === 401 || status === 403) {
+        lines.push(
+          `Verdict: AUTH REJECTED (HTTP ${status}) — session/token expired or revoked. Log out and back in.`
+        );
+      } else if (status >= 200 && status < 300) {
+        lines.push(
+          `Verdict: BACKEND REACHABLE & AUTHORIZED (HTTP ${status}, ${latency}ms) — the offline flag is STALE. This was a transient blip; it should self-heal on the next retry. You can also run reconnectNow.`
+        );
+      } else if (status >= 500) {
+        lines.push(
+          `Verdict: BACKEND ERRORING (HTTP ${status}) — server-side issue, not your network.`
+        );
+      } else {
+        lines.push(`Verdict: Unexpected HTTP ${status}.`);
+      }
+    } catch (err) {
+      const latency = Date.now() - startedAt;
+      const errName = (err as Error)?.name ?? "Error";
+      const errMsg = (err as Error)?.message ?? String(err);
+      lines.push(`Probe: GET ${url} → threw (${latency}ms)`);
+      lines.push(
+        `Verdict: BACKEND UNREACHABLE — network/DNS/TLS failure (${errName}: ${errMsg}). Check internet and that ${hostOf(base)} resolves.`
+      );
+    }
+
+    this.emitConnectionDiagnostics(lines);
+  }
+
+  /**
+   * Shared output sink for runConnectionDiagnostics: console.log (regardless of
+   * debugLogging, like sync-diagnostics), a best-effort clipboard copy, and a
+   * persistent Notice (0 = no auto-dismiss) so the verdict can be read/copied.
+   */
+  private async emitConnectionDiagnostics(lines: string[]): Promise<void> {
+    if (process.env.NODE_ENV === "production") return;
+
+    const report = lines.join("\n");
+    console.log(`${LOG_PREFIX} ${report}`);
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(report);
+      }
+    } catch (err) {
+      this.logError("Connection diagnostics: clipboard copy failed", err);
+    }
+    new Notice(report, 0);
+  }
+
+  /**
    * Wires window focus and document visibility events to trigger an
    * immediate sync when the user comes back to Obsidian. With pure
    * polling, multi-user changes only land on the next interval (10 s in
@@ -10057,6 +10240,8 @@ export default class VaultGuardPlugin extends Plugin {
       this.connectionState.failedAttempts = 0;
       this.connectionState.nextRetryAt = null;
       this.stopConnectionRetry();
+      // Connectivity returned — kill any pending blip notice before it fires.
+      this.cancelConnectionLostNotice();
 
       // Flush queued operations whenever connectivity is restored.
       if (previousStatus !== "online") {
@@ -10072,7 +10257,7 @@ export default class VaultGuardPlugin extends Plugin {
         this.connectionState.nextRetryAt = null;
       }
       if (notify && this.session && previousStatus === "online") {
-        this.notifyConnectionLost();
+        this.scheduleConnectionLostNotice();
       }
     }
 
@@ -10098,17 +10283,43 @@ export default class VaultGuardPlugin extends Plugin {
     }
   }
 
-  private notifyConnectionLost(): void {
-    const now = Date.now();
-    if (
-      this.lastConnectionLostNoticeAt !== null &&
-      now - this.lastConnectionLostNoticeAt < CONNECTION_LOST_NOTICE_THROTTLE_MS
-    ) {
-      return;
-    }
+  /**
+   * Debounced connection-lost notice. Schedules the toast CONNECTION_LOST_NOTICE_GRACE_MS
+   * out instead of firing immediately, so a transient blip that recovers within
+   * the grace window (cancelConnectionLostNotice runs on the online edge) never
+   * surfaces an alarming "working offline" popup. Only a sustained outage gets a
+   * toast. The 30s throttle still applies — but at fire time, not schedule time —
+   * to avoid storms across repeated offline transitions.
+   */
+  private scheduleConnectionLostNotice(): void {
+    // A notice is already pending for this outage; don't stack timers.
+    if (this.connectionLostNoticeTimer) return;
 
-    this.lastConnectionLostNoticeAt = now;
-    new Notice("VaultGuard Sync: Connection lost. Working offline with cached data.");
+    this.connectionLostNoticeTimer = setTimeout(() => {
+      this.connectionLostNoticeTimer = null;
+
+      // Recovered during the grace window — nothing to report.
+      if (this.connectionState.status === "online") return;
+
+      const now = Date.now();
+      if (
+        this.lastConnectionLostNoticeAt !== null &&
+        now - this.lastConnectionLostNoticeAt < CONNECTION_LOST_NOTICE_THROTTLE_MS
+      ) {
+        return;
+      }
+
+      this.lastConnectionLostNoticeAt = now;
+      new Notice("VaultGuard Sync: Connection lost. Working offline with cached data.");
+    }, CONNECTION_LOST_NOTICE_GRACE_MS);
+  }
+
+  /** Cancels a pending debounced connection-lost notice (called on the online edge and on unload). */
+  private cancelConnectionLostNotice(): void {
+    if (this.connectionLostNoticeTimer) {
+      clearTimeout(this.connectionLostNoticeTimer);
+      this.connectionLostNoticeTimer = null;
+    }
   }
 
   /**

@@ -365,31 +365,69 @@ export type AgentBridgeAskUserHandler = (
   },
 ) => Promise<AgentBridgeAskUserResult>;
 
+// Every sensitive mutation that the in-app chat confirms with an Approve/Deny
+// card. ALL of these now share the same in-chat confirmation path on the MCP
+// (subscription / Claude-CLI) transport — see confirmMutation / applyConfirmedMutation.
+export type AgentBridgeConfirmOperation =
+  | "set_permission"
+  | "share_create"
+  | "share_revoke"
+  | "member_add"
+  | "member_remove"
+  | "member_set_role"
+  | "restore";
+
+// Resolved payload for a set_permission confirmation (principal already resolved
+// to a userId/role + a normalized path/level), so the apply step never re-resolves.
+export interface AgentBridgeSetPermissionPayload {
+  userId?: string;
+  role?: string;
+  pathPattern: string;
+  level: "none" | "read" | "write" | "admin";
+}
+
 // The action a deferred confirmation will apply once the user approves. Kept
 // minimal + serializable so the chat view can persist it with the conversation
-// and re-apply it after a reload. Currently only set_permission.
+// and re-apply it after a reload. Exactly one of the operation-specific payloads
+// (setPermission / share / membership / restore) is set, matching `operation`;
+// principals/paths are already resolved at pause time so the apply step is pure.
 export interface AgentBridgeConfirmAction {
-  operation: "set_permission";
+  operation: AgentBridgeConfirmOperation;
   leaseId: string;
   preview: string;
-  setPermission: {
-    userId?: string;
+  setPermission?: AgentBridgeSetPermissionPayload;
+  share?: { op: "create" | "revoke"; relPath?: string; shareId?: string; expiresAt?: string };
+  membership?: {
+    op: "add" | "remove" | "set_role";
+    vaultId: string;
+    userId: string;
     role?: string;
-    pathPattern: string;
-    level: "none" | "read" | "write" | "admin";
+    label: string;
   };
+  restore?: { path: string };
 }
 
 // Non-blocking confirmation handler. Shows an Approve/Deny card carrying `action`
 // and returns immediately (does NOT await the click). The chat view applies the
-// action via AgentBridgeToolSurface.applyConfirmedSetPermission on approval.
+// action via AgentBridgeToolSurface.applyConfirmedMutation on approval.
 export type AgentBridgeConfirmPausedHandler = (request: {
   lease: AgentBridgeLeaseSummary;
-  operation: "set_permission";
+  operation: AgentBridgeConfirmOperation;
   path: string;
   preview: string;
   action: AgentBridgeConfirmAction;
 }) => Promise<void>;
+
+// Maps each confirm operation to the tool name its audit row should carry.
+const CONFIRM_OP_TOOL: Record<AgentBridgeConfirmOperation, string> = {
+  set_permission: "vaultguard_set_permission",
+  share_create: "vaultguard_share",
+  share_revoke: "vaultguard_share",
+  member_add: "vaultguard_membership",
+  member_remove: "vaultguard_membership",
+  member_set_role: "vaultguard_membership",
+  restore: "vaultguard_files",
+};
 
 // Read-only filesystem surface for the gated import tools. main.ts wires this
 // from the desktop-gated local-file-importer helpers; null on mobile / when the
@@ -445,14 +483,29 @@ export interface AgentBridgeToolSurface {
   audit(leaseId: string, args: AgentBridgeAuditArgs): Promise<unknown>;
   // File lifecycle & recovery (history / overview / deleted / restore). In-app
   // chat only; gated by the lease's allowFileHistory flag. The restore op is
-  // additionally user-confirmed; the backend authorizes every op.
-  files(leaseId: string, args: AgentBridgeFilesArgs): Promise<unknown>;
+  // additionally user-confirmed; on the MCP transport it PAUSES (in-chat card)
+  // exactly like set_permission. The backend authorizes every op.
+  files(
+    leaseId: string,
+    args: AgentBridgeFilesArgs,
+    transport?: "rpc" | "mcp" | "inproc",
+  ): Promise<unknown>;
   // Share-link management (list / create / revoke). In-app chat only; gated by
-  // the lease's allowShareManagement flag. create/revoke are user-confirmed.
-  share(leaseId: string, args: AgentBridgeShareArgs): Promise<unknown>;
+  // the lease's allowShareManagement flag. create/revoke are user-confirmed and
+  // PAUSE (in-chat card) on the MCP transport, like set_permission.
+  share(
+    leaseId: string,
+    args: AgentBridgeShareArgs,
+    transport?: "rpc" | "mcp" | "inproc",
+  ): Promise<unknown>;
   // Vault-membership management (add / remove / set_role). In-app chat only;
-  // gated by the lease's allowMembershipWrites flag. Every op is user-confirmed.
-  membership(leaseId: string, args: AgentBridgeMembershipArgs): Promise<unknown>;
+  // gated by the lease's allowMembershipWrites flag. Every op is user-confirmed
+  // and PAUSES (in-chat card) on the MCP transport, like set_permission.
+  membership(
+    leaseId: string,
+    args: AgentBridgeMembershipArgs,
+    transport?: "rpc" | "mcp" | "inproc",
+  ): Promise<unknown>;
   // Applies a previously-paused set_permission confirmation after the user
   // approves the Approve/Deny card (MCP/Claude-CLI path). The bridge re-validates
   // the lease + capability, runs the change inside withAgentContext, and emits a
@@ -462,8 +515,15 @@ export interface AgentBridgeToolSurface {
   // (permissions.set-level). Called by the chat view, not by the model.
   applyConfirmedSetPermission(
     leaseId: string,
-    payload: AgentBridgeConfirmAction["setPermission"],
+    payload: AgentBridgeSetPermissionPayload,
   ): Promise<unknown>;
+  // Generalized apply for ANY previously-paused mutation confirmation (share /
+  // membership / file restore / set_permission). Same guarantees as
+  // applyConfirmedSetPermission (re-validate lease + capability, run inside
+  // withAgentContext, emit a bridge.tool_invoked audit row) and returns a
+  // human-readable result summary the chat view feeds back to the model — for a
+  // created share link that summary includes the URL. Called by the chat view.
+  applyConfirmedMutation(leaseId: string, action: AgentBridgeConfirmAction): Promise<string>;
   // Interactive user prompt. In-app chat only; gated by allowUserInteraction.
   askUser(leaseId: string, args: AgentBridgeAskUserArgs): Promise<AgentBridgeAskUserResult>;
   // Gated source-read tools for /import-knowledge. In-app chat only; gated by
@@ -1520,10 +1580,14 @@ export class VaultGuardAgentBridge {
           leaseId,
           args as unknown as Record<string, unknown>,
         ),
-      // Direct method (not a model-dispatched tool): the chat view calls this
-      // after the user approves a paused set_permission card.
+      // Direct methods (not model-dispatched tools): the chat view calls these
+      // after the user approves a paused confirmation card. applyConfirmedMutation
+      // is the generalized entry (share / membership / restore / set_permission);
+      // applyConfirmedSetPermission is retained for the existing direct callers.
       applyConfirmedSetPermission: (leaseId, payload) =>
         this.applyConfirmedSetPermission(leaseId, payload),
+      applyConfirmedMutation: (leaseId, action) =>
+        this.applyConfirmedMutation(leaseId, action),
       askUser: (leaseId, args) =>
         this.invokeInProcess(
           "vaultguard_ask_user",
@@ -2368,7 +2432,11 @@ export class VaultGuardAgentBridge {
   // each op (history needs read on the path; overview/deleted/restore are
   // admin-only). The op=restore mutation is additionally gated by an ALWAYS-on
   // user confirmation before the undelete is applied.
-  async files(leaseId: string, args: AgentBridgeFilesArgs): Promise<unknown> {
+  async files(
+    leaseId: string,
+    args: AgentBridgeFilesArgs,
+    transport: "rpc" | "mcp" | "inproc" = "inproc",
+  ): Promise<unknown> {
     const lease = this.requireLease(leaseId);
     if (!lease.allowFileHistory) {
       // "does not allow" → invokeToolWithAudit classifies the outcome "denied".
@@ -2427,12 +2495,14 @@ export class VaultGuardAgentBridge {
           throw new Error("VaultGuard file restore is unavailable — update the plugin/server.");
         }
         const path = this.requireFilesPath(args.path, "restore");
-        await this.requireMutationConfirm(
+        const preview = `Restore the deleted file "${path}". It will re-appear locally on the next sync.`;
+        const { paused } = await this.confirmMutation(
           lease,
-          "restore",
+          { operation: "restore", leaseId, preview, restore: { path } },
           path,
-          `Restore the deleted file "${path}". It will re-appear locally on the next sync.`,
+          transport,
         );
+        if (paused) return this.pausedConfirmResult(preview, "file restore");
         return provider.restoreDeletedFile(path);
       }
 
@@ -2452,31 +2522,62 @@ export class VaultGuardAgentBridge {
   }
 
   // Shared ALWAYS-on confirmation for the administrative mutations exposed by
-  // vaultguard_files / vaultguard_share / vaultguard_membership. Mirrors the
-  // blocking confirm path of set_permission: the capability flag is the hard
-  // gate, and this confirmation is the user's safety check. "was not approved"
-  // → invokeToolWithAudit classifies the outcome "denied".
-  private async requireMutationConfirm(
+  // vaultguard_files / vaultguard_share / vaultguard_membership. Behaves exactly
+  // like set_permission's confirmation split so all four mutation tools are
+  // consistent:
+  //   • MCP transport (subscription / Claude-CLI) → PAUSE: show the same in-chat
+  //     Approve/Deny card via confirmWritePaused and return { paused:true }
+  //     IMMEDIATELY, so the confirmation can't block past Claude Code's tool
+  //     timeout and end the turn under an open modal. The chat view applies the
+  //     action via applyConfirmedMutation when the user approves.
+  //   • Every other transport (in-process API-key, RPC) → BLOCK on the modal
+  //     exactly as before and return { paused:false }; the caller executes inline.
+  // The capability flag is still the hard gate; this is the user's safety check.
+  // "was not approved" → invokeToolWithAudit classifies the outcome "denied".
+  private async confirmMutation(
     lease: AgentBridgeLease,
-    operation:
-      | "restore"
-      | "share_create"
-      | "share_revoke"
-      | "member_add"
-      | "member_remove"
-      | "member_set_role",
+    action: AgentBridgeConfirmAction,
     path: string,
-    preview: string,
-  ): Promise<void> {
+    transport: "rpc" | "mcp" | "inproc",
+  ): Promise<{ paused: boolean }> {
+    const confirmPaused = this.deps.confirmWritePaused;
+    if (transport === "mcp" && confirmPaused) {
+      await confirmPaused({
+        lease: this.summarizeLease(lease),
+        operation: action.operation,
+        path,
+        preview: action.preview,
+        action,
+      });
+      return { paused: true };
+    }
     const approved = await this.deps.confirmWrite({
       lease: this.summarizeLease(lease),
-      operation,
+      operation: action.operation,
       path,
-      preview,
+      preview: action.preview,
     });
     if (!approved) {
-      throw new Error(`VaultGuard ${operation} on "${path}" was not approved.`);
+      throw new Error(`VaultGuard ${action.operation} on "${path}" was not approved.`);
     }
+    return { paused: false };
+  }
+
+  // The tool result returned when a mutation PAUSES for an in-chat confirmation.
+  // Mirrors pauseForSetPermission's marker: tells the model to STOP (not retry,
+  // not claim a timeout/error) — the action runs the moment the user approves the
+  // card, and the chat view feeds the result back as a fresh turn.
+  private pausedConfirmResult(preview: string, noun: string): Record<string, unknown> {
+    return {
+      status: "paused_for_confirmation",
+      preview,
+      resumeInstruction:
+        `VaultGuard has shown the user an Approve/Deny card for this ${noun} and ` +
+        "PAUSED the turn. Stop now: do NOT call the tool again, and do NOT claim a " +
+        "timeout or a server/connection error — there is none. The action runs the " +
+        "moment the user approves the card, even if this turn has already ended, and " +
+        "you'll be prompted to continue with the result then.",
+    };
   }
 
   // ─── vaultguard_share: internal share-link management ──────────────────────
@@ -2486,7 +2587,11 @@ export class VaultGuardAgentBridge {
   // the authenticated API client as the signed-in user. The backend re-authorizes
   // every op (vault member + read permission to mint; creator/admin to revoke)
   // and gates the whole feature to Pro. create/revoke are user-confirmed.
-  async share(leaseId: string, args: AgentBridgeShareArgs): Promise<unknown> {
+  async share(
+    leaseId: string,
+    args: AgentBridgeShareArgs,
+    transport: "rpc" | "mcp" | "inproc" = "inproc",
+  ): Promise<unknown> {
     const lease = this.requireLease(leaseId);
     if (!lease.allowShareManagement) {
       throw new Error("VaultGuard agent lease does not allow share management.");
@@ -2515,14 +2620,21 @@ export class VaultGuardAgentBridge {
         }
         const relPath = this.requireFilesPath(args.path, "create");
         const expiresAt = this.expiresInDaysToIso(args.expiresInDays);
-        await this.requireMutationConfirm(
+        const preview = expiresAt
+          ? `Create an internal share link for "${relPath}" (expires ${expiresAt}).`
+          : `Create an internal share link for "${relPath}" (no expiry).`;
+        const { paused } = await this.confirmMutation(
           lease,
-          "share_create",
+          {
+            operation: "share_create",
+            leaseId,
+            preview,
+            share: { op: "create", relPath, ...(expiresAt ? { expiresAt } : {}) },
+          },
           relPath,
-          expiresAt
-            ? `Create an internal share link for "${relPath}" (expires ${expiresAt}).`
-            : `Create an internal share link for "${relPath}" (no expiry).`,
+          transport,
         );
+        if (paused) return this.pausedConfirmResult(preview, "share link");
         return provider.createShare({ relPath, ...(expiresAt ? { expiresAt } : {}) });
       }
 
@@ -2534,12 +2646,14 @@ export class VaultGuardAgentBridge {
         if (!shareId) {
           throw new Error('vaultguard_share op=revoke requires a "shareId".');
         }
-        await this.requireMutationConfirm(
+        const preview = `Revoke the share link "${shareId}". Existing recipients will lose the deep link.`;
+        const { paused } = await this.confirmMutation(
           lease,
-          "share_revoke",
+          { operation: "share_revoke", leaseId, preview, share: { op: "revoke", shareId } },
           shareId,
-          `Revoke the share link "${shareId}". Existing recipients will lose the deep link.`,
+          transport,
         );
+        if (paused) return this.pausedConfirmResult(preview, "share-link revocation");
         await provider.revokeShare(shareId);
         return { shareId, revoked: true };
       }
@@ -2556,7 +2670,11 @@ export class VaultGuardAgentBridge {
   // the authenticated API client as the signed-in user, and the backend
   // re-authorizes every op (vault-admin). Every op is user-confirmed. op=add
   // resolves the person through the org directory (org-admin gated).
-  async membership(leaseId: string, args: AgentBridgeMembershipArgs): Promise<unknown> {
+  async membership(
+    leaseId: string,
+    args: AgentBridgeMembershipArgs,
+    transport: "rpc" | "mcp" | "inproc" = "inproc",
+  ): Promise<unknown> {
     const lease = this.requireLease(leaseId);
     if (!lease.allowMembershipWrites) {
       throw new Error("VaultGuard agent lease does not allow membership changes.");
@@ -2578,12 +2696,19 @@ export class VaultGuardAgentBridge {
         }
         const role = this.normalizePermissionRole(args.role);
         const resolved = await this.resolveOrgUser(provider, args.user);
-        await this.requireMutationConfirm(
+        const preview = `Add ${resolved.label} to this vault as ${role}.`;
+        const { paused } = await this.confirmMutation(
           lease,
-          "member_add",
+          {
+            operation: "member_add",
+            leaseId,
+            preview,
+            membership: { op: "add", vaultId, userId: resolved.userId, role, label: resolved.label },
+          },
           `member:${resolved.label}`,
-          `Add ${resolved.label} to this vault as ${role}.`,
+          transport,
         );
+        if (paused) return this.pausedConfirmResult(preview, "membership change");
         return provider.addVaultMember(vaultId, resolved.userId, role);
       }
 
@@ -2593,12 +2718,19 @@ export class VaultGuardAgentBridge {
         }
         const member = await this.resolveAccessMember(provider, vaultId, args.user);
         const label = member.displayName ?? member.email ?? member.userId;
-        await this.requireMutationConfirm(
+        const preview = `Remove ${label} from this vault. Their access (and active leases) are revoked.`;
+        const { paused } = await this.confirmMutation(
           lease,
-          "member_remove",
+          {
+            operation: "member_remove",
+            leaseId,
+            preview,
+            membership: { op: "remove", vaultId, userId: member.userId, label },
+          },
           `member:${label}`,
-          `Remove ${label} from this vault. Their access (and active leases) are revoked.`,
+          transport,
         );
+        if (paused) return this.pausedConfirmResult(preview, "membership change");
         await provider.removeVaultMember(vaultId, member.userId);
         return { userId: member.userId, removed: true };
       }
@@ -2610,12 +2742,19 @@ export class VaultGuardAgentBridge {
         const role = this.normalizePermissionRole(args.role);
         const member = await this.resolveAccessMember(provider, vaultId, args.user);
         const label = member.displayName ?? member.email ?? member.userId;
-        await this.requireMutationConfirm(
+        const preview = `Change ${label}'s vault role to ${role}.`;
+        const { paused } = await this.confirmMutation(
           lease,
-          "member_set_role",
+          {
+            operation: "member_set_role",
+            leaseId,
+            preview,
+            membership: { op: "set_role", vaultId, userId: member.userId, role, label },
+          },
           `member:${label}`,
-          `Change ${label}'s vault role to ${role}.`,
+          transport,
         );
+        if (paused) return this.pausedConfirmResult(preview, "membership change");
         return provider.updateVaultMember(vaultId, member.userId, role);
       }
 
@@ -2756,7 +2895,7 @@ export class VaultGuardAgentBridge {
   // bridge.tool_invoked audit row (the paused tool call recorded only the pause).
   async applyConfirmedSetPermission(
     leaseId: string,
-    payload: AgentBridgeConfirmAction["setPermission"],
+    payload: AgentBridgeSetPermissionPayload,
   ): Promise<unknown> {
     const lease = this.requireLease(leaseId);
     if (!lease.allowPermissionWrites) {
@@ -2794,6 +2933,167 @@ export class VaultGuardAgentBridge {
     }
   }
 
+  // Generalized apply for ANY paused mutation confirmation (share / membership /
+  // restore / set_permission) after the user approves the in-chat card. Mirrors
+  // applyConfirmedSetPermission's guarantees for every op: re-validate the lease +
+  // capability, run inside withAgentContext (backend audit row agent-attributed),
+  // and emit a local bridge.tool_invoked row (the paused tool call recorded only
+  // the pause). Returns a human-readable summary the chat view feeds back to the
+  // model — for a created share link it includes the URL. The backend stays the
+  // sole authority + audit source.
+  async applyConfirmedMutation(leaseId: string, action: AgentBridgeConfirmAction): Promise<string> {
+    // set_permission keeps its dedicated apply (own audit shape + tested path).
+    if (action.operation === "set_permission") {
+      if (!action.setPermission) {
+        throw new Error("Malformed set_permission confirmation — missing payload.");
+      }
+      await this.applyConfirmedSetPermission(leaseId, action.setPermission);
+      return action.preview;
+    }
+
+    const lease = this.requireLease(leaseId);
+    const provider = this.deps.queryAccess;
+    if (!provider) {
+      throw new Error("VaultGuard action is unavailable — no server connection.");
+    }
+    const auditPath = this.confirmActionPath(action);
+    const auditMeta: Record<string, unknown> = {
+      leaseId: lease.leaseId,
+      agentName: lease.agentName,
+      transport: "confirm",
+      tool: CONFIRM_OP_TOOL[action.operation],
+      preview: action.preview,
+    };
+    try {
+      const summary = await this.deps.withAgentContext(lease.agentName, lease.leaseId, () =>
+        this.runConfirmedMutation(lease, provider, action),
+      );
+      void this.deps.emitAudit("bridge.tool_invoked", auditPath, { ...auditMeta, outcome: "success" });
+      return summary;
+    } catch (err) {
+      void this.deps.emitAudit("bridge.tool_invoked", auditPath, {
+        ...auditMeta,
+        outcome: "error",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+  }
+
+  // Executes a confirmed non-set_permission mutation against the API provider,
+  // re-checking the relevant capability flag (the lease may have changed since
+  // the pause). Runs INSIDE withAgentContext (see applyConfirmedMutation) so the
+  // backend audit row is agent-attributed. Returns the summary string.
+  private async runConfirmedMutation(
+    lease: AgentBridgeLease,
+    provider: AccessQueryProvider,
+    action: AgentBridgeConfirmAction,
+  ): Promise<string> {
+    switch (action.operation) {
+      case "share_create": {
+        if (!lease.allowShareManagement) {
+          throw new Error("VaultGuard agent lease does not allow share management.");
+        }
+        if (typeof provider.createShare !== "function") {
+          throw new Error("VaultGuard share creation is unavailable — update the plugin/server.");
+        }
+        const relPath = action.share?.relPath;
+        if (!relPath) throw new Error("Malformed share-create confirmation — missing path.");
+        const expiresAt = action.share?.expiresAt;
+        const rec = await provider.createShare({ relPath, ...(expiresAt ? { expiresAt } : {}) });
+        return (
+          `Created an internal share link for "${rec.relPath}": ${rec.url}` +
+          `${rec.expiresAt ? ` (expires ${rec.expiresAt})` : ""}.`
+        );
+      }
+      case "share_revoke": {
+        if (!lease.allowShareManagement) {
+          throw new Error("VaultGuard agent lease does not allow share management.");
+        }
+        if (typeof provider.revokeShare !== "function") {
+          throw new Error("VaultGuard share revocation is unavailable — update the plugin/server.");
+        }
+        const shareId = action.share?.shareId;
+        if (!shareId) throw new Error("Malformed share-revoke confirmation — missing shareId.");
+        await provider.revokeShare(shareId);
+        return `Revoked the share link "${shareId}".`;
+      }
+      case "member_add": {
+        const m = this.requireMembershipPayload(lease, provider, action, "addVaultMember");
+        if (!m.role) throw new Error("Malformed membership-add confirmation — missing role.");
+        await provider.addVaultMember!(m.vaultId, m.userId, m.role);
+        return `Added ${m.label} to the vault as ${m.role}.`;
+      }
+      case "member_remove": {
+        const m = this.requireMembershipPayload(lease, provider, action, "removeVaultMember");
+        await provider.removeVaultMember!(m.vaultId, m.userId);
+        return `Removed ${m.label} from the vault.`;
+      }
+      case "member_set_role": {
+        const m = this.requireMembershipPayload(lease, provider, action, "updateVaultMember");
+        if (!m.role) throw new Error("Malformed membership set-role confirmation — missing role.");
+        await provider.updateVaultMember!(m.vaultId, m.userId, m.role);
+        return `Changed ${m.label}'s vault role to ${m.role}.`;
+      }
+      case "restore": {
+        if (!lease.allowFileHistory) {
+          throw new Error("VaultGuard agent lease does not allow file history queries.");
+        }
+        if (typeof provider.restoreDeletedFile !== "function") {
+          throw new Error("VaultGuard file restore is unavailable — update the plugin/server.");
+        }
+        const path = action.restore?.path;
+        if (!path) throw new Error("Malformed restore confirmation — missing path.");
+        await provider.restoreDeletedFile(path);
+        return `Restored the deleted file "${path}". It will re-appear locally on the next sync.`;
+      }
+      default:
+        throw new Error(`Unsupported confirmed mutation "${action.operation}".`);
+    }
+  }
+
+  // Shared validation for the three membership apply branches: re-check the
+  // capability flag + the specific provider method, and pull the resolved payload.
+  private requireMembershipPayload(
+    lease: AgentBridgeLease,
+    provider: AccessQueryProvider,
+    action: AgentBridgeConfirmAction,
+    method: "addVaultMember" | "removeVaultMember" | "updateVaultMember",
+  ): NonNullable<AgentBridgeConfirmAction["membership"]> {
+    if (!lease.allowMembershipWrites) {
+      throw new Error("VaultGuard agent lease does not allow membership changes.");
+    }
+    if (typeof provider[method] !== "function") {
+      throw new Error("VaultGuard membership changes are unavailable — update the plugin/server.");
+    }
+    const m = action.membership;
+    if (!m?.vaultId || !m.userId) {
+      throw new Error("Malformed membership confirmation — missing vault/user.");
+    }
+    return m;
+  }
+
+  // The audit path for a confirmed mutation, matching the path each tool would
+  // log on its direct (non-paused) call.
+  private confirmActionPath(action: AgentBridgeConfirmAction): string | null {
+    switch (action.operation) {
+      case "set_permission":
+        return action.setPermission?.pathPattern ?? null;
+      case "share_create":
+        return action.share?.relPath ?? null;
+      case "share_revoke":
+        return action.share?.shareId ?? null;
+      case "restore":
+        return action.restore?.path ?? null;
+      case "member_add":
+      case "member_remove":
+      case "member_set_role":
+        return action.membership ? `member:${action.membership.label}` : null;
+      default:
+        return null;
+    }
+  }
+
   // Validate the lease/provider/vault + resolve the principal + normalize the
   // path/level. Shared by the blocking and paused entry points.
   private async prepareSetPermission(
@@ -2802,7 +3102,7 @@ export class VaultGuardAgentBridge {
   ): Promise<{
     lease: AgentBridgeLease;
     provider: AccessQueryProvider;
-    payload: AgentBridgeConfirmAction["setPermission"];
+    payload: AgentBridgeSetPermissionPayload;
     preview: string;
   }> {
     const lease = this.requireLease(leaseId);
@@ -2852,7 +3152,7 @@ export class VaultGuardAgentBridge {
 
   private async executeSetPermissionPayload(
     provider: AccessQueryProvider,
-    payload: AgentBridgeConfirmAction["setPermission"],
+    payload: AgentBridgeSetPermissionPayload,
   ): Promise<unknown> {
     const result = await provider.setPermissionLevel({
       userId: payload.userId,
@@ -4052,24 +4352,36 @@ export class VaultGuardAgentBridge {
           limit: typeof args.limit === "number" ? args.limit : undefined,
         });
       case "vaultguard_files":
-        return this.files(leaseId, {
-          op: typeof args.op === "string" ? args.op : "",
-          path: typeof args.path === "string" ? args.path : undefined,
-          limit: typeof args.limit === "number" ? args.limit : undefined,
-        });
+        return this.files(
+          leaseId,
+          {
+            op: typeof args.op === "string" ? args.op : "",
+            path: typeof args.path === "string" ? args.path : undefined,
+            limit: typeof args.limit === "number" ? args.limit : undefined,
+          },
+          transport,
+        );
       case "vaultguard_share":
-        return this.share(leaseId, {
-          op: typeof args.op === "string" ? args.op : "",
-          path: typeof args.path === "string" ? args.path : undefined,
-          shareId: typeof args.shareId === "string" ? args.shareId : undefined,
-          expiresInDays: typeof args.expiresInDays === "number" ? args.expiresInDays : undefined,
-        });
+        return this.share(
+          leaseId,
+          {
+            op: typeof args.op === "string" ? args.op : "",
+            path: typeof args.path === "string" ? args.path : undefined,
+            shareId: typeof args.shareId === "string" ? args.shareId : undefined,
+            expiresInDays: typeof args.expiresInDays === "number" ? args.expiresInDays : undefined,
+          },
+          transport,
+        );
       case "vaultguard_membership":
-        return this.membership(leaseId, {
-          op: typeof args.op === "string" ? args.op : "",
-          user: typeof args.user === "string" ? args.user : undefined,
-          role: typeof args.role === "string" ? args.role : undefined,
-        });
+        return this.membership(
+          leaseId,
+          {
+            op: typeof args.op === "string" ? args.op : "",
+            user: typeof args.user === "string" ? args.user : undefined,
+            role: typeof args.role === "string" ? args.role : undefined,
+          },
+          transport,
+        );
       case "vaultguard_set_permission": {
         const setPermArgs = {
           path: typeof args.path === "string" ? args.path : "",

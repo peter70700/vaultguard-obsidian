@@ -11,7 +11,7 @@
 // one-time debug log and chat continues uninterrupted.
 
 import type { AnthropicConversationMessage } from "./anthropic-client";
-import type { AgentBridgeAskUserArgs } from "../../plugin/agent-bridge";
+import type { AgentBridgeAskUserArgs, AgentBridgeConfirmAction } from "../../plugin/agent-bridge";
 
 const LOG_PREFIX = "[VaultGuard Chat]";
 const ENVELOPE_SUFFIX = ".json.envelope";
@@ -48,10 +48,11 @@ export interface Conversation {
   updatedAt: number;
   messages: AnthropicConversationMessage[];
   pendingUserQuestion?: PendingUserQuestion | null;
-  // Queue of deferred Approve/Deny confirmations (currently set_permission only).
-  // The model issues several set_permission calls in ONE turn; each returns a
-  // paused marker immediately and its action lands here. The chat view shows them
-  // as a single batched Approve-all/Deny-all card and the plugin applies them on
+  // Queue of deferred Approve/Deny confirmations for sensitive agent mutations
+  // (set_permission, share create/revoke, membership add/remove/set_role, file
+  // restore). The model issues one or more in ONE turn; each returns a paused
+  // marker immediately and its action lands here. The chat view shows them as a
+  // single batched Approve-all/Deny-all card and the plugin applies them on
   // approval — decoupled from the (likely already-ended) turn. Persisted
   // (LAK-encrypted) so pending approvals survive a reload.
   pendingConfirmations?: PendingConfirmationAction[] | null;
@@ -66,24 +67,16 @@ export interface Conversation {
 }
 
 // A deferred confirmation attached to a paused question. When present, the
-// paused card is an Approve/Deny confirmation for a sensitive action (currently
-// only set_permission) rather than a free-text question: on approval the PLUGIN
-// applies the action via the AgentBridge surface, decoupled from the chat turn
-// (which has already ended — the MCP tool returned a paused marker immediately
-// rather than blocking on the modal and timing out). Persisted with the
-// conversation (LAK-encrypted) so the pending approval survives a reload.
-export interface PendingConfirmationAction {
-  operation: "set_permission";
-  leaseId: string;
-  // Human-readable summary shown in the card and the resume message.
-  preview: string;
-  setPermission: {
-    userId?: string;
-    role?: string;
-    pathPattern: string;
-    level: "none" | "read" | "write" | "admin";
-  };
-}
+// paused card is an Approve/Deny confirmation for a sensitive agent mutation
+// (set_permission, share create/revoke, membership add/remove/set_role, file
+// restore) rather than a free-text question: on approval the PLUGIN applies the
+// action via the AgentBridge surface (applyConfirmedMutation), decoupled from the
+// chat turn (which has already ended — the MCP tool returned a paused marker
+// immediately rather than blocking on the modal and timing out). Persisted with
+// the conversation (LAK-encrypted) so the pending approval survives a reload.
+// Structurally identical to AgentBridgeConfirmAction (the bridge's canonical
+// shape) so the chat view can round-trip it without translation.
+export type PendingConfirmationAction = AgentBridgeConfirmAction;
 
 export interface PendingUserQuestion {
   id: string;
