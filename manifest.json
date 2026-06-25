@@ -1,8 +1,8 @@
 {
   "id": "vaultguard-sync",
   "name": "VaultGuard Sync",
-  "version": "1.0.40",
-  "minAppVersion": "1.4.0",
+  "version": "1.0.41",
+  "minAppVersion": "1.8.7",
   "description": "End-to-end encrypted sync with per-file permissions and audit logging via an AWS backend. Replaces standard file sync for teams that need compliance-grade vault security. Desktop and mobile; agent bridge is desktop-only.",
   "author": "Peter Sedmak",
   "isDesktopOnly": false

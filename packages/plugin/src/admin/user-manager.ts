@@ -148,17 +148,17 @@ export class UserManager {
     // View permissions button
     const viewPermsBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "View permissions" } });
     setIcon(viewPermsBtn, "key");
-    viewPermsBtn.addEventListener("click", () => this.showUserPermissions(user));
+    viewPermsBtn.addEventListener("click", () => { void this.showUserPermissions(user); });
 
     // View activity button
     const viewActivityBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "View activity" } });
     setIcon(viewActivityBtn, "activity");
-    viewActivityBtn.addEventListener("click", () => this.showUserActivity(user));
+    viewActivityBtn.addEventListener("click", () => { void this.showUserActivity(user); });
 
     // Edit role button
     const editRoleBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "Change role" } });
     setIcon(editRoleBtn, "user-cog");
-    editRoleBtn.addEventListener("click", () => this.showRoleEditor(user, container));
+    editRoleBtn.addEventListener("click", () => { void this.showRoleEditor(user, container); });
 
     // Lifecycle actions.
     if (user.status === "active") {
@@ -167,21 +167,21 @@ export class UserManager {
         attr: { title: "Revoke access" },
       });
       setIcon(revokeBtn, "x-circle");
-      revokeBtn.addEventListener("click", () => this.confirmRevokeAccess(user, container));
+      revokeBtn.addEventListener("click", () => { void this.confirmRevokeAccess(user, container); });
     } else if (user.status === "pending") {
       const resendBtn = actionsEl.createEl("button", {
         cls: "vaultguard-icon-btn",
         attr: { title: "Resend invitation" },
       });
       setIcon(resendBtn, "send");
-      resendBtn.addEventListener("click", () => this.resendInvitation(user));
+      resendBtn.addEventListener("click", () => { void this.resendInvitation(user); });
     } else if (user.status === "suspended" || user.status === "revoked") {
       const reactivateBtn = actionsEl.createEl("button", {
         cls: "vaultguard-icon-btn vaultguard-success",
         attr: { title: "Reactivate user" },
       });
       setIcon(reactivateBtn, "check-circle");
-      reactivateBtn.addEventListener("click", () => this.reactivateUser(user, container));
+      reactivateBtn.addEventListener("click", () => { void this.reactivateUser(user, container); });
     }
   }
 

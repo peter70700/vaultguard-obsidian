@@ -340,8 +340,8 @@ export class AdminModal extends Modal {
 
     const toolbar = container.createDiv({ cls: "vaultguard-toolbar" });
     const treeContainer = container.createDiv({ cls: "vaultguard-permission-tree" });
-    container.addEventListener("vaultguard-refresh-permissions", async () => {
-      await this.renderPermissionTree(treeContainer);
+    container.addEventListener("vaultguard-refresh-permissions", () => {
+      void this.renderPermissionTree(treeContainer);
     });
     toolbar.createSpan({
       text: "Your currently assigned rule set.",
