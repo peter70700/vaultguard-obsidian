@@ -105,8 +105,11 @@ export function renderMarkdownWithFallback(
     cls: "vaultguard-chat-md-fallback",
     text: markdown,
   });
+  // Off-screen staging element: markdown renders here, then its children are
+  // moved into `host`. Hidden via CSS (`.vaultguard-chat-md-render-target` in
+  // styles.css) rather than an inline style — the Obsidian
+  // `no-static-styles-assignment` rule forbids direct `.style` writes.
   const renderTarget = host.createDiv({ cls: "vaultguard-chat-md-render-target" });
-  renderTarget.style.display = "none";
 
   void MarkdownRenderer.render(app, markdown, renderTarget, sourcePath, component).then(
     () => {

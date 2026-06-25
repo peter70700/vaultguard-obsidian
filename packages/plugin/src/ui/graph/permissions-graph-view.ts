@@ -109,6 +109,8 @@ const SEARCH_SCOPE_CLS = "vaultguard-pg-search-scope";
 const SEARCH_COUNT_CLS = "vaultguard-pg-search-count";
 const EMPTY_CLS = "vaultguard-pg-empty";
 const EMPTY_ICON_CLS = "vaultguard-pg-empty-icon";
+const EMPTY_ACTION_CLS = "vaultguard-pg-empty-action";
+const EMPTY_ACTION_ICON_CLS = "vaultguard-pg-empty-action-icon";
 const NOTE_CLS = "vaultguard-pg-note";
 const STATUS_CLS = "vaultguard-pg-status";
 
@@ -314,7 +316,8 @@ export class PermissionsGraphView extends ItemView {
 
     if (reason === "offline") {
       // The user IS signed in — don't tell them to sign in. The panel
-      // re-renders itself automatically once the connection is restored.
+      // re-renders itself automatically once the connection is restored, and
+      // the Retry button forces a reconnect probe now.
       setIcon(icon, "cloud-off");
       empty.createEl("p", {
         text: "VaultGuard is offline — the permissions map needs a connection.",
@@ -322,8 +325,13 @@ export class PermissionsGraphView extends ItemView {
       empty.createEl("p", {
         cls: NOTE_CLS,
         text:
-          "You're signed in. This panel will populate automatically once the " +
-          "connection comes back. Until then it stays offline and makes no network calls.",
+          "You're signed in. This panel populates automatically once the " +
+          "connection comes back — or retry now. Until then it stays offline " +
+          "and makes no network calls.",
+      });
+      this.addEmptyStateAction(empty, "Retry connection", "refresh-cw", async () => {
+        await this.plugin.reconnectNow();
+        await this.refresh();
       });
       return;
     }
@@ -333,7 +341,11 @@ export class PermissionsGraphView extends ItemView {
       empty.createEl("p", { text: "Select a VaultGuard vault to map its permissions." });
       empty.createEl("p", {
         cls: NOTE_CLS,
-        text: "Choose a vault in VaultGuard settings, then reopen this panel.",
+        text: "Choose a vault to bind this folder — the map loads automatically.",
+      });
+      this.addEmptyStateAction(empty, "Choose vault", "git-fork", async () => {
+        await this.plugin.switchServerVault();
+        await this.refresh();
       });
       return;
     }
@@ -343,8 +355,41 @@ export class PermissionsGraphView extends ItemView {
     empty.createEl("p", {
       cls: NOTE_CLS,
       text:
-        "Sign in and go online to see who can access which files. " +
-        "Until then, this panel stays fully offline and makes no network calls.",
+        "Sign in to see who can access which files. The map loads automatically " +
+        "once you're signed in — until then this panel stays fully offline and " +
+        "makes no network calls.",
+    });
+    this.addEmptyStateAction(empty, "Sign in", "log-in", () => {
+      // Opens the login modal. Login completion re-renders this panel via the
+      // plugin (main.ts refreshPermissionsGraph), so no manual refresh here —
+      // the modal flow is async and outlives this click handler.
+      this.plugin.openLoginModal();
+    });
+  }
+
+  /**
+   * Append a single primary CTA button to an empty state. The handler may be
+   * sync or async; while an async handler runs the button disables itself so a
+   * second click can't stack login modals / reconnect probes. Built entirely
+   * with Obsidian DOM helpers + the stock `mod-cta` class — no inline
+   * element.style (Obsidian-review rule).
+   */
+  private addEmptyStateAction(
+    empty: HTMLElement,
+    label: string,
+    iconName: string,
+    handler: () => void | Promise<void>,
+  ): void {
+    const btn = empty.createEl("button", { cls: `${EMPTY_ACTION_CLS} mod-cta` });
+    setIcon(btn.createSpan({ cls: EMPTY_ACTION_ICON_CLS }), iconName);
+    btn.createSpan({ text: label });
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      void Promise.resolve(handler()).finally(() => {
+        // The view may have re-rendered mid-flight (button detached); only
+        // re-enable if it's still in the DOM.
+        if (btn.isConnected) btn.disabled = false;
+      });
     });
   }
 

@@ -3136,6 +3136,15 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Public entry point to open the login modal — used by UI surfaces outside
+   * main.ts (e.g. the Permissions graph "Sign in" empty-state CTA) that can't
+   * call the private handleLogin() directly.
+   */
+  openLoginModal(): void {
+    this.handleLogin();
+  }
+
+  /**
    * Handles the login flow. Opens a login modal for the user
    * to enter their email, password, and optional MFA code.
    *
@@ -3604,6 +3613,12 @@ export default class VaultGuardPlugin extends Plugin {
         this.filePermissionHeader?.invalidateCache();
         void this.filePermissionHeader?.update({ force: true });
         this.syncFileExplorerDecorationsState();
+        // Repopulate any open Permissions graph now that session + vault binding
+        // + permission warmup have all settled. The connection-edge refresh in
+        // setConnectionStatus() can fire while serverVaultId is still empty
+        // (login flips online before binding), leaving the panel pinned on its
+        // "select a vault" empty state until reopened — this closes that gap.
+        this.refreshPermissionsGraph();
       });
     } else {
       this.log("Vault binding skipped — sync engine deferred until a vault is picked.");
@@ -4913,6 +4928,9 @@ export default class VaultGuardPlugin extends Plugin {
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed after vault switch", err);
       });
+      // A bound vault is the gate the Permissions graph waits on — refresh any
+      // open panel so it loads (or re-targets) the newly selected vault live.
+      this.refreshPermissionsGraph();
     }
     return changed;
   }
@@ -4924,6 +4942,8 @@ export default class VaultGuardPlugin extends Plugin {
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed after vault binding update", err);
       });
+      // Same gate as switchServerVault — load the graph for the bound vault.
+      this.refreshPermissionsGraph();
     }
     return changed;
   }
@@ -10093,6 +10113,16 @@ export default class VaultGuardPlugin extends Plugin {
   /**
    * Attempts to reconnect to the VaultGuard backend.
    */
+  /**
+   * Public entry point for a user-initiated reconnect probe — used by UI
+   * surfaces (e.g. the Permissions graph "Retry connection" empty-state CTA)
+   * that can't call the private attemptReconnection() directly. On success it
+   * flips the status online, which re-renders waiting Permissions graphs.
+   */
+  async reconnectNow(): Promise<void> {
+    await this.attemptReconnection();
+  }
+
   private async attemptReconnection(): Promise<void> {
     if (!this.session) {
       this.setConnectionStatus("offline", { scheduleRetry: false, notify: false });

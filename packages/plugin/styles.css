@@ -5278,6 +5278,11 @@ button .vaultguard-btn-spinner:only-child {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* Off-screen markdown staging target — content is moved into the host, never
+   shown directly. Hidden here so the renderer sets no inline styles. */
+.vaultguard-chat-md-render-target {
+  display: none;
+}
 .vaultguard-chat-md-chunk + .vaultguard-chat-md-chunk {
   margin-top: 6px;
 }
@@ -6567,4 +6572,27 @@ button .vaultguard-btn-spinner:only-child {
   margin: 0;
   max-width: 280px;
   line-height: 1.5;
+}
+
+.vaultguard-pg-empty-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  cursor: pointer;
+}
+
+.vaultguard-pg-empty-action:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.vaultguard-pg-empty-action-icon {
+  display: inline-flex;
+  align-items: center;
+}
+
+.vaultguard-pg-empty-action-icon .svg-icon {
+  width: 16px;
+  height: 16px;
 }

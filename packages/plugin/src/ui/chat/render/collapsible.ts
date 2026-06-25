@@ -55,35 +55,16 @@ export function createCollapsible(parent: HTMLElement, options: CollapsibleOptio
   let open = options.open === true;
 
   const apply = (): void => {
+    // Layout is driven entirely by CSS keyed on these two classes (the
+    // `.is-open` / `.vaultguard-chat-is-collapsed` rules in styles.css carry the
+    // same display/height/overflow values, with `!important` where needed). Keep
+    // this to class + attribute toggles so no inline styles are set — the
+    // Obsidian `no-static-styles-assignment` rule forbids direct `.style` writes.
     root.toggleClass(OPEN_CLS, open);
     root.toggleClass(COLLAPSED_CLS, !open);
-    root.style.setProperty("display", "block", "important");
-    root.style.setProperty("flex", "0 0 auto");
-    root.style.setProperty("overflow", "hidden");
     header.hidden = false;
     header.setAttr("aria-expanded", String(open));
-    header.style.setProperty("display", "flex", "important");
-    header.style.setProperty("min-height", "30px");
     body.hidden = !open;
-    if (open) {
-      root.style.setProperty("height", "auto", "important");
-      root.style.removeProperty("min-height");
-      root.style.removeProperty("max-height");
-      body.style.setProperty("display", "block", "important");
-      body.style.setProperty("visibility", "visible", "important");
-      body.style.setProperty("height", "auto", "important");
-      body.style.setProperty("min-height", "0");
-      body.style.removeProperty("max-height");
-      body.style.setProperty("overflow", "visible");
-    } else {
-      root.style.setProperty("height", "32px", "important");
-      root.style.setProperty("min-height", "32px");
-      body.style.removeProperty("visibility");
-      body.style.setProperty("overflow", "hidden");
-      body.style.setProperty("height", "0", "important");
-      body.style.setProperty("min-height", "0");
-      body.style.setProperty("display", "none", "important");
-    }
   };
   apply();
 
