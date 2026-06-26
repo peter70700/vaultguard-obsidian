@@ -278,7 +278,7 @@ class PermissionRuleModal extends Modal {
 
   private renderPrincipalSelector(container: HTMLElement): void {
     new Setting(container)
-      .setName("Principal Type")
+      .setName("Principal type")
       .setDesc("Apply this access level to one user, all users, or a vault role")
       .addDropdown((dropdown) =>
         dropdown
@@ -501,9 +501,9 @@ class PermissionRuleModal extends Modal {
 
   private renderLevelSelector(container: HTMLElement): void {
     new Setting(container)
-      .setName("Permission Level")
+      .setName("Permission level")
       .setDesc(
-        "No access = cannot read, Read only = can view but not edit, Write = view + edit, Admin = manage access"
+        "No access = cannot read, read only = can view but not edit, write = view + edit, admin = manage access"
       )
       .addDropdown((dropdown) =>
         dropdown

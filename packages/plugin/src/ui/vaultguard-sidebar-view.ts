@@ -283,7 +283,7 @@ export class VaultGuardSidebarView extends ItemView {
   private renderRevocationNotice(container: HTMLElement): void {
     const notice = container.createDiv({ cls: "vaultguard-revocation-notice" });
 
-    notice.createEl("h3", { text: "Access Revoked" });
+    notice.createEl("h3", { text: "Access revoked" });
     notice.createEl("p", {
       text: "Your access to this vault has been revoked by an administrator.",
     });
@@ -470,7 +470,7 @@ export class VaultGuardSidebarView extends ItemView {
       cls: "vaultguard-sb-filter-select",
       attr: { "aria-label": "Filter by user" },
     });
-    userSelect.createEl("option", { value: "all", text: "All Users" });
+    userSelect.createEl("option", { value: "all", text: "All users" });
     userSelect.addEventListener("change", () => {
       this.filterUser = userSelect.value;
       this.renderEntries();
@@ -481,7 +481,7 @@ export class VaultGuardSidebarView extends ItemView {
       cls: "vaultguard-sb-filter-select",
       attr: { "aria-label": "Filter by role" },
     });
-    roleSelect.createEl("option", { value: "all", text: "All Roles" });
+    roleSelect.createEl("option", { value: "all", text: "All roles" });
     roleSelect.addEventListener("change", () => {
       this.filterRole = roleSelect.value;
       this.renderEntries();

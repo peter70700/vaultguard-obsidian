@@ -2310,7 +2310,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Manual sync trigger
     this.addCommand({
       id: "sync-now",
-      name: "Sync Now",
+      name: "Sync now",
       callback: () => this.performSync({ userInitiated: true, forceCatchup: true }),
     });
 
@@ -2536,14 +2536,14 @@ export default class VaultGuardPlugin extends Plugin {
     // View current user's permissions
     this.addCommand({
       id: "view-permissions",
-      name: "View Permissions",
+      name: "View permissions",
       callback: () => this.showPermissionsModal(),
     });
 
     // Manage the whole vault's permission rules (admin-panel-style table)
     this.addCommand({
       id: "manage-permission-rules",
-      name: "Manage Permissions",
+      name: "Manage permissions",
       callback: () => this.showPermissionRulesModal(),
     });
 
@@ -2559,7 +2559,7 @@ export default class VaultGuardPlugin extends Plugin {
     // command palette doesn't surface a broken entry.
     this.addCommand({
       id: "create-agent-bridge-lease",
-      name: "Create Agent Bridge Lease",
+      name: "Create agent bridge lease",
       checkCallback: (checking: boolean) => {
         if (Platform.isMobileApp) return false;
         const ready = !!this.session && !!this.settings.serverVaultId;
@@ -2570,7 +2570,7 @@ export default class VaultGuardPlugin extends Plugin {
 
     this.addCommand({
       id: "revoke-agent-bridge-leases",
-      name: "Revoke Agent Bridge Leases",
+      name: "Revoke agent bridge leases",
       checkCallback: (checking: boolean) => {
         if (Platform.isMobileApp) return false;
         if (checking) return true;
@@ -2660,7 +2660,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Pick / switch the bound server-side vault for this Obsidian folder.
     this.addCommand({
       id: "pick-vault",
-      name: "Pick or Switch Server Vault",
+      name: "Pick or switch server vault",
       checkCallback: (checking: boolean) => {
         if (checking) {
           return !!this.session && !!this.apiClient;
@@ -2672,7 +2672,7 @@ export default class VaultGuardPlugin extends Plugin {
     // Admin panel (only shown to admin/owner users)
     this.addCommand({
       id: "admin",
-      name: "Manage Organization",
+      name: "Manage organization",
       checkCallback: (checking: boolean) => {
         const isAdmin =
           this.session?.role === "admin" || this.session?.role === "owner";
@@ -3342,6 +3342,14 @@ export default class VaultGuardPlugin extends Plugin {
   private pendingChallengeSession: string | null = null;
 
   /**
+   * True while a Cognito NEW_PASSWORD_REQUIRED challenge is awaiting the user's
+   * new password (admin-issued temporary password). Paired with
+   * `pendingChallengeSession` so the re-submit branch can respond to the
+   * challenge instead of starting a fresh USER_PASSWORD_AUTH.
+   */
+  private pendingNewPasswordChallenge = false;
+
+  /**
    * Performs login by authenticating directly with Cognito,
    * then using the JWT tokens for API calls.
    */
@@ -3358,6 +3366,44 @@ export default class VaultGuardPlugin extends Plugin {
     if (isLocalDevAuth(cfg.cognitoUserPoolId)) {
       authResult = await devServerLogin(cfg.apiEndpoint, credentials.email, credentials.password);
       await this.completeLogin(authResult, credentials.email);
+      return;
+    }
+
+    // If we have a pending NEW_PASSWORD_REQUIRED challenge and the user supplied
+    // a new password, respond to that challenge (mirrors the MFA re-submit
+    // below). The response may itself carry a follow-on challenge (e.g.
+    // MFA_SETUP / SOFTWARE_TOKEN_MFA) or the final tokens, so route it through
+    // the same handleAuthResult helper as the initial auth.
+    if (this.pendingChallengeSession && this.pendingNewPasswordChallenge && credentials.newPassword) {
+      let challengeResult: CognitoAuthResult;
+      try {
+        challengeResult = await cognitoRespondToChallenge(
+          cfg.cognitoUserPoolId,
+          cfg.cognitoClientId,
+          "NEW_PASSWORD_REQUIRED",
+          this.pendingChallengeSession,
+          {
+            USERNAME: credentials.email,
+            NEW_PASSWORD: credentials.newPassword,
+          }
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/invalidpassword|conform to policy|password.*(policy|requirement)/i.test(message)) {
+          throw new Error(
+            "That password doesn't meet the requirements. Use at least 12 characters with upper/lowercase, a number, and a symbol."
+          );
+        }
+        if (/attribute/i.test(message)) {
+          throw new Error(
+            "This account needs extra setup to set a password — contact your admin."
+          );
+        }
+        throw err;
+      }
+      this.pendingChallengeSession = null;
+      this.pendingNewPasswordChallenge = false;
+      await this.handleAuthResult(challengeResult, credentials);
       return;
     }
 
@@ -3384,6 +3430,20 @@ export default class VaultGuardPlugin extends Plugin {
       );
     }
 
+    await this.handleAuthResult(authResult, credentials);
+  }
+
+  /**
+   * Routes a Cognito auth result: handles any outstanding challenge
+   * (MFA required, MFA setup, new password required) or completes the login
+   * when tokens are present. Shared by the initial auth path and the
+   * challenge re-submit paths so a challenge that follows another challenge
+   * (e.g. NEW_PASSWORD_REQUIRED → MFA_SETUP) is handled identically.
+   */
+  private async handleAuthResult(
+    authResult: CognitoAuthResult,
+    credentials: LoginCredentials
+  ): Promise<void> {
     // Handle challenges (MFA required, new password required, etc.)
     if (authResult.challengeName) {
       this.pendingChallengeSession = authResult.session ?? null;
@@ -3400,7 +3460,12 @@ export default class VaultGuardPlugin extends Plugin {
       }
 
       if (authResult.challengeName === "NEW_PASSWORD_REQUIRED") {
-        throw new Error("Password change required. Please contact your administrator.");
+        // Admin-issued temporary password — drive the inline set-password
+        // sub-form in the login modal via this sentinel. The modal re-submits
+        // with credentials.newPassword, which performLogin responds to above.
+        this.pendingChallengeSession = authResult.session ?? null;
+        this.pendingNewPasswordChallenge = true;
+        throw new Error("NEW_PASSWORD_REQUIRED");
       }
       throw new Error(`Authentication challenge: ${authResult.challengeName}`);
     }
@@ -3432,6 +3497,15 @@ export default class VaultGuardPlugin extends Plugin {
             verifySession,
             code
           );
+        },
+        onCancel: () => {
+          // Cancelling/closing the MFA-setup modal mid-login must settle the
+          // awaited Promise (resolve, NOT reject — avoids a generic error toast)
+          // so the login flow ends cleanly with no session instead of hanging.
+          new Notice(
+            "VaultGuard Sync: two-factor setup is required to finish signing in. You were not signed in — start the login again when you're ready."
+          );
+          resolve();
         },
         onComplete: (result) => {
           void (async () => {
@@ -3767,7 +3841,7 @@ export default class VaultGuardPlugin extends Plugin {
       "VaultGuard: Vault connected. Reload Obsidian so every file shows everyone who has access to it."
     );
     const actions = frag.createDiv();
-    actions.setCssStyles({ marginTop: "8px" });
+    actions.addClass("vaultguard-reload-notice-actions");
     const reloadBtn = actions.createEl("button", { text: "Reload now" });
     reloadBtn.addEventListener("click", () => {
       // "Reload app without saving" — re-runs the full startup (session
@@ -5373,14 +5447,39 @@ export default class VaultGuardPlugin extends Plugin {
         const url = `${normalizedBase}/orgs/${encodeURIComponent(slugCandidate)}/config`;
 
         try {
-          const response = await requestUrl({ url, method: 'GET', throw: false });
+          let response;
+          try {
+            response = await requestUrl({ url, method: 'GET', throw: false });
+          } catch {
+            // A genuine network/connection failure (DNS, offline) — requestUrl
+            // can still throw these even with throw:false. Surface a friendly
+            // message and try the next base/slug candidate.
+            lastError = new Error(
+              "Couldn't reach the server. Check your internet connection and the org slug."
+            );
+            continue;
+          }
 
           if (response.status === 404) {
             throw new Error(`Organization "${slug}" not found. Check the slug and try again.`);
           }
 
+          if (response.status === 401 || response.status === 403) {
+            throw new Error(
+              `The server rejected the connection for "${slug}". Double-check the org slug or ask your admin.`
+            );
+          }
+
+          if (response.status >= 500) {
+            throw new Error(
+              `"${slug}"'s server is temporarily unavailable. Please try again in a moment.`
+            );
+          }
+
           if (response.status < 200 || response.status >= 300) {
-            throw new Error(`Server returned ${response.status}`);
+            throw new Error(
+              `Couldn't connect to "${slug}" (error ${response.status}). Check the slug and try again.`
+            );
           }
 
           const config = response.json;

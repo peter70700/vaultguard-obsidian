@@ -332,7 +332,7 @@ export class PermissionRulesView {
       this.search = searchInput.value;
       this.renderRows();
     });
-    const addBtn = toolbar.createEl("button", { cls: "mod-cta", text: "Add Rule" });
+    const addBtn = toolbar.createEl("button", { cls: "mod-cta", text: "Add rule" });
     addBtn.addEventListener("click", () => this.openForm(null));
 
     this.rowsContainer = root.createDiv({ cls: "vaultguard-rules-table-wrap" });

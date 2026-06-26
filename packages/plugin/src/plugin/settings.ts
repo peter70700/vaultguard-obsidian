@@ -244,7 +244,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * call until the user stores a key or uses a logged-in Claude Code subscription.
    */
   private renderAiChatSection(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("AI Chat").setHeading();
+    new Setting(containerEl).setName("AI chat").setHeading();
 
     this.renderAiProviderBlock(containerEl);
 
@@ -331,7 +331,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // ── Model ───────────────────────────────────────────────────────────────
     new Setting(containerEl)
       .setName("Model")
-      .setDesc("Anthropic model used for AI Chat turns.")
+      .setDesc("Anthropic model used for AI chat turns.")
       .addDropdown((dropdown) => {
         for (const m of AI_CHAT_MODELS) dropdown.addOption(m.id, m.label);
         dropdown
@@ -371,7 +371,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     // ── Permissions ────────────────────────────────────────────────────────
     new Setting(containerEl)
-      .setName("AI Chat permissions")
+      .setName("AI chat permissions")
       .setDesc(
         "Choose whether AI-created writes need a manual diff confirmation. Skip mode is for trusted sessions; " +
           "VaultGuard still enforces vault scope, hidden-path blocks, and your server-side file permissions.",
@@ -881,7 +881,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     if (!session) {
       new Setting(sectionEl)
         .setName("Not connected")
-        .setDesc("Log in from the Account section above to view, bind, create, or change server vaults.");
+        .setDesc("Log in from the account section above to view, bind, create, or change server vaults.");
       return;
     }
 
@@ -1722,7 +1722,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         .addButton((button) =>
           button
             .setButtonText("Reset")
-            .setTooltip("Clear locally cached connection fields and use the bundled Cloud defaults")
+            .setTooltip("Clear locally cached connection fields and use the bundled cloud defaults")
             .onClick(async () => {
               button.setDisabled(true);
               try {
@@ -1919,7 +1919,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         );
 
       new Setting(containerEl)
-        .setName("Cognito User Pool ID")
+        .setName("Cognito user pool ID")
         .addText((text) =>
           text
             .setPlaceholder("eu-central-1_XXXXXXXXX")
@@ -1931,7 +1931,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         );
 
       new Setting(containerEl)
-        .setName("Cognito Client ID")
+        .setName("Cognito client ID")
         .addText((text) =>
           text
             .setPlaceholder("1a2b3c4d5e6f7g8h9i0j")
@@ -2042,7 +2042,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         });
         selfHostNote.appendText("Self-hosting your own VaultGuard server? ");
         const link = selfHostNote.createEl("a", {
-          text: "Configure it in Connection settings",
+          text: "Configure it in connection settings",
           href: "#",
         });
         link.addEventListener("click", (e) => {
@@ -2345,7 +2345,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     });
 
     // ── Danger Zone ─────────────────────────────────────────────────────────
-    new Setting(containerEl).setName("Danger Zone").setHeading();
+    new Setting(containerEl).setName("Danger zone").setHeading();
     containerEl.createEl("p", {
       text: "These actions cannot be undone.",
       cls: "setting-item-description mod-warning",
@@ -2358,7 +2358,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       )
       .addButton((button) =>
         button
-          .setButtonText("Clear Cache")
+          .setButtonText("Clear cache")
           .setWarning()
           .onClick(async () => {
             const confirmed = await this.showDestructiveConfirmation(
@@ -2433,7 +2433,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * every active lease, rotate one token, or revoke one lease.
    */
   private renderAgentBridgeSection(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Agent bridge connections (Desktop only.)").setHeading();
+    new Setting(containerEl).setName("Agent bridge connections (desktop only.)").setHeading();
 
     // Agent bridge needs a local HTTP server (Node `http` module). That's
     // only reachable in desktop Obsidian's renderer. On mobile we surface

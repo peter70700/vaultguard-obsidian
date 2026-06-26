@@ -1,4 +1,4 @@
-import { App, Modal, ButtonComponent } from "obsidian";
+import { App, ButtonComponent, Modal, setIcon } from "obsidian";
 import { setButtonLoading } from "../ui/loading-button";
 import { createShieldIcon } from "../ui/icons";
 
@@ -13,6 +13,12 @@ export interface LoginCredentials {
   passphrase: string;
   /** Whether this is a first-time ZK setup (passphrase creation) */
   zkSetup: boolean;
+  /**
+   * New password supplied in response to a Cognito NEW_PASSWORD_REQUIRED
+   * challenge (admin-issued temporary password). Only set when the inline
+   * set-password sub-form is active.
+   */
+  newPassword?: string;
 }
 
 export class LoginModal extends Modal {
@@ -40,8 +46,13 @@ export class LoginModal extends Modal {
   private mfaLabelEl: HTMLElement | null = null;
   private mfaRecoveryLinkEl: HTMLElement | null = null;
   private passphraseContainer: HTMLElement | null = null;
+  private newPasswordContainer: HTMLElement | null = null;
   private errorEl: HTMLElement | null = null;
   private showMfa: boolean = false;
+  /** Active when the NEW_PASSWORD_REQUIRED inline sub-form is revealed. */
+  private showNewPassword: boolean = false;
+  private newPasswordValue: string = "";
+  private newPasswordConfirm: string = "";
   /** Active when the MFA panel is in "enter recovery code" mode. */
   private recoveryMode: boolean = false;
   private encryptionMode: EncryptionMode;
@@ -147,6 +158,7 @@ export class LoginModal extends Modal {
     });
     passInput.addEventListener("input", () => { this.password = passInput.value; });
     passInput.addEventListener("keydown", (e) => { if (e.key === "Enter") this.handleSubmit(); });
+    this.addPasswordToggle(passInput);
 
     // Forgot password link
     if (this.onForgotPassword && this.onConfirmReset) {
@@ -161,7 +173,7 @@ export class LoginModal extends Modal {
     // MFA field (hidden by default)
     this.mfaContainer = form.createDiv({ cls: "vaultguard-field-group vaultguard-mfa-container" });
     this.mfaContainer.hide();
-    this.mfaLabelEl = this.mfaContainer.createEl("label", { text: "MFA Code", cls: "vaultguard-field-label" });
+    this.mfaLabelEl = this.mfaContainer.createEl("label", { text: "MFA code", cls: "vaultguard-field-label" });
     this.mfaHintEl = this.mfaContainer.createEl("span", {
       text: "Enter the 6-digit code from your authenticator app",
       cls: "vaultguard-field-hint",
@@ -208,23 +220,25 @@ export class LoginModal extends Modal {
         ' unless your organization administrator performs an emergency key recovery. There is no "forgot passphrase" reset.'
       );
 
-      this.passphraseContainer.createEl("label", { text: "Encryption Passphrase", cls: "vaultguard-field-label" });
+      this.passphraseContainer.createEl("label", { text: "Encryption passphrase", cls: "vaultguard-field-label" });
       const ppInput = this.passphraseContainer.createEl("input", {
         cls: "vaultguard-field-input",
         attr: { type: "password", placeholder: "Choose a strong passphrase" },
       });
       ppInput.addEventListener("input", () => { this.passphrase = ppInput.value; });
+      this.addPasswordToggle(ppInput);
 
-      this.passphraseContainer.createEl("label", { text: "Confirm Passphrase", cls: "vaultguard-field-label" });
+      this.passphraseContainer.createEl("label", { text: "Confirm passphrase", cls: "vaultguard-field-label" });
       const ppConfirm = this.passphraseContainer.createEl("input", {
         cls: "vaultguard-field-input",
         attr: { type: "password", placeholder: "Confirm passphrase" },
       });
       ppConfirm.addEventListener("input", () => { this.passphraseConfirm = ppConfirm.value; });
       ppConfirm.addEventListener("keydown", (e) => { if (e.key === "Enter") this.handleSubmit(); });
+      this.addPasswordToggle(ppConfirm);
     } else {
       // Returning user: single passphrase field
-      this.passphraseContainer.createEl("label", { text: "Encryption Passphrase", cls: "vaultguard-field-label" });
+      this.passphraseContainer.createEl("label", { text: "Encryption passphrase", cls: "vaultguard-field-label" });
       this.passphraseContainer.createEl("span", {
         text: "This unlocks your end-to-end encryption keys locally.",
         cls: "vaultguard-field-hint",
@@ -235,7 +249,42 @@ export class LoginModal extends Modal {
       });
       ppInput.addEventListener("input", () => { this.passphrase = ppInput.value; });
       ppInput.addEventListener("keydown", (e) => { if (e.key === "Enter") this.handleSubmit(); });
+      this.addPasswordToggle(ppInput);
     }
+
+    // New-password sub-form (Cognito NEW_PASSWORD_REQUIRED challenge —
+    // admin-issued temporary password). Hidden until the challenge surfaces.
+    this.newPasswordContainer = form.createDiv({
+      cls: "vaultguard-field-group vaultguard-new-password-container",
+    });
+    this.newPasswordContainer.hide();
+    this.newPasswordContainer.createEl("label", {
+      text: "New password",
+      cls: "vaultguard-field-label",
+    });
+    this.newPasswordContainer.createEl("span", {
+      text: "Your account requires a new password before you can sign in.",
+      cls: "vaultguard-field-hint",
+    });
+    const newPwInput = this.newPasswordContainer.createEl("input", {
+      cls: "vaultguard-field-input",
+      attr: { type: "password", placeholder: "New password" },
+    });
+    newPwInput.addEventListener("input", () => { this.newPasswordValue = newPwInput.value; });
+    this.addPasswordToggle(newPwInput);
+    this.attachPasswordRequirements(newPwInput, this.newPasswordContainer);
+
+    this.newPasswordContainer.createEl("label", {
+      text: "Confirm new password",
+      cls: "vaultguard-field-label",
+    });
+    const newPwConfirm = this.newPasswordContainer.createEl("input", {
+      cls: "vaultguard-field-input",
+      attr: { type: "password", placeholder: "Confirm new password" },
+    });
+    newPwConfirm.addEventListener("input", () => { this.newPasswordConfirm = newPwConfirm.value; });
+    newPwConfirm.addEventListener("keydown", (e) => { if (e.key === "Enter") this.handleSubmit(); });
+    this.addPasswordToggle(newPwConfirm);
 
     // Buttons
     const actionRow = contentEl.createDiv({ cls: "vaultguard-login-actions" });
@@ -245,9 +294,21 @@ export class LoginModal extends Modal {
       .onClick(() => this.close());
 
     this.submitBtn = new ButtonComponent(actionRow)
-      .setButtonText("Sign In")
+      .setButtonText("Sign in")
       .setCta()
       .onClick(() => this.handleSubmit());
+
+    // Setup-guide docs link — opens the verified landing route in the browser.
+    const footer = contentEl.createDiv({ cls: "vaultguard-login-footer" });
+    const docsLink = footer.createEl("a", {
+      text: "Setup guide",
+      cls: "vaultguard-login-docs-link",
+      href: "#",
+    });
+    docsLink.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.open("https://example.com/#/docs/setup", "_blank", "noopener,noreferrer");
+    });
 
     // Focus first visible input on open
     setTimeout(() => {
@@ -283,6 +344,61 @@ export class LoginModal extends Modal {
     }
   }
 
+  /**
+   * Reveals the inline "set a new password" sub-form in response to a Cognito
+   * NEW_PASSWORD_REQUIRED challenge (admin-issued temporary password). Mirrors
+   * `showMfaPrompt()`: it unhides the pre-built container and re-labels the
+   * submit button so the same Sign-in action drives the challenge response.
+   */
+  private showNewPasswordPrompt(): void {
+    this.showNewPassword = true;
+    if (this.newPasswordContainer) {
+      this.newPasswordContainer.show();
+    }
+    this.showError("");
+    if (this.submitBtn) {
+      this.submitBtn.setButtonText("Set password & sign in");
+    }
+  }
+
+  /**
+   * Attaches a live password-requirements checklist beneath a password input.
+   * Each item toggles the `vaultguard-pw-req-met` class via `classList` on every
+   * keystroke — purely advisory; the on-submit validation remains authoritative.
+   * No inline `.style` assignments (project policy / community-review finding).
+   */
+  private attachPasswordRequirements(input: HTMLInputElement, container: HTMLElement): void {
+    const requirements: Array<{ label: string; test: (value: string) => boolean }> = [
+      { label: "At least 12 characters", test: (v) => v.length >= 12 },
+      { label: "An uppercase letter", test: (v) => /[A-Z]/.test(v) },
+      { label: "A lowercase letter", test: (v) => /[a-z]/.test(v) },
+      { label: "A number", test: (v) => /[0-9]/.test(v) },
+      { label: "A symbol", test: (v) => /[^A-Za-z0-9]/.test(v) },
+    ];
+
+    const list = container.createDiv({ cls: "vaultguard-pw-req-list" });
+    const items = requirements.map((req) => {
+      const item = list.createDiv({ cls: "vaultguard-pw-req" });
+      const icon = item.createSpan({ cls: "vaultguard-pw-req-icon" });
+      setIcon(icon, "circle");
+      item.createSpan({ cls: "vaultguard-pw-req-label", text: req.label });
+      return { req, item, icon };
+    });
+
+    const update = (): void => {
+      const value = input.value;
+      for (const { req, item, icon } of items) {
+        const met = req.test(value);
+        item.classList.toggle("vaultguard-pw-req-met", met);
+        icon.empty();
+        setIcon(icon, met ? "check" : "circle");
+      }
+    };
+
+    input.addEventListener("input", update);
+    update();
+  }
+
   /** Flips the MFA panel between TOTP-code entry and recovery-code entry. */
   private toggleRecoveryMode(): void {
     this.recoveryMode = !this.recoveryMode;
@@ -298,11 +414,45 @@ export class LoginModal extends Modal {
     }
   }
 
+  /**
+   * Wrap a password <input> with a show/hide toggle button. The input is
+   * re-parented into a relatively-positioned wrapper so the eye button can sit
+   * at its right edge (all layout lives in styles.css — no inline styles). The
+   * button is type="button" so it never submits the surrounding form.
+   */
+  private addPasswordToggle(input: HTMLInputElement): void {
+    const parent = input.parentElement;
+    if (!parent) return;
+
+    // Create the wrapper at the input's current position, then move the input
+    // inside it. Event listeners attached to the input survive the DOM move.
+    const wrap = createDiv({ cls: "vaultguard-password-wrap" });
+    parent.insertBefore(wrap, input);
+    wrap.appendChild(input);
+    input.addClass("vaultguard-password-input");
+
+    const btn = wrap.createEl("button", {
+      cls: "vaultguard-password-toggle",
+      attr: { type: "button", "aria-label": "Show password" },
+    });
+    setIcon(btn, "eye");
+
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      btn.empty();
+      setIcon(btn, reveal ? "eye-off" : "eye");
+      btn.setAttribute("aria-label", reveal ? "Hide password" : "Show password");
+      input.focus();
+    });
+  }
+
   /** Sync the MFA input/label/hint/link to whichever mode is active. */
   private applyMfaModeUi(): void {
     if (!this.mfaInputEl || !this.mfaLabelEl || !this.mfaHintEl) return;
     if (this.recoveryMode) {
-      this.mfaLabelEl.setText("Recovery Code");
+      this.mfaLabelEl.setText("Recovery code");
       this.mfaHintEl.setText(
         "Enter one of the recovery codes you saved when you set up MFA. This will reset your authenticator — you'll be asked to set up a new one on next sign-in."
       );
@@ -315,7 +465,7 @@ export class LoginModal extends Modal {
         if (link) link.setText("Have your authenticator? Use TOTP code");
       }
     } else {
-      this.mfaLabelEl.setText("MFA Code");
+      this.mfaLabelEl.setText("MFA code");
       this.mfaHintEl.setText("Enter the 6-digit code from your authenticator app");
       this.mfaInputEl.setAttribute("placeholder", "123456");
       this.mfaInputEl.setAttribute("maxlength", "6");
@@ -366,6 +516,16 @@ export class LoginModal extends Modal {
       this.showError("Please enter your MFA code.");
       return;
     }
+    if (this.showNewPassword) {
+      if (this.newPasswordValue.length < 12) {
+        this.showError("New password must be at least 12 characters.");
+        return;
+      }
+      if (this.newPasswordValue !== this.newPasswordConfirm) {
+        this.showError("New passwords do not match.");
+        return;
+      }
+    }
     if (this.encryptionMode === 'hybrid-zk') {
       if (!this.passphrase) {
         this.showError("Please enter your encryption passphrase.");
@@ -387,7 +547,10 @@ export class LoginModal extends Modal {
 
     const submitEl = this.submitBtn?.buttonEl;
     if (submitEl) {
-      setButtonLoading(submitEl, true, { label: this.showMfa ? "Verifying" : "Signing in" });
+      const loadingLabel = this.showNewPassword
+        ? "Setting password"
+        : (this.showMfa ? "Verifying" : "Signing in");
+      setButtonLoading(submitEl, true, { label: loadingLabel });
     }
 
     try {
@@ -398,12 +561,17 @@ export class LoginModal extends Modal {
         mfaCode: this.mfaCode,
         passphrase: this.passphrase,
         zkSetup: this.isZkSetup,
+        newPassword: this.showNewPassword ? this.newPasswordValue : undefined,
       });
       this.close();
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Login failed";
 
-      if (msg.toLowerCase().includes("mfa") || msg.toLowerCase().includes("challenge") || msg.toLowerCase().includes("2fa")) {
+      // The NEW_PASSWORD_REQUIRED sentinel must be matched BEFORE the generic
+      // "mfa"/"challenge"/"2fa" test so the word "password" routes here.
+      if (msg === "NEW_PASSWORD_REQUIRED") {
+        this.showNewPasswordPrompt();
+      } else if (msg.toLowerCase().includes("mfa") || msg.toLowerCase().includes("challenge") || msg.toLowerCase().includes("2fa")) {
         this.showMfaPrompt();
       } else if (msg.toLowerCase().includes("incorrect passphrase")) {
         this.showError("Incorrect encryption passphrase. If you have lost your passphrase, contact your organization administrator for key recovery.");
@@ -413,8 +581,11 @@ export class LoginModal extends Modal {
     } finally {
       if (submitEl?.isConnected) {
         setButtonLoading(submitEl, false);
-        // Keep the post-MFA label in sync with the current flow state.
-        this.submitBtn?.setButtonText(this.showMfa ? "Verify MFA" : "Sign In");
+        // Keep the button label in sync with the current flow state.
+        const label = this.showNewPassword
+          ? "Set password & sign in"
+          : (this.showMfa ? "Verify MFA" : "Sign In");
+        this.submitBtn?.setButtonText(label);
       }
     }
   }
@@ -440,7 +611,7 @@ export class LoginModal extends Modal {
         cls: "vaultguard-login-subtitle",
       });
     } else {
-      contentEl.createEl("h2", { text: "Reset Password", cls: "vaultguard-login-title" });
+      contentEl.createEl("h2", { text: "Reset password", cls: "vaultguard-login-title" });
       contentEl.createEl("p", {
         text: "Enter your email to receive a password reset code.",
         cls: "vaultguard-login-subtitle",
@@ -489,7 +660,7 @@ export class LoginModal extends Modal {
     let sendCodeBtn: ButtonComponent;
     const sendCodeRow = form.createDiv({ cls: "vaultguard-reset-send-row" });
     sendCodeBtn = new ButtonComponent(sendCodeRow)
-      .setButtonText("Send Reset Code")
+      .setButtonText("Send reset code")
       .setCta()
       .onClick(async () => {
         const email = resetEmailInput.value.trim();
@@ -512,7 +683,7 @@ export class LoginModal extends Modal {
         } finally {
           if (sendCodeBtn.buttonEl.isConnected) {
             setButtonLoading(sendCodeBtn.buttonEl, false);
-            sendCodeBtn.setButtonText("Resend Code");
+            sendCodeBtn.setButtonText("Resend code");
           }
         }
       });
@@ -523,7 +694,7 @@ export class LoginModal extends Modal {
 
     // Code field
     const codeGroup = confirmSection.createDiv({ cls: "vaultguard-field-group" });
-    codeGroup.createEl("label", { text: "Reset Code", cls: "vaultguard-field-label" });
+    codeGroup.createEl("label", { text: "Reset code", cls: "vaultguard-field-label" });
     codeGroup.createEl("span", {
       text: "Enter the code sent to your email",
       cls: "vaultguard-field-hint",
@@ -535,29 +706,28 @@ export class LoginModal extends Modal {
 
     // New password field
     const newPassGroup = confirmSection.createDiv({ cls: "vaultguard-field-group" });
-    newPassGroup.createEl("label", { text: "New Password", cls: "vaultguard-field-label" });
-    newPassGroup.createEl("span", {
-      text: "12+ characters with uppercase, lowercase, numbers, and symbols",
-      cls: "vaultguard-field-hint",
-    });
+    newPassGroup.createEl("label", { text: "New password", cls: "vaultguard-field-label" });
     const newPassInput = newPassGroup.createEl("input", {
       cls: "vaultguard-field-input",
       attr: { type: "password", placeholder: "New password" },
     });
+    this.addPasswordToggle(newPassInput);
+    this.attachPasswordRequirements(newPassInput, newPassGroup);
 
     // Confirm password field
     const confirmPassGroup = confirmSection.createDiv({ cls: "vaultguard-field-group" });
-    confirmPassGroup.createEl("label", { text: "Confirm New Password", cls: "vaultguard-field-label" });
+    confirmPassGroup.createEl("label", { text: "Confirm new password", cls: "vaultguard-field-label" });
     const confirmPassInput = confirmPassGroup.createEl("input", {
       cls: "vaultguard-field-input",
       attr: { type: "password", placeholder: "Confirm new password" },
     });
+    this.addPasswordToggle(confirmPassInput);
 
     // "Reset Password" button
     let resetBtn: ButtonComponent;
     const resetRow = confirmSection.createDiv({ cls: "vaultguard-reset-send-row" });
     resetBtn = new ButtonComponent(resetRow)
-      .setButtonText("Reset Password")
+      .setButtonText("Reset password")
       .setCta()
       .onClick(async () => {
         const email = resetEmailInput.value.trim();
@@ -606,7 +776,7 @@ export class LoginModal extends Modal {
     // Back to login link
     const actionRow = contentEl.createDiv({ cls: "vaultguard-login-actions" });
     new ButtonComponent(actionRow)
-      .setButtonText("Back to Login")
+      .setButtonText("Back to login")
       .onClick(() => this.onOpen());
 
     // Focus email input
@@ -648,7 +818,7 @@ export class LoginModal extends Modal {
       if (this.mfaInputEl) this.mfaInputEl.value = "";
       if (this.mfaContainer) this.mfaContainer.hide();
       this.applyMfaModeUi();
-      this.submitBtn?.setButtonText("Sign In");
+      this.submitBtn?.setButtonText("Sign in");
       this.showError("");
       // Display a transient success message via the error banner (re-used as
       // an info banner) — keeps the modal lightweight.

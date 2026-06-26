@@ -12,6 +12,55 @@ the Obsidian client.
 - **Learn more / managed hosting:** https://vaultguard.cloud
 - **Compare editions:** https://vaultguard.cloud/#/compare
 
+## Features
+
+- **End-to-end encrypted sync** — every file is AES-256-GCM encrypted before it
+  leaves the device; the server stores ciphertext only. Decryption needs a
+  short-lived, server-issued key lease that is revoked instantly on offboarding.
+- **Local at-rest encryption** — every file in your vault folder is also
+  encrypted in place on disk under a per-device key wrapped by the OS keychain,
+  so Finder, Spotlight, and backup tools only ever see ciphertext.
+- **Per-file permissions** — vault, folder, and file-level grants with role
+  inheritance, enforced server-side. Default deny; explicit grants only.
+- **Permission-aware AI chat** — a native Claude chat panel inside Obsidian
+  (the **VaultGuard Chat** ribbon icon). Ask about your notes, or have Claude
+  draft and edit them. Every file it reads or writes runs through the *same*
+  at-rest decryption, per-file permission checks, and audit logging as a human
+  user; the model never touches the on-disk ciphertext. Connect with your own
+  Anthropic API key or by driving an existing Claude subscription — until you
+  connect, the panel makes zero outbound calls. Works on desktop and mobile
+  (token-by-token streaming is desktop-only).
+- **Visual permissions graph** — the **VaultGuard Permissions** ribbon icon (or
+  the "VaultGuard: Open permissions graph" command) opens an interactive map of
+  who can reach what: users, files, and folders as nodes, with edges colored by
+  access level (read / write / admin) and dashed for time-bound grants. Click any
+  node or edge to see exactly which rule grants that access and why. The graph
+  only ever shows files you yourself can read. Desktop-only.
+- **Audit logging** — every access and permission change is recorded to an
+  append-only audit log (advanced dashboards, alerts, and CSV export are a Pro
+  feature).
+- **Re-encryption on offboarding** — revoking a user rotates the keys for the
+  files they could reach, so their cached copies become permanently unreadable.
+- **Built-in vault tools** — both the AI chat and any external agent work
+  through one curated, permission-gated tool surface instead of raw file access:
+  `list` and `search` the files you can see, `read` decrypted content,
+  `apply_patch` edits, and `create` new notes. Every call is permission-checked
+  and audit-logged, and the tools refuse hidden/excluded paths (`.obsidian`,
+  `.trash`, `.git`, …).
+- **MCP server for external agents** — VaultGuard runs a built-in **MCP (Model
+  Context Protocol)** server over Streamable HTTP, so you can wire your own AI
+  tools — Claude Code, Cursor, Claudian, anything that speaks MCP — into the
+  vault. They surface as `mcp__vaultguard__list` / `search` / `read` /
+  `apply_patch` / `create` and connect with short-lived, scoped lease tokens you
+  mint, rotate, and revoke from **Settings → VaultGuard → Agent bridge
+  connections**. Agents never get raw filesystem access or your keys — only
+  decrypted content they're allowed to read. Desktop-only.
+
+The AI chat, permissions graph, built-in tools, and MCP server are plugin
+features and work on **every edition** (Community, Pro, Enterprise) — the
+security primitives are never paywalled. See the [security plane](#security-plane)
+table below for the full per-edition breakdown.
+
 ## Editions
 
 VaultGuard Community Edition is the open-source, self-hosted stack (your AWS,

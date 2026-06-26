@@ -27,7 +27,12 @@ export class MfaSetupModal extends Modal {
   private session: string;
   private onVerify: (code: string, session: string) => Promise<{ session: string; status: string }>;
   private onComplete: (result: MfaSetupResult) => void;
+  private onCancel?: () => void;
   private recoveryCodes: string[] = [];
+  /** Set once MFA setup completes successfully, so cancel handlers no-op. */
+  private completed = false;
+  /** Guards `onCancel` so the Cancel button + onClose can't double-fire it. */
+  private cancelNotified = false;
 
   constructor(
     app: App,
@@ -37,6 +42,12 @@ export class MfaSetupModal extends Modal {
       session: string;
       onVerify: (code: string, session: string) => Promise<{ session: string; status: string }>;
       onComplete: (result: MfaSetupResult) => void;
+      /**
+       * Invoked when the user cancels or closes the modal before completing
+       * setup. Lets the caller settle its awaited login Promise instead of
+       * hanging in "Signing in" limbo. Fires at most once.
+       */
+      onCancel?: () => void;
     }
   ) {
     super(app);
@@ -45,6 +56,14 @@ export class MfaSetupModal extends Modal {
     this.session = opts.session;
     this.onVerify = opts.onVerify;
     this.onComplete = opts.onComplete;
+    this.onCancel = opts.onCancel;
+  }
+
+  /** Fire `onCancel` once, unless setup already completed successfully. */
+  private notifyCancel(): void {
+    if (this.completed || this.cancelNotified) return;
+    this.cancelNotified = true;
+    this.onCancel?.();
   }
 
   onOpen(): void {
@@ -54,6 +73,9 @@ export class MfaSetupModal extends Modal {
   }
 
   onClose(): void {
+    // Closing without completing setup (X button, Esc, click-outside) must
+    // still notify the caller so the awaited login Promise settles.
+    this.notifyCancel();
     this.modalEl.removeClass("vaultguard-mfa-setup-modal");
     this.contentEl.removeClass("vaultguard-mfa-setup-content");
     this.contentEl.empty();
@@ -65,7 +87,7 @@ export class MfaSetupModal extends Modal {
     contentEl.empty();
 
     contentEl.createEl("h2", {
-      text: "Set Up Two-Factor Authentication",
+      text: "Set up two-factor authentication",
       cls: "vaultguard-modal-title",
     });
     contentEl.createEl("p", {
@@ -109,7 +131,7 @@ export class MfaSetupModal extends Modal {
 
     // Verification code input
     const verifyGroup = contentEl.createDiv({ cls: "vaultguard-field-group" });
-    verifyGroup.createEl("label", { text: "Verification Code", cls: "vaultguard-field-label" });
+    verifyGroup.createEl("label", { text: "Verification code", cls: "vaultguard-field-label" });
     const codeInput = verifyGroup.createEl("input", {
       cls: "vaultguard-field-input vaultguard-mfa-input",
       attr: { type: "text", placeholder: "123456", maxlength: "6", inputmode: "numeric", pattern: "[0-9]*" },
@@ -121,10 +143,13 @@ export class MfaSetupModal extends Modal {
 
     // Buttons
     const actionRow = contentEl.createDiv({ cls: "vaultguard-login-actions" });
-    new ButtonComponent(actionRow).setButtonText("Cancel").onClick(() => this.close());
+    new ButtonComponent(actionRow).setButtonText("Cancel").onClick(() => {
+      this.notifyCancel();
+      this.close();
+    });
 
     const verifyBtn = new ButtonComponent(actionRow)
-      .setButtonText("Verify & Enable")
+      .setButtonText("Verify & enable")
       .setCta();
 
     verifyBtn.onClick(async () => {
@@ -153,7 +178,7 @@ export class MfaSetupModal extends Modal {
         errorEl.show();
       } finally {
         verifyBtn.setDisabled(false);
-        verifyBtn.setButtonText("Verify & Enable");
+        verifyBtn.setButtonText("Verify & enable");
       }
     });
 
@@ -166,7 +191,7 @@ export class MfaSetupModal extends Modal {
     contentEl.empty();
 
     contentEl.createEl("h2", {
-      text: "Save Your Recovery Codes",
+      text: "Save your recovery codes",
       cls: "vaultguard-modal-title",
     });
     contentEl.createEl("p", {
@@ -185,13 +210,13 @@ export class MfaSetupModal extends Modal {
 
     // Copy all button
     const copyAllBtn = contentEl.createEl("button", {
-      text: "Copy All Codes",
+      text: "Copy all codes",
       cls: "vaultguard-mfa-copy-all-btn",
     });
     copyAllBtn.addEventListener("click", () => {
       navigator.clipboard.writeText(this.recoveryCodes.join("\n"));
       copyAllBtn.setText("Copied!");
-      window.setTimeout(() => copyAllBtn.setText("Copy All Codes"), 2000);
+      window.setTimeout(() => copyAllBtn.setText("Copy all codes"), 2000);
     });
 
     contentEl.createEl("p", {
@@ -216,6 +241,9 @@ export class MfaSetupModal extends Modal {
     });
 
     doneBtn.onClick(() => {
+      // Mark completed BEFORE onComplete/close so the onClose-triggered
+      // notifyCancel() no-ops and the cancel path never double-fires.
+      this.completed = true;
       this.onComplete({
         session,
         recoveryCodes: this.recoveryCodes,

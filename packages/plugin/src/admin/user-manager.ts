@@ -292,10 +292,10 @@ class InviteUserModal extends Modal {
     contentEl.empty();
     this.modalEl.addClass("vaultguard-dialog-modal");
     contentEl.addClass("vaultguard-dialog-content");
-    contentEl.createEl("h3", { text: "Invite User" });
+    contentEl.createEl("h3", { text: "Invite user" });
 
     new Setting(contentEl)
-      .setName("Email Address")
+      .setName("Email address")
       .setDesc("An invitation will be sent via AWS Cognito")
       .addText((text) =>
         text
@@ -320,7 +320,7 @@ class InviteUserModal extends Modal {
       );
 
     new Setting(contentEl)
-      .setName("Send Welcome Email")
+      .setName("Send welcome email")
       .setDesc("Send an email with setup instructions and invite link")
       .addToggle((toggle) =>
         toggle.setValue(this.sendWelcomeEmail).onChange((value) => {
@@ -331,7 +331,7 @@ class InviteUserModal extends Modal {
     const actionRow = contentEl.createDiv({ cls: "vaultguard-modal-actions" });
     new ButtonComponent(actionRow).setButtonText("Cancel").onClick(() => this.close());
     new ButtonComponent(actionRow)
-      .setButtonText("Send Invite")
+      .setButtonText("Send invite")
       .setCta()
       .onClick(() => this.handleInvite());
   }
@@ -530,7 +530,7 @@ class RoleEditorModal extends Modal {
     });
 
     new Setting(contentEl)
-      .setName("New Role")
+      .setName("New role")
       .setDesc("Changing a role immediately updates the user's effective permissions")
       .addDropdown((dropdown) =>
         dropdown
@@ -546,7 +546,7 @@ class RoleEditorModal extends Modal {
     const actionRow = contentEl.createDiv({ cls: "vaultguard-modal-actions" });
     new ButtonComponent(actionRow).setButtonText("Cancel").onClick(() => this.close());
     new ButtonComponent(actionRow)
-      .setButtonText("Update Role")
+      .setButtonText("Update role")
       .setCta()
       .onClick(() => this.handleUpdate());
   }
@@ -595,7 +595,7 @@ class RevokeAccessModal extends Modal {
     this.modalEl.addClass("vaultguard-revoke-modal");
     contentEl.addClass("vaultguard-dialog-content");
 
-    contentEl.createEl("h3", { text: "Revoke Access", cls: "vaultguard-danger-title" });
+    contentEl.createEl("h3", { text: "Revoke access", cls: "vaultguard-danger-title" });
 
     contentEl.createEl("p", {
       text: `You are about to revoke all access for ${this.user.displayName} (${this.user.email}).`,
@@ -632,7 +632,7 @@ class RevokeAccessModal extends Modal {
     const actionRow = contentEl.createDiv({ cls: "vaultguard-modal-actions" });
     new ButtonComponent(actionRow).setButtonText("Cancel").onClick(() => this.close());
     new ButtonComponent(actionRow)
-      .setButtonText("Revoke Access")
+      .setButtonText("Revoke access")
       .setWarning()
       .onClick(async () => {
         if (confirmValue !== this.user.email) {

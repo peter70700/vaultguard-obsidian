@@ -199,7 +199,7 @@ export class FilePermissionPanel {
     if (this.rules.length === 0) {
       container.createDiv({
         cls: "vaultguard-fp-empty",
-        text: "No permission rules for this file. Access is based on default role permissions.",
+        text: "No file-specific rules. Access here follows each member's vault role (viewer / editor / admin).",
       });
       return;
     }
@@ -421,7 +421,7 @@ export class FilePermissionPanel {
     // "No Access" creates a deny rule so admins can revoke inherited access
     // for one principal without removing them from the vault. Mirrors the
     // option already available in the existing-rule dropdown.
-    levelSelect.createEl("option", { text: "No Access", attr: { value: "none" } });
+    levelSelect.createEl("option", { text: "No access", attr: { value: "none" } });
     levelSelect.value = this.draftLevel;
 
     // Optional expiry — when set, the grant is written as a time-bound rule

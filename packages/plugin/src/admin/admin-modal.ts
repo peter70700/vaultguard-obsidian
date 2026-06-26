@@ -280,7 +280,7 @@ export class AdminModal extends Modal {
     // Toolbar
     const toolbar = this.createDivElement(container, "vaultguard-toolbar");
     new ButtonComponent(toolbar)
-      .setButtonText("Invite User")
+      .setButtonText("Invite user")
       .setCta()
       .onClick(() => this.userManager.showInviteDialog(container));
 
@@ -760,7 +760,7 @@ export class AdminModal extends Modal {
 
     // Apply filters button
     new ButtonComponent(toolbar)
-      .setButtonText("Apply Filters")
+      .setButtonText("Apply filters")
       .onClick(async () => {
         this.auditFilters = {
           search: searchInput.getValue(),
@@ -850,7 +850,7 @@ export class AdminModal extends Modal {
       if (this.auditHasMore) {
         const pagination = container.createDiv({ cls: "vaultguard-pagination" });
         const loadMoreBtn = new ButtonComponent(pagination);
-        loadMoreBtn.setButtonText("Load More").onClick(async () => {
+        loadMoreBtn.setButtonText("Load more").onClick(async () => {
           loadMoreBtn.setDisabled(true);
           loadMoreBtn.setButtonText("Loading...");
           await this.fetchAndRenderAuditLog(container, filters, true, vaultRecord);
@@ -1035,14 +1035,14 @@ export class AdminModal extends Modal {
   private async renderRecoveryTab(): Promise<void> {
     const container = this.contentContainer.createDiv({ cls: "vaultguard-recovery-tab" });
 
-    container.createEl("h3", { text: "Key Recovery & Re-encryption" });
+    container.createEl("h3", { text: "Key recovery & re-encryption" });
     container.createEl("p", {
       text: "Manage encryption key recovery for offboarded users and trigger re-encryption of affected files.",
       cls: "setting-item-description",
     });
 
     // ── Re-encryption trigger ─────────────────────────────
-    container.createEl("h4", { text: "Re-encrypt Files After Offboarding" });
+    container.createEl("h4", { text: "Re-encrypt files after offboarding" });
     container.createEl("p", {
       text: "After revoking a user, re-encrypt all files they had access to with new keys. " +
         "This ensures the revoked user's old key material cannot decrypt any retained copies. " +
@@ -1052,7 +1052,7 @@ export class AdminModal extends Modal {
 
     let targetUserId = "";
     new Setting(container)
-      .setName("Target User ID")
+      .setName("Target user ID")
       .setDesc("The user ID of the revoked user whose files need re-encryption")
       .addText((text) => {
         text
@@ -1063,11 +1063,11 @@ export class AdminModal extends Modal {
       });
 
     new Setting(container)
-      .setName("Start Re-encryption")
+      .setName("Start re-encryption")
       .setDesc("This will decrypt and re-encrypt all files the user had access to. May take several minutes for large vaults.")
       .addButton((btn) =>
         btn
-          .setButtonText("Trigger Re-encryption")
+          .setButtonText("Trigger re-encryption")
           .setWarning()
           .onClick(async () => {
             const userId = targetUserId.trim();
@@ -1098,13 +1098,13 @@ export class AdminModal extends Modal {
               new Notice(`Failed to start re-encryption: ${errorMessage(error)}`);
             } finally {
               btn.setDisabled(false);
-              btn.setButtonText("Trigger Re-encryption");
+              btn.setButtonText("Trigger re-encryption");
             }
           })
       );
 
     // ── Job status check ─────────────────────────────────
-    container.createEl("h4", { text: "Check Job Status" });
+    container.createEl("h4", { text: "Check job status" });
 
     let jobIdValue = "";
     new Setting(container)
@@ -1118,7 +1118,7 @@ export class AdminModal extends Modal {
           });
       })
       .addButton((btn) =>
-        btn.setButtonText("Check Status").onClick(async () => {
+        btn.setButtonText("Check status").onClick(async () => {
           const jobId = jobIdValue.trim();
           if (!jobId) {
             new Notice("Please enter a job ID.");
@@ -1129,7 +1129,7 @@ export class AdminModal extends Modal {
       );
 
     // ── Key Recovery (ZK mode) ───────────────────────────
-    container.createEl("h4", { text: "Emergency Key Recovery" });
+    container.createEl("h4", { text: "Emergency key recovery" });
     container.createEl("p", {
       text: "For organizations using end-to-end encryption (hybrid ZK mode): recover a user's " +
         "encrypted master key using the organization recovery key. This is a sensitive operation " +
@@ -1147,7 +1147,7 @@ export class AdminModal extends Modal {
 
     let recoveryUserId = "";
     new Setting(container)
-      .setName("Recover User's Key")
+      .setName("Recover user's key")
       .setDesc("Enter the user ID to recover their wrapped master key")
       .addText((text) => {
         text
@@ -1158,7 +1158,7 @@ export class AdminModal extends Modal {
       })
       .addButton((btn) =>
         btn
-          .setButtonText("Initiate Recovery")
+          .setButtonText("Initiate recovery")
           .setWarning()
           .onClick(async () => {
             const userId = recoveryUserId.trim();
@@ -1183,7 +1183,7 @@ export class AdminModal extends Modal {
                 const wrappedKey = data.wrappedUMK_org;
                 new Notice("Recovery key retrieved.");
                 const resultEl = container.createDiv({ cls: "vaultguard-recovery-result" });
-                resultEl.createEl("h4", { text: "Recovery Result" });
+                resultEl.createEl("h4", { text: "Recovery result" });
                 resultEl.createEl("p", {
                   text: data.message || "Unwrap this key with the organization recovery private key.",
                 });
@@ -1396,7 +1396,7 @@ export class AdminModal extends Modal {
     container.createEl("h3", { text: "Organization" });
 
     new Setting(container)
-      .setName("Organization Name")
+      .setName("Organization name")
       .setDesc("Display name for your organization")
       .addText((text) =>
         text
@@ -1413,10 +1413,10 @@ export class AdminModal extends Modal {
       .addText((text) => text.setValue(settings.orgId).setDisabled(true));
 
     // Sync configuration section
-    container.createEl("h3", { text: "Sync Configuration" });
+    container.createEl("h3", { text: "Sync configuration" });
 
     new Setting(container)
-      .setName("Sync Mode")
+      .setName("Sync mode")
       .setDesc("How vault data is synchronized with the backend")
       .addDropdown((dropdown) =>
         dropdown
@@ -1431,7 +1431,7 @@ export class AdminModal extends Modal {
       );
 
     const syncIntervalSetting = new Setting(container)
-      .setName("Sync Interval (minutes)")
+      .setName("Sync interval (minutes)")
       .setDesc("How often to sync (only applies to periodic mode)")
       .addText((text) => {
         text.inputEl.type = "number";
@@ -1448,10 +1448,10 @@ export class AdminModal extends Modal {
     syncIntervalSetting.settingEl.addClass("vaultguard-number-setting");
 
     // Security policies section
-    container.createEl("h3", { text: "Security Policies" });
+    container.createEl("h3", { text: "Security policies" });
 
     new Setting(container)
-      .setName("Enforce Encryption")
+      .setName("Enforce encryption")
       .setDesc("VaultGuard always encrypts vault data at rest. This policy is always enabled.")
       .addToggle((toggle) =>
         toggle
@@ -1475,7 +1475,7 @@ export class AdminModal extends Modal {
       );
 
     const maxSessionSetting = new Setting(container)
-      .setName("Max Session Duration (hours)")
+      .setName("Max session duration (hours)")
       .setDesc("Force re-authentication after this many hours")
       .addText((text) => {
         text.inputEl.type = "number";
@@ -1507,7 +1507,7 @@ export class AdminModal extends Modal {
     autoLockSetting.settingEl.addClass("vaultguard-number-setting");
 
     const allowedDomainsSetting = new Setting(container)
-      .setName("Allowed Email Domains")
+      .setName("Allowed email domains")
       .setDesc("Domains allowed for user invites. Leave blank to allow any domain.")
       .addTextArea((text) => {
         text.inputEl.rows = 3;
@@ -1522,7 +1522,7 @@ export class AdminModal extends Modal {
     allowedDomainsSetting.settingEl.addClass("vaultguard-admin-textarea-setting");
 
     const retentionSetting = new Setting(container)
-      .setName("Audit Log Retention (days)")
+      .setName("Audit log retention (days)")
       .setDesc("How long to retain audit log entries")
       .addText((text) => {
         text.inputEl.type = "number";
@@ -1550,7 +1550,7 @@ export class AdminModal extends Modal {
 
     if (readOnly) {
       new Setting(container).addButton((btn) =>
-        btn.setButtonText("Retry Load").onClick(() => {
+        btn.setButtonText("Retry load").onClick(() => {
           this.renderActiveTab();
         })
       );
@@ -1562,7 +1562,7 @@ export class AdminModal extends Modal {
     new Setting(container)
       .addButton((btn) => {
         btn
-          .setButtonText("Save Settings")
+          .setButtonText("Save settings")
           .setCta()
           .onClick(async () => {
             try {
@@ -1576,12 +1576,12 @@ export class AdminModal extends Modal {
               new Notice(`Failed to save: ${errorMessage(error)}`);
             } finally {
               btn.setDisabled(false);
-              btn.setButtonText("Save Settings");
+              btn.setButtonText("Save settings");
             }
           });
       })
       .addButton((btn) => {
-        btn.setButtonText("Reset to Defaults").onClick(async () => {
+        btn.setButtonText("Reset to defaults").onClick(async () => {
           const confirmed = await this.showConfirmDialog(
             "Reset Settings",
             "Are you sure you want to reset all settings to their defaults? This cannot be undone."
@@ -1597,7 +1597,7 @@ export class AdminModal extends Modal {
               new Notice(`Failed to reset: ${errorMessage(error)}`);
             } finally {
               btn.setDisabled(false);
-              btn.setButtonText("Reset to Defaults");
+              btn.setButtonText("Reset to defaults");
             }
           }
         });

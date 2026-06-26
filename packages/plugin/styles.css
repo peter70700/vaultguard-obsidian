@@ -1262,6 +1262,18 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   margin-top: 8px;
 }
 
+/* Friendly zero-vault state (vault-picker-modal.ts renderEmptyState) */
+.vaultguard-vault-picker-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vaultguard-vault-picker-empty-actions {
+  display: flex;
+  gap: 8px;
+}
+
 /* ─── Binding Reconciliation Modal ─────────────────────────────────────── */
 
 .modal.vaultguard-reconciliation-modal {
@@ -1774,6 +1786,45 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   color: var(--text-faint);
 }
 
+/* Show/hide password toggle (login-modal.ts addPasswordToggle) */
+.vaultguard-password-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.vaultguard-password-input {
+  padding-right: 40px;
+}
+
+.vaultguard-password-toggle {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-muted);
+  border-radius: 4px;
+}
+
+.vaultguard-password-toggle:hover {
+  color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
+}
+
+.vaultguard-password-toggle svg {
+  width: 16px;
+  height: 16px;
+}
+
 .vaultguard-mfa-container {
   border-top: 1px solid var(--background-modifier-border);
   padding-top: 16px;
@@ -1891,6 +1942,64 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   margin-top: 4px;
 }
 
+/* ─── New-password challenge (NEW_PASSWORD_REQUIRED) ──────────────────── */
+
+.vaultguard-new-password-container {
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 16px;
+  margin-top: 2px;
+}
+
+/* ─── Live password-requirements checklist ───────────────────────────── */
+
+.vaultguard-pw-req-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 4px;
+}
+
+.vaultguard-pw-req {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8em;
+  color: var(--text-muted);
+}
+
+.vaultguard-pw-req .vaultguard-pw-req-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.vaultguard-pw-req .vaultguard-pw-req-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.vaultguard-pw-req-met {
+  color: var(--color-green, #2ea043);
+}
+
+/* ─── Login footer / setup-guide docs link ───────────────────────────── */
+
+.vaultguard-login-footer {
+  margin-top: 14px;
+  text-align: center;
+}
+
+.vaultguard-login-docs-link {
+  font-size: 0.82em;
+  color: var(--interactive-accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.vaultguard-login-docs-link:hover {
+  text-decoration: underline;
+}
+
 @media (max-width: 420px) {
   .modal.vaultguard-login-modal .modal-content,
   .vaultguard-login-modal-content {
@@ -1982,6 +2091,13 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
    on the open file. The file's content is still in the local cache (so
    that sync works) but must never be shown to a user who has been denied.
    ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Establish a containing block for the absolutely-positioned overlay.
+   Applied to `.view-content` defensively so custom themes that reset it to
+   `position: static` can't let the overlay escape the editor pane. */
+.vaultguard-noaccess-host {
+  position: relative;
+}
 
 .vaultguard-noaccess-overlay {
   position: absolute;
@@ -4857,6 +4973,11 @@ button .vaultguard-btn-spinner:only-child {
   opacity: 0.7;
 }
 
+/* Reload-prompt Notice: spacing above the "Reload now" button row. */
+.vaultguard-reload-notice-actions {
+  margin-top: 8px;
+}
+
 /* Pro-upsell modal — prominent paywall badge + supporting layout. */
 .vaultguard-pro-upsell-badge {
   display: flex;
@@ -5200,6 +5321,44 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-chat-empty-hint {
   font-size: 12px;
   color: var(--text-faint);
+}
+.vaultguard-chat-welcome {
+  max-width: 380px;
+  margin: 0 auto;
+  padding: 24px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.vaultguard-chat-welcome-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.vaultguard-chat-welcome-chip {
+  padding: 4px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-normal);
+  font-size: 0.85em;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.vaultguard-chat-welcome-chip:hover {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+
+/* Passive, once-per-session mobile-only note: live streaming is desktop-only,
+   so explain quietly inline rather than nagging with a per-turn Notice. */
+.vaultguard-chat-stream-hint {
+  font-size: 12px;
+  color: var(--text-faint);
+  text-align: center;
+  padding: 8px 12px;
 }
 
 /* Message bubbles */

@@ -257,11 +257,8 @@ export class ReadOnlyGuard {
 
     // The overlay is positioned absolute; ensure the parent establishes a
     // containing block. Obsidian's default `.view-content` is `position:
-    // relative` already, but set it defensively for any custom themes.
-    const computed = getComputedStyle(viewContent);
-    if (computed.position === "static") {
-      viewContent.setCssStyles({ position: "relative" });
-    }
+    // relative` already, but apply the class defensively for any custom themes.
+    viewContent.addClass("vaultguard-noaccess-host");
 
     const overlay = document.createElement("div");
     overlay.className = NOACCESS_OVERLAY_CLS;

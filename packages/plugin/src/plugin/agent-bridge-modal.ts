@@ -57,7 +57,7 @@ export class AgentBridgeLeaseModal extends Modal {
   private renderForm(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Create Agent Bridge Lease" });
+    contentEl.createEl("h2", { text: "Create agent bridge lease" });
     contentEl.createEl("p", {
       text:
         "Mint a short-lived token for an external agent. The agent can only use VaultGuard bridge tools within the scope below; hidden and local-only files remain blocked.",
@@ -117,7 +117,7 @@ export class AgentBridgeLeaseModal extends Modal {
     new Setting(contentEl)
       .setName("Lifetime")
       .setDesc(
-        "Time-limited leases live in memory only and expire on the clock. 'Until logout' leases are persistent — they survive Obsidian restarts (encrypted on disk via the at-rest cipher) and end when you log out. Persistent leases require re-auth and cannot use 'Allow writes'."
+        "Time-limited leases live in memory only and expire on the clock. 'until logout' leases are persistent — they survive Obsidian restarts (encrypted on disk via the at-rest cipher) and end when you log out. Persistent leases require re-auth and cannot use 'allow writes'."
       )
       .addDropdown((dropdown) =>
         dropdown

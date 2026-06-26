@@ -418,13 +418,18 @@ export class PathPermissionsModal extends Modal {
     // for revoking inherited access (e.g. blocking one user from a folder
     // their role can otherwise read). Same option as the existing-rule
     // dropdown so admins have one consistent way to express deny.
-    levelSelect.createEl("option", { text: "No Access", attr: { value: "none" } });
+    levelSelect.createEl("option", { text: "No access", attr: { value: "none" } });
     levelSelect.value = this.draftLevel;
 
     const addBtn = new ButtonComponent(form)
       .setButtonText("Add")
       .setCta();
     addBtn.buttonEl.type = "button";
+    // While the team directory is still resolving (admins only), a teammate
+    // rule could be submitted against a half-loaded list. Disable Add until
+    // load completes; loadUsers() calls render(), which rebuilds this button
+    // with usersLoading=false, re-enabling it.
+    addBtn.setDisabled(this.usersLoading);
 
     const quickListEl = section.createDiv({ cls: "vaultguard-access-picker" });
 
@@ -539,6 +544,13 @@ export class PathPermissionsModal extends Modal {
     };
 
     const submitAddRule = async (): Promise<void> => {
+      // Belt-and-suspenders against the teammate-load race: the disabled Add
+      // button covers the button path, but Enter-to-submit and any stale render
+      // could still fire while the directory is loading.
+      if (this.usersLoading) {
+        new Notice("VaultGuard Sync: still loading teammates — try again in a moment.");
+        return;
+      }
       const principalType = typeSelect.value as "user" | "role";
       const rawPrincipalValue = principalInput.value.trim();
       const level = levelSelect.value;

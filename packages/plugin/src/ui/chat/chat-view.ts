@@ -208,6 +208,10 @@ export class VaultGuardChatView extends ItemView {
   // The streaming preference baked into the current runtime, so a settings
   // change mid-session rebuilds the runtime with the new transport.
   private runtimeStreaming = false;
+  // Passive once-per-view-session guard for the mobile streaming hint (the
+  // streaming toggle is hidden on mobile and live streaming is forced off, so
+  // a single muted line explains why — never a recurring Notice).
+  private streamHintShown = false;
 
   // ─── In-panel multi-tab state (AI chat tabs) ───────────────────────────────
   // The plugin owns ONE Obsidian chat view. Conversation tabs live inside that
@@ -396,6 +400,21 @@ export class VaultGuardChatView extends ItemView {
     window.setTimeout(() => this.resolveInitialConversation(), 0);
 
     this.inputController?.focus();
+    this.maybeShowMobileStreamingHint();
+  }
+
+  // Passive, once-per-view-session hint: on mobile the streaming toggle is
+  // hidden and live streaming is forced off, so explain it with a single muted
+  // line rather than a per-turn Notice (which would nag).
+  private maybeShowMobileStreamingHint(): void {
+    if (this.streamHintShown) return;
+    if (!Platform.isMobileApp || !this.plugin.settings.aiChatStreaming) return;
+    if (!this.listEl) return;
+    this.streamHintShown = true;
+    this.listEl.createDiv({
+      cls: "vaultguard-chat-stream-hint",
+      text: "Live token streaming is desktop-only; on mobile, replies arrive when complete.",
+    });
   }
 
   async onClose(): Promise<void> {
@@ -442,6 +461,56 @@ export class VaultGuardChatView extends ItemView {
       text:
         "Add your Anthropic API key in VaultGuard settings → AI Chat. " +
         "Until you do, this panel stays fully offline and makes no network calls.",
+    });
+  }
+
+  private renderWelcomeState(): void {
+    if (!this.listEl) return;
+    // Don't duplicate the banner (mirrors renderConnectState).
+    if (this.listEl.querySelector(`.${EMPTY_CLS}`)) return;
+    // Defensive connectedness re-check so this is safe to call from any site.
+    const connected =
+      this.plugin.settings.aiChatProvider === "subscription" ||
+      new AnthropicKeyStore(this.plugin).hasKey();
+    if (!connected) return;
+
+    // Live inside an EMPTY_CLS container so the existing first-turn removals
+    // (handleSubmit / subscription / renderMessages) clear the welcome too.
+    const welcome = this.listEl.createDiv({
+      cls: [EMPTY_CLS, "vaultguard-chat-welcome"],
+    });
+    const icon = welcome.createDiv({ cls: "vaultguard-chat-empty-icon" });
+    setIcon(icon, "message-square");
+    welcome.createEl("p", {
+      text:
+        "Ask about your vault, organize notes, or run a command — " +
+        "I work over your vault with your permissions.",
+    });
+
+    const chips: { label: string; value: string }[] = [
+      { label: "Summarize my recent notes", value: "Summarize my recent notes" },
+      { label: "Find notes about…", value: "Find notes about " },
+      { label: "What links to this note?", value: "What links to this note?" },
+      { label: "/organize-knowledge-base", value: "/organize-knowledge-base" },
+      { label: "$format-note", value: "$format-note " },
+    ];
+
+    const chipRow = welcome.createDiv({ cls: "vaultguard-chat-welcome-chips" });
+    for (const chip of chips) {
+      const button = chipRow.createEl("button", {
+        cls: "vaultguard-chat-welcome-chip",
+        text: chip.label,
+      });
+      // Pre-fill only — never auto-submit.
+      button.addEventListener("click", () => {
+        this.inputController?.setText(chip.value);
+        this.inputController?.focus();
+      });
+    }
+
+    welcome.createEl("p", {
+      cls: "vaultguard-chat-empty-hint",
+      text: "Type / for commands, $ for writing skills, @ to reference a note",
     });
   }
 
@@ -1154,6 +1223,8 @@ export class VaultGuardChatView extends ItemView {
       !new AnthropicKeyStore(this.plugin).hasKey()
     ) {
       this.renderConnectState();
+    } else {
+      this.renderWelcomeState();
     }
   }
 
@@ -2266,7 +2337,7 @@ export class VaultGuardChatView extends ItemView {
     lines.push("");
     lines.push(`direct children (${list.children.length}):`);
     Array.from(list.children)
-      .filter((child): child is HTMLElement => child instanceof HTMLElement)
+      .filter((child): child is HTMLElement => child.instanceOf(HTMLElement))
       .forEach((child, index) => {
         lines.push(this.describeChatDebugElement(child, `child[${index}]`, list));
       });
@@ -2290,7 +2361,7 @@ export class VaultGuardChatView extends ItemView {
 
   private findSuspiciousChatDebugElements(list: HTMLElement): HTMLElement[] {
     const all = [list, ...Array.from(list.querySelectorAll("*"))].filter(
-      (el): el is HTMLElement => el instanceof HTMLElement,
+      (el): el is HTMLElement => el.instanceOf(HTMLElement),
     );
     return all.filter((el) => this.chatDebugReasons(el, list).length > 0).slice(0, 120);
   }

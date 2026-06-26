@@ -1147,7 +1147,7 @@ export class FilePermissionHeader {
         cls: "vaultguard-fh-popover-edit-input",
         attr: {
           type: "text",
-          placeholder: "First Last",
+          placeholder: "First last",
           value: user ? getAccessUserDisplayName(user) : "",
         },
       }) as HTMLInputElement;
@@ -1164,7 +1164,7 @@ export class FilePermissionHeader {
         if (isVisible) {
           editForm.hide();
         } else {
-          editForm.setCssStyles({ display: "flex" });
+          editForm.show();
         }
         if (!isVisible) {
           editInput.focus();

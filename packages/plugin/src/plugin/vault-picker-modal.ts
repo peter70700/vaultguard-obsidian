@@ -34,6 +34,8 @@ export class VaultPickerModal extends Modal {
   private listEl: HTMLElement | null = null;
   private errorEl: HTMLElement | null = null;
   private busy = false;
+  /** One-shot guard so single-vault auto-bind only fires once per modal. */
+  private autoBindAttempted = false;
 
   constructor(
     app: App,
@@ -193,13 +195,32 @@ export class VaultPickerModal extends Modal {
     this.listEl.empty();
 
     const usable = vaults.filter((v) => !v.archived);
-    if (usable.length === 0) {
+
+    // Single usable vault → bind automatically (admins and non-admins alike).
+    // One-shot guard prevents a re-render loop; on failure autoBind falls back
+    // to a normal selectable row.
+    if (usable.length === 1 && !this.autoBindAttempted && !this.busy) {
+      this.autoBindAttempted = true;
       this.listEl.createEl("p", {
-        text: "You don't belong to any vaults yet.",
+        text: `Binding to "${usable[0].name}"…`,
         cls: "setting-item-description",
       });
+      void this.autoBind(usable[0]);
       return;
     }
+
+    if (usable.length === 0) {
+      this.renderEmptyState();
+      return;
+    }
+
+    this.renderVaultRows(usable);
+  }
+
+  /** Render one selectable "Select" row per usable vault. */
+  private renderVaultRows(usable: VaultRecord[]): void {
+    if (!this.listEl) return;
+    this.listEl.empty();
 
     for (const vault of usable) {
       const row = this.listEl.createDiv({ cls: "vaultguard-vault-picker-row" });
@@ -223,6 +244,73 @@ export class VaultPickerModal extends Modal {
           });
         });
     }
+  }
+
+  /**
+   * Auto-bind to the only usable vault. pick() closes the modal on success and
+   * surfaces an error (without closing) on failure — so if the modal is still
+   * open afterwards, binding failed and we fall back to a clickable row.
+   */
+  private async autoBind(vault: VaultRecord): Promise<void> {
+    await this.pick({
+      vaultId: vault.vaultId,
+      name: vault.name,
+      slug: vault.slug,
+    });
+    if (this.listEl && this.listEl.isConnected) {
+      this.renderVaultRows([vault]);
+    }
+  }
+
+  /** Friendly zero-vault state: explainer + Retry (always) + Contact-admin (non-admins). */
+  private renderEmptyState(): void {
+    if (!this.listEl) return;
+    this.listEl.empty();
+
+    const empty = this.listEl.createDiv({ cls: "vaultguard-vault-picker-empty" });
+
+    if (this.options.canCreateVaults) {
+      empty.createEl("p", {
+        text: "You don't have any vaults yet — create one below ↓, or retry.",
+        cls: "setting-item-description",
+      });
+      const actions = empty.createDiv({ cls: "vaultguard-vault-picker-empty-actions" });
+      new ButtonComponent(actions)
+        .setButtonText("Retry")
+        .onClick(() => this.retry());
+    } else {
+      empty.createEl("p", {
+        text:
+          "You're not a member of any vault yet. Ask an organization admin to " +
+          "add you, then retry.",
+        cls: "setting-item-description",
+      });
+      const actions = empty.createDiv({ cls: "vaultguard-vault-picker-empty-actions" });
+      new ButtonComponent(actions)
+        .setButtonText("Contact your admin")
+        .onClick(() => {
+          window.open(
+            "mailto:?subject=" +
+              encodeURIComponent("VaultGuard: please add me to a vault"),
+            "_blank"
+          );
+        });
+      new ButtonComponent(actions)
+        .setButtonText("Retry")
+        .onClick(() => this.retry());
+    }
+  }
+
+  /** Re-show "Loading…" then refetch the vault list. */
+  private retry(): void {
+    if (this.listEl) {
+      this.listEl.empty();
+      this.listEl.createEl("p", {
+        text: "Loading...",
+        cls: "setting-item-description",
+      });
+    }
+    void this.loadVaults();
   }
 
   private async pick(result: VaultPickerResult): Promise<void> {
