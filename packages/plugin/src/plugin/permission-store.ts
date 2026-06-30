@@ -94,6 +94,7 @@ const LEAF_SWEEP_YIELD_BATCH = 50;
  * A per-instance flag would re-warn on every reconstruction (IN-01).
  */
 let metadataCacheWarnedOnce = false;
+let metadataPurgeFallbackNoticeShown = false;
 
 // ── Store ────────────────────────────────────────────────────────────────────
 
@@ -146,6 +147,15 @@ export class PermissionStore extends Events {
 
   /** D-12: one-time feature-detect of undocumented metadataCache.deletePath. */
   private metadataCacheDeleteAvailable = false;
+
+  /**
+   * Paths whose access has resolved to NONE during a permission-change sweep.
+   * This is a supported fallback that does not depend on Obsidian's
+   * undocumented metadataCache.deletePath. VaultGuard graph/agent metadata
+   * readers consult this set and suppress these paths even if Obsidian's native
+   * metadata cache still contains backlinks/tags until restart.
+   */
+  private metadataSuppressedPaths: Set<string> = new Set();
 
   constructor(private cfg: PermissionStoreConfig) {
     super();
@@ -257,6 +267,15 @@ export class PermissionStore extends Events {
    */
   getStoreState(): PermissionStoreState {
     return this.state;
+  }
+
+  /**
+   * Defense-in-depth metadata side-channel guard. Returns true after a path has
+   * resolved to NONE during a permission-change sweep and before a later sweep
+   * proves the path is readable again.
+   */
+  isMetadataSuppressed(path: string): boolean {
+    return this.metadataSuppressedPaths.has(this.normalizeVaultPath(path));
   }
 
   /** Wave 2 Fix 2 (1.0.31): set before a warm-up cycle starts. */
@@ -499,13 +518,7 @@ export class PermissionStore extends Events {
         await this.sweepLeaves(serverConfirmed, path);
         return;
       }
-      if (level === PermissionLevel.NONE && this.metadataCacheDeleteAvailable) {
-        try {
-          (this.cfg.app.metadataCache as unknown as { deletePath: (p: string) => void }).deletePath(path);
-        } catch (err) {
-          this.cfg.log(`[VaultGuard] metadataCache.deletePath('${path}') threw: ${(err as Error).message}`);
-        }
-      }
+      this.applyMetadataPrivacyGuard(path, level);
       // Leaf sweep (per-path). filterPath narrows the sweep to leaves
       // currently viewing this path (Pitfall 5: rename emits OLD path,
       // but the leaf may now view the NEW path → filter prevents a
@@ -522,25 +535,17 @@ export class PermissionStore extends Events {
       this.cache.delete(k);
       this.inFlight.delete(k);
     }
-    if (this.metadataCacheDeleteAvailable) {
-      for (const cachedPath of previouslyCachedNonRoot) {
-        let level: PermissionLevel;
-        try {
-          level = await this.getPermission(cachedPath);
-        } catch (err) {
-          this.cfg.log(
-            `Permission store: wildcard re-resolve skipped "${cachedPath}" (resolve failed: ${(err as Error).message})`
-          );
-          continue;
-        }
-        if (level === PermissionLevel.NONE) {
-          try {
-            (this.cfg.app.metadataCache as unknown as { deletePath: (p: string) => void }).deletePath(cachedPath);
-          } catch (err) {
-            this.cfg.log(`[VaultGuard] metadataCache.deletePath('${cachedPath}') threw: ${(err as Error).message}`);
-          }
-        }
+    for (const cachedPath of previouslyCachedNonRoot) {
+      let level: PermissionLevel;
+      try {
+        level = await this.getPermission(cachedPath);
+      } catch (err) {
+        this.cfg.log(
+          `Permission store: wildcard re-resolve skipped "${cachedPath}" (resolve failed: ${(err as Error).message})`
+        );
+        continue;
       }
+      this.applyMetadataPrivacyGuard(cachedPath, level);
     }
     // Leaf sweep (wildcard). No filterPath — sweep every open leaf.
     await this.sweepLeaves(serverConfirmed);
@@ -621,6 +626,40 @@ export class PermissionStore extends Events {
         this.noneStreak.delete(path);
       }
     }
+  }
+
+  private applyMetadataPrivacyGuard(path: string, level: PermissionLevel): void {
+    const normalized = this.normalizeVaultPath(path);
+    if (!normalized) return;
+
+    if (level !== PermissionLevel.NONE) {
+      this.metadataSuppressedPaths.delete(normalized);
+      return;
+    }
+
+    this.metadataSuppressedPaths.add(normalized);
+
+    if (!this.metadataCacheDeleteAvailable) {
+      this.notifyMetadataPurgeFallback();
+      return;
+    }
+
+    try {
+      (this.cfg.app.metadataCache as unknown as { deletePath: (p: string) => void }).deletePath(normalized);
+    } catch (err) {
+      this.cfg.log(`[VaultGuard] metadataCache.deletePath('${normalized}') threw: ${(err as Error).message}`);
+      this.notifyMetadataPurgeFallback();
+    }
+  }
+
+  private notifyMetadataPurgeFallback(): void {
+    if (metadataPurgeFallbackNoticeShown) return;
+    metadataPurgeFallbackNoticeShown = true;
+    new Notice(
+      "VaultGuard Sync: Obsidian could not purge restricted-file metadata automatically. " +
+        "VaultGuard graph and AI metadata are hidden for revoked paths; restart Obsidian to clear native backlinks/tags.",
+      12000
+    );
   }
 
   // ── Private: leaf detach ───────────────────────────────────────────────────

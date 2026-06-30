@@ -17,7 +17,7 @@ import { requestUrl } from "obsidian";
  * Per CONTEXT.md D-44 and RESEARCH.md §"Pattern 3":
  *   - Parameterizes the FEATURES payload over Cloud vs Community variants
  *   - Asserts the featureEnabled predicate returns the cached value verbatim
- *   - Static-grep guard-rails ensure main.ts and admin-modal.ts retain the
+ *   - Static-grep guard-rails ensure commands.ts and admin-modal.ts retain the
  *     branch-selector reads AND wire ProUpsellModal at every site, so the
  *     same compiled binary observably routes CE users to an upsell modal
  *     instead of silently hiding Pro UI.
@@ -31,8 +31,8 @@ import { requestUrl } from "obsidian";
  * `fetch`. The mock is set up via tests/setup.ts; we just reset it per spec.
  *
  * Gating mechanism note (post-260513-gj3):
- *   - `shareLinks`     — branch-selected via `this.featureEnabled('shareLinks')`
- *                        in src/plugin/main.ts at the command palette and the
+ *   - `shareLinks`     — branch-selected via `ctx.featureEnabled('shareLinks')`
+ *                        in src/plugin/commands.ts at the command palette and the
  *                        file-context-menu click handlers. CE branch opens
  *                        ProUpsellModal('shareLinks'); Pro branch opens the
  *                        share-management modal / mints a link.
@@ -117,7 +117,7 @@ describe.each([
   });
 
   it("share-link file-menu: always added on files; click branches on featureEnabled", () => {
-    // Mirrors main.ts post-260513-gj3: if (!isFolder) { menu.addItem(... onClick branches ...) }
+    // Mirrors commands.ts post-260513-gj3: if (!isFolder) { menu.addItem(... onClick branches ...) }
     // Item is now always added regardless of edition; the click handler routes
     // CE users to ProUpsellModal('shareLinks') and Pro users to the mint flow.
     const featureEnabled = (name: keyof FeaturesPayload) => payload.features[name];
@@ -153,15 +153,17 @@ describe.each([
 
 describe("cross-edition: static guard-rail (branch selectors + ProUpsellModal wiring)", () => {
   const mainPath = join(__dirname, "..", "src", "plugin", "main.ts");
+  const settingsRuntimePath = join(__dirname, "..", "src", "plugin", "settings-runtime.ts");
+  const commandsPath = join(__dirname, "..", "src", "plugin", "commands.ts");
   const adminModalPath = join(__dirname, "..", "src", "admin", "admin-modal.ts");
 
-  it("main.ts retains a featureEnabled('shareLinks') call (now used as branch selector, not gate)", () => {
-    const src = readFileSync(mainPath, "utf8");
+  it("commands.ts retains a featureEnabled('shareLinks') call (now used as branch selector, not gate)", () => {
+    const src = readFileSync(commandsPath, "utf8");
     expect(src).toMatch(/featureEnabled\(\s*['"]shareLinks['"]\s*\)/);
   });
 
-  it("main.ts wires ProUpsellModal at the two shareLinks sites", () => {
-    const src = readFileSync(mainPath, "utf8");
+  it("commands.ts wires ProUpsellModal at the two shareLinks sites", () => {
+    const src = readFileSync(commandsPath, "utf8");
     const proUpsellCount = (src.match(/new ProUpsellModal\(/g) ?? []).length;
     expect(proUpsellCount).toBeGreaterThanOrEqual(2);
     expect(src).toMatch(/from\s+["']\.\.\/ui\/pro-upsell-modal["']/);
@@ -178,12 +180,12 @@ describe("cross-edition: static guard-rail (branch selectors + ProUpsellModal wi
     expect(src).toMatch(/features\?\.billing/);
   });
 
-  it("main.ts retains the four-feature normalization (proves the FEATURES contract is wired)", () => {
+  it("settings runtime retains the four-feature normalization (proves the FEATURES contract is wired)", () => {
     // If any of these four lines disappears, the plugin can no longer
     // surface the corresponding branch behavior — the FEATURES contract
     // is broken at the boundary even before any UI code runs. This is the
     // catch-all guard-rail for the FEATURES payload shape.
-    const src = readFileSync(mainPath, "utf8");
+    const src = readFileSync(settingsRuntimePath, "utf8");
     expect(src).toMatch(/shareLinks:\s*Boolean\(features\.shareLinks\)/);
     expect(src).toMatch(/advancedAudit:\s*Boolean\(features\.advancedAudit\)/);
     expect(src).toMatch(/billing:\s*Boolean\(features\.billing\)/);

@@ -183,8 +183,9 @@ that rule instead of returning a duplicate-rule conflict.
 For plugin UI source-of-truth rules, including which Obsidian surfaces use raw
 rules versus server-computed effective access, see
 [`docs/PERMISSION-UI.md`](PERMISSION-UI.md). In short:
-`/permissions/access` and `/permissions/access/batch` are the display source for
-"who has effective access"; raw `/permissions` rules are primarily for editing
+`/vaults/{vaultId}/permissions/access` and
+`/vaults/{vaultId}/permissions/access/batch` are the display source for
+"who has effective access"; raw `/vaults/{vaultId}/permissions` rules are primarily for editing
 and fallback reconstruction.
 
 ### Audit (vault-scoped)

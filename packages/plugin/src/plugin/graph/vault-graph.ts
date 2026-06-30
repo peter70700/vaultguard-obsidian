@@ -352,6 +352,8 @@ export class VaultGraph {
     let visible: boolean;
     if (this.deps.isPathExcluded(p)) {
       visible = false;
+    } else if (this.deps.isMetadataSuppressed?.(p) === true) {
+      visible = false;
     } else if (!this.deps.matchesLeaseScope(p)) {
       visible = false;
     } else {

@@ -124,6 +124,92 @@ describe("VaultGuardApiClient", () => {
   });
 });
 
+describe("VaultGuardApiClient server sessions", () => {
+  const sessionEnvelope = {
+    sessionId: "server-session-1",
+    userId: "user-123",
+    email: "user@example.com",
+    roles: ["editor"],
+    expiresAt: "2026-06-29T12:00:00.000Z",
+    orgSettings: {
+      orgId: "org-123",
+      orgName: "VaultGuard",
+      syncMode: "periodic",
+      syncIntervalMinutes: 30,
+      enforceEncryption: true,
+      maxSessionDurationHours: 24,
+      requireMfa: false,
+      allowedDomains: [],
+      retentionDays: 365,
+      autoLockMinutes: 30,
+    },
+  };
+
+  function makeSessionClient(
+    getSessionId?: () => string | null
+  ): VaultGuardApiClient {
+    const client = new VaultGuardApiClient({
+      baseUrl: "https://api.example.com",
+      orgId: "org-123",
+      getAuthTokens: vi.fn(async () => ({
+        accessToken: "provider-access-token",
+        refreshToken: "provider-refresh-token",
+        idToken: "provider-id-token",
+        expiresAt: Date.now() + 60_000,
+      })),
+      getSessionId,
+    });
+    (client as any).resolvedBaseUrl = "https://api.example.com";
+    return client;
+  }
+
+  beforeEach(() => {
+    mockRequestUrl.mockReset();
+  });
+
+  it("opens authenticated server sessions with optional vault audit context", async () => {
+    const client = makeSessionClient(() => "existing-session-id");
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(200, sessionEnvelope));
+
+    await expect(client.openServerSession({ vaultId: "vault-abc" })).resolves.toEqual(
+      sessionEnvelope
+    );
+
+    expect(mockRequestUrl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "https://api.example.com/auth/session",
+        method: "POST",
+        headers: {
+          Authorization: "provider-id-token",
+          "X-VaultGuard-Session-Id": "existing-session-id",
+        },
+        body: JSON.stringify({ vaultId: "vault-abc" }),
+        contentType: "application/json",
+        throw: false,
+      })
+    );
+  });
+
+  it("omits session header and body when neither value is configured", async () => {
+    const client = makeSessionClient(() => null);
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(200, sessionEnvelope));
+
+    await client.openServerSession();
+
+    const request = mockRequestUrl.mock.calls[0]![0];
+    expect(request.headers).toEqual({ Authorization: "provider-id-token" });
+    expect(request.body).toBeUndefined();
+    expect(request.contentType).toBeUndefined();
+  });
+
+  it("does not expose the stale production email/password login method", () => {
+    const client = makeSessionClient();
+
+    expect("login" in client).toBe(false);
+    expect((client as any).login).toBeUndefined();
+  });
+});
+
 // ─── Agent-bridge context propagation ──────────────────────────────────────
 //
 // These tests pin down the contract between the plugin's agent-bridge layer

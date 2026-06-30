@@ -3,6 +3,8 @@
 This document covers the Obsidian plugin release only. The plugin is the
 installable client that runs inside Obsidian.
 
+> Current release operations map: [RELEASE-PROCESS.md](RELEASE-PROCESS.md).
+
 ## Release Scope
 
 Ship one VaultGuard plugin artifact.
@@ -171,8 +173,8 @@ git push origin <version>
 This repo sets `tag-version-prefix=` in `.npmrc`, so `npm version` creates tags
 like `0.1.1` instead of `v0.1.1`.
 
-When a tag like `0.1.1` is pushed, `.github/workflows/release.yml` runs tests,
-packages the plugin, and creates a GitHub release with:
+When a tag like `0.1.1` is pushed, `.github/workflows/plugin-release.yml` runs
+tests, packages the plugin, and creates a GitHub release with:
 
 - `main.js`
 - `manifest.json`
@@ -183,13 +185,12 @@ The tag must exactly match `manifest.json` version.
 
 ## Official Community Plugin Status
 
-VaultGuard Sync is already admitted to the Obsidian community directory under id
-`vaultguard-sync`, repo `peter70700/vaultguard-obsidian` (the public monorepo,
-which surfaces `manifest.json` at root via the export script for the directory's
-HEAD-read). Manual review by Obsidian staff may still be pending — until it
-lands, the directory entry's description carries a "This plugin has not been
-manually reviewed by Obsidian staff" prefix, but the plugin is installable in
-Obsidian today.
+Repo-local release docs must not be treated as live community-directory proof.
+Before claiming VaultGuard Sync is admitted, manually reviewed, or installable
+from Obsidian's community directory, verify the current state in the Obsidian
+community dashboard or directory during the release task. The expected public
+plugin id is `vaultguard-sync`, and the expected public repo is
+`peter70700/vaultguard-obsidian`.
 
 **Submission flow** (for reference / future plugins): Obsidian uses
 [community.obsidian.md](https://community.obsidian.md) — sign in, link GitHub,

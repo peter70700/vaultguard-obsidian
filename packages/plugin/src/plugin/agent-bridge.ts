@@ -650,6 +650,10 @@ interface AgentBridgeDeps {
   // permission itself); renameFile through the permission-checked rename.
   deleteFile(path: string): Promise<void>;
   renameFile(oldPath: string, newPath: string): Promise<void>;
+  // Optional local denylist for paths whose access was revoked while
+  // Obsidian's native metadata cache could not be purged. Graph metadata must
+  // respect it before reading stale backlinks/tags.
+  isMetadataSuppressed?: (path: string) => boolean;
   confirmWrite(request: {
     lease: AgentBridgeLeaseSummary;
     operation:
@@ -2232,6 +2236,8 @@ export class VaultGuardAgentBridge {
       matchesLeaseScope: (path) => this.matchesAnyScope(this.normalizePath(path), lease.scopes),
       // Exclusion + hidden + traversal gate, reused from the read/list path.
       isPathExcluded: (path) => this.isBlockedPath(path),
+      isMetadataSuppressed: (path) =>
+        this.deps.isMetadataSuppressed?.(this.normalizePath(path)) ?? false,
       getPermission: (path) => this.deps.getPermission(this.normalizePath(path)),
     });
 

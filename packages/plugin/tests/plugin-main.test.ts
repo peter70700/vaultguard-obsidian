@@ -733,6 +733,74 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.settings.defaultConflictResolution).toBe("keep_local");
   });
 
+  it("migrates a legacy showPermissionIndicators=false into the granular display toggles", async () => {
+    const plugin = makePlugin();
+    // A user who turned the old single toggle OFF must keep the explorer dots
+    // and avatars off after the split; the note-header banner (always on
+    // before) stays on.
+    plugin.loadData = vi.fn().mockResolvedValue({
+      orgSlug: "acme",
+      showPermissionIndicators: false,
+    });
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.loadSettings();
+
+    expect(plugin.settings.showMyPermissionLevel).toBe(false);
+    expect(plugin.settings.showOthersAccess).toBe(false);
+    expect(plugin.settings.showPermissionBanner).toBe(true);
+  });
+
+  it("migrates a legacy showPermissionIndicators=true into all three display toggles on", async () => {
+    const plugin = makePlugin();
+    plugin.loadData = vi.fn().mockResolvedValue({
+      orgSlug: "acme",
+      showPermissionIndicators: true,
+    });
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.loadSettings();
+
+    expect(plugin.settings.showMyPermissionLevel).toBe(true);
+    expect(plugin.settings.showOthersAccess).toBe(true);
+    expect(plugin.settings.showPermissionBanner).toBe(true);
+  });
+
+  it("does not let the legacy toggle override already-persisted granular keys", async () => {
+    const plugin = makePlugin();
+    // Once the granular keys exist in data.json the legacy field is inert: the
+    // migration reads the RAW data and detects the new keys' presence, so a
+    // stale showPermissionIndicators=false must not clobber them.
+    plugin.loadData = vi.fn().mockResolvedValue({
+      orgSlug: "acme",
+      showPermissionIndicators: false,
+      showMyPermissionLevel: true,
+      showOthersAccess: false,
+      showPermissionBanner: false,
+    });
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.loadSettings();
+
+    expect(plugin.settings.showMyPermissionLevel).toBe(true);
+    expect(plugin.settings.showOthersAccess).toBe(false);
+    expect(plugin.settings.showPermissionBanner).toBe(false);
+  });
+
+  it("leaves the granular display toggles at their defaults when no legacy key is present", async () => {
+    const plugin = makePlugin();
+    // Fresh install / data.json with neither the legacy nor the new keys: the
+    // DEFAULT_SETTINGS seed (all true) stands, migration is a no-op.
+    plugin.loadData = vi.fn().mockResolvedValue({ orgSlug: "acme" });
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.loadSettings();
+
+    expect(plugin.settings.showMyPermissionLevel).toBe(true);
+    expect(plugin.settings.showOthersAccess).toBe(true);
+    expect(plugin.settings.showPermissionBanner).toBe(true);
+  });
+
   it("restores persisted Community Edition feature flags on load", async () => {
     const plugin = makePlugin();
     plugin.loadData = vi.fn().mockResolvedValue({
@@ -1810,7 +1878,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.filePermissionHeader.update).toHaveBeenCalledWith({ force: true });
   });
 
-  it("re-enables file explorer decorations when permission indicators are turned back on", () => {
+  it("re-enables file explorer decorations when a permission indicator toggle is turned back on", () => {
     const plugin = makePlugin();
     plugin.session = makeSession();
     plugin.settings.serverVaultId = "vault-abc";
@@ -1821,14 +1889,42 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       enable: vi.fn(),
       refresh: vi.fn(),
       disable: vi.fn(),
+      setDisplayOptions: vi.fn(),
     };
 
-    plugin.settings.showPermissionIndicators = true;
+    plugin.settings.showMyPermissionLevel = true;
+    plugin.settings.showOthersAccess = true;
     plugin.refreshFileExplorerDecorations();
 
+    expect(plugin.fileExplorerDecorations.setDisplayOptions).toHaveBeenCalledWith({
+      showMyLevel: true,
+      showOthersAccess: true,
+    });
     expect(plugin.fileExplorerDecorations.enable).toHaveBeenCalledOnce();
     expect(plugin.fileExplorerDecorations.refresh).toHaveBeenCalledOnce();
     expect(plugin.fileExplorerDecorations.disable).not.toHaveBeenCalled();
+  });
+
+  it("disables file explorer decorations only when both indicator toggles are off", () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.apiClient = {
+      isAuthenticated: vi.fn(() => true),
+    };
+    plugin.fileExplorerDecorations = {
+      enable: vi.fn(),
+      refresh: vi.fn(),
+      disable: vi.fn(),
+      setDisplayOptions: vi.fn(),
+    };
+
+    plugin.settings.showMyPermissionLevel = false;
+    plugin.settings.showOthersAccess = false;
+    plugin.refreshFileExplorerDecorations();
+
+    expect(plugin.fileExplorerDecorations.disable).toHaveBeenCalledOnce();
+    expect(plugin.fileExplorerDecorations.enable).not.toHaveBeenCalled();
   });
 
   it("propagates a vault admin membership into live UI context for an org member", async () => {

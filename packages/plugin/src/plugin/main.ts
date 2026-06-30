@@ -12,15 +12,10 @@
  * - Offline support: Graceful degradation with cached keys and queued changes.
  */
 
-import { Notice, Plugin, Platform, TFile, TFolder, TAbstractFile, Menu, normalizePath, addIcon, requestUrl, RequestUrlResponse, EventRef } from "obsidian";
-import { VaultGuardSettingTab, DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
+import { Notice, Plugin, Platform, TFile, TFolder, Menu, normalizePath, requestUrl, RequestUrlResponse } from "obsidian";
+import { VaultGuardSettingTab, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
-import { AgentBridgeLeaseModal } from "./agent-bridge-modal";
-import { WriteConfirmModal } from "../ui/chat/render/write-confirm-modal";
-import {
-  ConversationStore,
-  type ConversationStorageAdapter,
-} from "../ui/chat/conversation-store";
+import type { ConversationStore } from "../ui/chat/conversation-store";
 import { BindingReconciliationModal, ReconciliationDecision, ReconciliationPlan } from "./binding-reconciliation-modal";
 import { ShareManagementModal } from "./share-management-modal";
 import { PluginAllowlistModal, PluginAllowlistPrompt } from "./plugin-allowlist-modal";
@@ -49,17 +44,17 @@ import { ReadOnlyGuard } from "./readonly-guard";
 import { PermissionStore } from "./permission-store";
 import { UpdateChecker } from "./update-checker";
 import { SyncDiagnostics } from "./sync-diagnostics";
-import { AtRestCipher, AtRestStorage } from "../crypto/at-rest-cipher";
-import { probeSafeStorage } from "../crypto/safe-storage";
+import type { AtRestCipher } from "../crypto/at-rest-cipher";
+import {
+  createAtRestAdapterRuntime,
+  type AtRestAdapterRuntime,
+} from "./at-rest-adapter-runtime";
 import { PathPermissionsModal } from "../ui/path-permissions-modal";
 import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
 import { VaultGuardSidebarView, VAULTGUARD_VIEW_TYPE } from "../ui/vaultguard-sidebar-view";
 import { registerChatDebugCommand } from "../ui/chat/chat-debug-command";
-import { VaultGuardChatView, VAULTGUARD_CHAT_VIEW_TYPE } from "../ui/chat/chat-view";
 import {
-  PermissionsGraphView,
-  VAULTGUARD_GRAPH_VIEW_TYPE,
   type PermissionsGraphDataSource,
   type PermissionsGraphDataset,
 } from "../ui/graph/permissions-graph-view";
@@ -68,41 +63,79 @@ import type {
   VaultGuardSidebarAuthState,
   VaultGuardSidebarViewConfig,
 } from "../ui/vaultguard-sidebar-view";
-// sd4: the gated source-read tool's fs surface + the converters back the
-// in-app-chat /import-knowledge agent. The standalone sd2 importer (command,
-// ribbon, batch-confirm modal, 1:1 path mapping) was retired in favor of this.
-import { makeImportSourceFs } from "../ui/import/local-file-importer";
-import { classifyExtension, dispatchConvert } from "../ui/import/converters/dispatch";
-import {
+import type {
   AgentBridgeLeaseInput,
   AgentBridgeLeaseSecret,
-  AgentBridgeLeaseSummary,
-  AgentBridgeAskUserHandler,
-  AgentBridgeConfirmPausedHandler,
-  AgentBridgePersistenceAdapter,
   AgentBridgeServerInfo,
   AgentBridgeToolSurface,
-  VaultGuardAgentBridge,
 } from "./agent-bridge";
-import { VaultGraph } from "./graph/vault-graph";
 import {
-  inspectSkillInstall,
-  installSkill,
-  uninstallSkill,
-  type InstallResult,
-  type SkillInstallStatus,
-  type SkillInstallerDeps,
+  createAgentBridgeRuntime,
+  type AgentBridgeRuntime,
+} from "./agent-bridge-wiring";
+import type {
+  InstallResult,
+  SkillInstallStatus,
 } from "./agent-bridge-skill/installer";
-
-// Shield icon SVG for the ribbon
-const VAULTGUARD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>`;
-// The AI Chat ribbon button and view tab use Obsidian's stock lucide
-// `message-square` icon. Stock icons are pre-registered by Obsidian, so the
-// ribbon button always carries its glyph at first paint. A custom `addIcon`
-// icon can lose that registration race and render an INVISIBLE ribbon button —
-// which is why the chat icon used to be missing until the view was opened from
-// the command palette.
-export const VAULTGUARD_CHAT_ICON_ID = "message-square";
+import { registerVaultGuardCommands } from "./commands";
+import {
+  registerFocusSyncHandlers as registerFocusSyncHandlersLifecycle,
+  registerFolderLifecycleListeners as registerFolderLifecycleListenersLifecycle,
+  registerInviteProtocolHandler as registerInviteProtocolHandlerLifecycle,
+  registerObsidianSyncListener as registerObsidianSyncListenerLifecycle,
+  registerObsidianSyncWarning,
+  registerSessionActivityTracking as registerSessionActivityTrackingLifecycle,
+  registerShareProtocolHandler as registerShareProtocolHandlerLifecycle,
+  registerSidebarLayoutLifecycle,
+  registerSidebarPermissionLifecycle,
+  renderObsidianSyncNotice as renderObsidianSyncNoticeLifecycle,
+} from "./lifecycle-events";
+import {
+  createPermissionStore,
+  initFileExplorerDecorations as initFileExplorerDecorationsWiring,
+  initFilePermissionHeader as initFilePermissionHeaderWiring,
+  initReadOnlyGuard as initReadOnlyGuardWiring,
+} from "./permission-wiring";
+import {
+  createPermissionsGraphRuntime,
+  type PermissionsGraphRuntime,
+} from "./permissions-graph-wiring";
+import {
+  VAULTGUARD_CHAT_ICON_ID,
+  type AtRestAdapterRuntimeContext,
+  type AgentBridgeRuntimeContext,
+  type LifecycleEventsContext,
+  type PermissionStoreFactoryContext,
+  type PermissionSurfaceContext,
+  type PermissionsGraphRuntimeContext,
+  type SyncRuntimeContext,
+  type VaultAdapterOriginalMethods,
+  type PluginSettingsRuntimeContext,
+  type VaultGuardCommandContext,
+  type VaultGuardRibbonContext,
+  type VaultGuardSidebarActivationContext,
+  type VaultGuardViewRegistrationContext,
+} from "./plugin-runtime-types";
+import {
+  createPluginSettingsRuntime,
+  type PluginSettingsRuntime,
+} from "./settings-runtime";
+import {
+  createSyncRuntime,
+  type SyncRuntime,
+} from "./sync-runtime";
+import {
+  activatePermissionsGraph as activatePermissionsGraphView,
+  activateVaultGuardChat as activateVaultGuardChatView,
+  activateVaultGuardSidebar as activateVaultGuardSidebarView,
+  copyVaultGuardChatDomDebugReport as copyVaultGuardChatDomDebugReportView,
+  ensureVaultGuardSidebar as ensureVaultGuardSidebarView,
+  openNewVaultGuardChatTab as openNewVaultGuardChatTabView,
+  openVaultGuardChatHistory as openVaultGuardChatHistoryView,
+  registerVaultGuardRibbons,
+  registerVaultGuardViews,
+  reloadVaultGuardSidebar as reloadVaultGuardSidebarView,
+} from "./views";
 import {
   VaultGuardSettings,
   ServerEdition,
@@ -121,6 +154,8 @@ import {
   ApiResponse,
 } from "../types";
 
+export { VAULTGUARD_CHAT_ICON_ID };
+
 function getActiveObsidianDocument(): Document | null {
   if (typeof activeDocument !== "undefined") {
     return activeDocument;
@@ -134,12 +169,6 @@ function getActiveObsidianDocument(): Document | null {
 
 /** Minimum allowed sync interval in seconds */
 const MIN_SYNC_INTERVAL = 10;
-
-/** Grace period before key expiry to trigger renewal (5 minutes) */
-const KEY_RENEWAL_GRACE_MS = 5 * 60 * 1000;
-
-/** Server heartbeat interval for revocation detection */
-const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 
 /** Maximum time between connection retry attempts (2 minutes) */
 const MAX_RETRY_INTERVAL_MS = 2 * 60 * 1000;
@@ -164,22 +193,8 @@ const CONNECTION_LOST_NOTICE_THROTTLE_MS = 30 * 1000;
  */
 const CONNECTION_LOST_NOTICE_GRACE_MS = 8 * 1000;
 
-/**
- * Maximum age of a deletion tombstone (30 days). Tombstones older than this
- * are pruned on load so a path that never reconciles cannot grow the set
- * unbounded.
- */
-const DELETION_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-
 /** Plugin log prefix for console output */
 const LOG_PREFIX = "[VaultGuard]";
-
-/**
- * Hard cap on entries scanned by the limited-access placeholder sweep
- * (sweepPlaceholderPaths). Vaults larger than this should not be the
- * bootstrap target for v1 of limited-access mode; revisit with telemetry.
- */
-const MAX_SWEEP_ENTRIES = 5000;
 
 /**
  * Hard cap on per-session permission warmup retries. After this many
@@ -193,34 +208,6 @@ const MAX_SWEEP_ENTRIES = 5000;
 const MAX_WARMUP_RETRIES = 3;
 
 /**
- * Plugin id -> list of historical plugin ids whose lak.envelope may still be
- * on disk and should be migrated INTO this id's folder before the at-rest
- * cipher initializes. Generic shape so a future rename appends cleanly.
- *
- * Why: commit 9495041 (2026-05-14) renamed manifest.id from `vaultguard` to
- * `vaultguard-sync`. The envelope path is derived from manifest.id, so on
- * upgrade init() saw no envelope at the new path and generated a fresh LAK
- * while every on-disk VG1 file was still ciphertext under the OLD LAK,
- * silently bricking decryption for any user who fell back to the disk LAK
- * (e.g. a stranded user with read-deny rules and no /** key lease).
- */
-const PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION: Record<string, string[]> = {
-  "vaultguard-sync": ["vaultguard"],
-};
-
-/**
- * Sentinel filename uploaded into every server-side folder so the empty-folder
- * case isn't lost across the round-trip. S3 has no native concept of an empty
- * directory — without this marker, a folder with no files in it disappears
- * entirely from the admin panel structure view.
- *
- * Must match the marker filename the backend writes for empty folders. Any
- * compatible self-hosted backend (see docs/openapi.yaml) must use the same
- * value or empty folders will not round-trip correctly.
- */
-const FOLDER_MARKER_NAME = ".vaultguard-folder";
-
-/**
  * Bumped whenever a user-visible sync change ships. Surfaced by the "Status"
  * command so a user can confirm whether their Obsidian process has actually
  * reloaded the freshly-built `main.js`. Without a marker like this, "rebuilt
@@ -228,20 +215,6 @@ const FOLDER_MARKER_NAME = ".vaultguard-folder";
  * never ran" — which is exactly the trap that caused the missing-toast report.
  */
 const SYNC_FEATURE_REVISION = 9;
-
-type VaultGuardPluginData = Partial<VaultGuardSettings> & {
-  storedSessions?: Record<string, unknown>;
-};
-
-interface ProtectedSessionEnvelope {
-  v: 1;
-  // "electron-safe-storage": desktop, sealed by Electron's safeStorage (OS keystore).
-  // "at-rest-cipher": mobile / safeStorage-less hosts, sealed by AtRestCipher (AES-GCM
-  // with the LAK whose own KEK falls back to a vault-scoped AES key — same
-  // security ceiling as the local at-rest encryption of vault content).
-  storage: "electron-safe-storage" | "at-rest-cipher";
-  ciphertext: string;
-}
 
 type AccessTokenRefreshResult =
   | { ok: true }
@@ -262,18 +235,6 @@ interface RemoteFileContentResponse {
   content: string;
   encoding?: string;
   decrypted?: boolean;
-}
-
-/**
- * On-disk shape of the LAK-encrypted permissions-graph cache envelope. Stamped
- * with the owning userId so it's never surfaced to a different signed-in user.
- */
-interface PersistedPermissionsGraphCache {
-  // Bumped to 2 when the dataset gained per-folder access summaries; v1 envelopes
-  // are rejected so old caches can't mask the folder-permission feature.
-  version: 2;
-  userId: string;
-  entries: Record<string, { fetchedAt: number; data: PermissionsGraphDataset }>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,6 +264,12 @@ export default class VaultGuardPlugin extends Plugin {
    */
   serverEdition: ServerEdition | null = null;
   serverFeatures: ServerFeatures | null = null;
+
+  /** Settings/config/session persistence runtime extracted from the entrypoint. */
+  private settingsRuntime: PluginSettingsRuntime | null = null;
+
+  /** Sync runtime for extracted behavior; sync state remains entrypoint-owned. */
+  private syncRuntime: SyncRuntime | null = null;
 
   /**
    * Whether the connected backend advertises a given capability. Used by
@@ -472,30 +439,33 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private lastLogoutAuthState: VaultGuardSidebarAuthState | null = null;
 
-  /** Original vault adapter methods (saved for restoration on unload) */
-  private originalAdapterMethods: {
-    read: ((normalizedPath: string) => Promise<string>) | null;
-    write: ((normalizedPath: string, data: string) => Promise<void>) | null;
-    readBinary: ((normalizedPath: string) => Promise<ArrayBuffer>) | null;
-    writeBinary: ((normalizedPath: string, data: ArrayBuffer) => Promise<void>) | null;
-    list: ((normalizedPath: string) => Promise<{ files: string[]; folders: string[] }>) | null;
-    remove: ((normalizedPath: string) => Promise<void>) | null;
-    rename: ((oldPath: string, newPath: string) => Promise<void>) | null;
-  } = {
-    read: null,
-    write: null,
-    readBinary: null,
-    writeBinary: null,
-    list: null,
-    remove: null,
-    rename: null,
-  };
+  /** At-rest adapter runtime extracted from the Obsidian entrypoint. */
+  private atRestAdapterRuntime: AtRestAdapterRuntime | null = null;
 
-  /** Local at-rest cipher — encrypts vault files on disk so Finder shows ciphertext. */
-  private atRestCipher: AtRestCipher | null = null;
+  /**
+   * Test-compatible pass-through for the raw adapter methods. Runtime code owns
+   * the state; main.ts keeps this property name because existing tests and
+   * extracted runtimes still inspect or stub it through the plugin object.
+   */
+  private get originalAdapterMethods(): VaultAdapterOriginalMethods {
+    return this.ensureAtRestAdapterRuntimeObject().getOriginalAdapterMethods();
+  }
 
-  /** Per-process flag so the first-run "encrypt your plaintext files" Notice fires once. */
-  private atRestFirstRunOffered = false;
+  private set originalAdapterMethods(methods: VaultAdapterOriginalMethods) {
+    this.ensureAtRestAdapterRuntimeObject().setOriginalAdapterMethods(methods);
+  }
+
+  /**
+   * Test-compatible pass-through for the local at-rest cipher. Runtime code owns
+   * the cipher, while main.ts preserves the historical property surface.
+   */
+  private get atRestCipher(): AtRestCipher | null {
+    return this.ensureAtRestAdapterRuntimeObject().getAtRestCipher();
+  }
+
+  private set atRestCipher(cipher: AtRestCipher | null) {
+    this.ensureAtRestAdapterRuntimeObject().setAtRestCipher(cipher);
+  }
 
   /**
    * Whether this plugin process has already run the "verify local files exist
@@ -559,31 +529,6 @@ export default class VaultGuardPlugin extends Plugin {
    * calls (token refresh, displayName update, etc.) shouldn't toast-storm.
    */
   private safeStorageUnavailableNotified = false;
-
-  /**
-   * Per-path timestamp for the denied-cache-wipe Notice. Obsidian re-reads the
-   * same file on tab focus, sync, etc., and we don't want a Notice stampede
-   * for a single denied path.
-   */
-  private readOnlyFallbackNoticeAt: Map<string, number> = new Map();
-
-  /**
-   * Per-path timestamp for the cloud-decrypt fallback Notice. Same stampede
-   * concern as `readOnlyFallbackNoticeAt`, but for the case where the cloud
-   * copy is encrypted with a key the current lease can't unwrap.
-   */
-  private cloudDecryptFallbackNoticeAt: Map<string, number> = new Map();
-
-  /** Resolves when `initAtRestCipher()` finishes its first attempt. Reads
-   * issued before init completes (e.g. early `onload()` adapter reads on
-   * mobile, where session restore awaits the cipher) await this with a
-   * 10s timeout before deciding to fail closed on VG1-prefixed bytes. */
-  private cipherInitPromise: Promise<boolean> | null = null;
-
-  /** Per-path 60s debounce for the corrupted-write Notice that fires when
-   * an `interceptedWrite` / `interceptedWriteBinary` call would have
-   * persisted bytes whose plaintext starts with the VG1 magic header. */
-  private corruptedWriteNoticeAt: Map<string, number> = new Map();
 
   /**
    * Unified permission cache + event bus (Phase 9). Replaces the previous
@@ -663,7 +608,655 @@ export default class VaultGuardPlugin extends Plugin {
    * they never receive the LAK, cloud key lease, refresh token, or raw vault
    * filesystem access.
    */
-  private agentBridge: VaultGuardAgentBridge | null = null;
+  private agentBridgeRuntime: AgentBridgeRuntime | null = null;
+  private permissionsGraphRuntime: PermissionsGraphRuntime | null = null;
+
+  private createAtRestAdapterRuntimeContext(): AtRestAdapterRuntimeContext {
+    const thisPlugin = this;
+    return {
+      app: this.app,
+      manifestId: this.manifest?.id,
+      get settings() {
+        return thisPlugin.settings;
+      },
+      getSession: () => this.session,
+      getKeyLease: () => this.keyLease,
+      isVaultLeaseDenied: () => this.vaultLeaseDenied,
+      getPlaceholderPaths: () => this.placeholderPaths,
+      isApplyingRemoteWrite: () => this.applyingRemoteWrite,
+      getSyncState: () => this.syncState,
+      getOfflineQueue: () => this.offlineQueue,
+      getPermissionStore: () => this.permissionStore,
+      hasWarmedAtLeastOnce: () => this.hasWarmedAtLeastOnce,
+      saveSettings: () => this.saveSettings(),
+      openVaultGuardSettings: () => this.openVaultGuardSettings(),
+      showLoginRequiredNotice: (action, path) =>
+        this.showLoginRequiredNotice(action, path),
+      awaitPermissionReadiness: () => this.awaitPermissionReadiness(),
+      getEffectivePermission: (path) => this.getEffectivePermission(path),
+      resolvePermissionFromCache: (path) => this.resolvePermissionFromCache(path),
+      isPathExcluded: (path) => this.isPathExcluded(path),
+      normalizeVaultPath: (path) => this.normalizeVaultPath(path),
+      vaultConfigPath: (...parts) => this.vaultConfigPath(...parts),
+      toPermissionPath: (path) => this.toPermissionPath(path),
+      isFolderMarkerPath: (path) => this.isFolderMarkerPath(path),
+      readPlainFromDisk: (path) => this.readPlainFromDisk(path),
+      writePlainToDisk: (path, data) => this.writePlainToDisk(path, data),
+      readPlainBinaryFromDisk: (path) => this.readPlainBinaryFromDisk(path),
+      writePlainBinaryToDisk: (path, data) =>
+        this.writePlainBinaryToDisk(path, data),
+      notifyCloudDecryptFallback: (path) => this.notifyCloudDecryptFallback(path),
+      notifyCorruptedWrite: (path) => this.notifyCorruptedWrite(path),
+      isOnline: () => this.isOnline(),
+      isNetworkError: (error) => this.isNetworkError(error),
+      setConnectionStatus: (status, options) =>
+        this.setConnectionStatus(status, options),
+      shouldUploadChangesImmediately: () => this.shouldUploadChangesImmediately(),
+      queueOfflineOperation: (operation, path, data) =>
+        this.queueOfflineOperation(operation, path, data),
+      recordDeletionTombstone: (path) => this.recordDeletionTombstone(path),
+      clearDeletionTombstone: (path) => this.clearDeletionTombstone(path),
+      updateStatusBar: () => this.updateStatusBar(),
+      encryptContent: (content) => this.encryptContent(content),
+      computeHash: (content) => this.computeHash(content),
+      apiRequest: <T>(
+        method: string,
+        endpoint: string,
+        body?: Record<string, unknown>,
+        idTokenOverride?: string
+      ) =>
+        idTokenOverride !== undefined
+          ? this.apiRequest<T>(method, endpoint, body, idTokenOverride)
+          : body !== undefined
+            ? this.apiRequest<T>(method, endpoint, body)
+            : this.apiRequest<T>(method, endpoint),
+      vaultPath: (suffix = "") => this.vaultPath(suffix),
+      readFileDecrypted: (path) => this.readFileDecrypted(path),
+      fetchRemoteFileContent: (path) => this.fetchRemoteFileContent(path),
+      decodeRemoteFileContent: (path, data) =>
+        this.decodeRemoteFileContent(path, data),
+      decodeBase64Utf8: (base64) => this.decodeBase64Utf8(base64),
+      emitAuditEvent: (action, resourcePath, metadata) =>
+        this.emitAuditEvent(action as AuditAction, resourcePath, metadata),
+      log: (message) => this.log(message),
+      logError: (message, error) => this.logError(message, error),
+    };
+  }
+
+  private createAtRestAdapterRuntime(): AtRestAdapterRuntime {
+    return createAtRestAdapterRuntime(this.createAtRestAdapterRuntimeContext());
+  }
+
+  private ensureAtRestAdapterRuntimeObject(): AtRestAdapterRuntime {
+    if (!this.atRestAdapterRuntime) {
+      this.atRestAdapterRuntime = this.createAtRestAdapterRuntime();
+    }
+    return this.atRestAdapterRuntime;
+  }
+
+  private createSyncRuntimeContext(): SyncRuntimeContext {
+    return {
+      app: this.app,
+      normalizeVaultPath: (path) => this.normalizeVaultPath(path),
+      isPathExcluded: (path) => this.isPathExcluded(path),
+      getSettings: () => this.settings,
+      getSession: () => this.session,
+      getSyncState: () => this.syncState,
+      getConnectionState: () => this.connectionState,
+      getKeyLease: () => this.keyLease,
+      setKeyLease: (lease) => {
+        this.keyLease = lease;
+      },
+      isVaultLeaseDenied: () => this.vaultLeaseDenied,
+      getEffectiveSyncMode: () => this.getEffectiveSyncMode(),
+      getEffectiveSyncIntervalSeconds: () => this.getEffectiveSyncIntervalSeconds(),
+      getSyncTimer: () => this.syncTimer,
+      setSyncTimer: (timer) => {
+        this.syncTimer = timer;
+      },
+      setSyncTimerPaused: (paused) => {
+        this.syncTimerPaused = paused;
+      },
+      getKeyRenewalTimer: () => this.keyRenewalTimer,
+      setKeyRenewalTimer: (timer) => {
+        this.keyRenewalTimer = timer;
+      },
+      getHeartbeatTimer: () => this.heartbeatTimer,
+      setHeartbeatTimer: (timer) => {
+        this.heartbeatTimer = timer;
+      },
+      getOfflineQueue: () => this.offlineQueue,
+      setOfflineQueue: (queue) => {
+        this.offlineQueue = queue;
+      },
+      getOfflineQueueFlushPromise: () => this.offlineQueueFlushPromise,
+      setOfflineQueueFlushPromise: (promise) => {
+        this.offlineQueueFlushPromise = promise;
+      },
+      getLocalOnlyCatchupCompleted: () => this.localOnlyCatchupCompleted,
+      setLocalOnlyCatchupCompleted: (completed) => {
+        this.localOnlyCatchupCompleted = completed;
+      },
+      getRemoteInventoryRepairCompleted: () => this.remoteInventoryRepairCompleted,
+      setRemoteInventoryRepairCompleted: (completed) => {
+        this.remoteInventoryRepairCompleted = completed;
+      },
+      getPlaceholderPaths: () => this.placeholderPaths,
+      getPlaceholderPathsSize: () => this.placeholderPaths.size,
+      getOfflineQueueLength: () => this.offlineQueue.length,
+      getDeletionTombstonesCount: () =>
+        Object.keys(this.settings.deletionTombstones ?? {}).length,
+      isSyncTimerAlive: () => !!this.syncTimer,
+      isSyncTimerPaused: () => this.syncTimerPaused,
+      isKeyRenewalTimerAlive: () => !!this.keyRenewalTimer,
+      isHeartbeatTimerAlive: () => !!this.heartbeatTimer,
+      isConnectionRetryTimerAlive: () => !!this.connectionRetryTimer,
+      isConnectionLostNoticeTimerAlive: () => !!this.connectionLostNoticeTimer,
+      isApplyingRemoteWrite: () => this.applyingRemoteWrite,
+      setApplyingRemoteWrite: (value) => {
+        this.applyingRemoteWrite = value;
+      },
+      isFolderLifecycleListenersRegistered: () =>
+        this.folderLifecycleListenersRegistered,
+      saveSettings: () => this.saveSettings(),
+      isOnline: () => this.isOnline(),
+      setConnectionStatus: (status, options) =>
+        this.setConnectionStatus(status, options),
+      performInitialReconciliation: () => this.performInitialReconciliation(),
+      registerFolderLifecycleListeners: () => this.registerFolderLifecycleListeners(),
+      performSync: (options) => this.performSync(options),
+      buildLocalSyncManifest: () => this.buildLocalSyncManifest(),
+      askReconciliationPlan: (plan) => this.askReconciliationPlan(plan),
+      uploadReconciledFile: (path, content, options) =>
+        this.uploadReconciledFile(path, content, options),
+      removeUnsyncedLocalFile: (path) => this.removeUnsyncedLocalFile(path),
+      uploadLocalOnlyFiles: () => this.uploadLocalOnlyFiles(),
+      repairMissingRemoteItems: () => this.repairMissingRemoteItems(),
+      collectLocalFolderPaths: () => this.collectLocalFolderPaths(),
+      localPathExists: (path) => this.localPathExists(path),
+      ensureLocalFolderPath: (folderPath) => this.ensureLocalFolderPath(folderPath),
+      ensureParentFoldersForPath: (path) => this.ensureParentFoldersForPath(path),
+      writeLocalFileFromRemote: (path, content) =>
+        this.writeLocalFileFromRemote(path, content),
+      syncFileRenameToServer: (oldPath, newPath) =>
+        this.syncFileRenameToServer(oldPath, newPath),
+      syncFileDeleteToServer: (path) => this.syncFileDeleteToServer(path),
+      uploadFolderMarker: (folderPath) => this.uploadFolderMarker(folderPath),
+      deleteFolderMarker: (folderPath) => this.deleteFolderMarker(folderPath),
+      deleteFolderContentsOnServer: (folderPath) =>
+        this.deleteFolderContentsOnServer(folderPath),
+      applyRemoteChange: (metadata) => this.applyRemoteChange(metadata),
+      applyRemoteDeletion: (path) => this.applyRemoteDeletion(path),
+      readFileDecrypted: (path) => this.readFileDecrypted(path),
+      fetchRemoteFileContent: (path) => this.fetchRemoteFileContent(path),
+      decodeRemoteFileContent: (path, data) =>
+        this.decodeRemoteFileContent(path, data),
+      readRemotePlaintext: (path) => this.readRemotePlaintext(path),
+      resolveReconciliationConflict: (path, strategy, localManifest) =>
+        this.resolveReconciliationConflict(path, strategy, localManifest),
+      hasOriginalAdapterRead: () => !!this.originalAdapterMethods.read,
+      hasOriginalAdapterWrite: () => !!this.originalAdapterMethods.write,
+      hasOriginalAdapterRemove: () => !!this.originalAdapterMethods.remove,
+      removeLocalPath: async (path) => {
+        if (!this.originalAdapterMethods.remove) return;
+        await this.originalAdapterMethods.remove(path);
+      },
+      readPlainFromDisk: (path) => this.readPlainFromDisk(path),
+      writePlainToDisk: (path, data) => this.writePlainToDisk(path, data),
+      decryptContent: (content) => this.decryptContent(content),
+      bytesToBase64: (bytes) => this.bytesToBase64(bytes),
+      notifyCloudDecryptFallback: (path) => this.notifyCloudDecryptFallback(path),
+      getEffectivePermission: (path) => this.getEffectivePermission(path),
+      emitAuditEvent: (action, resourcePath, metadata) =>
+        this.emitAuditEvent(action as AuditAction, resourcePath, metadata),
+      encryptContent: (content) => this.encryptContent(content),
+      computeHash: (content) => this.computeHash(content),
+      apiRequest: <T>(
+        method: string,
+        endpoint: string,
+        body?: Record<string, unknown>,
+        idTokenOverride?: string
+      ) =>
+        idTokenOverride !== undefined
+          ? this.apiRequest<T>(method, endpoint, body, idTokenOverride)
+          : body !== undefined
+            ? this.apiRequest<T>(method, endpoint, body)
+            : this.apiRequest<T>(method, endpoint),
+      vaultPath: (suffix = "") => this.vaultPath(suffix),
+      isNetworkError: (error) => this.isNetworkError(error),
+      recordSyncDiagnostic: (event, detail) => this.syncDiagnostics.record(event, detail),
+      showNotice: (message, timeout) => {
+        if (timeout === undefined) {
+          new Notice(message);
+        } else {
+          new Notice(message, timeout);
+        }
+      },
+      showLoginRequiredNotice: (action, path) =>
+        this.showLoginRequiredNotice(action, path),
+      updateStatusBar: () => this.updateStatusBar(),
+      ensureVaultScopedKeyLease: () => this.ensureVaultScopedKeyLease(),
+      renewKeyLease: () => this.renewKeyLease(),
+      forceLogout: (noticeMessage) => this.forceLogout(noticeMessage),
+      invalidatePermissionStore: () => this.permissionStore.invalidate(),
+      emitPermissionChanged: (payload) => this.permissionStore.emit("changed", payload),
+      clearPlaceholderPaths: () => {
+        this.placeholderPaths.clear();
+      },
+      log: (message) => this.log(message),
+      logError: (message, error) => this.logError(message, error),
+    };
+  }
+
+  private ensureSyncRuntime(): SyncRuntime {
+    if (!this.syncRuntime) {
+      this.syncRuntime = createSyncRuntime(this.createSyncRuntimeContext());
+    }
+    return this.syncRuntime;
+  }
+
+  private createAgentBridgeRuntimeContext(): AgentBridgeRuntimeContext {
+    return {
+      app: this.app,
+      pluginForModal: this,
+      manifestId: this.manifest?.id,
+      getSession: () => this.session,
+      getServerVaultId: () => this.settings.serverVaultId,
+      getApiClient: () => this.apiClient,
+      getAtRestCipher: () => this.getAtRestCipher(),
+      getAdapterReadBinary: () =>
+        this.ensureAtRestAdapterRuntimeObject().getAdapterReadBinary(),
+      getAdapterWriteBinary: () =>
+        this.ensureAtRestAdapterRuntimeObject().getAdapterWriteBinary(),
+      normalizeVaultPath: (path) => this.normalizeVaultPath(path),
+      vaultConfigPath: (...parts) => this.vaultConfigPath(...parts),
+      ensureParentFoldersForPath: (path) => this.ensureParentFoldersForPath(path),
+      isPathExcluded: (path) => this.isPathExcluded(path),
+      getEffectivePermission: (path) => this.getEffectivePermission(path),
+      isMetadataSuppressed: (path) =>
+        this.permissionStore?.isMetadataSuppressed(path) ?? false,
+      readText: (path) => this.interceptedRead(path),
+      writeText: (path, content) => this.interceptedWrite(path, content),
+      deleteFile: (path) => this.interceptedDelete(path),
+      renameFile: (oldPath, newPath) => this.interceptedRename(oldPath, newPath),
+      emitAudit: (action, resourcePath, metadata) =>
+        this.emitAuditEvent(action, resourcePath, metadata),
+      log: (message) => this.log(message),
+      logError: (message, error) => this.logError(message, error),
+    };
+  }
+
+  private createAgentBridgeRuntime(): AgentBridgeRuntime {
+    return createAgentBridgeRuntime(this.createAgentBridgeRuntimeContext());
+  }
+
+  private ensureAgentBridgeRuntimeObject(): AgentBridgeRuntime {
+    if (!this.agentBridgeRuntime) {
+      this.agentBridgeRuntime = this.createAgentBridgeRuntime();
+    }
+    return this.agentBridgeRuntime;
+  }
+
+  private createRibbonContext(): VaultGuardRibbonContext {
+    return {
+      addRibbonIcon: (icon, title, callback) =>
+        this.addRibbonIcon(icon, title, callback),
+      setVaultGuardRibbonEl: (el) => {
+        this.vaultGuardRibbonEl = el;
+      },
+      setVaultGuardChatRibbonEl: (el) => {
+        this.vaultGuardChatRibbonEl = el;
+      },
+      setVaultGuardGraphRibbonEl: (el) => {
+        this.vaultGuardGraphRibbonEl = el;
+      },
+      showVaultGuardMenu: (evt) => this.showVaultGuardMenu(evt),
+      updateRibbonAuthIndicator: () => this.updateRibbonAuthIndicator(),
+      activateVaultGuardChat: () => this.activateVaultGuardChat(),
+      activatePermissionsGraph: () => this.activatePermissionsGraph(),
+    };
+  }
+
+  private createViewRegistrationContext(): VaultGuardViewRegistrationContext {
+    const thisPlugin = this;
+    return {
+      registerView: (type, viewCreator) => this.registerView(type, viewCreator),
+      get sidebarViewConfig() {
+        return thisPlugin.sidebarViewConfig;
+      },
+      pluginForViews: this,
+      getSidebarAuthState: () => this.getSidebarAuthState(),
+      handleLogin: () => this.handleLogin(),
+      openVaultGuardSettings: () => this.openVaultGuardSettings(),
+    };
+  }
+
+  private createSidebarActivationContext(): VaultGuardSidebarActivationContext {
+    return {
+      app: this.app,
+      createSidebarViewConfig: () => this.createSidebarViewConfig(),
+      getSidebarViewConfig: () => this.sidebarViewConfig,
+      setSidebarViewConfig: (config) => {
+        this.sidebarViewConfig = config;
+      },
+    };
+  }
+
+  private createPermissionStoreContext(): PermissionStoreFactoryContext {
+    return {
+      app: this.app,
+      getSession: () => this.session,
+      getVaultMemberRole: () => this.vaultMemberRole,
+      isOnline: () => this.isOnline(),
+      log: (msg) => this.log(msg),
+      setConnectionOffline: () => this.setConnectionStatus("offline"),
+      fetchPermissionLevelFromServer: (path) => this.fetchPermissionLevelFromServer(path),
+      isNetworkError: (err) => this.isNetworkError(err),
+    };
+  }
+
+  private createPermissionSurfaceContext(): PermissionSurfaceContext {
+    const thisPlugin = this;
+    return {
+      app: this.app,
+      plugin: this,
+      registerEvent: (eventRef) => this.registerEvent(eventRef),
+      get apiClient() {
+        return thisPlugin.apiClient;
+      },
+      get session() {
+        return thisPlugin.session;
+      },
+      get orgSettings() {
+        return thisPlugin.orgSettings;
+      },
+      get permissionStore() {
+        return thisPlugin.permissionStore;
+      },
+      getEffectiveUiRole: () => this.getEffectiveUiRole(),
+      isEffectiveAdmin: () => this.isEffectiveAdmin(),
+      getEffectivePermission: (path) => this.getEffectivePermission(path),
+      isFileExplorerDecorationDataReady: () => this.isFileExplorerDecorationDataReady(),
+      syncFileExplorerDecorationsState: (refresh) =>
+        this.syncFileExplorerDecorationsState(refresh),
+      isPermissionBannerEnabled: () => this.settings.showPermissionBanner,
+    };
+  }
+
+  private createCommandContext(): VaultGuardCommandContext {
+    const thisPlugin = this;
+    return {
+      app: this.app,
+      logPrefix: LOG_PREFIX,
+      addCommand: (command) => {
+        this.addCommand(command);
+      },
+      registerEvent: (eventRef) => {
+        this.registerEvent(eventRef);
+      },
+      onFileMenu: (callback) => this.app.workspace.on("file-menu", callback),
+      get session() {
+        return thisPlugin.session;
+      },
+      get apiClient() {
+        return thisPlugin.apiClient;
+      },
+      get settings() {
+        return thisPlugin.settings;
+      },
+      get connectionState() {
+        return thisPlugin.connectionState;
+      },
+      get syncState() {
+        return thisPlugin.syncState;
+      },
+      get syncDiagnostics() {
+        return thisPlugin.syncDiagnostics;
+      },
+      get manifestVersion() {
+        return thisPlugin.manifest.version;
+      },
+      get folderLifecycleListenersRegistered() {
+        return thisPlugin.folderLifecycleListenersRegistered;
+      },
+      get syncTimerAlive() {
+        return !!thisPlugin.syncTimer;
+      },
+      get keyLease() {
+        return thisPlugin.keyLease;
+      },
+      get vaultLeaseDenied() {
+        return thisPlugin.vaultLeaseDenied;
+      },
+      get placeholderPathsSize() {
+        return thisPlugin.placeholderPaths.size;
+      },
+      get offlineQueueLength() {
+        return thisPlugin.offlineQueue.length;
+      },
+      get deletionTombstonesCount() {
+        return Object.keys(thisPlugin.settings.deletionTombstones ?? {}).length;
+      },
+      get permissionStore() {
+        return thisPlugin.permissionStore;
+      },
+      get updateChecker() {
+        return thisPlugin.updateChecker;
+      },
+      handleLogin: () => this.handleLogin(),
+      forceLogout: (noticeMessage) => this.forceLogout(noticeMessage),
+      performSync: (options) => this.performSync(options),
+      getEffectivePermission: (path) => this.getEffectivePermission(path),
+      runConnectionDiagnostics: () => this.runConnectionDiagnostics(),
+      featureEnabled: (name) => this.featureEnabled(name),
+      isEffectiveAdmin: () => this.isEffectiveAdmin(),
+      openShareManagementModal: () => this.openShareManagementModal(),
+      showStatusNotice: () => this.showStatusNotice(),
+      showVaultGuardMenu: (evt) => this.showVaultGuardMenu(evt),
+      openAuditLog: () => this.openAuditLog(),
+      openWebAdminPanel: () => this.openWebAdminPanel(),
+      openVaultGuardSettings: () => this.openVaultGuardSettings(),
+      showPermissionsModal: () => this.showPermissionsModal(),
+      showPermissionRulesModal: (initialSearch) => this.showPermissionRulesModal(initialSearch),
+      activateVaultGuardSidebar: () => this.activateVaultGuardSidebar(),
+      openAgentBridgeLeaseModal: () => this.openAgentBridgeLeaseModal(),
+      revokeAllAgentBridgeLeases: () => this.revokeAllAgentBridgeLeases(),
+      stopAgentBridgeServer: () => this.stopAgentBridgeServer(),
+      encryptVaultAtRest: () => this.encryptVaultAtRest(),
+      decryptVaultAtRest: () => this.decryptVaultAtRest(),
+      switchServerVault: () => this.switchServerVault(),
+      showAdminPanel: () => this.showAdminPanel(),
+      showPathPermissionsModal: (path, isFolder, initialExplain) =>
+        this.showPathPermissionsModal(path, isFolder, initialExplain),
+      showAddPermissionForPath: (path, isFolder) =>
+        this.showAddPermissionForPath(path, isFolder),
+      copyShareLinkForPath: (path) => this.copyShareLinkForPath(path),
+      activateVaultGuardChat: () => this.activateVaultGuardChat(),
+      activatePermissionsGraph: () => this.activatePermissionsGraph(),
+      openVaultGuardChatHistory: () => this.openVaultGuardChatHistory(),
+      openNewVaultGuardChatTab: () => this.openNewVaultGuardChatTab(),
+      copyVaultGuardChatDomDebugReport: () => this.copyVaultGuardChatDomDebugReport(),
+      registerChatDebugCommand: () => registerChatDebugCommand(this),
+      logError: (message, error) => this.logError(message, error),
+    };
+  }
+
+  private createLifecycleEventsContext(): LifecycleEventsContext {
+    const thisPlugin = this;
+    const registerDomEvent = this.registerDomEvent.bind(this) as (
+      target: Window | Document,
+      type: string,
+      callback: EventListenerOrEventListenerObject,
+    ) => void;
+
+    return {
+      app: this.app,
+      logPrefix: LOG_PREFIX,
+      protocolHost: this as unknown as LifecycleEventsContext["protocolHost"],
+      registerEvent: (eventRef) => {
+        this.registerEvent(eventRef);
+      },
+      registerDomEvent: (target, type, callback) => {
+        registerDomEvent(target, type, callback);
+      },
+      registerInterval: (id) => {
+        this.registerInterval(id);
+      },
+      get session() {
+        return thisPlugin.session;
+      },
+      get settings() {
+        return thisPlugin.settings;
+      },
+      get syncState() {
+        return thisPlugin.syncState;
+      },
+      get permissionStore() {
+        return thisPlugin.permissionStore;
+      },
+      get folderLifecycleListenersRegistered() {
+        return thisPlugin.folderLifecycleListenersRegistered;
+      },
+      setFolderLifecycleListenersRegistered: (registered) => {
+        this.folderLifecycleListenersRegistered = registered;
+      },
+      get obsidianSyncNotice() {
+        return thisPlugin.obsidianSyncNotice;
+      },
+      setObsidianSyncNotice: (notice) => {
+        this.obsidianSyncNotice = notice;
+      },
+      get syncDiagnostics() {
+        return thisPlugin.syncDiagnostics;
+      },
+      redeemInvite: (params) => this.redeemInvite(params),
+      handleShareLink: (params) => this.handleShareLink(params),
+      reloadVaultGuardSidebar: () => this.reloadVaultGuardSidebar(),
+      ensureVaultGuardSidebar: () => this.ensureVaultGuardSidebar(),
+      noteSessionActivity: () => this.noteSessionActivity(),
+      handleFocusSyncTrigger: () => this.handleFocusSyncTrigger(),
+      resumeSyncLoop: (reason) => this.resumeSyncLoop(reason),
+      pauseSyncLoop: (reason) => this.pauseSyncLoop(reason),
+      handleBrowserOnline: () => this.handleBrowserOnline(),
+      handleBrowserOffline: () => this.handleBrowserOffline(),
+      handleFolderCreated: (path) => this.handleFolderCreated(path),
+      handleFolderDeleted: (path) => this.handleFolderDeleted(path),
+      handleFolderRenamed: (path, oldPath) =>
+        this.handleFolderRenamed(path, oldPath),
+      handleVaultFileRenamed: (path, oldPath) =>
+        this.handleVaultFileRenamed(path, oldPath),
+      handleVaultFileDeleted: (path) => this.handleVaultFileDeleted(path),
+      log: (message) => this.log(message),
+      logError: (message, error) => this.logError(message, error),
+    };
+  }
+
+  private getSettingsRuntime(): PluginSettingsRuntime {
+    if (!this.settingsRuntime) {
+      this.settingsRuntime = createPluginSettingsRuntime(
+        this.createSettingsRuntimeContext(),
+      );
+    }
+    return this.settingsRuntime;
+  }
+
+  private createSettingsRuntimeContext(): PluginSettingsRuntimeContext {
+    const thisPlugin = this;
+    return {
+      app: this.app,
+      loadData: () => this.loadData(),
+      saveData: (data) => this.saveData(data),
+      savePluginData: () => this.savePluginData(),
+      get settings() {
+        return thisPlugin.settings;
+      },
+      setSettings: (settings) => {
+        this.settings = settings;
+      },
+      get persistedSessions() {
+        return thisPlugin.persistedSessions;
+      },
+      setPersistedSessions: (sessions) => {
+        this.persistedSessions = sessions;
+      },
+      get pluginDataSaveQueue() {
+        return thisPlugin.pluginDataSaveQueue;
+      },
+      setPluginDataSaveQueue: (queue) => {
+        this.pluginDataSaveQueue = queue;
+      },
+      get configuredApiEndpoint() {
+        return thisPlugin.configuredApiEndpoint;
+      },
+      setConfiguredApiEndpoint: (endpoint) => {
+        this.configuredApiEndpoint = endpoint;
+      },
+      get resolvedApiEndpoint() {
+        return thisPlugin.resolvedApiEndpoint;
+      },
+      setResolvedApiEndpoint: (endpoint) => {
+        this.resolvedApiEndpoint = endpoint;
+      },
+      get apiEndpointResolutionPromise() {
+        return thisPlugin.apiEndpointResolutionPromise;
+      },
+      setApiEndpointResolutionPromise: (promise) => {
+        this.apiEndpointResolutionPromise = promise;
+      },
+      get serverEdition() {
+        return thisPlugin.serverEdition;
+      },
+      setServerEdition: (edition) => {
+        this.serverEdition = edition;
+      },
+      get serverFeatures() {
+        return thisPlugin.serverFeatures;
+      },
+      setServerFeatures: (features) => {
+        this.serverFeatures = features;
+      },
+      get derivedBindingId() {
+        return thisPlugin.derivedBindingId;
+      },
+      setDerivedBindingId: (bindingId) => {
+        this.derivedBindingId = bindingId;
+      },
+      get apiClient() {
+        return thisPlugin.apiClient;
+      },
+      setApiClient: (apiClient) => {
+        this.apiClient = apiClient;
+      },
+      get session() {
+        return thisPlugin.session;
+      },
+      setSession: (session) => {
+        this.session = session;
+      },
+      get vaultMemberRole() {
+        return thisPlugin.vaultMemberRole;
+      },
+      get atRestCipher() {
+        return thisPlugin.atRestCipher;
+      },
+      get safeStorageUnavailableNotified() {
+        return thisPlugin.safeStorageUnavailableNotified;
+      },
+      setSafeStorageUnavailableNotified: (notified) => {
+        this.safeStorageUnavailableNotified = notified;
+      },
+      computeHash: (content) => this.computeHash(content),
+      pruneDeletionTombstones: () => this.pruneDeletionTombstones(),
+      protectSessionForStorage: (session) => this.protectSessionForStorage(session),
+      protectSessionWithAtRest: (session) => this.protectSessionWithAtRest(session),
+      forceLogout: (noticeMessage) => this.forceLogout(noticeMessage),
+      refreshAccessToken: (session) => this.refreshAccessToken(session),
+      initializeApiClientFromSession: (session) =>
+        this.initializeApiClientFromSession(session),
+      log: (message) => this.log(message),
+      logError: (message, error) => this.logError(message, error),
+    };
+  }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Lifecycle
@@ -679,35 +1272,8 @@ export default class VaultGuardPlugin extends Plugin {
 
     // Register the ribbon buttons SYNCHRONOUSLY, up front, before the first
     // `await`. Ribbon buttons created *after* an await can be appended after
-    // Obsidian has already taken its initial ribbon snapshot, leaving the button
-    // missing until a later workspace event re-rendered the ribbon — which is
-    // exactly why the chat icon only showed up after opening the view from the
-    // command palette. The chat button uses a STOCK lucide icon, so its glyph is
-    // always present at first paint (a custom `addIcon` icon can lose that race).
-    addIcon("vaultguard-shield", VAULTGUARD_ICON);
-    this.vaultGuardRibbonEl = this.addRibbonIcon("vaultguard-shield", "VaultGuard", (evt: MouseEvent) => {
-      this.showVaultGuardMenu(evt);
-    });
-    this.updateRibbonAuthIndicator();
-
-    // AI Chat ribbon entry. TODO(ai-chat-feature-gate): no server `aiChat` flag
-    // yet — always present for now; the view shows a connect state and makes no
-    // model call until the user stores a key or uses a logged-in Claude Code
-    // subscription (§11).
-    this.vaultGuardChatRibbonEl = this.addRibbonIcon(VAULTGUARD_CHAT_ICON_ID, "VaultGuard Chat", () => {
-      void this.activateVaultGuardChat();
-    });
-
-    // Permissions Graph ribbon entry — desktop-only v1 (cytoscape canvas
-    // interaction + sidebar real estate). On mobile we skip the ribbon entirely,
-    // matching the agent-bridge command's desktop gate. The view itself shows a
-    // connect empty state and makes no network call until signed in + online.
-    if (!Platform.isMobileApp) {
-      this.vaultGuardGraphRibbonEl = this.addRibbonIcon("git-fork", "VaultGuard Permissions", () => {
-        void this.activatePermissionsGraph();
-      });
-    }
-    this.updateRibbonAuthIndicator();
+    // Obsidian has already taken its initial ribbon snapshot.
+    registerVaultGuardRibbons(this.createRibbonContext());
 
     // (sd4) The sd2 "Import local files" ribbon was retired. Importing is now an
     // agent-driven chat slash command (/import-knowledge) inside the AI chat
@@ -740,16 +1306,7 @@ export default class VaultGuardPlugin extends Plugin {
     // succeed even when `apiEndpoint` is empty (manual / Community-edition
     // first-run). Must precede any init* method that subscribes via
     // `this.registerEvent(this.permissionStore.on('changed', ...))`.
-    this.permissionStore = new PermissionStore({
-      getSession: () => this.session,
-      getVaultMemberRole: () => this.vaultMemberRole,
-      isOnline: () => this.isOnline(),
-      log: (msg) => this.log(msg),
-      onOfflineDetected: () => this.setConnectionStatus("offline"),
-      fetchPermissionLevelFromServer: (path) => this.fetchPermissionLevelFromServer(path),
-      isNetworkError: (err) => this.isNetworkError(err),
-      app: this.app,
-    });
+    this.permissionStore = createPermissionStore(this.createPermissionStoreContext());
 
     // Install the adapter intercept BEFORE any awaited startup work. Reads that
     // Obsidian fires during plugin load (workspace restore, initial indexer)
@@ -833,47 +1390,11 @@ export default class VaultGuardPlugin extends Plugin {
     // users from accumulating edits that fail at save time.
     this.initReadOnlyGuard();
 
-    // Register the VaultGuard sidebar view
-    this.registerView(VAULTGUARD_VIEW_TYPE, (leaf) => {
-      const view = new VaultGuardSidebarView(leaf, {
-        getAuthState: () => this.getSidebarAuthState(),
-        onLogin: () => this.handleLogin(),
-        onOpenSettings: () => this.openVaultGuardSettings(),
-      });
-      if (this.sidebarViewConfig) {
-        view.configure(this.sidebarViewConfig);
-      }
-      return view;
-    });
-
-    // Register the VaultGuard AI Chat view. Construction wires it to the agent
-    // bridge tool surface + lease minting + the encrypted key store + settings;
-    // the view reaches vault content ONLY through the lease (encryption boundary
-    // §3) and makes no model call until the user stores a key or uses a logged-in
-    // Claude Code subscription (§11).
-    // TODO(ai-chat-feature-gate): there is no `aiChat` ServerFeatures flag yet —
-    // keep registration visible for now. Replace with featureEnabled("aiChat")
-    // once the server advertises the capability.
-    this.registerView(
-      VAULTGUARD_CHAT_VIEW_TYPE,
-      (leaf) => new VaultGuardChatView(leaf, this),
-    );
-
-    // Permissions Graph view (desktop-only; the ribbon/command gate on
-    // Platform.isMobileApp). Registered unconditionally so a workspace restore
-    // of a previously-open leaf rehydrates correctly.
-    this.registerView(
-      VAULTGUARD_GRAPH_VIEW_TYPE,
-      (leaf) => new PermissionsGraphView(leaf, this),
-    );
+    registerVaultGuardViews(this.createViewRegistrationContext());
 
     // Phase 9: subscribe the sidebar to the unified permission bus. One
     // emit fans out to decorations + header + sidebar + readOnlyGuard.
-    this.registerEvent(
-      this.permissionStore.on("changed", () => {
-        this.reloadVaultGuardSidebar();
-      })
-    );
+    registerSidebarPermissionLifecycle(this.createLifecycleEventsContext());
 
     // Build sidebar config from current session (if restored)
     const sidebarConfig = this.createSidebarViewConfig();
@@ -885,9 +1406,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.initFileExplorerDecorations();
 
     // Auto-open the VaultGuard sidebar in the right panel on first load.
-    this.app.workspace.onLayoutReady(() => {
-      this.ensureVaultGuardSidebar();
-    });
+    registerSidebarLayoutLifecycle(this.createLifecycleEventsContext());
 
     // Restore server-side session state and encryption lease in background.
     if (this.session) {
@@ -936,12 +1455,9 @@ export default class VaultGuardPlugin extends Plugin {
     // Restore original vault adapter methods
     this.restoreVaultAdapter();
 
-    if (this.agentBridge) {
-      await this.agentBridge.stopHttpServer().catch((err) =>
-        this.logError("Stopping agent bridge server failed", err)
-      );
-      this.agentBridge.revokeAllLeases();
-      this.agentBridge = null;
+    if (this.agentBridgeRuntime) {
+      await this.agentBridgeRuntime.shutdown();
+      this.agentBridgeRuntime = null;
     }
 
     // Tear down API client
@@ -987,32 +1503,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private registerInviteProtocolHandler(): void {
-    const pluginWithProtocolHandler = this as unknown as {
-      registerObsidianProtocolHandler?: (
-        action: string,
-        handler: (params: Record<string, string>) => unknown
-      ) => void;
-    };
-
-    if (typeof pluginWithProtocolHandler.registerObsidianProtocolHandler !== "function") {
-      this.log(
-        "Obsidian protocol handlers are not available in this Obsidian version; invite links can still be pasted in settings."
-      );
-      return;
-    }
-
-    // Register `obsidian://vaultguard-invite?org=...&email=...` deep link
-    // so invitees can click the email button and have the plugin auto-configure.
-    pluginWithProtocolHandler.registerObsidianProtocolHandler(
-      "vaultguard-invite",
-      async (params) => {
-        try {
-          await this.redeemInvite(params);
-        } catch (err) {
-          this.logError("Invite redemption failed", err);
-        }
-      }
-    );
+    registerInviteProtocolHandlerLifecycle(this.createLifecycleEventsContext());
   }
 
   /**
@@ -1030,27 +1521,7 @@ export default class VaultGuardPlugin extends Plugin {
    * switch to instead of silently opening the wrong file.
    */
   private registerShareProtocolHandler(): void {
-    const pluginWithProtocolHandler = this as unknown as {
-      registerObsidianProtocolHandler?: (
-        action: string,
-        handler: (params: Record<string, string>) => unknown
-      ) => void;
-    };
-
-    if (typeof pluginWithProtocolHandler.registerObsidianProtocolHandler !== "function") {
-      return;
-    }
-
-    pluginWithProtocolHandler.registerObsidianProtocolHandler(
-      "vaultguard-share",
-      async (params) => {
-        try {
-          await this.handleShareLink(params);
-        } catch (err) {
-          this.logError("Share link handling failed", err);
-        }
-      }
-    );
+    registerShareProtocolHandlerLifecycle(this.createLifecycleEventsContext());
   }
 
   /**
@@ -1128,232 +1599,8 @@ export default class VaultGuardPlugin extends Plugin {
   // ─────────────────────────────────────────────────────────────────────────
 
   private initAgentBridge(): void {
-    this.agentBridge = new VaultGuardAgentBridge({
-      getSession: () => this.session,
-      getServerVaultId: () => this.settings.serverVaultId,
-      getVaultConfigDir: () => this.normalizeVaultPath(this.app.vault.configDir),
-      getAllFilePaths: () =>
-        this.app.vault
-          .getFiles()
-          .map((file) => this.normalizeVaultPath(file.path)),
-      fileExists: async (path) => this.app.vault.adapter.exists(path),
-      ensureParentFolders: (path) => this.ensureParentFoldersForPath(path),
-      isPathExcluded: (path) => this.isPathExcluded(path),
-      getPermission: (path) => this.getEffectivePermission(path),
-      // VaultGraph reads only the in-memory metadataCache. The bridge hands
-      // in a per-lease GraphPermissionDeps (scope predicate + the same gates);
-      // we supply the App so the same compiled service serves the in-plugin
-      // chat and external MCP clients.
-      makeVaultGraph: (graphDeps) => new VaultGraph(this.app, graphDeps),
-      readText: (path) => this.interceptedRead(path),
-      writeText: (path, content) => this.interceptedWrite(path, content),
-      // Destructive ops route through the same permission-checked, audited,
-      // at-rest-safe interceptors the manual file explorer uses.
-      deleteFile: (path) => this.interceptedDelete(path),
-      renameFile: (oldPath, newPath) => this.interceptedRename(oldPath, newPath),
-      confirmWrite: (request) => this.confirmAgentBridgeWrite(request),
-      log: (message) => this.log(message),
-      emitAudit: (action, resourcePath, metadata) =>
-        this.emitAuditEvent(action, resourcePath, metadata),
-      // Forwards to the API client's instance-scoped agent-context stack so
-      // every downstream HTTP request issued during `fn` carries
-      // X-VG-Agent-Name / X-VG-Lease-Id and the backend's `logAudit`
-      // helper merges them into the audit row's metadata. If the API
-      // client is absent (early-startup race), we still run `fn` so the
-      // bridge stays functional — the only loss is the attribution tag.
-      withAgentContext: (agentName, leaseId, fn) =>
-        this.apiClient
-          ? this.apiClient.withAgentContext(agentName, leaseId, fn)
-          : fn(),
-      // Backend permission/membership queries for the in-app chat's
-      // vaultguard_access tool. Delegates to the authenticated API client
-      // (requestUrl underneath); fails closed if the client is not yet ready.
-      queryAccess: {
-        getPathAccess: (path) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.getPathAccess(path);
-        },
-        getBatchPathAccess: (paths) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.getBatchPathAccess(paths);
-        },
-        getUserPermissions: (userId) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.getUserPermissions(userId);
-        },
-        listPermissionRules: (pathFilter) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.getPermissions(pathFilter);
-        },
-        listVaultMembers: (vaultId) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.listVaultMembers(vaultId);
-        },
-        // Audit-log read for the in-app chat's vaultguard_audit tool. The backend
-        // gates the log to vault admins and clamps the window to retention.
-        queryAudit: async (filters) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          const page = await this.apiClient.getAuditLogPage(filters);
-          return { entries: page.entries, count: page.count, nextCursor: page.nextCursor };
-        },
-        // File lifecycle & recovery for the in-app chat's vaultguard_files tool.
-        // Each is backend-gated (history needs read; deleted/overview/restore are
-        // admin); restore runs inside withAgentContext so its audit row is
-        // attributed to the chat agent.
-        getFileHistory: (path) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.getFileHistory(path);
-        },
-        getDeletedFiles: () => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.getDeletedFiles();
-        },
-        restoreDeletedFile: (path) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.restoreDeletedFile(path);
-        },
-        getVaultOverview: () => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.getVaultOverview();
-        },
-        // Share-link management for the in-app chat's vaultguard_share tool. The
-        // backend re-authorizes each op and gates the feature to Pro.
-        listShares: () => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.listShares();
-        },
-        createShare: (input) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.createShare(input);
-        },
-        revokeShare: (shareId) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.revokeShare(shareId);
-        },
-        // Vault-membership management for the in-app chat's vaultguard_membership
-        // tool. listOrgUsers (org-admin gated) resolves a person for op=add; the
-        // membership mutations are re-authorized as vault-admin server-side.
-        listOrgUsers: () => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.listUsers();
-        },
-        addVaultMember: (vaultId, userId, role) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.addVaultMember(vaultId, userId, role);
-        },
-        removeVaultMember: (vaultId, userId) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.removeVaultMember(vaultId, userId);
-        },
-        updateVaultMember: (vaultId, userId, role) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.updateVaultMember(vaultId, userId, role);
-        },
-        // Permission mutation for the in-app chat's vaultguard_set_permission
-        // tool. Runs inside withAgentContext so the backend permissions.set-level
-        // audit row is attributed to the chat agent; the backend remains the sole
-        // authority (vault-admin / file-admin) and rejects unauthorized changes.
-        setPermissionLevel: (input) => {
-          if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-          return this.apiClient.setPermissionLevel(input);
-        },
-      },
-      // Gated source-read provider for the in-app chat's /import-knowledge tools.
-      // Desktop-only — makeImportSourceFs() returns null on mobile / non-Electron
-      // hosts, so the vaultguard_import_* tools fail closed there. The bridge owns
-      // the sandbox guard (realpath + prefix); this provider only does raw reads.
-      importFs: makeImportSourceFs(),
-      // sd2 converters back the source → text step. Pure + offline (no network).
-      importConvert: (input) => dispatchConvert(input),
-      importClassify: (ext) => classifyExtension(ext),
-      askUser: async (request) => this.askUserInVaultGuardChat(request),
-      confirmWritePaused: async (request) => this.pauseConfirmInVaultGuardChat(request),
-      persistence: this.makeAgentBridgePersistenceAdapter(),
-    });
-  }
-
-  private async askUserInVaultGuardChat(
-    request: Parameters<AgentBridgeAskUserHandler>[0],
-  ) {
-    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
-    for (const leaf of leaves) {
-      if (leaf.view instanceof VaultGuardChatView) {
-        this.app.workspace.revealLeaf(leaf);
-        return leaf.view.askUserFromAgent(request);
-      }
-    }
-    throw new Error("VaultGuard AI Chat is not open to answer this question.");
-  }
-
-  // Non-blocking confirmation: render an Approve/Deny card in the open chat view
-  // (which persists it + applies the action on approval) and return immediately.
-  // Mirrors askUserInVaultGuardChat. Fails closed if no chat view is open so the
-  // bridge surfaces a clear error instead of silently dropping the change.
-  private async pauseConfirmInVaultGuardChat(
-    request: Parameters<AgentBridgeConfirmPausedHandler>[0],
-  ): Promise<void> {
-    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
-    for (const leaf of leaves) {
-      if (leaf.view instanceof VaultGuardChatView) {
-        this.app.workspace.revealLeaf(leaf);
-        return leaf.view.confirmWriteFromAgent(request);
-      }
-    }
-    throw new Error("VaultGuard AI Chat is not open to confirm this change.");
-  }
-
-  /**
-   * Persistence adapter for the agent bridge. Stores the lease envelope
-   * encrypted by the at-rest cipher (so the on-disk file is opaque even
-   * to a forensic image of the disk) and routes through the *raw*
-   * adapter methods so the AtRestCipher layer doesn't double-encrypt
-   * what we already encrypted at the application layer.
-   */
-  private makeAgentBridgePersistenceAdapter(): AgentBridgePersistenceAdapter | null {
-    const pluginId = this.manifest?.id ?? "vaultguard-sync";
-    const PATH = this.vaultConfigPath("plugins", pluginId, "agent-leases.envelope");
-    return {
-      readEnvelope: async (): Promise<string | null> => {
-        if (!this.atRestCipher?.isReady()) return null;
-        const readBin = this.originalAdapterMethods.readBinary;
-        if (!readBin) return null;
-        try {
-          const exists = await this.app.vault.adapter.exists(PATH);
-          if (!exists) return null;
-          const cipherBytes = await readBin(PATH);
-          const plaintext = await this.atRestCipher.decryptString(cipherBytes);
-          return plaintext;
-        } catch (err) {
-          this.logError("Failed to read agent bridge lease envelope", err);
-          return null;
-        }
-      },
-      writeEnvelope: async (plaintext: string): Promise<void> => {
-        if (!this.atRestCipher?.isReady()) {
-          throw new Error(
-            "VaultGuard Sync at-rest encryption is not ready; cannot persist agent bridge leases."
-          );
-        }
-        const writeBin = this.originalAdapterMethods.writeBinary;
-        if (!writeBin) {
-          throw new Error(
-            "Vault adapter is not initialized; cannot persist agent bridge leases."
-          );
-        }
-        await this.ensureParentFoldersForPath(PATH);
-        const cipher = await this.atRestCipher.encryptString(plaintext);
-        await writeBin(PATH, cipher);
-      },
-      deleteEnvelope: async (): Promise<void> => {
-        try {
-          const exists = await this.app.vault.adapter.exists(PATH);
-          if (!exists) return;
-          await this.app.vault.adapter.remove(PATH);
-        } catch (err) {
-          this.logError("Failed to delete agent bridge lease envelope", err);
-        }
-      },
-    };
+    this.agentBridgeRuntime = this.createAgentBridgeRuntime();
+    this.agentBridgeRuntime.init();
   }
 
   /**
@@ -1367,59 +1614,14 @@ export default class VaultGuardPlugin extends Plugin {
    * as "no persistence available" and continues.
    */
   getConversationStore(): ConversationStore | null {
-    const cipher = this.atRestCipher;
-    if (!cipher) return null;
-
-    const pluginId = this.manifest?.id ?? "vaultguard-sync";
-    const DIR = this.vaultConfigPath("plugins", pluginId, "chat");
-    const adapter: ConversationStorageAdapter = {
-      exists: async (name) => {
-        try {
-          return await this.app.vault.adapter.exists(`${DIR}/${name}`);
-        } catch {
-          return false;
-        }
-      },
-      readBinary: async (name) => {
-        const readBin = this.originalAdapterMethods.readBinary;
-        if (!readBin) throw new Error("Vault adapter not initialized.");
-        return readBin(`${DIR}/${name}`);
-      },
-      writeBinary: async (name, bytes) => {
-        const writeBin = this.originalAdapterMethods.writeBinary;
-        if (!writeBin) throw new Error("Vault adapter not initialized.");
-        await this.ensureParentFoldersForPath(`${DIR}/${name}`);
-        await writeBin(`${DIR}/${name}`, bytes);
-      },
-      remove: async (name) => {
-        try {
-          if (await this.app.vault.adapter.exists(`${DIR}/${name}`)) {
-            await this.app.vault.adapter.remove(`${DIR}/${name}`);
-          }
-        } catch (err) {
-          this.logError("Failed to remove conversation envelope", err);
-        }
-      },
-      list: async () => {
-        try {
-          if (!(await this.app.vault.adapter.exists(DIR))) return [];
-          const listing = await this.app.vault.adapter.list(DIR);
-          // adapter.list returns full paths under DIR; strip the dir prefix.
-          return listing.files.map((p) => p.slice(p.lastIndexOf("/") + 1));
-        } catch {
-          return [];
-        }
-      },
-    };
-
-    return new ConversationStore({ cipher, adapter });
+    return this.ensureAgentBridgeRuntimeObject().getConversationStore();
   }
 
-  private ensureAgentBridge(): VaultGuardAgentBridge {
-    if (!this.agentBridge) {
+  private ensureAgentBridgeRuntime(): AgentBridgeRuntime {
+    if (!this.agentBridgeRuntime) {
       this.initAgentBridge();
     }
-    return this.agentBridge!;
+    return this.agentBridgeRuntime!;
   }
 
   /**
@@ -1428,11 +1630,11 @@ export default class VaultGuardPlugin extends Plugin {
    * mint its own leases; a user or admin must create one first.
    */
   getAgentBridge(): AgentBridgeToolSurface {
-    return this.ensureAgentBridge().getToolSurface();
+    return this.ensureAgentBridgeRuntime().getToolSurface();
   }
 
   async createAgentBridgeLease(input: AgentBridgeLeaseInput = {}): Promise<AgentBridgeLeaseSecret> {
-    return this.ensureAgentBridge().createLease(input);
+    return this.ensureAgentBridgeRuntime().createLease(input);
   }
 
   /**
@@ -1442,20 +1644,19 @@ export default class VaultGuardPlugin extends Plugin {
    * Throws on mobile / non-Electron (no import fs provider) or an invalid folder.
    */
   async beginAgentBridgeImportSession(absRoot: string): Promise<string> {
-    return this.ensureAgentBridge().beginImportSession(absRoot);
+    return this.ensureAgentBridgeRuntime().beginImportSession(absRoot);
   }
 
   /** Clear the bridge import session so the gated source-read tools go inert. */
   endAgentBridgeImportSession(): void {
-    if (!this.agentBridge) return;
-    this.agentBridge.endImportSession();
+    this.agentBridgeRuntime?.endImportSession();
   }
 
   /** True when the bridge currently has an import session armed. Lets the chat
    * re-arm a remembered source root only when the singleton bridge isn't already
    * pointed at it (e.g. after a reload, resume, or import-tab switch). */
   hasActiveAgentBridgeImportSession(): boolean {
-    return this.agentBridge?.hasActiveImportSession() ?? false;
+    return this.agentBridgeRuntime?.hasActiveImportSession() ?? false;
   }
 
   /**
@@ -1481,11 +1682,11 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   rotateAgentBridgeLeaseToken(leaseId: string): AgentBridgeLeaseSecret {
-    return this.ensureAgentBridge().rotateLeaseToken(leaseId);
+    return this.ensureAgentBridgeRuntime().rotateLeaseToken(leaseId);
   }
 
   async loadPersistedAgentBridgeLeases(): Promise<{ restored: number; dropped: number }> {
-    return this.ensureAgentBridge().loadPersistedLeases();
+    return this.ensureAgentBridgeRuntime().loadPersistedLeases();
   }
 
   /**
@@ -1497,29 +1698,12 @@ export default class VaultGuardPlugin extends Plugin {
    * to an external agent right after Obsidian starts.
    */
   private async restorePersistentAgentBridgeLeases(): Promise<void> {
-    if (!this.session || !this.settings.serverVaultId) return;
-    if (!this.atRestCipher?.isReady()) {
-      // No LAK, no envelope to read. Persistent leases require at-rest;
-      // re-attempt later if the cipher is initialized after first-run.
-      return;
-    }
-    try {
-      const { restored } = await this.loadPersistedAgentBridgeLeases();
-      if (restored > 0) {
-        const server = await this.startAgentBridgeServer();
-        new Notice(
-          `VaultGuard Sync: ${restored} persistent agent bridge ${restored === 1 ? "lease is" : "leases are"} active. Endpoint: ${server.endpoint}.`,
-          8000
-        );
-      }
-    } catch (err) {
-      this.logError("Failed to restore persistent agent bridge leases", err);
-    }
+    await this.ensureAgentBridgeRuntime().restorePersistentLeases();
   }
 
   async revokeAgentBridgeLeasesForSessionEnd(reason: string): Promise<number> {
-    if (!this.agentBridge) return 0;
-    return this.agentBridge.revokePersistentLeasesForSessionEnd(reason);
+    if (!this.agentBridgeRuntime) return 0;
+    return this.agentBridgeRuntime.revokePersistentLeasesForSessionEnd(reason);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1532,87 +1716,35 @@ export default class VaultGuardPlugin extends Plugin {
   // it touches the user's home directory.
   // ─────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Resolves Node `fs`/`path`/`os` via Electron's require if available,
-   * otherwise returns null. Mobile and other web-only contexts hit the
-   * null path and the UI shows "skill install not available on this
-   * device" instead of throwing.
-   */
-  private getSkillInstallerDeps(): SkillInstallerDeps | null {
-    const maybeWindow = typeof window !== "undefined" ? (window as unknown as Record<string, unknown>) : {};
-    const req =
-      typeof maybeWindow.require === "function"
-        ? (maybeWindow.require as NodeRequire)
-        : null;
-    if (!req) return null;
-    try {
-      const fs = req("fs") as SkillInstallerDeps["fs"];
-      const path = req("path") as SkillInstallerDeps["path"];
-      const os = req("os") as { homedir(): string };
-      return {
-        fs,
-        path,
-        homedir: () => os.homedir(),
-        log: (msg) => this.log(msg),
-      };
-    } catch (err) {
-      this.logError("Could not load Node FS modules for skill installer", err);
-      return null;
-    }
-  }
-
   getAgentBridgeSkillStatus(): (SkillInstallStatus & { available: true }) | { available: false } {
-    const deps = this.getSkillInstallerDeps();
-    if (!deps) return { available: false };
-    return { ...inspectSkillInstall(deps), available: true };
+    return this.ensureAgentBridgeRuntimeObject().getSkillStatus();
   }
 
   async installAgentBridgeSkill(options: { overwriteUnmanaged?: boolean } = {}): Promise<InstallResult> {
-    const deps = this.getSkillInstallerDeps();
-    if (!deps) {
-      throw new Error(
-        "Skill install requires Node filesystem access (desktop Obsidian). Skipping on this device."
-      );
-    }
-    const result = installSkill(deps, options);
-    await this.emitAuditEvent("bridge.skill_installed", result.filePath, {
-      action: result.action,
-      overwriteUnmanaged: options.overwriteUnmanaged === true,
-    });
-    return result;
+    return this.ensureAgentBridgeRuntimeObject().installSkill(options);
   }
 
   async uninstallAgentBridgeSkill(options: { force?: boolean } = {}): Promise<{
     filePath: string;
     removed: boolean;
   }> {
-    const deps = this.getSkillInstallerDeps();
-    if (!deps) {
-      throw new Error("Skill uninstall requires Node filesystem access (desktop Obsidian).");
-    }
-    const result = uninstallSkill(deps, options);
-    if (result.removed) {
-      await this.emitAuditEvent("bridge.skill_uninstalled", result.filePath, {
-        force: options.force === true,
-      });
-    }
-    return result;
+    return this.ensureAgentBridgeRuntimeObject().uninstallSkill(options);
   }
 
   revokeAgentBridgeLease(leaseId: string): boolean {
-    return this.ensureAgentBridge().revokeLease(leaseId);
+    return this.ensureAgentBridgeRuntime().revokeLease(leaseId);
   }
 
   revokeAllAgentBridgeLeases(): void {
-    this.ensureAgentBridge().revokeAllLeases();
+    this.ensureAgentBridgeRuntime().revokeAllLeases();
   }
 
   async startAgentBridgeServer(): Promise<AgentBridgeServerInfo> {
-    return this.ensureAgentBridge().startHttpServer();
+    return this.ensureAgentBridgeRuntime().startServer();
   }
 
   async stopAgentBridgeServer(): Promise<void> {
-    await this.ensureAgentBridge().stopHttpServer();
+    await this.ensureAgentBridgeRuntime().stopServer();
   }
 
   /**
@@ -1682,50 +1814,8 @@ export default class VaultGuardPlugin extends Plugin {
     });
   }
 
-  private async confirmAgentBridgeWrite(request: {
-    lease: AgentBridgeLeaseSummary;
-    operation:
-      | "create"
-      | "apply_patch"
-      | "delete"
-      | "rename"
-      | "set_permission"
-      | "restore"
-      | "share_create"
-      | "share_revoke"
-      | "member_add"
-      | "member_remove"
-      | "member_set_role";
-    path: string;
-    preview: string;
-  }): Promise<boolean> {
-    // Render a real red/green diff in an Obsidian modal when the app UI is
-    // available. This is presentation-only: the approve/reject Promise<boolean>
-    // contract and the upstream-capped preview are unchanged.
-    if (this.app?.workspace) {
-      return new Promise<boolean>((resolve) => {
-        new WriteConfirmModal(
-          this.app,
-          {
-            agentName: request.lease.agentName,
-            operation: request.operation,
-            path: request.path,
-            scopes: request.lease.scopes,
-            expiresAt: request.lease.expiresAt,
-            preview: request.preview,
-          },
-          (allow) => resolve(allow),
-        ).open();
-      });
-    }
-
-    // Headless fallback (tests / no-DOM hosts): fail closed without a native
-    // blocking dialog.
-    return false;
-  }
-
   private openAgentBridgeLeaseModal(): void {
-    new AgentBridgeLeaseModal(this).open();
+    this.ensureAgentBridgeRuntimeObject().openLeaseModal();
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1737,241 +1827,46 @@ export default class VaultGuardPlugin extends Plugin {
    * for any missing fields.
    */
   async loadSettings(): Promise<void> {
-    const data = ((await this.loadData()) ?? {}) as VaultGuardPluginData;
-    this.persistedSessions = this.normalizePersistedSessions(data.storedSessions);
-    delete data.storedSessions;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
-    this.settings.defaultConflictResolution = this.normalizeConflictStrategy(
-      this.settings.defaultConflictResolution
-    );
-    this.settings.excludedPaths = this.withRequiredExcludedPaths(this.settings.excludedPaths);
-    this.settings.apiEndpoint = normalizeVaultGuardApiBaseUrl(this.settings.apiEndpoint);
-    this.configuredApiEndpoint = this.settings.apiEndpoint;
-    this.serverEdition = this.normalizeServerEdition(this.settings.serverEdition);
-    this.serverFeatures = this.normalizeServerFeatures(this.settings.serverFeatures);
-
-    // Initialize the tombstone map for legacy data.json that predates the field,
-    // then prune any entries older than the TTL (or with malformed timestamps).
-    // Do NOT saveSettings here — the next normal save persists the pruned set.
-    if (!this.settings.deletionTombstones) this.settings.deletionTombstones = {};
-    this.pruneDeletionTombstones();
-
-    this.derivedBindingId = await this.computeDerivedVaultBindingId();
-  }
-
-  /**
-   * Coerce a persisted conflict-resolution strategy to one the plugin
-   * actually implements. The "merge" option (an unfinished three-way
-   * auto-merge that was never wired into either conflict path) was removed;
-   * a previously-saved "merge" — or any unknown value — falls back to
-   * DUPLICATE, the safest automatic resolution because it keeps both copies
-   * and never discards the user's local edit.
-   */
-  private normalizeConflictStrategy(value: unknown): ConflictResolutionStrategy {
-    switch (value) {
-      case ConflictResolutionStrategy.ASK_USER:
-      case ConflictResolutionStrategy.KEEP_LOCAL:
-      case ConflictResolutionStrategy.KEEP_REMOTE:
-      case ConflictResolutionStrategy.DUPLICATE:
-        return value;
-      default:
-        return ConflictResolutionStrategy.DUPLICATE;
-    }
+    await this.getSettingsRuntime().loadSettings();
   }
 
   private normalizeServerEdition(value: unknown): ServerEdition | null {
-    return value === "community" || value === "pro" ? value : null;
+    return this.getSettingsRuntime().normalizeServerEdition(value);
   }
 
   private normalizeServerFeatures(value: unknown): ServerFeatures | null {
-    if (!value || typeof value !== "object") {
-      return null;
-    }
-    const features = value as Partial<Record<keyof ServerFeatures, unknown>>;
-    return {
-      shareLinks: Boolean(features.shareLinks),
-      advancedAudit: Boolean(features.advancedAudit),
-      billing: Boolean(features.billing),
-      webAdmin: Boolean(features.webAdmin),
-    };
-  }
-
-  private communityServerFeatures(): ServerFeatures {
-    return {
-      shareLinks: false,
-      advancedAudit: false,
-      billing: false,
-      webAdmin: false,
-    };
+    return this.getSettingsRuntime().normalizeServerFeatures(value);
   }
 
   private cacheServerCapabilities(config: Record<string, unknown>): boolean {
-    const edition = this.normalizeServerEdition(config.edition) ?? "pro";
-    const features =
-      this.normalizeServerFeatures(config.features) ??
-      (edition === "community"
-        ? this.communityServerFeatures()
-        : { ...ASSUMED_SERVER_FEATURES });
-
-    const changed =
-      this.serverEdition !== edition ||
-      !this.serverFeatures ||
-      this.serverFeatures.shareLinks !== features.shareLinks ||
-      this.serverFeatures.advancedAudit !== features.advancedAudit ||
-      this.serverFeatures.billing !== features.billing ||
-      this.serverFeatures.webAdmin !== features.webAdmin;
-
-    this.serverEdition = edition;
-    this.serverFeatures = { ...features };
-    this.settings.serverEdition = edition;
-    this.settings.serverFeatures = { ...features };
-    this.settings.serverFeaturesResolvedAt = new Date().toISOString();
-    return changed;
+    return this.getSettingsRuntime().cacheServerCapabilities(config);
   }
 
   private async refreshServerCapabilitiesFromConfiguredEndpoint(): Promise<boolean> {
-    const cfg = this.getEffectiveConfig();
-    const base = normalizeVaultGuardApiBaseUrl(cfg.apiEndpoint);
-    const identifiers = Array.from(
-      new Set(
-        [
-          this.settings.orgSlug,
-          cfg.organizationId,
-        ]
-          .map((value) => (value ?? "").trim())
-          .filter((value) => value.length > 0)
-      )
-    );
-
-    if (!base || identifiers.length === 0) {
-      return false;
-    }
-
-    let lastError: Error | null = null;
-    for (const identifier of identifiers) {
-      const url = `${base}/orgs/${encodeURIComponent(identifier)}/config`;
-      try {
-        const response = await requestUrl({ url, method: "GET", throw: false });
-        if (response.status === 404) {
-          continue;
-        }
-        if (response.status === 401 || response.status === 403) {
-          return false;
-        }
-        if (response.status < 200 || response.status >= 300) {
-          lastError = new Error(`Server returned ${response.status}`);
-          continue;
-        }
-        if (!response.json || typeof response.json !== "object") {
-          lastError = new Error("Invalid config response from server");
-          continue;
-        }
-
-        const config = response.json as Record<string, unknown>;
-        if (typeof config.orgSlug === "string" && config.orgSlug) {
-          this.settings.orgSlug = config.orgSlug;
-        }
-        const changed = this.cacheServerCapabilities(config);
-        await this.saveSettings();
-        return changed;
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-      }
-    }
-
-    if (lastError) {
-      this.logError("Server capability discovery failed", lastError);
-    }
-    return false;
-  }
-
-  private withRequiredExcludedPaths(paths: string[] | undefined): string[] {
-    const merged: string[] = [];
-    const seen = new Set<string>();
-
-    const add = (path: string): void => {
-      const cleaned = path.trim().replace(/^\/+/, "").replace(/\/+$/, "");
-      if (!cleaned || seen.has(cleaned)) return;
-      seen.add(cleaned);
-      merged.push(cleaned);
-    };
-
-    for (const path of paths ?? []) {
-      add(path);
-    }
-    for (const path of DEFAULT_EXCLUDED_PATHS) {
-      add(path);
-    }
-
-    return merged;
+    return this.getSettingsRuntime().refreshServerCapabilitiesFromConfiguredEndpoint();
   }
 
   /**
    * Persists current settings to Obsidian's data store.
    */
   async saveSettings(): Promise<void> {
-    const normalizedApiEndpoint = normalizeVaultGuardApiBaseUrl(this.settings.apiEndpoint);
-    const apiEndpointChanged = normalizedApiEndpoint !== this.configuredApiEndpoint;
-    this.settings.apiEndpoint = normalizedApiEndpoint;
-    await this.savePluginData();
-
-    if (apiEndpointChanged) {
-      this.configuredApiEndpoint = normalizedApiEndpoint;
-      this.resetResolvedApiEndpoint();
-      this.rebuildApiClient();
-    }
-  }
-
-  private clearResolvedConnectionFields(): void {
-    this.settings.orgSlug = "";
-    this.settings.apiEndpoint = "";
-    this.settings.organizationId = "";
-    this.settings.cognitoUserPoolId = "";
-    this.settings.cognitoClientId = "";
-    this.settings.serverEdition = undefined;
-    this.settings.serverFeatures = undefined;
-    this.settings.serverFeaturesResolvedAt = undefined;
-    this.serverEdition = null;
-    this.serverFeatures = null;
+    await this.getSettingsRuntime().saveSettings();
   }
 
   async resetCloudConnectionDefaults(): Promise<void> {
-    if (this.session) {
-      await this.forceLogout("VaultGuard Sync: Logged out because the connection target changed.");
-    }
-    this.settings.manualConfig = false;
-    this.clearResolvedConnectionFields();
-    await this.saveSettings();
+    await this.getSettingsRuntime().resetCloudConnectionDefaults();
   }
 
   async setManualConfigurationMode(manualConfig: boolean): Promise<void> {
-    if ((this.settings.manualConfig ?? false) === manualConfig) {
-      return;
-    }
-
-    if (this.session) {
-      await this.forceLogout("VaultGuard Sync: Logged out because the connection mode changed.");
-    }
-
-    this.settings.manualConfig = manualConfig;
-    this.clearResolvedConnectionFields();
-    await this.saveSettings();
+    await this.getSettingsRuntime().setManualConfigurationMode(manualConfig);
   }
 
   getConnectionTargetLabel(): string {
-    const config = this.getEffectiveConfig();
-    const endpoint = config.apiEndpoint || "not configured";
-    const mode = this.settings.manualConfig ? "manual/self-hosted" : "VaultGuard Cloud";
-    const org =
-      this.settings.orgSlug ||
-      this.settings.organizationId ||
-      (this.settings.manualConfig ? "" : "not connected");
-    return org ? `${mode}: ${endpoint} (${org})` : `${mode}: ${endpoint}`;
+    return this.getSettingsRuntime().getConnectionTargetLabel();
   }
 
   private readConfigString(config: Record<string, unknown>, key: string): string {
-    const value = config[key];
-    return typeof value === "string" ? value.trim() : "";
+    return this.getSettingsRuntime().readConfigString(config, key);
   }
 
   private applyResolvedConnectionConfig(
@@ -1979,190 +1874,15 @@ export default class VaultGuardPlugin extends Plugin {
     fallbackApiEndpoint: string,
     fallbackOrgSlug = ""
   ): void {
-    const cognitoUserPoolId = this.readConfigString(config, "cognitoUserPoolId");
-    const cognitoClientId = this.readConfigString(config, "cognitoClientId");
-    if (!cognitoUserPoolId || !cognitoClientId) {
-      throw new Error("Invalid config response from server");
-    }
-
-    const apiEndpoint = normalizeVaultGuardApiBaseUrl(
-      this.readConfigString(config, "apiEndpoint") || fallbackApiEndpoint
+    this.getSettingsRuntime().applyResolvedConnectionConfig(
+      config,
+      fallbackApiEndpoint,
+      fallbackOrgSlug,
     );
-    if (!apiEndpoint) {
-      throw new Error("Invalid config response from server: missing API endpoint");
-    }
-
-    const orgSlug = this.readConfigString(config, "orgSlug") || fallbackOrgSlug;
-    const organizationId =
-      this.readConfigString(config, "orgId") ||
-      this.readConfigString(config, "organizationId");
-
-    if (orgSlug) {
-      this.settings.orgSlug = orgSlug;
-    }
-    this.settings.apiEndpoint = apiEndpoint;
-    this.settings.organizationId = organizationId;
-    this.settings.cognitoUserPoolId = cognitoUserPoolId;
-    this.settings.cognitoClientId = cognitoClientId;
-    this.cacheServerCapabilities(config);
   }
-
-  private assertHttpsOrLocalhostUrl(rawUrl: string, label: string): URL {
-    let parsed: URL;
-    try {
-      parsed = new URL(rawUrl.trim());
-    } catch {
-      throw new Error(`Enter a valid ${label}.`);
-    }
-
-    const hostname = parsed.hostname.toLowerCase();
-    const isLocalhost =
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "::1" ||
-      hostname === "[::1]";
-    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLocalhost)) {
-      throw new Error(`${label} must use HTTPS, except localhost during development.`);
-    }
-
-    return parsed;
-  }
-
-  private normalizeManualServerConfigUrl(rawUrl: string): string {
-    const parsed = this.assertHttpsOrLocalhostUrl(rawUrl, "server config URL");
-    return parsed.toString();
-  }
-
-  /**
-   * Reasonable upper bound for a well-known config document. The legitimate
-   * payload is ~500 bytes; 64 KB leaves ~125x headroom while preventing a
-   * malicious server from exhausting Obsidian's memory with a multi-GB body.
-   */
-  private static readonly MANUAL_CONFIG_MAX_BYTES = 64 * 1024;
-
-  /** Timeout for the manual config fetch — Obsidian's requestUrl has no abort. */
-  private static readonly MANUAL_CONFIG_TIMEOUT_MS = 10_000;
 
   async applyManualServerConfigUrl(rawUrl: string): Promise<void> {
-    const url = this.normalizeManualServerConfigUrl(rawUrl);
-    const pastedOrigin = new URL(url);
-
-    // WR-04: bound the wait with a manual timeout (requestUrl has no native
-    // abort path) so a stalled or pathological server can't hang the plugin.
-    const response = await Promise.race([
-      requestUrl({ url, method: "GET", throw: false }),
-      new Promise<never>((_resolve, reject) =>
-        setTimeout(
-          () => reject(new Error("Server config request timed out after 10 seconds.")),
-          VaultGuardPlugin.MANUAL_CONFIG_TIMEOUT_MS
-        )
-      ),
-    ]);
-
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Server returned ${response.status}`);
-    }
-
-    // WR-04: cap response size before doing any further parsing/work.
-    const bodyText = response.text ?? "";
-    if (bodyText.length > VaultGuardPlugin.MANUAL_CONFIG_MAX_BYTES) {
-      throw new Error(
-        "Server config response is unexpectedly large; rejecting to prevent memory exhaustion."
-      );
-    }
-
-    // Strict shape: must be a JSON object literal (not null, not array, not primitive).
-    if (
-      !response.json ||
-      typeof response.json !== "object" ||
-      Array.isArray(response.json)
-    ) {
-      throw new Error("Invalid config response from server: expected a JSON object");
-    }
-
-    const config = response.json as Record<string, unknown>;
-
-    // WR-05 + CR-01: validate the response shape AND enforce that any apiEndpoint
-    // in the body shares the same hostname as the pasted URL. The well-known doc
-    // is by RFC-8615 convention served from the API root, so the pasted URL's
-    // host is the authoritative API host — the response body must not be allowed
-    // to redirect the user to a different (attacker-controlled) host.
-    this.validateWellKnownConfig(config, pastedOrigin);
-
-    if (this.session) {
-      await this.forceLogout("VaultGuard Sync: Logged out because the connection target changed.");
-    }
-
-    this.settings.manualConfig = true;
-    // Use the pasted URL's origin as the apiEndpoint fallback when the body
-    // omits it. When the body provides an apiEndpoint, it has just been
-    // hostname-pinned to the pasted URL by validateWellKnownConfig.
-    this.applyResolvedConnectionConfig(config, pastedOrigin.origin, this.settings.orgSlug);
-    await this.saveSettings();
-    this.rebuildApiClient();
-  }
-
-  /**
-   * Strict validator for a manually-pasted /.well-known/vaultguard.json
-   * response. Rejects the response — does not partial-apply — if any field
-   * fails its format check, or if the body's apiEndpoint points at a host
-   * other than the one the user pasted.
-   */
-  private validateWellKnownConfig(
-    config: Record<string, unknown>,
-    pastedOrigin: URL
-  ): void {
-    const cognitoUserPoolId = this.readConfigString(config, "cognitoUserPoolId");
-    const cognitoClientId = this.readConfigString(config, "cognitoClientId");
-    if (!cognitoUserPoolId || !cognitoClientId) {
-      throw new Error("Invalid config response from server: missing Cognito identifiers");
-    }
-
-    // Cognito User Pool IDs follow `<region>_<random>` where region is a
-    // standard AWS region name. Reject anything that doesn't match — a real
-    // server can never return e.g. an HTML error page parsed as a string here.
-    if (!/^[a-z]{2}-[a-z]+-\d+_[A-Za-z0-9]{6,}$/.test(cognitoUserPoolId)) {
-      throw new Error(
-        "Invalid config response from server: cognitoUserPoolId is not a valid Cognito pool identifier"
-      );
-    }
-
-    // Cognito App Client IDs are 20-26 lowercase alphanumeric characters.
-    if (!/^[a-z0-9]{20,26}$/.test(cognitoClientId)) {
-      throw new Error(
-        "Invalid config response from server: cognitoClientId is not a valid Cognito app client identifier"
-      );
-    }
-
-    // orgSlug (if present) must match the backend's slug regex.
-    const orgSlug = this.readConfigString(config, "orgSlug");
-    if (orgSlug && !/^[a-z0-9][a-z0-9-]{0,46}[a-z0-9]$/.test(orgSlug)) {
-      throw new Error(
-        "Invalid config response from server: orgSlug is not a valid identifier"
-      );
-    }
-
-    // CR-01: any apiEndpoint in the response body must point at the same host
-    // the user pasted. We never honor a body-supplied redirect to a different
-    // host — that would let a malicious .well-known doc silently route the
-    // user's credentials and encrypted vault traffic to attacker infrastructure.
-    const apiEndpoint = this.readConfigString(config, "apiEndpoint");
-    if (apiEndpoint) {
-      let parsed: URL;
-      try {
-        parsed = new URL(apiEndpoint);
-      } catch {
-        throw new Error(
-          "Invalid config response from server: apiEndpoint is not a parseable URL"
-        );
-      }
-      this.assertHttpsOrLocalhostUrl(apiEndpoint, "API endpoint");
-      if (parsed.hostname.toLowerCase() !== pastedOrigin.hostname.toLowerCase()) {
-        throw new Error(
-          `Invalid config response from server: apiEndpoint host (${parsed.hostname}) does not match the pasted URL host (${pastedOrigin.hostname}). To use a separate API host, paste that host's /.well-known/vaultguard.json URL directly.`
-        );
-      }
-    }
+    await this.getSettingsRuntime().applyManualServerConfigUrl(rawUrl);
   }
 
   /**
@@ -2176,111 +1896,16 @@ export default class VaultGuardPlugin extends Plugin {
     cognitoClientId: string;
     organizationId: string;
   } {
-    if (this.settings.manualConfig) {
-      return {
-        apiEndpoint: this.settings.apiEndpoint,
-        cognitoUserPoolId: this.settings.cognitoUserPoolId,
-        cognitoClientId: this.settings.cognitoClientId,
-        organizationId: this.settings.organizationId,
-      };
-    }
-    return {
-      apiEndpoint: this.settings.apiEndpoint || SAAS_DEFAULTS.apiEndpoint,
-      cognitoUserPoolId: this.settings.cognitoUserPoolId || SAAS_DEFAULTS.cognitoUserPoolId,
-      cognitoClientId: this.settings.cognitoClientId || SAAS_DEFAULTS.cognitoClientId,
-      organizationId: this.settings.organizationId,
-    };
+    return this.getSettingsRuntime().getEffectiveConfig();
   }
 
   private rebuildApiClient(): void {
-    if (this.apiClient) {
-      this.apiClient.destroy();
-      this.apiClient = null;
-    }
-
-    const config = this.getEffectiveConfig();
-
-    if (!config.apiEndpoint) {
-      return;
-    }
-
-    this.apiClient = new VaultGuardApiClient({
-      baseUrl: config.apiEndpoint,
-      orgId: config.organizationId,
-      vaultId: this.settings.serverVaultId,
-      getAuthTokens: async (forceRefresh = false) => {
-        if (!this.session) {
-          return null;
-        }
-
-        const expiresAt = new Date(this.session.tokenExpiresAt).getTime();
-        if (forceRefresh || expiresAt - Date.now() <= 60_000) {
-          const refreshResult = await this.refreshAccessToken(this.session);
-          if (!refreshResult.ok) {
-            return null;
-          }
-        }
-
-        if (!this.session) {
-          return null;
-        }
-
-        return {
-          accessToken: this.session.accessToken,
-          refreshToken: this.session.refreshToken,
-          idToken: this.session.idToken,
-          expiresAt: new Date(this.session.tokenExpiresAt).getTime(),
-        };
-      },
-      getSessionId: () => this.session?.sessionId ?? null,
-    });
-
-    if (this.session) {
-      this.initializeApiClientFromSession(this.session);
-    }
-  }
-
-  private resetResolvedApiEndpoint(): void {
-    this.resolvedApiEndpoint = null;
-    this.apiEndpointResolutionPromise = null;
+    this.getSettingsRuntime().rebuildApiClient();
   }
 
   private async getResolvedApiEndpoint(idToken?: string, probePath?: string): Promise<string> {
-    const configuredApiEndpoint = normalizeVaultGuardApiBaseUrl(this.getEffectiveConfig().apiEndpoint);
-    if (!configuredApiEndpoint) {
-      return "";
-    }
-
-    if (this.resolvedApiEndpoint) {
-      return this.resolvedApiEndpoint;
-    }
-
-    if (!idToken) {
-      return configuredApiEndpoint;
-    }
-
-    if (this.apiEndpointResolutionPromise) {
-      return await this.apiEndpointResolutionPromise;
-    }
-
-    const resolutionPromise = resolveVaultGuardApiBaseUrl(
-      configuredApiEndpoint,
-      idToken,
-      probePath
-    );
-    this.apiEndpointResolutionPromise = resolutionPromise;
-
-    try {
-      this.resolvedApiEndpoint = await resolutionPromise;
-      return this.resolvedApiEndpoint;
-    } finally {
-      if (this.apiEndpointResolutionPromise === resolutionPromise) {
-        this.apiEndpointResolutionPromise = null;
-      }
-    }
+    return this.getSettingsRuntime().getResolvedApiEndpoint(idToken, probePath);
   }
-
-  // ─────────────────────────────────────────────────────────────────────────
   // Command Registration
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -2288,553 +1913,52 @@ export default class VaultGuardPlugin extends Plugin {
    * Registers all plugin commands accessible via the command palette.
    */
   private registerCommands(): void {
-    // Login command
-    this.addCommand({
-      id: "login",
-      name: "Login",
-      callback: () => this.handleLogin(),
-    });
+    registerVaultGuardCommands(this.createCommandContext());
+  }
 
-    // Logout command (only shown when logged in)
-    this.addCommand({
-      id: "logout",
-      name: "Logout",
-      checkCallback: (checking: boolean) => {
-        if (checking) {
-          return !!this.session;
-        }
-        this.forceLogout();
-      },
-    });
-
-    // Manual sync trigger
-    this.addCommand({
-      id: "sync-now",
-      name: "Sync now",
-      callback: () => this.performSync({ userInitiated: true, forceCatchup: true }),
-    });
-
-    // ── TEMPORARY DEBUG (260623-dpc) — remove after root-causing the
-    // /import-knowledge "no WRITE permission for new files" denials. Read-only:
-    // surfaces the live permission state that decides whether the AgentBridge
-    // create() gate (agent-bridge.ts requireWritablePath) allows a brand-new
-    // path. Mutates nothing; probing a path only triggers a normal permission
-    // check. Desktop+mobile safe (no Node FS).
-    //
-    // Dev-build-only (260625-gg7): registered ONLY in non-production builds.
-    // esbuild substitutes the `process.env.NODE_ENV` literal (define in
-    // esbuild.config.mjs) → in a production build this becomes
-    // `if ("production" !== "production")` = `if (false)` and minify's DCE drops
-    // the whole block, so this command is absent from shipped main.js. vitest
-    // (NODE_ENV != "production") and dev builds keep it.
-    if (process.env.NODE_ENV !== "production") {
-      this.addCommand({
-        id: "vaultguard-debug-import-permission-state",
-        name: "VaultGuard (debug): Show import permission state",
-        callback: async () => {
-          const levelName = (l: PermissionLevel | undefined): string =>
-            l === undefined ? "<uncached>" : `${PermissionLevel[l] ?? "?"} (${l})`;
-
-          const rootSeed = this.permissionStore.getCachedPermission("");
-          const probePaths = ["test-notes-1/probe.md", "Clients/probe.md"];
-          const probed: string[] = [];
-          for (const p of probePaths) {
-            try {
-              const lvl = await this.getEffectivePermission(p);
-              probed.push(
-                `  ${p} → ${levelName(lvl)}${lvl >= PermissionLevel.WRITE ? " ✅ can create" : " ❌ create blocked"}`
-              );
-            } catch (err) {
-              probed.push(`  ${p} → ERROR ${String(err)}`);
-            }
-          }
-
-          const isAdminOwner = this.session?.role === "admin" || this.session?.role === "owner";
-          const rootWriteCapable = rootSeed !== undefined && rootSeed >= PermissionLevel.WRITE;
-          const report = [
-            "VaultGuard import permission diagnostic (260623-dpc)",
-            `session: ${this.session ? "present" : "NONE (not logged in)"}`,
-            `session.role (org): ${this.session?.role ?? "—"}`,
-            `session.roles: ${this.session?.roles?.join(", ") || "—"}`,
-            `session.vaultMemberRole (per-vault): ${this.session?.vaultMemberRole ?? "—"}`,
-            `admin/owner short-circuit: ${isAdminOwner ? "YES → every path resolves ADMIN" : "no"}`,
-            `vaultLeaseDenied (limited-access): ${this.vaultLeaseDenied}`,
-            `placeholderPaths.size: ${this.placeholderPaths.size}`,
-            `serverVaultId: ${this.settings.serverVaultId ? "set" : "MISSING"}`,
-            `root "" cache seed: ${levelName(rootSeed)}${rootWriteCapable ? " (write-capable baseline)" : " (NOT write-capable for new paths)"}`,
-            "new-path probes (what /import-knowledge create() hits):",
-            ...probed,
-          ].join("\n");
-
-          // console.log (not this.log) so it prints regardless of debugLogging.
-          console.log(`${LOG_PREFIX} ${report}`);
-          // timeout 0 → Notice stays until dismissed so the user can read/copy it.
-          new Notice(report, 0);
-        },
-      });
+  private getPermissionsGraphRuntime(): PermissionsGraphRuntime {
+    if (!this.permissionsGraphRuntime) {
+      this.permissionsGraphRuntime = createPermissionsGraphRuntime(
+        this.createPermissionsGraphRuntimeContext(),
+      );
     }
+    return this.permissionsGraphRuntime;
+  }
 
-    // Sync diagnostics (DX4-DIAG) — DEVELOPER-ONLY diagnostic command.
-    // Registered ONLY in dev builds: it is DEAD-CODE-ELIMINATED from the
-    // PRODUCTION bundle. esbuild substitutes the `process.env.NODE_ENV` literal
-    // (define in esbuild.config.mjs) so in a production build the guard becomes
-    // `if ("production" !== "production")` = `if (false)` and minify strips the
-    // whole branch — shipped main.js contains neither this command nor its id
-    // string. vitest (NODE_ENV != "production") and dev builds keep it.
-    //
-    // This is a DEV/PROD BUILD FLAG, NOT an EDITION flag. The "one binary /
-    // Cloud == Community parity" constraint (CLAUDE.md) is preserved: the SAME
-    // production bundle ships to BOTH Cloud and Community, and neither gets this
-    // command. The dev/prod axis is orthogonal to the pro/community axis.
-    //
-    // When it IS present (dev), it is read-only and emits ONLY a whitelisted,
-    // secret-free snapshot (no tokens / DEK / raw session; userId masked to 8
-    // chars), so the copied report is always safe to paste. It surfaces the
-    // startup/sync breadcrumb trace recorded by `this.syncDiagnostics` to
-    // investigate why initializeSyncEngine() may not run on a session restore.
-    // Mutates nothing; desktop + mobile safe (no Node FS).
-    if (process.env.NODE_ENV !== "production") {
-      this.addCommand({
-        id: "sync-diagnostics",
-        name: "Copy sync diagnostics",
-        callback: async () => {
-          // WHITELIST ONLY — insertion order is the report's State-section order.
-          // SECURITY: never include this.session raw, access/id/refresh tokens,
-          // this.keyLease.key, or any DEK. Only booleans / counts / IDs /
-          // timestamps below. keyLeaseExpiry is the lease's ISO expiry string
-          // (not the key); serverVaultId is a vault UUID (not a secret).
-          const state: Record<string, unknown> = {
-            pluginVersion: this.manifest.version,
-            platform: Platform.isMobileApp ? "mobile" : "desktop",
-            connectionStatus: this.connectionState.status,
-            sessionPresent: !!this.session,
-            userId: this.session?.userId ? this.session.userId.slice(0, 8) : "—",
-            roles: this.session?.roles?.join(", ") || "—",
-            vaultMemberRole: this.session?.vaultMemberRole ?? "—",
-            serverVaultId: this.settings.serverVaultId || "—",
-            bindingReconciledVaultId: this.settings.bindingReconciledVaultId ?? "—",
-            orgSlug: this.settings.orgSlug || "—",
-            folderLifecycleListenersRegistered: this.folderLifecycleListenersRegistered,
-            syncTimerAlive: !!this.syncTimer,
-            syncIntervalSec: this.settings.syncInterval,
-            keyLeasePresent: !!this.keyLease,
-            keyLeaseExpiry: this.keyLease?.expiresAt ?? "—",
-            vaultLeaseDenied: this.vaultLeaseDenied,
-            lastSync: this.syncState.lastSync ?? "—",
-            lastSyncTimestampSetting: this.settings.lastSyncTimestamp ?? "—",
-            offlineQueueLength: this.offlineQueue.length,
-            deletionTombstonesCount: Object.keys(this.settings.deletionTombstones ?? {}).length,
-            placeholderPathsCount: this.placeholderPaths.size,
-          };
-
-          const report = this.syncDiagnostics.buildReport(state);
-
-          // console.log (not this.log) so it prints regardless of debugLogging,
-          // exactly like the existing read-only diagnostic above.
-          console.log(`${LOG_PREFIX} ${report}`);
-
-          // Copy defensively — clipboard failure must NOT throw out of the
-          // callback (mirrors chat-view.ts / settings.ts guards). The console.log
-          // already happened, so the report stays recoverable either way.
-          try {
-            if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-              await navigator.clipboard.writeText(report);
-            }
-          } catch (err) {
-            this.logError("Sync diagnostics: clipboard copy failed", err);
-          }
-
-          new Notice("VaultGuard: Sync diagnostics copied to clipboard + console.", 5000);
-        },
-      });
-    }
-
-    // Dev-only: actively probe the backend to explain WHY the connection went
-    // offline. setConnectionStatus("offline") is set from ~6 call sites but the
-    // reason is never recorded on connectionState, so neither "Status" nor
-    // "sync-diagnostics" can say what dropped it. This re-runs the probe live
-    // (raw requestUrl, NOT apiRequest — so it doesn't mutate status and mask
-    // the result) and classifies the failure. NODE_ENV-gated so esbuild DCE
-    // strips it from the released bundle.
-    if (process.env.NODE_ENV !== "production") {
-      this.addCommand({
-        id: "diagnose-connection",
-        name: "Diagnose connection (probe backend)",
-        callback: async () => this.runConnectionDiagnostics(),
-      });
-    }
-
-    // Share-link lifecycle: list active links and revoke leaked ones. On
-    // Community Edition the command opens a Pro-upsell modal instead of the
-    // share-management modal — same compiled binary, show-but-block UX.
-    this.addCommand({
-      id: "manage-share-links",
-      name: "Manage share links",
-      checkCallback: (checking: boolean) => {
-        const ready =
-          !!this.session &&
-          !!this.apiClient &&
-          !!this.settings.serverVaultId;
-        if (checking) return ready;
-        if (ready) {
-          if (!this.featureEnabled('shareLinks')) {
-            new ProUpsellModal(this.app, "shareLinks").open();
-          } else {
-            this.openShareManagementModal();
-          }
-        }
+  private createPermissionsGraphRuntimeContext(): PermissionsGraphRuntimeContext {
+    const thisPlugin = this;
+    return {
+      app: this.app,
+      get apiClient() {
+        return thisPlugin.apiClient;
       },
-    });
-
-    // Status — surfaces auth/sync state in a Notice. Useful for diagnosing
-    // "is the plugin actually reloaded after my rebuild?" — if this command
-    // doesn't exist in the palette, the new build isn't loaded.
-    this.addCommand({
-      id: "status",
-      name: "Status",
-      callback: () => this.showStatusNotice(),
-    });
-
-    // Main plugin menu
-    this.addCommand({
-      id: "open-menu",
-      name: "Open sync menu",
-      callback: () => this.showVaultGuardMenu(),
-    });
-
-    // Audit log — admin/owner only; opens AdminModal preset to the audit tab.
-    this.addCommand({
-      id: "open-audit-log",
-      name: "Open Audit Log",
-      checkCallback: (checking: boolean) => {
-        const isAdmin =
-          this.session?.role === "admin" || this.session?.role === "owner";
-        const ready = !!this.session && isAdmin && !!this.apiClient;
-        if (checking) return ready;
-        if (ready) this.openAuditLog();
+      get session() {
+        return thisPlugin.session;
       },
-    });
-
-    // Web admin panel — any logged-in user; CE-branch shows ProUpsellModal.
-    this.addCommand({
-      id: "open-web-admin",
-      name: "Open Web Admin Panel",
-      checkCallback: (checking: boolean) => {
-        const ready = !!this.session;
-        if (checking) return ready;
-        if (ready) this.openWebAdminPanel();
+      get manifestId() {
+        return thisPlugin.manifest?.id;
       },
-    });
-
-    // Direct settings entry point
-    this.addCommand({
-      id: "open-settings",
-      name: "Open settings",
-      callback: () => this.openVaultGuardSettings(),
-    });
-
-    // View current user's permissions
-    this.addCommand({
-      id: "view-permissions",
-      name: "View permissions",
-      callback: () => this.showPermissionsModal(),
-    });
-
-    // Manage the whole vault's permission rules (admin-panel-style table)
-    this.addCommand({
-      id: "manage-permission-rules",
-      name: "Manage permissions",
-      callback: () => this.showPermissionRulesModal(),
-    });
-
-    // Open VaultGuard Files sidebar
-    this.addCommand({
-      id: "files-panel",
-      name: "Open files panel",
-      callback: () => this.activateVaultGuardSidebar(),
-    });
-
-    // Agent bridge needs Node `http` (local MCP server) — desktop only.
-    // We still register on mobile via checkCallback returning false so the
-    // command palette doesn't surface a broken entry.
-    this.addCommand({
-      id: "create-agent-bridge-lease",
-      name: "Create agent bridge lease",
-      checkCallback: (checking: boolean) => {
-        if (Platform.isMobileApp) return false;
-        const ready = !!this.session && !!this.settings.serverVaultId;
-        if (checking) return ready;
-        this.openAgentBridgeLeaseModal();
+      get atRestCipher() {
+        return thisPlugin.getAtRestCipher();
       },
-    });
-
-    this.addCommand({
-      id: "revoke-agent-bridge-leases",
-      name: "Revoke agent bridge leases",
-      checkCallback: (checking: boolean) => {
-        if (Platform.isMobileApp) return false;
-        if (checking) return true;
-        this.revokeAllAgentBridgeLeases();
-        void this.stopAgentBridgeServer().catch((err) =>
-          this.logError("Stopping agent bridge server failed", err)
-        );
-        new Notice("VaultGuard Sync: Agent bridge leases revoked.");
+      get adapterReadBinary() {
+        return thisPlugin.ensureAtRestAdapterRuntimeObject().getAdapterReadBinary();
       },
-    });
-
-    // Always-present discoverability command so mobile users see a clear
-    // explanation when they search the palette for "agent bridge" instead of
-    // an empty result. On desktop, this opens the lease modal like the
-    // primary command above (it's a synonym entry point).
-    this.addCommand({
-      id: "vaultguard-agent-bridge-info",
-      name: "VaultGuard: Agent bridge (desktop only)",
-      callback: () => {
-        if (Platform.isMobileApp) {
-          new Notice(
-            "Agent bridge requires Obsidian desktop. This feature is unavailable on mobile.",
-            6000
-          );
-          return;
-        }
-        if (!this.session || !this.settings.serverVaultId) {
-          new Notice(
-            "Agent bridge requires Obsidian desktop. Sign in and pick a vault to mint a lease.",
-            6000
-          );
-          return;
-        }
-        this.openAgentBridgeLeaseModal();
+      get adapterWriteBinary() {
+        return thisPlugin.ensureAtRestAdapterRuntimeObject().getAdapterWriteBinary();
       },
-    });
-
-    // Manual update probe — bypasses the 24h throttle. Lets users (and
-    // support) confirm the plugin is the latest published version on demand.
-    this.addCommand({
-      id: "check-for-updates",
-      name: "Check for plugin updates",
-      callback: async () => {
-        if (!this.updateChecker) {
-          new Notice("VaultGuard Sync: update checker is not initialized.");
-          return;
-        }
-        new Notice("VaultGuard Sync: checking for updates…");
-        const result = await this.updateChecker.checkNow();
-        if (result.latest === null) {
-          new Notice(
-            this.settings.disableUpdateChecks
-              ? "VaultGuard Sync: update checks are disabled in settings."
-              : "VaultGuard Sync: couldn't reach the release feed. Try again later.",
-            6000
-          );
-          return;
-        }
-        if (!result.isNewer) {
-          new Notice(
-            `VaultGuard Sync: you're on the latest version (${this.manifest.version}).`,
-            5000
-          );
-        }
-        // If a newer version exists, the checker has already shown its own Notice.
-      },
-    });
-
-    // One-shot at-rest encryption pass over the entire vault. Lazy migration
-    // (encrypting on touch) is sufficient over time, but a user testing the
-    // protection wants instant feedback. This command walks every file and
-    // rewrites already-plaintext bytes as ciphertext.
-    this.addCommand({
-      id: "encrypt-vault-at-rest",
-      name: "Encrypt vault at rest (full pass)",
-      callback: () => void this.encryptVaultAtRest(),
-    });
-
-    // Reverse the at-rest encryption — useful before disabling the plugin
-    // so the vault contents remain readable through normal Obsidian.
-    this.addCommand({
-      id: "decrypt-vault-at-rest",
-      name: "Decrypt vault at rest (back to plaintext)",
-      callback: () => void this.decryptVaultAtRest(),
-    });
-
-    // Pick / switch the bound server-side vault for this Obsidian folder.
-    this.addCommand({
-      id: "pick-vault",
-      name: "Pick or switch server vault",
-      checkCallback: (checking: boolean) => {
-        if (checking) {
-          return !!this.session && !!this.apiClient;
-        }
-        void this.switchServerVault();
-      },
-    });
-
-    // Admin panel (only shown to admin/owner users)
-    this.addCommand({
-      id: "admin",
-      name: "Manage organization",
-      checkCallback: (checking: boolean) => {
-        const isAdmin =
-          this.session?.role === "admin" || this.session?.role === "owner";
-        if (checking) {
-          return isAdmin;
-        }
-        if (isAdmin) {
-          this.showAdminPanel();
-        }
-      },
-    });
-
-    // Right-click context menu on files and folders in the file explorer
-    this.registerEvent(
-      this.app.workspace.on("file-menu", (menu: Menu, file: TAbstractFile) => {
-        if (!this.session || !this.apiClient) return;
-
-        const isAdmin = this.isEffectiveAdmin();
-
-        const path = file.path;
-        const isFolder = file instanceof TFolder;
-        const label = isFolder ? "folder" : "file";
-
-        // "View Permissions" — available to all authenticated users
-        menu.addItem((item) => {
-          item
-            .setTitle(`VaultGuard Sync: View ${label} permissions`)
-            .setIcon("shield")
-            .onClick(() => {
-              this.showPathPermissionsModal(path, isFolder);
-            });
-        });
-
-        menu.addItem((item) => {
-          item
-            .setTitle(`VaultGuard Sync: Explain ${label} permissions`)
-            .setIcon("circle-help")
-            .onClick(() => {
-              this.showPathPermissionsModal(path, isFolder, true);
-            });
-        });
-
-        // "Copy share link" — files only, any vault member can mint a link
-        // since the link itself grants nothing without team membership. On
-        // Community Edition this opens a Pro-upsell modal explaining the
-        // feature instead of minting a link.
-        if (!isFolder) {
-          menu.addItem((item) => {
-            item
-              .setTitle("VaultGuard Sync: Copy share link")
-              .setIcon("link")
-              .onClick(() => {
-                if (!this.featureEnabled('shareLinks')) {
-                  new ProUpsellModal(this.app, "shareLinks").open();
-                  return;
-                }
-                void this.copyShareLinkForPath(path);
-              });
-          });
-        }
-
-        // "Set Permissions" — admin only
-        if (isAdmin) {
-          menu.addItem((item) => {
-            item
-              .setTitle(`VaultGuard Sync: Set permissions on ${label}`)
-              .setIcon("lock")
-              .onClick(() => {
-                this.showAddPermissionForPath(path, isFolder);
-              });
-          });
-        }
-      })
-    );
-
-    // AI Chat — the real entry point for the chat panel.
-    // TODO(ai-chat-feature-gate): no server `aiChat` flag yet — always listed;
-    // the view stays offline until a key or logged-in subscription is available.
-    this.addCommand({
-      id: "vaultguard-open-chat",
-      name: "VaultGuard Chat: Open AI chat panel",
-      callback: () => {
-        void this.activateVaultGuardChat();
-      },
-    });
-
-    // Permissions Graph command — desktop-only, requires a connected vault.
-    // Mirrors the agent-bridge command gate (returns false on mobile so the
-    // palette doesn't surface a broken entry).
-    this.addCommand({
-      id: "vaultguard-open-permissions-graph",
-      name: "VaultGuard: Open permissions graph",
-      checkCallback: (checking: boolean) => {
-        if (Platform.isMobileApp) return false;
-        const ready = !!this.session && !!this.settings.serverVaultId;
-        if (checking) return ready;
-        void this.activatePermissionsGraph();
-      },
-    });
-
-    // Previous chats — open the panel and surface the saved-conversation list.
-    this.addCommand({
-      id: "vaultguard-chat-history",
-      name: "VaultGuard Chat: Previous chats",
-      callback: () => {
-        void this.openVaultGuardChatHistory();
-      },
-    });
-
-    // New chat tab — keeps one Obsidian chat panel open and creates an
-    // in-panel conversation tab instead of spawning standalone chat leaves.
-    this.addCommand({
-      id: "vaultguard-chat-new-tab",
-      name: "VaultGuard Chat: New chat tab",
-      callback: () => {
-        void this.openNewVaultGuardChatTab();
-      },
-    });
-
-    // Dev-only: dumps chat-panel DOM geometry to the clipboard for diagnosing
-    // layout bugs (thin/empty rows). NODE_ENV-gated so esbuild DCE strips it
-    // from the released bundle — it must never appear in a user's palette.
-    if (process.env.NODE_ENV !== "production") {
-      this.addCommand({
-        id: "vaultguard-chat-copy-dom-debug-report",
-        name: "VaultGuard Chat: Copy DOM debug report",
-        callback: () => {
-          void this.copyVaultGuardChatDomDebugReport();
-        },
-      });
-    }
-
-    // (sd4) The sd2 standalone "import-knowledge" command was retired. Importing
-    // is now /import-knowledge inside the AI chat panel: an executable chat slash
-    // command that arms a gated, sandboxed source-read tool and lets the agent
-    // survey the picked folder and synthesize an organized KB (see VaultGuardChatView).
-
-    // The headless debug harness stays useful for proving the tool path, but the
-    // chat view above is the real entry now. NODE_ENV-gated so esbuild DCE strips
-    // it (and the chat-debug-command module) from the released bundle; in dev
-    // builds it additionally stays invisible unless settings.debugLogging is on
-    // (its own checkCallback guard).
-    if (process.env.NODE_ENV !== "production") {
-      registerChatDebugCommand(this);
-    }
+      vaultConfigPath: (...parts) => this.vaultConfigPath(...parts),
+      ensureParentFoldersForPath: (path) => this.ensureParentFoldersForPath(path),
+      normalizeVaultPath: (path) => this.normalizeVaultPath(path),
+      logError: (message, error) => this.logError(message, error),
+    };
   }
 
   /**
    * Open (or reveal) the VaultGuard AI Chat panel in the right sidebar.
    */
   private async activateVaultGuardChat(): Promise<void> {
-    const existing = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
-    if (existing.length > 0) {
-      this.app.workspace.revealLeaf(existing[0]);
-      return;
-    }
-
-    const leaf = this.app.workspace.getRightLeaf(false);
-    if (leaf) {
-      await leaf.setViewState({ type: VAULTGUARD_CHAT_VIEW_TYPE, active: true });
-      this.app.workspace.revealLeaf(leaf);
-    }
+    await activateVaultGuardChatView(this.createSidebarActivationContext());
   }
 
   /**
@@ -2842,18 +1966,7 @@ export default class VaultGuardPlugin extends Plugin {
    * editor area (like Obsidian's own Graph view), not the right sidebar.
    */
   private async activatePermissionsGraph(): Promise<void> {
-    const existing = this.app.workspace.getLeavesOfType(VAULTGUARD_GRAPH_VIEW_TYPE);
-    if (existing.length > 0) {
-      this.app.workspace.revealLeaf(existing[0]);
-      return;
-    }
-
-    // A main-area tab — `getLeaf("tab")` opens in the centre workspace.
-    const leaf = this.app.workspace.getLeaf("tab");
-    if (leaf) {
-      await leaf.setViewState({ type: VAULTGUARD_GRAPH_VIEW_TYPE, active: true });
-      this.app.workspace.revealLeaf(leaf);
-    }
+    await activatePermissionsGraphView(this.createSidebarActivationContext());
   }
 
   /**
@@ -2865,60 +1978,12 @@ export default class VaultGuardPlugin extends Plugin {
    * the signed-in user can see.
    */
   getPermissionsGraphDataSource(): PermissionsGraphDataSource {
-    return {
-      listVaultMembers: (vaultId) => {
-        if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-        return this.apiClient.listVaultMembers(vaultId);
-      },
-      getPermissions: () => {
-        if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-        return this.apiClient.getPermissions();
-      },
-      getUserPermissions: (userId) => {
-        if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-        return this.apiClient.getUserPermissions(userId);
-      },
-      getBatchPathAccess: (paths) => {
-        if (!this.apiClient) throw new Error("VaultGuard is not connected.");
-        return this.apiClient.getBatchPathAccess(paths);
-      },
-      getAllFilePaths: () =>
-        this.app.vault.getFiles().map((file) => this.normalizeVaultPath(file.path)),
-    };
-  }
-
-  // ─── Permissions-graph data cache ───────────────────────────────────────────
-  //
-  // Two layers: a fast in-memory map, and a disk envelope encrypted with the LAK
-  // (AtRestCipher) so the cached permissions map survives a restart yet stays
-  // opaque to a forensic disk image — exactly like the agent-leases envelope.
-  // Keyed by vaultId and stamped with the session userId, so a different user
-  // signing in never reads the previous user's (viewer-scoped) map. Refreshed
-  // past the TTL, on the view's explicit Refresh, or on logout.
-  private permissionsGraphCache = new Map<
-    string,
-    { data: PermissionsGraphDataset; fetchedAt: number }
-  >();
-  private static readonly PERMISSIONS_GRAPH_CACHE_TTL_MS = 30 * 60_000;
-
-  private permissionsGraphCachePath(): string {
-    const pluginId = this.manifest?.id ?? "vaultguard-sync";
-    return this.vaultConfigPath("plugins", pluginId, "permissions-graph.cache");
-  }
-
-  private isPermissionsGraphCacheFresh(fetchedAt: number): boolean {
-    return Date.now() - fetchedAt <= VaultGuardPlugin.PERMISSIONS_GRAPH_CACHE_TTL_MS;
+    return this.getPermissionsGraphRuntime().getDataSource();
   }
 
   /** In-memory cached dataset for a vault, or null if absent/expired. */
   getPermissionsGraphCache(vaultId: string): PermissionsGraphDataset | null {
-    const entry = this.permissionsGraphCache.get(vaultId);
-    if (!entry) return null;
-    if (!this.isPermissionsGraphCacheFresh(entry.fetchedAt)) {
-      this.permissionsGraphCache.delete(vaultId);
-      return null;
-    }
-    return entry.data;
+    return this.getPermissionsGraphRuntime().getCache(vaultId);
   }
 
   /**
@@ -2927,81 +1992,16 @@ export default class VaultGuardPlugin extends Plugin {
    * exists for the current user.
    */
   async loadPersistedPermissionsGraphCache(vaultId: string): Promise<PermissionsGraphDataset | null> {
-    const mem = this.getPermissionsGraphCache(vaultId);
-    if (mem) return mem;
-
-    if (!this.atRestCipher?.isReady()) return null;
-    const readBin = this.originalAdapterMethods.readBinary;
-    if (!readBin) return null;
-
-    const path = this.permissionsGraphCachePath();
-    try {
-      if (!(await this.app.vault.adapter.exists(path))) return null;
-      const cipherBytes = await readBin(path);
-      const plaintext = await this.atRestCipher.decryptString(cipherBytes);
-      const env = JSON.parse(plaintext) as PersistedPermissionsGraphCache;
-      if (!env || env.version !== 2) return null;
-      // Belongs to a different user → never surface it.
-      if (env.userId !== (this.session?.userId ?? "")) return null;
-      const entry = env.entries?.[vaultId];
-      if (!entry || !this.isPermissionsGraphCacheFresh(entry.fetchedAt)) return null;
-      this.permissionsGraphCache.set(vaultId, { data: entry.data, fetchedAt: entry.fetchedAt });
-      return entry.data;
-    } catch (err) {
-      this.logError("Failed to read permissions-graph cache", err);
-      return null;
-    }
+    return this.getPermissionsGraphRuntime().loadPersistedCache(vaultId);
   }
 
   async setPermissionsGraphCache(vaultId: string, data: PermissionsGraphDataset): Promise<void> {
-    this.permissionsGraphCache.set(vaultId, { data, fetchedAt: Date.now() });
-    await this.persistPermissionsGraphCache().catch((err) =>
-      this.logError("Failed to persist permissions-graph cache", err),
-    );
-  }
-
-  /** Write the fresh in-memory entries to the encrypted disk envelope. */
-  private async persistPermissionsGraphCache(): Promise<void> {
-    if (!this.atRestCipher?.isReady()) return;
-    const writeBin = this.originalAdapterMethods.writeBinary;
-    if (!writeBin) return;
-    const userId = this.session?.userId ?? "";
-    if (!userId) return;
-
-    const entries: PersistedPermissionsGraphCache["entries"] = {};
-    for (const [vid, entry] of this.permissionsGraphCache.entries()) {
-      if (this.isPermissionsGraphCacheFresh(entry.fetchedAt)) {
-        entries[vid] = { fetchedAt: entry.fetchedAt, data: entry.data };
-      }
-    }
-
-    const env: PersistedPermissionsGraphCache = { version: 2, userId, entries };
-    const path = this.permissionsGraphCachePath();
-    await this.ensureParentFoldersForPath(path);
-    const cipher = await this.atRestCipher.encryptString(JSON.stringify(env));
-    await writeBin(path, cipher);
+    await this.getPermissionsGraphRuntime().setCache(vaultId, data);
   }
 
   /** Drop one vault's cache, or all of it when called with no argument. */
   invalidatePermissionsGraphCache(vaultId?: string): void {
-    if (vaultId) {
-      this.permissionsGraphCache.delete(vaultId);
-      void this.persistPermissionsGraphCache().catch(() => {});
-    } else {
-      this.permissionsGraphCache.clear();
-      void this.deletePermissionsGraphCacheFile().catch(() => {});
-    }
-  }
-
-  private async deletePermissionsGraphCacheFile(): Promise<void> {
-    try {
-      const path = this.permissionsGraphCachePath();
-      if (await this.app.vault.adapter.exists(path)) {
-        await this.app.vault.adapter.remove(path);
-      }
-    } catch (err) {
-      this.logError("Failed to delete permissions-graph cache", err);
-    }
+    this.getPermissionsGraphRuntime().invalidateCache(vaultId);
   }
 
   /**
@@ -3010,34 +2010,17 @@ export default class VaultGuardPlugin extends Plugin {
    * with several standalone Obsidian chat leaves racing each other.
    */
   async openNewVaultGuardChatTab(): Promise<void> {
-    await this.activateVaultGuardChat();
-    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
-    const view = leaves[0]?.view;
-    if (view instanceof VaultGuardChatView) {
-      view.openFreshChatTab();
-    }
+    await openNewVaultGuardChatTabView(this.createSidebarActivationContext());
   }
 
   /** Open the chat panel and pop the previous-chats picker. */
   private async openVaultGuardChatHistory(): Promise<void> {
-    await this.activateVaultGuardChat();
-    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
-    const view = leaves[0]?.view;
-    if (view instanceof VaultGuardChatView) {
-      view.showHistoryPicker();
-    }
+    await openVaultGuardChatHistoryView(this.createSidebarActivationContext());
   }
 
   /** Copy a point-in-time DOM/CSS snapshot for diagnosing invisible chat rows. */
   private async copyVaultGuardChatDomDebugReport(): Promise<void> {
-    await this.activateVaultGuardChat();
-    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
-    const view = leaves[0]?.view;
-    if (view instanceof VaultGuardChatView) {
-      await view.copyDomDebugReport();
-      return;
-    }
-    new Notice("VaultGuard Chat: open the chat panel before copying a DOM debug report.");
+    await copyVaultGuardChatDomDebugReportView(this.createSidebarActivationContext());
   }
 
   /**
@@ -4606,7 +3589,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Snapshot of the cipher state for the settings UI. */
   getAtRestStatus(): import("../crypto/at-rest-cipher").AtRestStatus {
-    return this.atRestCipher?.getStatus() ?? { kind: "uninitialized" };
+    return this.ensureAtRestAdapterRuntimeObject().getAtRestStatus();
   }
 
   /**
@@ -4615,7 +3598,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Returns null before init or after the plugin unloads.
    */
   getAtRestCipher(): AtRestCipher | null {
-    return this.atRestCipher;
+    return this.ensureAtRestAdapterRuntimeObject().getAtRestCipher();
   }
 
   /**
@@ -4634,30 +3617,7 @@ export default class VaultGuardPlugin extends Plugin {
     failed: number;
     total: number;
   }> {
-    const cipher = this.atRestCipher;
-    const readBin = this.originalAdapterMethods.readBinary;
-    const files = this.app.vault.getFiles();
-    let plaintext = 0;
-    let encrypted = 0;
-    let excluded = 0;
-    let failed = 0;
-    if (!cipher || !readBin) {
-      return { plaintext: 0, encrypted: 0, excluded: 0, failed: 0, total: files.length };
-    }
-    for (const file of files) {
-      if (this.isAtRestExcluded(file.path)) {
-        excluded += 1;
-        continue;
-      }
-      try {
-        const bytes = await readBin(file.path);
-        if (cipher.isEncrypted(bytes)) encrypted += 1;
-        else plaintext += 1;
-      } catch {
-        failed += 1;
-      }
-    }
-    return { plaintext, encrypted, excluded, failed, total: files.length };
+    return this.ensureAtRestAdapterRuntimeObject().tallyAtRestState();
   }
 
   /**
@@ -4703,12 +3663,12 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Public entry for the "Encrypt vault at rest" button in settings. */
   async migrateVaultToAtRest(): Promise<void> {
-    return this.encryptVaultAtRest();
+    return this.ensureAtRestAdapterRuntimeObject().migrateVaultToAtRest();
   }
 
   /** Public entry for the "Decrypt vault" button in settings. */
   async revertVaultFromAtRest(): Promise<void> {
-    return this.decryptVaultAtRest();
+    return this.ensureAtRestAdapterRuntimeObject().revertVaultFromAtRest();
   }
 
   /**
@@ -4717,10 +3677,7 @@ export default class VaultGuardPlugin extends Plugin {
    * on `getAtRestStatus().kind === "unlocked"`.
    */
   async exportAtRestRecoveryCode(): Promise<string> {
-    if (!this.atRestCipher) {
-      throw new Error("VaultGuard Sync: at-rest cipher not initialised.");
-    }
-    return this.atRestCipher.exportRecoveryCode();
+    return this.ensureAtRestAdapterRuntimeObject().exportAtRestRecoveryCode();
   }
 
   /**
@@ -4729,14 +3686,7 @@ export default class VaultGuardPlugin extends Plugin {
    * show a generic "couldn't recognise that code" error.
    */
   async restoreAtRestFromRecoveryCode(code: string): Promise<boolean> {
-    if (!this.atRestCipher) {
-      // Cipher wasn't initialised yet (e.g. envelope load threw earlier).
-      // Build a fresh one bound to the same envelope file so the restored
-      // LAK gets persisted in the canonical location.
-      await this.initAtRestCipher();
-    }
-    if (!this.atRestCipher) return false;
-    return this.atRestCipher.restoreFromRecoveryCode(code);
+    return this.ensureAtRestAdapterRuntimeObject().restoreAtRestFromRecoveryCode(code);
   }
 
   /**
@@ -5414,144 +4364,15 @@ export default class VaultGuardPlugin extends Plugin {
    * SaaS API base URL or the currently configured apiEndpoint to discover it.
    */
   async resolveOrgConfig(slug: string, options: { silent?: boolean } = {}): Promise<void> {
-    const slugCandidates = Array.from(
-      new Set(
-        [slug.trim().toLowerCase(), slug.trim().toLowerCase().replace(/^org-/, "")]
-          .filter((value) => value.length > 0)
-      )
-    );
-
-    const fallbackBases = this.settings.manualConfig ? [] : [SAAS_DEFAULTS.fallbackApiUrl];
-    const bases = Array.from(
-      new Set(
-        [
-          this.getEffectiveConfig().apiEndpoint,
-          ...fallbackBases,
-        ].filter(Boolean)
-      )
-    );
-
-    // If no base URL at all, the user must enter one manually
-    if (bases.length === 0) {
-      throw new Error(
-        'No API endpoint configured. Enter an API endpoint manually or ask your admin for the org slug.'
-      );
-    }
-
-    let lastError: Error | null = null;
-
-    for (const base of bases) {
-      const normalizedBase = normalizeVaultGuardApiBaseUrl(base);
-
-      for (const slugCandidate of slugCandidates) {
-        const url = `${normalizedBase}/orgs/${encodeURIComponent(slugCandidate)}/config`;
-
-        try {
-          let response;
-          try {
-            response = await requestUrl({ url, method: 'GET', throw: false });
-          } catch {
-            // A genuine network/connection failure (DNS, offline) — requestUrl
-            // can still throw these even with throw:false. Surface a friendly
-            // message and try the next base/slug candidate.
-            lastError = new Error(
-              "Couldn't reach the server. Check your internet connection and the org slug."
-            );
-            continue;
-          }
-
-          if (response.status === 404) {
-            throw new Error(`Organization "${slug}" not found. Check the slug and try again.`);
-          }
-
-          if (response.status === 401 || response.status === 403) {
-            throw new Error(
-              `The server rejected the connection for "${slug}". Double-check the org slug or ask your admin.`
-            );
-          }
-
-          if (response.status >= 500) {
-            throw new Error(
-              `"${slug}"'s server is temporarily unavailable. Please try again in a moment.`
-            );
-          }
-
-          if (response.status < 200 || response.status >= 300) {
-            throw new Error(
-              `Couldn't connect to "${slug}" (error ${response.status}). Check the slug and try again.`
-            );
-          }
-
-          const config = response.json;
-
-          if (!config || typeof config !== "object") {
-            throw new Error('Invalid config response from server');
-          }
-
-          this.applyResolvedConnectionConfig(
-            config as Record<string, unknown>,
-            normalizedBase,
-            slugCandidate
-          );
-          await this.saveSettings();
-
-          // Rebuild the API client with new settings
-          this.rebuildApiClient();
-
-          this.log(`Org config resolved for "${this.settings.orgSlug}": API=${this.settings.apiEndpoint}`);
-          if (!options.silent) {
-            const orgName = this.readConfigString(config as Record<string, unknown>, "orgName");
-            new Notice(`VaultGuard Sync: Connected to ${orgName || this.settings.orgSlug}`);
-          }
-          return;
-        } catch (err) {
-          lastError = err instanceof Error ? err : new Error(String(err));
-        }
-      }
-    }
-
-    throw lastError ?? new Error('Failed to resolve org configuration');
+    await this.getSettingsRuntime().resolveOrgConfig(slug, options);
   }
 
   private syncSettingsFromTokenPayload(
     payload: Record<string, unknown>,
     fallbackRoles: string[] = []
   ): boolean {
-    const derived = deriveConnectionConfigFromTokenPayload(payload, fallbackRoles);
-    let changed = false;
-
-    if (
-      derived.organizationId &&
-      derived.organizationId !== this.settings.organizationId
-    ) {
-      this.settings.organizationId = derived.organizationId;
-      changed = true;
-    }
-
-    if (derived.orgSlug && derived.orgSlug !== this.settings.orgSlug) {
-      this.settings.orgSlug = derived.orgSlug;
-      changed = true;
-    }
-
-    if (
-      derived.cognitoUserPoolId &&
-      derived.cognitoUserPoolId !== this.settings.cognitoUserPoolId
-    ) {
-      this.settings.cognitoUserPoolId = derived.cognitoUserPoolId;
-      changed = true;
-    }
-
-    if (
-      derived.cognitoClientId &&
-      derived.cognitoClientId !== this.settings.cognitoClientId
-    ) {
-      this.settings.cognitoClientId = derived.cognitoClientId;
-      changed = true;
-    }
-
-    return changed;
+    return this.getSettingsRuntime().syncSettingsFromTokenPayload(payload, fallbackRoles);
   }
-
   getOrgPolicySettings(): OrgSettingsResponse | null {
     return this.orgSettings;
   }
@@ -5601,15 +4422,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private registerSessionActivityTracking(): void {
-    const recordActivity = () => this.noteSessionActivity();
-    const doc = getActiveObsidianDocument();
-
-    if (doc) {
-      this.registerDomEvent(doc, "mousedown", recordActivity);
-      this.registerDomEvent(doc, "keydown", recordActivity);
-      this.registerDomEvent(doc, "touchstart", recordActivity);
-    }
-    this.registerDomEvent(window, "focus", recordActivity);
+    registerSessionActivityTrackingLifecycle(this.createLifecycleEventsContext());
   }
 
   private noteSessionActivity(): void {
@@ -5675,9 +4488,7 @@ export default class VaultGuardPlugin extends Plugin {
     await this.revokeAgentBridgeLeasesForSessionEnd("logout").catch(() => {
       // Best-effort; logout proceeds.
     });
-    if (this.agentBridge) {
-      await this.agentBridge.stopHttpServer().catch(() => {});
-    }
+    await this.agentBridgeRuntime?.stopServerIfInitialized().catch(() => {});
 
     this.session = null;
     this.updateRibbonAuthIndicator();
@@ -5743,1498 +4554,129 @@ export default class VaultGuardPlugin extends Plugin {
    * the user disables Sync.
    */
   private checkForObsidianSync(): void {
-    this.renderObsidianSyncNotice();
-    this.registerObsidianSyncListener();
+    registerObsidianSyncWarning(this.createLifecycleEventsContext());
   }
 
   private renderObsidianSyncNotice(): void {
-    try {
-      // internalPlugins is not part of the public Obsidian API but is stable
-      // and the only way to detect that the built-in Sync core plugin is
-      // active. We narrow the unknown shape to the minimal surface we touch
-      // rather than casting to `any`.
-      interface InternalPluginRef {
-        readonly enabled?: boolean;
-        readonly _loaded?: boolean;
-      }
-      interface InternalPlugins {
-        getPluginById?(id: string): InternalPluginRef | undefined;
-      }
-      const appWithInternals = this.app as unknown as {
-        internalPlugins?: InternalPlugins;
-      };
-      const syncPlugin = appWithInternals.internalPlugins?.getPluginById?.("sync");
-      const isSyncEnabled = !!(syncPlugin && (syncPlugin.enabled ?? syncPlugin._loaded ?? false));
-
-      if (isSyncEnabled && !this.obsidianSyncNotice) {
-        console.warn(
-          `${LOG_PREFIX} Obsidian Sync is active. VaultGuard handles all sync and backup — ` +
-          "running both will cause file conflicts. Please disable Obsidian Sync."
-        );
-        this.obsidianSyncNotice = new Notice(
-          "VaultGuard Sync: Obsidian Sync is enabled. VaultGuard Sync handles all sync and " +
-          "backup for this vault — please disable Obsidian Sync to prevent " +
-          "file conflicts.\n\nSettings → Core plugins → Sync → Disable",
-          0 // persistent until dismissed
-        );
-      } else if (!isSyncEnabled && this.obsidianSyncNotice) {
-        this.obsidianSyncNotice.hide();
-        this.obsidianSyncNotice = null;
-      }
-    } catch {
-      // Defensive: if the internal API changes, don't block plugin load
-    }
+    renderObsidianSyncNoticeLifecycle(this.createLifecycleEventsContext());
   }
 
   private registerObsidianSyncListener(): void {
-    try {
-      interface InternalPluginsEvented {
-        on?(event: string, cb: () => void): EventRef;
-      }
-      const appWithInternals = this.app as unknown as {
-        internalPlugins?: InternalPluginsEvented;
-      };
-      const internalPlugins = appWithInternals.internalPlugins;
-
-      // Primary: react to enable/disable events. `internalPlugins.on("change", ...)`
-      // fires when any core plugin is toggled, so the Notice reconciles the
-      // moment the user disables Sync.
-      const ref = internalPlugins?.on?.("change", () => this.renderObsidianSyncNotice());
-      if (ref) {
-        this.registerEvent(ref);
-        return;
-      }
-
-      // Fallback: poll every 60s if the event API isn't present on this
-      // Obsidian build. registerInterval scopes the timer to plugin lifetime
-      // so it's auto-cleared on unload.
-      // window.setInterval returns a number (what registerInterval expects);
-      // this path is renderer-only, so window is always present here.
-      this.registerInterval(
-        window.setInterval(() => this.renderObsidianSyncNotice(), 60_000)
-      );
-    } catch {
-      // Defensive: never block plugin load
-    }
+    registerObsidianSyncListenerLifecycle(this.createLifecycleEventsContext());
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Local At-Rest Cipher
+  // Local At-Rest Adapter Runtime
   // ─────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Provisions or unlocks the on-disk at-rest cipher. The wrapped LAK lives
-   * in `data.json` under `wrappedLak` so it survives Obsidian restarts and
-   * never leaks into the synced vault folder. Surface failures as a Notice
-   * rather than throwing — a failed init must not block plugin loading,
-   * because the user might need to log in to recover.
-   */
   private async initAtRestCipher(): Promise<void> {
-    // The wrapped LAK lives in a sidecar file inside the plugin folder, not
-    // in data.json. Two reasons: (1) data.json is overwritten by
-    // savePluginData() with a settings-only object, so any extra key would
-    // get clobbered; (2) the LAK envelope is opaque bytes — keeping it out
-    // of the human-readable JSON document makes reviews / debugging
-    // settings clearer. The plugin folder is already in `isPathExcluded`,
-    // so this file never participates in vault sync.
-    const pluginId = this.manifest?.id ?? "vaultguard-sync";
-    const envelopePath = this.vaultConfigPath("plugins", pluginId, "lak.envelope");
-    const adapter = this.app.vault.adapter;
-
-    // One-time envelope migration after a plugin-id rename. If no envelope
-    // exists at the current path but one DOES exist under a historical
-    // plugin id, copy it across before AtRestCipher.init() runs so the
-    // existing unwrap path picks it up and on-disk VG1 files remain
-    // decryptable. See PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION and commit
-    // 9495041 (2026-05-14, vaultguard -> vaultguard-sync).
-    let envelopeMigrationFailureReason: string | null = null;
-    try {
-      const currentExists = await adapter.exists(envelopePath);
-      if (!currentExists) {
-        const priorIds = PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION[pluginId] ?? [];
-        for (const priorId of priorIds) {
-          const priorPath = this.vaultConfigPath("plugins", priorId, "lak.envelope");
-          try {
-            if (!(await adapter.exists(priorPath))) continue;
-            const priorBlob = await adapter.read(priorPath);
-            if (!priorBlob || priorBlob.trim().length === 0) continue;
-            try {
-              await adapter.write(envelopePath, priorBlob);
-              this.log(`[at-rest] Migrated LAK envelope from ${priorId} -> ${pluginId}`);
-              // Source envelope intentionally NOT removed: a second Obsidian
-              // window, a second install, or a rollback to the prior plugin
-              // id all benefit from the original staying put.
-              break;
-            } catch (writeErr) {
-              envelopeMigrationFailureReason =
-                `Found an at-rest envelope under the previous plugin id (${priorId}) but could not copy it into the current plugin folder (${pluginId}): ${
-                  writeErr instanceof Error ? writeErr.message : String(writeErr)
-                }. Your encrypted files have NOT been overwritten — close Obsidian, copy "${priorPath}" to "${envelopePath}" manually, and reopen.`;
-              break;
-            }
-          } catch (readErr) {
-            // A prior-id folder exists but reading the envelope failed.
-            // Treat as "no sibling found" and continue scanning the rest of
-            // the prior id list — do not block init.
-            this.logError(`[at-rest] Probing prior envelope at ${priorPath} failed`, readErr);
-          }
-        }
-      }
-    } catch (err) {
-      // adapter.exists threw for the current path — extremely unusual.
-      // Don't block init; fall through to AtRestStorage which has its own
-      // try/catch around adapter.read.
-      this.logError(`[at-rest] Probing current envelope at ${envelopePath} failed`, err);
-    }
-
-    const storage: AtRestStorage = {
-      loadWrappedLak: async () => {
-        try {
-          if (!(await adapter.exists(envelopePath))) return null;
-          const raw = await adapter.read(envelopePath);
-          return raw.trim().length > 0 ? raw : null;
-        } catch (err) {
-          this.logError(`Reading at-rest envelope at ${envelopePath} failed`, err);
-          return null;
-        }
-      },
-      saveWrappedLak: async (blob: string) => {
-        await adapter.write(envelopePath, blob);
-      },
-      clearWrappedLak: async () => {
-        try {
-          if (await adapter.exists(envelopePath)) {
-            await adapter.remove(envelopePath);
-          }
-        } catch (err) {
-          this.logError(`Removing at-rest envelope at ${envelopePath} failed`, err);
-        }
-      },
-      loadFallbackKek: async () => {
-        const value: unknown = this.app.loadLocalStorage("vaultguard.at-rest.kek.v1");
-        return typeof value === "string" && value.length > 0 ? value : null;
-      },
-      saveFallbackKek: async (kekBase64: string) => {
-        this.app.saveLocalStorage("vaultguard.at-rest.kek.v1", kekBase64);
-      },
-      clearFallbackKek: async () => {
-        this.app.saveLocalStorage("vaultguard.at-rest.kek.v1", null);
-      },
-    };
-
-    this.atRestCipher = new AtRestCipher(storage);
-
-    // If the envelope migration found a sibling but failed to copy it,
-    // short-circuit BEFORE running init(). Running init() now would see no
-    // envelope and silently generate a fresh LAK, which is the exact failure
-    // mode this migration block exists to prevent.
-    if (envelopeMigrationFailureReason !== null) {
-      const reason = envelopeMigrationFailureReason;
-      this.app.workspace.onLayoutReady(() =>
-        this.showAtRestRecoveryBanner(reason)
-      );
-      this.logError(
-        "AtRestCipher init aborted: envelope migration failed",
-        new Error(reason)
-      );
-      return;
-    }
-
-    try {
-      const initPromise = this.atRestCipher.init();
-      this.cipherInitPromise = initPromise;
-      const ok = await initPromise.catch(() => false);
-      if (this.cipherInitPromise === initPromise) {
-        this.cipherInitPromise = null;
-      }
-      const status = this.atRestCipher.getStatus();
-      if (!ok) {
-        if (status.kind === "needs-recovery") {
-          // Defer the banner until layout is ready — the recovery flow
-          // routes through the settings tab, which doesn't exist yet at
-          // this point in onload.
-          this.app.workspace.onLayoutReady(() =>
-            this.showAtRestRecoveryBanner(status.reason)
-          );
-        } else {
-          const reason = status.kind === "disabled" ? status.reason : "unknown";
-          new Notice(
-            `VaultGuard Sync: local at-rest encryption disabled. ${reason}`,
-            10000
-          );
-        }
-        this.logError(
-          "AtRestCipher init failed",
-          new Error(status.kind === "needs-recovery" || status.kind === "disabled" ? status.reason : "unknown")
-        );
-        return;
-      }
-      const method = status.kind === "unlocked" ? status.method : "unknown";
-      this.log(`AtRestCipher ready (${method}).`);
-      if (Platform.isMobileApp && this.settings.debugLogging) {
-        const ready = status.kind === "unlocked";
-        new Notice(
-          `VaultGuard diag: at-rest method=${method}, ready=${ready}`,
-          5000
-        );
-      }
-      if (method === "localstorage-fallback" && !Platform.isMobileApp) {
-        new Notice(
-          "VaultGuard Sync: at-rest encryption is using the vault-local fallback (OS keychain unavailable). Files in Finder are encrypted, but a full Electron-profile theft can recover the key. See docs/AT-REST-ENCRYPTION.md.",
-          10000
-        );
-      }
-      // First-run nudge: if we just provisioned a fresh LAK and there are
-      // plaintext files on disk, the user almost certainly wants them
-      // encrypted (they enabled the plugin). One Notice with a clear CTA;
-      // we don't auto-encrypt without consent because some users keep
-      // local-only vaults and may not want VaultGuard touching every file.
-      this.app.workspace.onLayoutReady(() => {
-        void this.maybeOfferFirstRunMigration();
-      });
-    } catch (err) {
-      this.logError("AtRestCipher init threw", err);
-    }
+    return this.ensureAtRestAdapterRuntimeObject().initAtRestCipher();
   }
 
-  /**
-   * Once per plugin process: if the vault still has plaintext files
-   * (typical right after install) surface a Notice with an "Encrypt now"
-   * link to the settings tab. Throttled by a settings flag so users who
-   * dismiss it don't get pestered every reload.
-   */
   private async maybeOfferFirstRunMigration(): Promise<void> {
-    if (this.atRestFirstRunOffered) return;
-    this.atRestFirstRunOffered = true;
-    if (this.settings.atRestFirstRunDismissed) return;
-    if (!this.atRestCipher?.isReady()) return;
-
-    try {
-      const tally = await this.tallyAtRestState();
-      if (tally.plaintext === 0) return;
-      const doc = getActiveObsidianDocument();
-      if (!doc) return;
-      const notice = new Notice("", 0);
-      const frag = doc.createDocumentFragment();
-      const strong = frag.createEl("strong");
-      strong.setText("VaultGuard Sync: at-rest encryption ready. ");
-      frag.appendText(
-        `${tally.plaintext} file${tally.plaintext === 1 ? "" : "s"} in this vault still on disk as plaintext. `
-      );
-      const link = frag.createEl("a", {
-        text: "Encrypt them now →",
-        cls: "vaultguard-notice-link",
-      });
-      link.addEventListener("click", () => {
-        notice.hide();
-        this.openVaultGuardSettings();
-      });
-      const dismiss = frag.createEl("a", {
-        text: "  Dismiss",
-        cls: "vaultguard-notice-dismiss",
-      });
-      dismiss.addEventListener("click", () => {
-        this.settings.atRestFirstRunDismissed = true;
-        void this.saveSettings();
-        notice.hide();
-      });
-      notice.setMessage(frag);
-    } catch (err) {
-      this.logError("First-run at-rest tally failed", err);
-    }
+    return this.ensureAtRestAdapterRuntimeObject().maybeOfferFirstRunMigration();
   }
 
-  /**
-   * Persistent banner shown when the cipher can't unwrap the LAK on this
-   * device — typically because the user moved the vault between machines
-   * or reinstalled the OS. Routes them to the settings tab where the
-   * "Restore from recovery code" button lives. The Notice is sticky
-   * (no timeout) because ignoring it leaves the vault unreadable.
-   */
   private showAtRestRecoveryBanner(reason: string): void {
-    const doc = getActiveObsidianDocument();
-    if (!doc) return;
-    const notice = new Notice("", 0);
-    const frag = doc.createDocumentFragment();
-    const strong = frag.createEl("strong");
-    strong.setText("VaultGuard Sync: cannot read encrypted files on this device. ");
-    frag.appendText(reason + " ");
-    const link = frag.createEl("a", {
-      text: "Open settings to restore →",
-      cls: "vaultguard-notice-link",
-    });
-    link.addEventListener("click", () => {
-      notice.hide();
-      this.openVaultGuardSettings();
-    });
-    notice.setMessage(frag);
+    return this.ensureAtRestAdapterRuntimeObject().showAtRestRecoveryBanner(reason);
   }
 
-  /**
-   * Walk the entire vault and rewrite each file as at-rest ciphertext.
-   *
-   * Safe to invoke repeatedly — files that already start with the at-rest
-   * magic header are skipped. Excluded paths (config folder, trash, plugin
-   * folder) are never touched. Used for a one-shot migration of legacy
-   * plaintext vaults; ongoing writes are encrypted automatically by the
-   * adapter interceptor.
-   */
   private async encryptVaultAtRest(): Promise<void> {
-    if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.readBinary || !this.originalAdapterMethods.writeBinary) {
-      new Notice("VaultGuard Sync: at-rest cipher not initialised — cannot run migration.");
-      return;
-    }
-    const cipher = this.atRestCipher;
-    const readBin = this.originalAdapterMethods.readBinary;
-    const writeBin = this.originalAdapterMethods.writeBinary;
-
-    const files = this.app.vault.getFiles();
-    let encrypted = 0;
-    let skipped = 0;
-    let failed = 0;
-    new Notice(`VaultGuard Sync: encrypting ${files.length} files at rest…`, 3000);
-
-    for (const file of files) {
-      if (this.isAtRestExcluded(file.path)) {
-        skipped += 1;
-        continue;
-      }
-      try {
-        const bytes = await readBin(file.path);
-        if (cipher.isEncrypted(bytes)) {
-          skipped += 1;
-          continue;
-        }
-        const ct = await cipher.encryptBinary(bytes);
-        await writeBin(file.path, ct);
-        encrypted += 1;
-      } catch (err) {
-        failed += 1;
-        this.logError(`At-rest encrypt: failed for "${file.path}"`, err);
-      }
-    }
-    new Notice(
-      `VaultGuard Sync: at-rest encryption pass complete. ${encrypted} encrypted, ${skipped} already-encrypted/excluded, ${failed} failed.`,
-      8000
-    );
+    return this.ensureAtRestAdapterRuntimeObject().encryptVaultAtRest();
   }
 
-  /**
-   * Walk the vault and rewrite each at-rest-encrypted file back to
-   * plaintext. Mirror of `encryptVaultAtRest`. Use before disabling the
-   * plugin if you want the vault folder to remain readable through normal
-   * tools.
-   */
   private async decryptVaultAtRest(): Promise<void> {
-    if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.readBinary || !this.originalAdapterMethods.writeBinary) {
-      new Notice("VaultGuard Sync: at-rest cipher not initialised — cannot decrypt.");
-      return;
-    }
-    const cipher = this.atRestCipher;
-    const readBin = this.originalAdapterMethods.readBinary;
-    const writeBin = this.originalAdapterMethods.writeBinary;
-
-    const files = this.app.vault.getFiles();
-    let decrypted = 0;
-    let skipped = 0;
-    let failed = 0;
-    new Notice(`VaultGuard Sync: decrypting ${files.length} files at rest…`, 3000);
-
-    for (const file of files) {
-      if (this.isAtRestExcluded(file.path)) {
-        skipped += 1;
-        continue;
-      }
-      try {
-        const bytes = await readBin(file.path);
-        if (!cipher.isEncrypted(bytes)) {
-          skipped += 1;
-          continue;
-        }
-        const plain = await cipher.decryptBinary(bytes);
-        await writeBin(file.path, plain);
-        decrypted += 1;
-      } catch (err) {
-        failed += 1;
-        this.logError(`At-rest decrypt: failed for "${file.path}"`, err);
-      }
-    }
-    new Notice(
-      `VaultGuard Sync: at-rest decryption pass complete. ${decrypted} decrypted, ${skipped} already-plaintext/excluded, ${failed} failed.`,
-      8000
-    );
+    return this.ensureAtRestAdapterRuntimeObject().decryptVaultAtRest();
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Vault Adapter Interception
-  // ─────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Intercepts the vault adapter's read, write, list, and delete methods
-   * to route operations through permission checks and encryption.
-   *
-   * Original methods are stored for restoration on plugin unload.
-   */
   private interceptVaultAdapter(): void {
-    const adapter = this.app.vault.adapter;
-
-    // Save original methods
-    this.originalAdapterMethods.read = adapter.read.bind(adapter);
-    this.originalAdapterMethods.write = adapter.write.bind(adapter);
-    this.originalAdapterMethods.list = adapter.list.bind(adapter);
-    this.originalAdapterMethods.remove = adapter.remove.bind(adapter);
-    if (typeof (adapter as unknown as Record<string, unknown>).readBinary === "function") {
-      this.originalAdapterMethods.readBinary = (
-        adapter as unknown as { readBinary: (p: string) => Promise<ArrayBuffer> }
-      ).readBinary.bind(adapter);
-    }
-    if (typeof (adapter as unknown as Record<string, unknown>).writeBinary === "function") {
-      this.originalAdapterMethods.writeBinary = (
-        adapter as unknown as { writeBinary: (p: string, d: ArrayBuffer) => Promise<void> }
-      ).writeBinary.bind(adapter);
-    }
-    if (typeof adapter.rename === "function") {
-      this.originalAdapterMethods.rename = adapter.rename.bind(adapter);
-    }
-
-    // Intercept read operations
-    adapter.read = async (normalizedPath: string): Promise<string> => {
-      return this.interceptedRead(normalizedPath);
-    };
-
-    // Intercept write operations
-    adapter.write = async (
-      normalizedPath: string,
-      data: string
-    ): Promise<void> => {
-      return this.interceptedWrite(normalizedPath, data);
-    };
-
-    // Intercept binary read/write so attachments (images, PDFs, ...) also
-    // get at-rest decryption/encryption. Without this, every non-text file
-    // in the vault would round-trip in plaintext on disk.
-    if (this.originalAdapterMethods.readBinary) {
-      (adapter as unknown as {
-        readBinary: (p: string) => Promise<ArrayBuffer>;
-      }).readBinary = async (normalizedPath: string): Promise<ArrayBuffer> => {
-        return this.interceptedReadBinary(normalizedPath);
-      };
-    }
-    if (this.originalAdapterMethods.writeBinary) {
-      (adapter as unknown as {
-        writeBinary: (p: string, d: ArrayBuffer) => Promise<void>;
-      }).writeBinary = async (
-        normalizedPath: string,
-        data: ArrayBuffer
-      ): Promise<void> => {
-        return this.interceptedWriteBinary(normalizedPath, data);
-      };
-    }
-
-    // Intercept list operations
-    adapter.list = async (
-      normalizedPath: string
-    ): Promise<{ files: string[]; folders: string[] }> => {
-      return this.interceptedList(normalizedPath);
-    };
-
-    // Intercept delete operations
-    adapter.remove = async (normalizedPath: string): Promise<void> => {
-      return this.interceptedDelete(normalizedPath);
-    };
-
-    // Intercept rename — without this the server keeps the old name forever
-    // (Obsidian renames don't go through write/remove, so the existing
-    // interceptors never fire) and the renamed file appears as a duplicate
-    // until the user manually deletes the old path.
-    if (this.originalAdapterMethods.rename) {
-      adapter.rename = async (oldPath: string, newPath: string): Promise<void> => {
-        return this.interceptedRename(oldPath, newPath);
-      };
-    }
-
-    this.log("Vault adapter methods intercepted.");
+    return this.ensureAtRestAdapterRuntimeObject().interceptVaultAdapter();
   }
 
-  /**
-   * Restores the original vault adapter methods.
-   * Called during plugin unload to prevent issues with other plugins.
-   */
   private restoreVaultAdapter(): void {
-    const adapter = this.app.vault.adapter;
-
-    if (this.originalAdapterMethods.read) {
-      adapter.read = this.originalAdapterMethods.read;
-    }
-    if (this.originalAdapterMethods.write) {
-      adapter.write = this.originalAdapterMethods.write;
-    }
-    if (this.originalAdapterMethods.readBinary) {
-      (adapter as unknown as { readBinary: (p: string) => Promise<ArrayBuffer> }).readBinary =
-        this.originalAdapterMethods.readBinary;
-    }
-    if (this.originalAdapterMethods.writeBinary) {
-      (adapter as unknown as {
-        writeBinary: (p: string, d: ArrayBuffer) => Promise<void>;
-      }).writeBinary = this.originalAdapterMethods.writeBinary;
-    }
-    if (this.originalAdapterMethods.list) {
-      adapter.list = this.originalAdapterMethods.list;
-    }
-    if (this.originalAdapterMethods.remove) {
-      adapter.remove = this.originalAdapterMethods.remove;
-    }
-    if (this.originalAdapterMethods.rename) {
-      adapter.rename = this.originalAdapterMethods.rename;
-    }
-
-    this.originalAdapterMethods = {
-      read: null,
-      write: null,
-      readBinary: null,
-      writeBinary: null,
-      list: null,
-      remove: null,
-      rename: null,
-    };
-    this.log("Vault adapter methods restored.");
+    return this.ensureAtRestAdapterRuntimeObject().restoreVaultAdapter();
   }
 
-  /**
-   * Permission-checked and decryption-aware file read operation.
-   * @param path - Normalized vault-relative file path
-   * @returns Decrypted file content
-   * @throws Error if the user lacks READ permission
-   */
   private async interceptedRead(path: string): Promise<string> {
-    if (this.isPathExcluded(path)) {
-      if (!this.originalAdapterMethods.read) {
-        throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
-      }
-      return this.originalAdapterMethods.read(path);
-    }
-
-    if (!this.session) {
-      throw new Error(this.showLoginRequiredNotice("open", path));
-    }
-
-    // Wait briefly for the cache warm-up before evaluating permission so
-    // Obsidian's startup workspace restore doesn't show "Failed to open"
-    // notices for paths that will resolve to ALLOW once the warm-up is
-    // done. The warm-up is fast (one /permissions fetch) — capping the
-    // wait at 5 s prevents an unresponsive backend from hanging the read.
-    await this.awaitPermissionReadiness();
-
-    const permission = await this.getEffectivePermission(path);
-
-    if (permission < PermissionLevel.READ) {
-      // Permission denial during read: log the denial for audit, but do
-      // NOT wipe and do NOT throw. Rationale (1.0.17 hardening after
-      // 1.0.15 data loss + 1.0.16 still-flooding incident):
-      //
-      //   * Wiping was the data-loss vector — destroying user files because
-      //     the permission cache said NONE meant a single cache miss erased
-      //     local content. Even with shouldDeferDenialWipe guarding the
-      //     startup window, post-warm-up NONE for legitimately-denied files
-      //     still destroyed them.
-      //
-      //   * Throwing produced the "stuck at indexing vault" symptom —
-      //     Obsidian's indexer retries failed reads, flooding the console
-      //     with errors per denied file on every startup.
-      //
-      //   * Revocation enforcement belongs in the sync engine, fired on a
-      //     CONFIRMED server permission-change event, not on every read.
-      //
-      // Returning the on-disk content trades a narrow privacy concern
-      // (someone with local disk access could read a file they no longer
-      // have server permission for) for ending the data-loss + indexing-
-      // flood incidents. At-rest encryption still protects the bytes on
-      // disk; only an authenticated user with a valid LAK can decrypt
-      // them, so the worst case is "user kept their own laptop after
-      // losing vault access" — which the file system permits anyway.
-      await this.emitAuditEvent("file.read", path, {
-        outcome: "denied",
-        reason: "permission-denied-read-fail-open",
-      });
-      this.log(`Permission denied for "${path}" (read fail-open).`);
-      return this.readPlainFromDisk(path);
-    }
-
-    // Phase-8 limited-access primary branch (OD-4): if this path is a known
-    // 36-byte VG1 placeholder, hydrate via the server-side decrypt endpoint
-    // and replace the on-disk placeholder with LAK-encrypted plaintext.
-    if (this.vaultLeaseDenied && this.placeholderPaths.has(path)) {
-      const response = await this.readFileDecrypted(path);
-      if (response.success && response.data?.decrypted === true) {
-        const plaintext = this.decodeBase64Utf8(response.data.content);
-        await this.writePlainToDisk(path, plaintext);
-        this.placeholderPaths.delete(path);
-        await this.emitAuditEvent("file.read", path);
-        return plaintext;
-      }
-      if (response.error?.statusCode === 404) {
-        // Read fail-open in limited-access mode. The prior behavior here
-        // (wipe + throw) was the data-loss vector behind the 2026-05-31
-        // Pete incident: any user with a deny-read rule overlapping /**
-        // gets a 403 on /auth/key-lease/scoped (see
-        // assertScopeHasNoReadDenyRules in auth/handler.ts), which forces
-        // vaultLeaseDenied=true for the whole session. From there, every
-        // read of a read-only file falls into this branch and erases
-        // local content. A 404 from readFileDecrypted is ambiguous — it
-        // could mean genuinely deleted, or denied-via-404 (share-bridge
-        // pattern). Deletion enforcement belongs in the sync engine on a
-        // confirmed permission_changed event, not on a single read 404.
-        // Mirrors the post-1.0.17 read fail-open principle at the top of
-        // this function.
-        this.placeholderPaths.delete(path);
-        await this.emitAuditEvent("file.read", path, {
-          outcome: "denied",
-          reason: "limited-access-placeholder-404-fail-open",
-        });
-        this.log(`Limited-access decrypt 404 for "${path}" (read fail-open).`);
-        return this.readPlainFromDisk(path);
-      }
-      // Other errors (5xx, network) — fall through to existing logic which
-      // already debounces a "decrypt failed" Notice.
-    }
-
-    try {
-      // If online, fetch the newest server copy. Full-access sessions decrypt
-      // locally with their lease; limited-access sessions ask the backend to
-      // decrypt only this permission-checked file.
-      if (this.isOnline()) {
-        const response = await this.fetchRemoteFileContent(path);
-
-        if (response.success && response.data) {
-          try {
-            const decrypted = await this.decodeRemoteFileContent(path, response.data);
-            await this.emitAuditEvent("file.read", path);
-            return decrypted;
-          } catch (decryptErr) {
-            // The cloud blob is encrypted with a key that doesn't match the
-            // current lease — typically because the file was uploaded under
-            // a different DEK (org-wide vs vault-scoped, or pre-rotation).
-            // The local copy is encrypted at rest with the LAK and stays
-            // readable, so fall back to it instead of letting an opaque
-            // OperationError leak to Obsidian's read pipeline.
-            this.logError(
-              `Cloud copy of "${path}" could not be decrypted with the current key lease — using local copy.`,
-              decryptErr
-            );
-            this.notifyCloudDecryptFallback(path);
-            await this.emitAuditEvent("file.read", path, {
-              source: "cache",
-              reason: "decrypt-failed",
-            });
-            return this.readPlainFromDisk(path);
-          }
-        }
-
-        if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
-          throw new Error(response.error.message);
-        }
-      }
-
-      // Fallback to local cached version if offline
-      const localContent = await this.readPlainFromDisk(path);
-
-      // Phase-8 secondary disambiguator (D-13): legacy on-disk placeholders
-      // written by older plugin versions before placeholderPaths existed. If
-      // decrypted plaintext is empty AND we're in limited-access mode, treat
-      // as a (legacy) placeholder and try to hydrate. Best-effort; the
-      // primary path is placeholderPaths.has(path) above. The vaultLeaseDenied
-      // guard prevents this from firing on legitimately-empty notes in full-
-      // access sessions (T-08-19).
-      if (localContent === "" && this.vaultLeaseDenied) {
-        try {
-          const response = await this.readFileDecrypted(path);
-          if (response.success && response.data?.decrypted === true) {
-            const plaintext = this.decodeBase64Utf8(response.data.content);
-            await this.writePlainToDisk(path, plaintext);
-            this.placeholderPaths.delete(path);
-            await this.emitAuditEvent("file.read", path);
-            return plaintext;
-          }
-          if (response.error?.statusCode === 404) {
-            // Read fail-open — see the branch above for full rationale.
-            // Returning the (empty) localContent at least leaves the file
-            // visible rather than wiping it; the primary placeholder
-            // branch above will retry hydration on the next read once
-            // the server-side decrypt succeeds.
-            this.placeholderPaths.delete(path);
-            await this.emitAuditEvent("file.read", path, {
-              outcome: "denied",
-              reason: "limited-access-empty-content-404-fail-open",
-            });
-            this.log(`Limited-access decrypt 404 for "${path}" (read fail-open).`);
-            return localContent;
-          }
-        } catch (err) {
-          if (this.isNetworkError(err)) {
-            // Offline — return the empty local content; we'll retry next read.
-          } else {
-            throw err;
-          }
-        }
-        // Fall through on other errors — return the empty local content.
-      }
-
-      await this.emitAuditEvent("file.read", path, { source: "cache" });
-      return localContent;
-    } catch (error) {
-      // If network error, fall back to local cache
-      if (this.isNetworkError(error)) {
-        this.setConnectionStatus("offline");
-        return this.readPlainFromDisk(path);
-      }
-      throw error;
-    }
+    return this.ensureAtRestAdapterRuntimeObject().interceptedRead(path);
   }
 
-  /**
-   * Shows a one-shot Notice when a file is opened without server READ access
-   * and the local cached content is wiped. Per-path debounced (60s) so tab
-   * restores and re-focus reads don't produce a stampede.
-   */
   private notifyDeniedLocalWipe(path: string): void {
-    const now = Date.now();
-    const last = this.readOnlyFallbackNoticeAt.get(path) ?? 0;
-    if (now - last < 60_000) return;
-    this.readOnlyFallbackNoticeAt.set(path, now);
-    new Notice(
-      `VaultGuard Sync: You don't have access to "${path}". Local cached content was wiped.`,
-      5000
-    );
+    return this.ensureAtRestAdapterRuntimeObject().notifyDeniedLocalWipe(path);
   }
 
-  /**
-   * Shows a debounced Notice when the cloud copy of a file can't be decrypted
-   * with the current key lease and we fall back to the local on-disk copy.
-   * Same per-path 60s throttle as `notifyDeniedLocalWipe` so tab restores
-   * don't produce a stampede.
-   */
   private notifyCloudDecryptFallback(path: string): void {
-    const now = Date.now();
-    const last = this.cloudDecryptFallbackNoticeAt.get(path) ?? 0;
-    if (now - last < 60_000) return;
-    this.cloudDecryptFallbackNoticeAt.set(path, now);
-    new Notice(
-      `VaultGuard Sync: Couldn't decrypt the cloud copy of "${path}" — showing local copy.`,
-      6000
-    );
+    return this.ensureAtRestAdapterRuntimeObject().notifyCloudDecryptFallback(path);
   }
 
-  /**
-   * Returns true if `data` starts with the VG1 magic header. Catches
-   * corrupted-read cascades where ciphertext bytes were returned as a
-   * UTF-8 string and now arrive at the write path.
-   */
   private looksLikeCiphertext(data: string): boolean {
-    return (
-      data.length >= 4 &&
-      data.charCodeAt(0) === 0x56 &&
-      data.charCodeAt(1) === 0x47 &&
-      data.charCodeAt(2) === 0x31 &&
-      data.charCodeAt(3) === 0x00
-    );
+    return this.ensureAtRestAdapterRuntimeObject().looksLikeCiphertext(data);
   }
 
-  /**
-   * Binary counterpart of `looksLikeCiphertext`. Prefers the cipher's
-   * own header check when available (full length + version validation),
-   * falls back to a manual 4-byte magic + version-byte test otherwise.
-   */
   private looksLikeCiphertextBytes(data: ArrayBuffer | Uint8Array): boolean {
-    if (this.atRestCipher) {
-      return this.atRestCipher.isEncrypted(data);
-    }
-    const view = data instanceof Uint8Array ? data : new Uint8Array(data);
-    if (view.length < 5) return false;
-    return (
-      view[0] === 0x56 &&
-      view[1] === 0x47 &&
-      view[2] === 0x31 &&
-      view[3] === 0x00 &&
-      view[4] === 0x01
-    );
+    return this.ensureAtRestAdapterRuntimeObject().looksLikeCiphertextBytes(data);
   }
 
-  /**
-   * Per-path-debounced Notice for a blocked corrupted write. Tells the
-   * user explicitly to close the file WITHOUT saving — saving again
-   * would just re-trigger the same block.
-   */
   private notifyCorruptedWrite(path: string): void {
-    const now = Date.now();
-    const last = this.corruptedWriteNoticeAt.get(path) ?? 0;
-    if (now - last < 60_000) return;
-    this.corruptedWriteNoticeAt.set(path, now);
-    new Notice(
-      `VaultGuard Sync: refusing to save "${path}" — it looks like the editor has VaultGuard ciphertext as its content (likely a corrupted-read cascade). The write was BLOCKED to protect the file. Close the file WITHOUT saving and reload it.`,
-      10000
-    );
+    return this.ensureAtRestAdapterRuntimeObject().notifyCorruptedWrite(path);
   }
 
-  /**
-   * Permission-checked and encryption-aware file write operation.
-   * @param path - Normalized vault-relative file path
-   * @param data - File content to write
-   * @throws Error if the user lacks WRITE permission
-   */
   private async interceptedWrite(path: string, data: string): Promise<void> {
-    if (this.looksLikeCiphertext(data)) {
-      this.notifyCorruptedWrite(path);
-      this.logError(
-        `Refusing to write ciphertext-as-plaintext to ${path}`,
-        new Error("blocked: VG1 magic in plaintext write")
-      );
-      void this.emitAuditEvent("file.write", path, {
-        outcome: "denied",
-        reason: "ciphertext-as-plaintext-write-blocked",
-      });
-      throw new Error(
-        `VaultGuard Sync: refusing to write "${path}" — content looks like at-rest ciphertext (corrupted-read cascade). File preserved.`
-      );
-    }
-
-    if (this.applyingRemoteWrite) {
-      await this.writePlainToDisk(path, data);
-      return;
-    }
-
-    if (this.isPathExcluded(path)) {
-      if (this.originalAdapterMethods.write) {
-        await this.originalAdapterMethods.write(path, data);
-      }
-      return;
-    }
-
-    if (!this.session) {
-      throw new Error(this.showLoginRequiredNotice("edit", path));
-    }
-
-    await this.awaitPermissionReadiness();
-    const permission = await this.getEffectivePermission(path);
-
-    if (permission < PermissionLevel.WRITE) {
-      await this.emitAuditEvent("file.write", path, { outcome: "denied" });
-      throw new Error(
-        `VaultGuard Sync: Access denied. You do not have write permission for "${path}".`
-      );
-    }
-
-    try {
-      // In manual mode, defer remote writes until the user runs a sync explicitly.
-      if (this.shouldUploadChangesImmediately() && this.isOnline() && this.keyLease) {
-        const encrypted = await this.encryptContent(data);
-        const response = await this.apiRequest("PUT", this.vaultPath(`/files/${encodeURIComponent(path)}`), {
-          content: encrypted,
-          hash: await this.computeHash(data),
-        });
-
-        if (!response.success) {
-          if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
-            throw new Error(response.error.message);
-          }
-
-          if (response.error?.statusCode === 0) {
-            this.setConnectionStatus("offline");
-            this.queueOfflineOperation("write", path, data);
-          } else {
-            throw new Error(response.error?.message ?? "Remote write failed.");
-          }
-        }
-
-        await this.writePlainToDisk(path, data);
-      } else {
-        await this.writePlainToDisk(path, data);
-        this.queueOfflineOperation("write", path, data);
-      }
-
-      await this.emitAuditEvent("file.write", path);
-      this.syncState.pendingChanges++;
-      this.updateStatusBar();
-    } catch (error) {
-      if (this.isNetworkError(error)) {
-        this.setConnectionStatus("offline");
-        await this.writePlainToDisk(path, data);
-        this.queueOfflineOperation("write", path, data);
-      } else {
-        throw error;
-      }
-    }
+    return this.ensureAtRestAdapterRuntimeObject().interceptedWrite(path, data);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Local at-rest read/write helpers
-  // ─────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Read a vault-relative file from local disk and return its plaintext.
-   *
-   * If the bytes on disk start with the at-rest magic header, decrypt with
-   * the LAK. Otherwise, treat the bytes as legacy plaintext (UTF-8) and
-   * return as-is — this is what makes lazy migration safe. Excluded paths
-   * (plugin self, Obsidian internals) are passed through unchanged because
-   * they were never encrypted.
-   *
-   * Internal plugin code (sync engine pulls, reconciliation, catch-up)
-   * MUST use this helper rather than `originalAdapterMethods.read` directly,
-   * or it will read raw ciphertext and corrupt downstream logic. See
-   * docs/AT-REST-ENCRYPTION.md for the rationale.
-   */
-  /**
-   * Paths that the at-rest cipher must never touch, regardless of the
-   * sync-level `isPathExcluded` matcher. Obsidian reads its own settings,
-   * plugin code, and theme files directly from disk before our plugin
-   * loads, so encrypting any of these would brick the install. The sync
-   * exclusion list is narrower (it only covers what shouldn't go to S3).
-   */
   private isAtRestExcluded(path: string): boolean {
-    const normalized = path.replace(/^\/+/, "");
-    if (!normalized) return false;
-    const configDir = this.normalizeVaultPath(this.app.vault.configDir);
-    if (normalized === configDir || normalized.startsWith(`${configDir}/`)) return true;
-    if (normalized === ".trash" || normalized.startsWith(".trash/")) return true;
-    return this.isPathExcluded(path);
+    return this.ensureAtRestAdapterRuntimeObject().isAtRestExcluded(path);
   }
 
   private async readPlainFromDisk(path: string): Promise<string> {
-    if (this.isAtRestExcluded(path)) {
-      if (!this.originalAdapterMethods.read) {
-        throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
-      }
-      return this.originalAdapterMethods.read(path);
-    }
-
-    // Prefer readBinary so we can detect the magic header bytes precisely.
-    if (this.originalAdapterMethods.readBinary) {
-      const bytes = await this.originalAdapterMethods.readBinary(path);
-      if (this.atRestCipher?.isEncrypted(bytes)) {
-        if (!this.atRestCipher.isReady()) {
-          await this.waitForCipherInit(10_000);
-        }
-        if (!this.atRestCipher.isReady()) {
-          throw new Error(
-            `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
-          );
-        }
-        return this.atRestCipher.decryptString(bytes);
-      }
-      // Legacy plaintext (or external write). Decode as UTF-8.
-      return new TextDecoder().decode(bytes);
-    }
-
-    // Legacy adapter without readBinary (rare; legacy mobile). Re-encode the
-    // first 4 chars and check for the VG1 magic — if it matches, this is
-    // ciphertext we must NOT return as a string.
-    if (!this.originalAdapterMethods.read) {
-      throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
-    }
-    const text = await this.originalAdapterMethods.read(path);
-    if (text.length >= 4) {
-      const head = new TextEncoder().encode(text.slice(0, 4));
-      if (
-        head.length >= 4 &&
-        head[0] === 0x56 &&
-        head[1] === 0x47 &&
-        head[2] === 0x31 &&
-        head[3] === 0x00
-      ) {
-        throw new Error(
-          `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
-        );
-      }
-    }
-    return text;
+    return this.ensureAtRestAdapterRuntimeObject().readPlainFromDisk(path);
   }
 
-  /**
-   * Wait up to `timeoutMs` for the at-rest cipher's init promise to settle.
-   * Returns true if init completed (regardless of success); false on timeout.
-   * No-op if `cipherInitPromise` is already null.
-   */
   private async waitForCipherInit(timeoutMs: number): Promise<boolean> {
-    const p = this.cipherInitPromise;
-    if (!p) return false;
-    const timeout = new Promise<boolean>((resolve) =>
-      setTimeout(() => resolve(false), timeoutMs)
-    );
-    await Promise.race([p.then(() => true).catch(() => true), timeout]);
-    return true;
+    return this.ensureAtRestAdapterRuntimeObject().waitForCipherInit(timeoutMs);
   }
 
-  /**
-   * Write a plaintext UTF-8 string to local disk, encrypting with the LAK
-   * before it touches storage.
-   *
-   * Excluded paths (plugin self, etc.) bypass at-rest encryption — see
-   * `isPathExcluded`. Managed vault files fail closed if the at-rest cipher
-   * is unavailable; writing plaintext would violate the local encryption
-   * guarantee after keychain/reset failures.
-   */
   private async writePlainToDisk(path: string, data: string): Promise<void> {
-    if (this.looksLikeCiphertext(data)) {
-      throw new Error(
-        `VaultGuard Sync: writePlainToDisk refused for "${path}" — content has VG1 magic header (corrupted-read cascade).`
-      );
-    }
-    if (this.isAtRestExcluded(path)) {
-      if (!this.originalAdapterMethods.write) return;
-      await this.originalAdapterMethods.write(path, data);
-      return;
-    }
-    if (!this.atRestCipher?.isReady()) {
-      throw new Error(
-        `VaultGuard Sync: refusing to write "${path}" because local at-rest encryption is unavailable.`
-      );
-    }
-    const ciphertext = await this.atRestCipher.encryptString(data);
-    if (this.originalAdapterMethods.writeBinary) {
-      await this.originalAdapterMethods.writeBinary(path, ciphertext);
-      return;
-    }
-    // Adapter without writeBinary — fall back to write() with the ciphertext
-    // re-encoded as a binary string. This path is rare (legacy mobile) and
-    // best-effort; modern Obsidian always exposes writeBinary.
-    if (this.originalAdapterMethods.write) {
-      const bin = new Uint8Array(ciphertext);
-      let s = "";
-      for (let i = 0; i < bin.length; i++) s += String.fromCharCode(bin[i]);
-      await this.originalAdapterMethods.write(path, s);
-    }
+    return this.ensureAtRestAdapterRuntimeObject().writePlainToDisk(path, data);
   }
 
-  /**
-   * Read raw bytes from disk, decrypting with the LAK when the on-disk
-   * format is at-rest-encrypted. Returns plaintext bytes — what every
-   * caller who used to call `readBinary` actually wants.
-   */
   private async readPlainBinaryFromDisk(path: string): Promise<ArrayBuffer> {
-    if (!this.originalAdapterMethods.readBinary) {
-      throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
-    }
-    if (this.isAtRestExcluded(path)) {
-      return this.originalAdapterMethods.readBinary(path);
-    }
-    const bytes = await this.originalAdapterMethods.readBinary(path);
-    if (this.atRestCipher?.isEncrypted(bytes)) {
-      if (!this.atRestCipher.isReady()) {
-        await this.waitForCipherInit(10_000);
-      }
-      if (!this.atRestCipher.isReady()) {
-        throw new Error(
-          `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
-        );
-      }
-      return this.atRestCipher.decryptBinary(bytes);
-    }
-    return bytes;
+    return this.ensureAtRestAdapterRuntimeObject().readPlainBinaryFromDisk(path);
   }
 
-  /**
-   * Write raw plaintext bytes to disk, encrypting with the LAK before
-   * storage. Mirror of `writePlainToDisk` for binary attachments.
-   */
   private async writePlainBinaryToDisk(path: string, data: ArrayBuffer): Promise<void> {
-    if (this.looksLikeCiphertextBytes(data)) {
-      throw new Error(
-        `VaultGuard Sync: writePlainBinaryToDisk refused for "${path}" — content has VG1 magic header (corrupted-read cascade).`
-      );
-    }
-    if (this.isAtRestExcluded(path)) {
-      if (!this.originalAdapterMethods.writeBinary) return;
-      await this.originalAdapterMethods.writeBinary(path, data);
-      return;
-    }
-    if (!this.atRestCipher?.isReady()) {
-      throw new Error(
-        `VaultGuard Sync: refusing to write "${path}" because local at-rest encryption is unavailable.`
-      );
-    }
-    const ciphertext = await this.atRestCipher.encryptBinary(data);
-    if (this.originalAdapterMethods.writeBinary) {
-      await this.originalAdapterMethods.writeBinary(path, ciphertext);
-    }
+    return this.ensureAtRestAdapterRuntimeObject().writePlainBinaryToDisk(path, data);
   }
 
-  /**
-   * Returns true when a NONE permission result for `path` should be treated
-   * as "permission unknown" rather than "explicitly denied". Used as a
-   * last-line guard inside the read interceptors so a cold-cache startup
-   * race cannot wipe vault content (1.0.15 data-loss regression).
-   *
-   * The check is deliberately strict: we only defer when there is no
-   * positive evidence whatsoever — no completed warm-up cycle AND no
-   * cached entry for this exact path. Once a warm-up has succeeded, a
-   * NONE result is real and the wipe proceeds.
-   */
   private shouldDeferDenialWipe(path: string): boolean {
-    if (this.hasWarmedAtLeastOnce) return false;
-    const cached = this.permissionStore.getCachedPermission(path);
-    if (cached !== undefined) return false;
-    return true;
+    return this.ensureAtRestAdapterRuntimeObject().shouldDeferDenialWipe(path);
   }
 
-  /**
-   * Permission-checked at-rest decrypted binary read.
-   *
-   * Same semantics as `interceptedRead`, but for non-text files
-   * (images, PDFs, binary attachments). Routes through the at-rest cipher
-   * so on-disk ciphertext is invisible to Obsidian and to the user.
-   */
   private async interceptedReadBinary(path: string): Promise<ArrayBuffer> {
-    if (!this.originalAdapterMethods.readBinary) {
-      throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
-    }
-    if (this.isPathExcluded(path)) {
-      return this.originalAdapterMethods.readBinary(path);
-    }
-    if (!this.session) {
-      throw new Error(this.showLoginRequiredNotice("open", path));
-    }
-
-    await this.awaitPermissionReadiness();
-    const permission = await this.getEffectivePermission(path);
-    if (permission < PermissionLevel.READ) {
-      // See interceptedRead for the fail-open rationale. Binary reads must
-      // not wipe or throw — they hit the same Obsidian-indexer retry loop
-      // and the same data-loss vector as text reads.
-      await this.emitAuditEvent("file.read", path, {
-        outcome: "denied",
-        reason: "permission-denied-read-fail-open",
-      });
-      this.log(`Permission denied for binary "${path}" (read fail-open).`);
-      return this.readPlainBinaryFromDisk(path);
-    }
-
-    return this.readPlainBinaryFromDisk(path);
+    return this.ensureAtRestAdapterRuntimeObject().interceptedReadBinary(path);
   }
 
-  /**
-   * Permission-checked at-rest encrypted binary write.
-   *
-   * Mirrors `interceptedWrite` for binary content. Managed binary writes fail
-   * closed until the backend supports binary sync; silently keeping encrypted
-   * attachments local would create a false sense of protected backup.
-   */
   private async interceptedWriteBinary(path: string, data: ArrayBuffer): Promise<void> {
-    if (!this.originalAdapterMethods.writeBinary) return;
-    if (this.looksLikeCiphertextBytes(data)) {
-      this.notifyCorruptedWrite(path);
-      this.logError(
-        `Refusing to write ciphertext-as-plaintext binary to ${path}`,
-        new Error("blocked: VG1 magic in plaintext binary write")
-      );
-      void this.emitAuditEvent("file.write", path, {
-        outcome: "denied",
-        reason: "ciphertext-as-plaintext-write-blocked",
-      });
-      throw new Error(
-        `VaultGuard Sync: refusing to write "${path}" — content looks like at-rest ciphertext (corrupted-read cascade). File preserved.`
-      );
-    }
-    if (this.applyingRemoteWrite || this.isPathExcluded(path)) {
-      await this.writePlainBinaryToDisk(path, data);
-      return;
-    }
-    if (!this.session) {
-      throw new Error(this.showLoginRequiredNotice("edit", path));
-    }
-    await this.awaitPermissionReadiness();
-    const permission = await this.getEffectivePermission(path);
-    if (permission < PermissionLevel.WRITE) {
-      await this.emitAuditEvent("file.write", path, { outcome: "denied" });
-      throw new Error(
-        `VaultGuard Sync: Access denied. You do not have write permission for "${path}".`
-      );
-    }
-    await this.emitAuditEvent("file.write", path, { outcome: "denied", reason: "binary-sync-unsupported" });
-    throw new Error(
-      `VaultGuard Sync: Binary files are not currently supported for protected sync. "${path}" was not written.`
-    );
+    return this.ensureAtRestAdapterRuntimeObject().interceptedWriteBinary(path, data);
   }
 
-  /**
-   * Checks whether the current user may delete a path.
-   * Delete is a distinct backend action, so WRITE does not imply deletion.
-   */
   private async canDeletePath(path: string): Promise<boolean> {
-    if (!this.session) {
-      return false;
-    }
-
-    if (this.session.role === "admin" || this.session.role === "owner") {
-      return true;
-    }
-
-    if (this.isOnline()) {
-      const roles = this.session.roles?.length ? this.session.roles : [this.session.role];
-      let response: ApiResponse<{ allowed: boolean }>;
-      try {
-        response = await this.apiRequest<{ allowed: boolean }>("POST", this.vaultPath('/permissions/check'), {
-          userId: this.session.userId,
-          roles,
-          action: "delete",
-          path: this.toPermissionPath(path),
-        });
-      } catch (error) {
-        if (this.isNetworkError(error)) {
-          this.setConnectionStatus("offline");
-        } else {
-          return false;
-        }
-        return this.resolvePermissionFromCache(path) >= PermissionLevel.ADMIN;
-      }
-
-      if (response.success) {
-        return response.data?.allowed === true;
-      }
-
-      if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
-        return false;
-      }
-
-      if (response.error?.statusCode !== 0) {
-        return false;
-      }
-    }
-
-    return this.resolvePermissionFromCache(path) >= PermissionLevel.ADMIN;
+    return this.ensureAtRestAdapterRuntimeObject().canDeletePath(path);
   }
 
-  /**
-   * Directory listing operation.
-   *
-   * Keep this path local-only. Obsidian calls adapter.list() while mounting the
-   * native file explorer and during startup indexing; doing live permission
-   * probes here can turn a cold cache or transient backend error into an empty
-   * vault tree. The file-explorer decoration layer fetches backend-confirmed
-   * access summaries asynchronously and hides explicit no-access file rows once
-   * it has evidence. Mutating operations still enforce permissions.
-   *
-   * @param path - Normalized vault-relative directory path
-   * @returns Raw local files and folders for the requested directory
-   */
   private async interceptedList(
     path: string
   ): Promise<{ files: string[]; folders: string[] }> {
-    if (!this.originalAdapterMethods.list) {
-      return { files: [], folders: [] };
-    }
-
-    return this.originalAdapterMethods.list(path);
+    return this.ensureAtRestAdapterRuntimeObject().interceptedList(path);
   }
 
-  /**
-   * Permission-checked file deletion operation.
-   * @param path - Normalized vault-relative file path
-   * @throws Error if the user lacks DELETE permission
-   */
   private async interceptedDelete(path: string): Promise<void> {
-    if (this.isPathExcluded(path)) {
-      if (this.originalAdapterMethods.remove) {
-        await this.originalAdapterMethods.remove(path);
-      }
-      return;
-    }
-
-    if (!this.session) {
-      throw new Error(this.showLoginRequiredNotice("delete", path));
-    }
-
-    if (!(await this.canDeletePath(path))) {
-      await this.emitAuditEvent("file.delete", path, { outcome: "denied" });
-      throw new Error(
-        `VaultGuard Sync: Access denied. You do not have permission to delete "${path}".`
-      );
-    }
-
-    // Tombstone the local removal up front (the point we commit to deleting
-    // locally): if the remote DELETE below is deferred (manual/offline) or is
-    // interrupted before it confirms, the tombstone survives a restart / re-bind
-    // so reconciliation cannot resurrect the file. A confirmed server DELETE
-    // (success or 404) clears it again immediately.
-    this.recordDeletionTombstone(path);
-
-    try {
-      // In manual mode, defer remote deletes until the user runs a sync explicitly.
-      if (this.shouldUploadChangesImmediately() && this.isOnline()) {
-        const response = await this.apiRequest(
-          "DELETE",
-          this.vaultPath(`/files/${encodeURIComponent(path)}`)
-        );
-
-        if (response.success || response.error?.statusCode === 404) {
-          // Success or already-gone == done — clear the tombstone for this path.
-          this.clearDeletionTombstone(path);
-        } else {
-          if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
-            throw new Error(response.error.message);
-          }
-
-          if (response.error?.statusCode === 0) {
-            this.setConnectionStatus("offline");
-            this.queueOfflineOperation("delete", path);
-          } else {
-            throw new Error(response.error?.message ?? "Remote delete failed.");
-          }
-        }
-      } else {
-        this.queueOfflineOperation("delete", path);
-      }
-
-      // Delete locally only after authorization and, when online, remote success.
-      if (this.originalAdapterMethods.remove) {
-        await this.originalAdapterMethods.remove(path);
-      }
-
-      await this.emitAuditEvent("file.delete", path);
-      this.permissionStore.emit("changed", { path });
-    } catch (error) {
-      if (this.isNetworkError(error)) {
-        this.setConnectionStatus("offline");
-        this.queueOfflineOperation("delete", path);
-      } else {
-        throw error;
-      }
-    }
+    return this.ensureAtRestAdapterRuntimeObject().interceptedDelete(path);
   }
 
-  /**
-   * Permission-checked file rename: keeps the local rename atomic with the
-   * server-side move (PUT new path, then DELETE old path). The original
-   * adapter rename runs first so the local file system is the source of
-   * truth for the new content; if the server move fails partway, we queue
-   * the missing half on the offline queue rather than rolling the local
-   * rename back.
-   */
   private async interceptedRename(oldPath: string, newPath: string): Promise<void> {
-    const oldNormalized = this.normalizeVaultPath(oldPath);
-    const newNormalized = this.normalizeVaultPath(newPath);
-
-    // Local rename happens first regardless of permissions or network — the
-    // existing adapter behaviour the user expects. Server reconciliation is
-    // best-effort on top.
-    if (this.originalAdapterMethods.rename) {
-      await this.originalAdapterMethods.rename(oldPath, newPath);
-    }
-
-    // Skip server work for binding-less / offline / non-bound states. We
-    // queue both halves so a future flush picks them up.
-    if (!this.session || !this.settings.serverVaultId) {
-      return;
-    }
-
-    // If either side of the rename is in the excluded list, treat as a
-    // local-only move — the server has no record of these paths and
-    // shouldn't gain one through a rename.
-    if (this.isPathExcluded(oldNormalized) || this.isPathExcluded(newNormalized)) {
-      // Pitfall 5: emit OLD path so cache + metadataCache invalidate; leaf
-      // sweep resolves CURRENT view per leaf (Plan 09-03).
-      this.permissionStore.emit("changed", { path: oldNormalized });
-      return;
-    }
-
-    // If this rename targets a folder, the adapter call has already moved the
-    // directory locally — but the existing file-mover logic below assumes a
-    // single file with readable content and would fail trying to read folder
-    // bytes. The vault.on('rename') folder listener handles the marker move
-    // and the children's vault.on('rename') events handle each child. Bail
-    // out here so we don't double-handle or corrupt the marker path.
-    const renamedItem = this.app.vault.getAbstractFileByPath(newPath);
-    if (renamedItem instanceof TFolder) {
-      // Pitfall 5: rename emits OLD path.
-      this.permissionStore.emit("changed", { path: oldNormalized });
-      return;
-    }
-    // Marker files should never round-trip through this path either.
-    if (this.isFolderMarkerPath(oldNormalized) || this.isFolderMarkerPath(newNormalized)) {
-      return;
-    }
-
-    const writePermission = await this.getEffectivePermission(newNormalized);
-    if (writePermission < PermissionLevel.WRITE) {
-      await this.emitAuditEvent("file.rename", oldNormalized, {
-        newPath: newNormalized,
-        outcome: "denied",
-      });
-      new Notice(
-        `VaultGuard Sync: Renamed locally, but the server copy of "${oldPath}" was not moved — you do not have write permission for "${newPath}".`
-      );
-      return;
-    }
-
-    if (!this.shouldUploadChangesImmediately() || !this.isOnline() || !this.keyLease) {
-      // Queue both halves: read content from the just-renamed local file so the
-      // queued write carries the right bytes when connectivity returns.
-      try {
-        const content = await this.readPlainFromDisk(newPath);
-        this.queueOfflineOperation("write", newNormalized, content);
-      } catch (err) {
-        this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
-      }
-      this.queueOfflineOperation("delete", oldNormalized);
-      // Pitfall 5: rename emits OLD path.
-      this.permissionStore.emit("changed", { path: oldNormalized });
-      return;
-    }
-
-    try {
-      const content = await this.readPlainFromDisk(newPath);
-      const encrypted = await this.encryptContent(content);
-
-      const putResp = await this.apiRequest(
-        "PUT",
-        this.vaultPath(`/files/${encodeURIComponent(newNormalized)}`),
-        {
-          content: encrypted,
-          hash: await this.computeHash(content),
-        }
-      );
-
-      if (!putResp.success) {
-        throw new Error(putResp.error?.message ?? `Rename: writing "${newPath}" failed.`);
-      }
-
-      const delResp = await this.apiRequest(
-        "DELETE",
-        this.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`)
-      );
-
-      if (!delResp.success) {
-        // New path is on the server but the old one wasn't deleted. Queue the
-        // delete so the next flush retries — without this the admin panel
-        // shows both names forever, which is exactly the duplicate-after-
-        // rename bug we're fixing.
-        this.logError(
-          `Rename: DELETE of old path "${oldNormalized}" failed`,
-          new Error(delResp.error?.message ?? "unknown")
-        );
-        this.queueOfflineOperation("delete", oldNormalized);
-      }
-
-      // Pitfall 5: rename emits OLD path.
-      this.permissionStore.emit("changed", { path: oldNormalized });
-      await this.emitAuditEvent("file.rename", oldNormalized, { newPath: newNormalized });
-      this.syncState.pendingChanges = this.offlineQueue.length;
-      this.updateStatusBar();
-    } catch (error) {
-      if (this.isNetworkError(error)) {
-        this.setConnectionStatus("offline");
-        try {
-          const content = await this.readPlainFromDisk(newPath);
-          this.queueOfflineOperation("write", newNormalized, content);
-        } catch (err) {
-          this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
-        }
-        this.queueOfflineOperation("delete", oldNormalized);
-        // Pitfall 5: rename emits OLD path.
-        this.permissionStore.emit("changed", { path: oldNormalized });
-      } else {
-        throw error;
-      }
-    }
+    return this.ensureAtRestAdapterRuntimeObject().interceptedRename(oldPath, newPath);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -7426,59 +4868,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Initializes the sync engine: performs initial sync and starts periodic timer.
    */
   private async initializeSyncEngine(): Promise<void> {
-    this.log("Initializing sync engine...");
-    this.syncDiagnostics.record("initializeSyncEngine.enter");
-
-    // Restore lastSync from persisted settings so a fresh process does not
-    // pull every server file (and silently overwrite local edits) on startup.
-    if (!this.syncState.lastSync && this.settings.lastSyncTimestamp) {
-      this.syncState.lastSync = this.settings.lastSyncTimestamp;
-    }
-
-    // First-time bind for this serverVaultId: reconcile local↔server before
-    // any sync writes happen. Without this, the initial /files/sync call with
-    // lastSyncTimestamp = epoch causes every server file to come back as
-    // "created" and silently overwrite same-named local files.
-    const vaultId = this.settings.serverVaultId;
-    this.syncDiagnostics.record("initializeSyncEngine.reconcileDecision", {
-      willReconcile: !!vaultId && this.settings.bindingReconciledVaultId !== vaultId,
-    });
-    if (vaultId && this.settings.bindingReconciledVaultId !== vaultId) {
-      try {
-        const reconciled = await this.performInitialReconciliation();
-        if (!reconciled) {
-          this.log("Initial reconciliation declined or aborted — sync engine will not start.");
-          this.syncDiagnostics.record("initializeSyncEngine.return.reconcileDeclined");
-          return;
-        }
-      } catch (err) {
-        this.logError("Initial reconciliation failed", err);
-        new Notice(
-          `VaultGuard Sync: Couldn't reconcile this folder with the server vault: ${
-            err instanceof Error ? err.message : "Unknown error"
-          }. Sync paused — open the sidebar to retry.`
-        );
-        this.syncDiagnostics.record("initializeSyncEngine.return.reconcileFailed");
-        return;
-      }
-    }
-
-    // Wire folder lifecycle listeners now that we have a bound vault. Files
-    // are mirrored via the adapter interceptors; folders need vault events
-    // because Obsidian doesn't expose mkdir/rmdir on the adapter pattern we
-    // intercept, and S3 needs an explicit marker for empty-folder survival.
-    this.syncDiagnostics.record("initializeSyncEngine.reachedRegisterListeners");
-    this.registerFolderLifecycleListeners();
-
-    // Perform initial sync
-    this.syncDiagnostics.record("initializeSyncEngine.reachedPerformSync");
-    await this.performSync();
-
-    // Start periodic sync timer
-    this.syncDiagnostics.record("initializeSyncEngine.reachedStartTimer");
-    this.startSyncTimer();
-
-    this.log("Sync engine initialized.");
+    return this.ensureSyncRuntime().initializeSyncEngine();
   }
 
   /**
@@ -7489,87 +4879,27 @@ export default class VaultGuardPlugin extends Plugin {
    * two PUT/DELETE round-trips for every direct file op.
    */
   private registerFolderLifecycleListeners(): void {
-    if (this.folderLifecycleListenersRegistered) {
-      this.syncDiagnostics.record("registerFolderLifecycleListeners.alreadyRegistered");
-      return;
-    }
-    this.folderLifecycleListenersRegistered = true;
-    this.syncDiagnostics.record("registerFolderLifecycleListeners.registered");
+    registerFolderLifecycleListenersLifecycle(this.createLifecycleEventsContext());
+  }
 
-    this.registerEvent(
-      this.app.vault.on("create", (file: TAbstractFile) => {
-        if (!(file instanceof TFolder)) return;
-        if (!this.settings.serverVaultId || !this.session) return;
-        void this.uploadFolderMarker(file.path).catch((err) =>
-          this.logError(`Folder create: marker for "${file.path}" failed`, err)
-        );
-      })
-    );
+  private handleFolderCreated(path: string): void {
+    return this.ensureSyncRuntime().handleFolderCreated(path);
+  }
 
-    this.registerEvent(
-      this.app.vault.on("delete", (file: TAbstractFile) => {
-        if (!(file instanceof TFolder)) return;
-        if (!this.settings.serverVaultId || !this.session) return;
-        // Defense-in-depth: even though the per-child file listener below also
-        // fires for each contained note, a deleted folder does a server-side
-        // PREFIX sweep so any child whose per-file event was missed (or that
-        // was already orphaned by an earlier missed event) is still removed.
-        // deleteFolderContentsOnServer() also removes the folder marker, so we
-        // do NOT separately call deleteFolderMarker() here.
-        void this.deleteFolderContentsOnServer(file.path).catch((err) =>
-          this.logError(`Folder delete: server cleanup for "${file.path}" failed`, err)
-        );
-      })
-    );
+  private handleFolderDeleted(path: string): void {
+    return this.ensureSyncRuntime().handleFolderDeleted(path);
+  }
 
-    this.registerEvent(
-      this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
-        if (!(file instanceof TFolder)) return;
-        if (!this.settings.serverVaultId || !this.session) return;
-        if (oldPath === file.path) return;
-        void (async () => {
-          try {
-            await this.deleteFolderMarker(oldPath);
-            await this.uploadFolderMarker(file.path);
-          } catch (err) {
-            this.logError(`Folder rename: marker move "${oldPath}" → "${file.path}" failed`, err);
-          }
-        })();
-      })
-    );
+  private handleFolderRenamed(path: string, oldPath: string): void {
+    return this.ensureSyncRuntime().handleFolderRenamed(path, oldPath);
+  }
 
-    // For files, vault.on('rename') is the only signal that fires when a
-    // child file's path changes because its parent folder was renamed —
-    // adapter.rename only fires once for the parent. Without this listener
-    // every child file stays at its old key in S3 and the admin panel shows
-    // duplicates after every folder rename. The DELETE old + PUT new logic
-    // is idempotent with our adapter.rename interceptor for direct file
-    // renames, so double-firing is harmless.
-    this.registerEvent(
-      this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
-        if (!(file instanceof TFile)) return;
-        if (!this.settings.serverVaultId || !this.session) return;
-        if (oldPath === file.path) return;
-        void this.syncFileRenameToServer(oldPath, file.path).catch((err) =>
-          this.logError(`File rename via vault event "${oldPath}" → "${file.path}" failed`, err)
-        );
-      })
-    );
+  private handleVaultFileRenamed(path: string, oldPath: string): void {
+    return this.ensureSyncRuntime().handleVaultFileRenamed(path, oldPath);
+  }
 
-    // Same rationale for delete: when a folder is removed, adapter.remove
-    // doesn't fire for its child files (Obsidian uses adapter.rmdir under
-    // the hood). The vault event is the only way to learn each child's path.
-    this.registerEvent(
-      this.app.vault.on("delete", (file: TAbstractFile) => {
-        if (!(file instanceof TFile)) return;
-        if (!this.settings.serverVaultId || !this.session) return;
-        void this.syncFileDeleteToServer(file.path).catch((err) =>
-          this.logError(`File delete via vault event "${file.path}" failed`, err)
-        );
-      })
-    );
-
-    this.log("Folder lifecycle listeners registered.");
+  private handleVaultFileDeleted(path: string): void {
+    return this.ensureSyncRuntime().handleVaultFileDeleted(path);
   }
 
   /**
@@ -7579,54 +4909,7 @@ export default class VaultGuardPlugin extends Plugin {
    * then DELETEs the old key.
    */
   private async syncFileRenameToServer(oldPath: string, newPath: string): Promise<void> {
-    if (!this.isOnline() || !this.keyLease) return;
-    if (!this.originalAdapterMethods.read) return;
-
-    const oldNormalized = this.normalizeVaultPath(oldPath);
-    const newNormalized = this.normalizeVaultPath(newPath);
-    if (this.isFolderMarkerPath(oldNormalized) || this.isFolderMarkerPath(newNormalized)) return;
-
-    const permission = await this.getEffectivePermission(newNormalized);
-    if (permission < PermissionLevel.WRITE) return;
-
-    let content: string;
-    try {
-      content = await this.readPlainFromDisk(newPath);
-    } catch (err) {
-      // If we can't read the file (e.g. it was renamed and immediately
-      // deleted), skip — the delete listener will clean up the old key.
-      this.log(`Rename sync: cannot read "${newPath}" (${err}); skipping server move.`);
-      return;
-    }
-
-    const encrypted = await this.encryptContent(content);
-    const putResp = await this.apiRequest(
-      "PUT",
-      this.vaultPath(`/files/${encodeURIComponent(newNormalized)}`),
-      { content: encrypted, hash: await this.computeHash(content) }
-    );
-    if (!putResp.success) {
-      // 401/403 are non-recoverable here — the user lost permission since
-      // the cache was warmed. Fall through to attempt the DELETE anyway so
-      // we don't strand the old key.
-      this.logError(
-        `Rename sync: PUT "${newNormalized}" failed`,
-        new Error(putResp.error?.message ?? "unknown")
-      );
-    }
-
-    const delResp = await this.apiRequest(
-      "DELETE",
-      this.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`)
-    );
-    if (!delResp.success && delResp.error?.statusCode !== 404) {
-      this.logError(
-        `Rename sync: DELETE "${oldNormalized}" failed`,
-        new Error(delResp.error?.message ?? "unknown")
-      );
-    }
-    // Pitfall 5: rename emits OLD path.
-    this.permissionStore.emit("changed", { path: oldNormalized });
+    return this.ensureSyncRuntime().syncFileRenameToServer(oldPath, newPath);
   }
 
   /**
@@ -7635,48 +4918,7 @@ export default class VaultGuardPlugin extends Plugin {
    * only path that fires for child files of a deleted folder.
    */
   private async syncFileDeleteToServer(path: string): Promise<void> {
-    const normalized = this.normalizeVaultPath(path);
-    // Empty / folder-marker / excluded paths never reach the server, so they
-    // must never be queued or tombstoned. (recordDeletionTombstone +
-    // queueOfflineOperation's flush also opt out, but guarding here keeps the
-    // offline queue clean and avoids a no-op tombstone write.)
-    if (!normalized || this.isFolderMarkerPath(normalized) || this.isPathExcluded(normalized)) {
-      return;
-    }
-
-    // Layer 1 (symmetric with interceptedDelete): when offline, do NOT silently
-    // drop the delete — tombstone it and enqueue an offline delete so it is
-    // re-attempted on reconnect. This is the path that fires for child files of
-    // a deleted folder.
-    if (!this.isOnline()) {
-      this.recordDeletionTombstone(normalized);
-      this.queueOfflineOperation("delete", normalized);
-      return;
-    }
-
-    const response = await this.apiRequest(
-      "DELETE",
-      this.vaultPath(`/files/${encodeURIComponent(normalized)}`)
-    );
-    if (response.success || response.error?.statusCode === 404) {
-      // Success or already-gone == done.
-      this.clearDeletionTombstone(normalized);
-    } else if (response.error?.statusCode === 0) {
-      // Transient network failure — mirror interceptedDelete: mark offline,
-      // tombstone, and queue for retry.
-      this.setConnectionStatus("offline");
-      this.recordDeletionTombstone(normalized);
-      this.queueOfflineOperation("delete", normalized);
-    } else {
-      // Other non-404 failure (5xx, recoverable permission state, etc.):
-      // tombstone first so it is retried later rather than lost, then log.
-      this.recordDeletionTombstone(normalized);
-      this.logError(
-        `Delete sync: DELETE "${normalized}" failed`,
-        new Error(response.error?.message ?? "unknown")
-      );
-    }
-    this.permissionStore.emit("changed", { path: normalized });
+    return this.ensureSyncRuntime().syncFileDeleteToServer(path);
   }
 
   /**
@@ -7708,305 +4950,7 @@ export default class VaultGuardPlugin extends Plugin {
    * and the regular sync engine may proceed; false if the user cancelled.
    */
   private async performInitialReconciliation(): Promise<boolean> {
-    if (!this.session || !this.isOnline()) {
-      throw new Error(
-        "Reconciliation requires an authenticated, online session."
-      );
-    }
-
-    new Notice("VaultGuard Sync: Comparing your folder with the server vault…");
-
-    // ── Step 1: Build local manifest ─────────────────────────────────────
-    const localFiles = this.app.vault.getFiles();
-    const localManifest = new Map<string, { content: string; hash: string }>();
-    for (const file of localFiles) {
-      try {
-        const normalized = this.normalizeVaultPath(file.path);
-        // Local-only opt-out: leave excluded paths out of the manifest so
-        // they're never bucketed for upload or conflict resolution.
-        if (this.isPathExcluded(normalized)) continue;
-        const content = await this.readPlainFromDisk(file.path);
-        const hash = await this.computeHash(content);
-        // The server keys deltas with a leading slash — keep the same shape
-        // for set-membership comparisons below.
-        localManifest.set(`/${normalized}`, { content, hash });
-      } catch (err) {
-        this.logError(`Reconciliation: failed to read local file "${file.path}"`, err);
-      }
-    }
-
-    // ── Step 2: Fetch server inventory ───────────────────────────────────
-    const inventory = await this.apiRequest<{
-      deltas: Array<{
-        path: string;
-        action: "created" | "modified" | "deleted";
-        lastModified: string;
-        checksum: string;
-        size: number;
-      }>;
-      syncTimestamp: string;
-    }>("POST", this.vaultPath("/files/sync"), {
-      lastSyncTimestamp: new Date(0).toISOString(),
-      fileChecksums: {},
-    });
-
-    if (!inventory.success || !inventory.data) {
-      throw new Error(inventory.error?.message ?? "Could not fetch the server vault inventory.");
-    }
-
-    const serverPaths = new Set<string>();
-    const serverFolderPaths = new Set<string>();
-    for (const delta of inventory.data.deltas) {
-      if (delta.action === "deleted") continue;
-      // Folder markers are tracked separately so the bucketing below treats
-      // them as folders to mirror, not as local-only files to "upload".
-      const normalized = this.normalizeVaultPath(delta.path);
-      if (this.isFolderMarkerPath(normalized)) {
-        const folderPath = this.folderPathFromMarkerPath(normalized);
-        if (this.isPathExcluded(folderPath)) continue;
-        serverFolderPaths.add(folderPath);
-        continue;
-      }
-      // Local-only opt-out: ignore the server's view of excluded paths.
-      if (this.isPathExcluded(normalized)) continue;
-      serverPaths.add(delta.path);
-    }
-
-    // ── Step 3: Bucketize ────────────────────────────────────────────────
-    const serverOnly: string[] = [];
-    const localOnly: string[] = [];
-    const conflicts: string[] = [];
-    const localManifestBoth: Array<{ path: string; localContent: string; localHash: string }> = [];
-
-    for (const path of serverPaths) {
-      if (!localManifest.has(path)) {
-        serverOnly.push(path);
-      }
-    }
-    for (const [path, entry] of localManifest.entries()) {
-      if (!serverPaths.has(path)) {
-        localOnly.push(path);
-      } else {
-        localManifestBoth.push({ path, localContent: entry.content, localHash: entry.hash });
-      }
-    }
-
-    // Phase-8 limited-access branch (BLOCKER-2 Q2 RESOLVED): skip the async-ack
-    // modal entirely — there is nothing for the user to acknowledge in this mode.
-    // localOnly uploads silently fail (no lease → no encrypt); conflicts can't
-    // be diffed (no plaintext at scale); serverOnly is written non-interactively
-    // as 36-byte VG1 placeholders so Obsidian's file explorer renders the tree.
-    // localOnly and conflicts handling defer to a follow-up phase (A4).
-    if (this.vaultLeaseDenied) {
-      for (const path of serverOnly) {
-        const normalized = this.normalizeVaultPath(path);
-        if (this.isPathExcluded(normalized)) continue;
-        if (this.isFolderMarkerPath(normalized)) continue;
-        // Layer 3 guard (limited-access): a path THIS client deleted locally
-        // must not reappear as a VG1 placeholder after a re-bind. Delete it on
-        // the server (clearing the tombstone on success/404) and skip the
-        // placeholder write entirely.
-        if (this.isPathTombstoned(normalized)) {
-          await this.deleteTombstonedServerPath(normalized);
-          continue;
-        }
-        await this.ensureParentFoldersForPath(normalized);
-        await this.writePlainToDisk(normalized, ""); // 36-byte VG1 placeholder
-        this.placeholderPaths.add(normalized);
-      }
-      // Mirror server-only folders too so the tree is visible.
-      for (const folderPath of serverFolderPaths) {
-        if (!folderPath) continue;
-        try {
-          await this.ensureLocalFolderPath(folderPath);
-        } catch (err) {
-          this.logError(`Reconciliation (limited): mkdir for "${folderPath}" failed`, err);
-        }
-      }
-      // Persist completion so this binding isn't re-reconciled on every restart.
-      this.settings.bindingReconciledVaultId = this.settings.serverVaultId;
-      this.syncState.lastSync = inventory.data.syncTimestamp;
-      this.settings.lastSyncTimestamp = inventory.data.syncTimestamp;
-      await this.saveSettings();
-      new Notice(
-        `VaultGuard Sync: Limited-access reconciliation — ${serverOnly.length} files visible. ` +
-          `Open one to fetch its content from the server.`,
-        6000
-      );
-      return true;
-    }
-
-    // For paths on both sides, fetch + decrypt the server copy and hash to
-    // determine real conflicts (the server's reported `checksum` is the S3
-    // ETag of the encrypted blob — never equal to a plaintext SHA-256).
-    const sameContent = new Set<string>();
-    for (const item of localManifestBoth) {
-      try {
-        const remoteContent = await this.readRemotePlaintext(item.path);
-        const remoteHash = await this.computeHash(remoteContent);
-        if (remoteHash === item.localHash) {
-          sameContent.add(item.path);
-        } else {
-          conflicts.push(item.path);
-        }
-      } catch (err) {
-        this.logError(`Reconciliation: comparison failed for "${item.path}"`, err);
-        conflicts.push(item.path);
-      }
-    }
-
-    const plan: ReconciliationPlan = { serverOnly, localOnly, conflicts };
-
-    // ── Step 4: Show preview modal ───────────────────────────────────────
-    const decision = await this.askReconciliationPlan(plan);
-    if (!decision.proceed) {
-      new Notice("VaultGuard Sync: Binding cancelled — no files were modified.");
-      return false;
-    }
-
-    // ── Step 5: Apply plan ───────────────────────────────────────────────
-    new Notice(
-      `VaultGuard Sync: Reconciling — ↓${serverOnly.length} ↑${localOnly.length} ⚠${conflicts.length}`
-    );
-
-    let downloaded = 0;
-    let downloadFailed = 0;
-    let deletedOnServer = 0;
-    for (const path of serverOnly) {
-      const normalized = this.normalizeVaultPath(path);
-      // Layer 3 guard: if THIS client previously deleted this path locally, a
-      // re-bind must not re-download the still-live server copy. Delete it on
-      // the server instead (clearing the tombstone on success/404). On failure
-      // the tombstone stays for retryOutstandingDeletions, and we skip the
-      // download so the deletion intent is never overridden.
-      if (this.isPathTombstoned(normalized)) {
-        if (await this.deleteTombstonedServerPath(normalized)) {
-          deletedOnServer += 1;
-        }
-        continue;
-      }
-      try {
-        await this.applyRemoteChange({
-          path: normalized,
-          size: 0,
-        });
-        downloaded += 1;
-      } catch (err) {
-        this.logError(`Reconciliation: download failed for "${path}"`, err);
-        downloadFailed += 1;
-      }
-    }
-
-    let uploaded = 0;
-    let uploadSkipped = 0;
-    let uploadFailed = 0;
-    for (const path of localOnly) {
-      const entry = localManifest.get(path);
-      if (!entry) continue;
-      try {
-        const outcome = await this.uploadReconciledFile(this.normalizeVaultPath(path), entry.content);
-        if (outcome === "uploaded") uploaded += 1;
-        else uploadSkipped += 1;
-      } catch (err) {
-        this.logError(`Reconciliation: upload failed for "${path}"`, err);
-        uploadFailed += 1;
-      }
-    }
-
-    let conflictsResolved = 0;
-    let conflictFailed = 0;
-    for (const path of conflicts) {
-      try {
-        await this.resolveReconciliationConflict(path, decision.conflictStrategy, localManifest);
-        conflictsResolved += 1;
-      } catch (err) {
-        this.logError(`Reconciliation: conflict resolution failed for "${path}"`, err);
-        conflictFailed += 1;
-      }
-    }
-
-    // ── Folder structure ────────────────────────────────────────────────
-    // Mirror folders both ways. Server-only folders become local mkdirs,
-    // local-only folders get a marker on the server. Without this, empty
-    // folders never make the round-trip — S3 has no native "empty folder"
-    // primitive and the admin overview would render the vault structure
-    // incorrectly (the original bug report).
-    let foldersUploaded = 0;
-    let foldersDownloaded = 0;
-    let foldersFailed = 0;
-
-    const localFolderPaths = new Set(this.collectLocalFolderPaths());
-
-    for (const folderPath of serverFolderPaths) {
-      if (!folderPath || localFolderPaths.has(folderPath)) continue;
-      try {
-        const created = await this.ensureLocalFolderPath(folderPath);
-        if (created) foldersDownloaded += 1;
-      } catch (err) {
-        this.logError(`Reconciliation: mkdir for "${folderPath}" failed`, err);
-        foldersFailed += 1;
-      }
-    }
-
-    for (const folderPath of localFolderPaths) {
-      if (serverFolderPaths.has(folderPath)) continue;
-      try {
-        const ok = await this.uploadFolderMarker(folderPath);
-        if (ok) foldersUploaded += 1;
-      } catch (err) {
-        this.logError(`Reconciliation: folder marker upload for "${folderPath}" failed`, err);
-        foldersFailed += 1;
-      }
-    }
-
-    const fullySucceeded = uploadFailed === 0 && downloadFailed === 0 && conflictFailed === 0 && foldersFailed === 0;
-
-    // ── Step 6: Persist completion ───────────────────────────────────────
-    // Only mark this binding as reconciled when every step actually landed.
-    // If anything failed, leave `bindingReconciledVaultId` unset so the next
-    // start retries — otherwise local-only files stay stranded on disk and
-    // the server vault silently disagrees with the plugin's "X uploaded"
-    // summary forever (admin panel shows 0 files, plugin claims they synced).
-    if (fullySucceeded) {
-      this.settings.bindingReconciledVaultId = this.settings.serverVaultId;
-    }
-    this.syncState.lastSync = inventory.data.syncTimestamp;
-    this.settings.lastSyncTimestamp = inventory.data.syncTimestamp;
-    await this.saveSettings();
-
-    const failureParts: string[] = [];
-    if (uploadFailed > 0) failureParts.push(`${uploadFailed} upload failed`);
-    if (uploadSkipped > 0) failureParts.push(`${uploadSkipped} skipped (no write permission)`);
-    if (downloadFailed > 0) failureParts.push(`${downloadFailed} download failed`);
-    if (conflictFailed > 0) failureParts.push(`${conflictFailed} conflict failed`);
-    if (foldersFailed > 0) failureParts.push(`${foldersFailed} folders failed`);
-
-    const summaryParts = [
-      `${downloaded} downloaded`,
-      `${uploaded} uploaded`,
-      `${conflictsResolved} conflicts resolved`,
-    ];
-    if (deletedOnServer > 0) summaryParts.push(`${deletedOnServer} removed on server`);
-    if (foldersDownloaded > 0) summaryParts.push(`${foldersDownloaded} folders mirrored locally`);
-    if (foldersUploaded > 0) summaryParts.push(`${foldersUploaded} folders preserved`);
-    if (sameContent.size > 0) {
-      summaryParts.push(`${sameContent.size} already in sync`);
-    }
-    if (failureParts.length > 0) {
-      summaryParts.push(failureParts.join(", "));
-    }
-    const summary = `${summaryParts.join(", ")}.`;
-
-    if (fullySucceeded) {
-      new Notice(`VaultGuard Sync: Reconciliation complete. ${summary}`);
-    } else {
-      new Notice(
-        `VaultGuard Sync: Reconciliation finished with errors — ${summary} Open the sidebar to retry.`,
-        10000
-      );
-    }
-    this.log(`Reconciliation complete: ${summary}`);
-    return true;
+    return this.ensureSyncRuntime().performInitialReconciliation();
   }
 
   private askReconciliationPlan(plan: ReconciliationPlan): Promise<ReconciliationDecision> {
@@ -8033,49 +4977,11 @@ export default class VaultGuardPlugin extends Plugin {
     content: string,
     options: { noWriteNotice?: string } = {}
   ): Promise<"uploaded" | "skipped"> {
-    if (!this.hasValidKeyLease()) {
-      this.log(`Reconciliation: skipping "${path}" — no encryption key lease available.`);
-      new Notice(
-        `VaultGuard Sync: Skipped upload of "${path}" — limited access sessions can download accessible files, but need a key lease to encrypt uploads.`
-      );
-      return "skipped";
-    }
-
-    const permission = await this.getEffectivePermission(path);
-    if (permission < PermissionLevel.WRITE) {
-      this.log(`Reconciliation: skipping "${path}" — no write permission.`);
-      new Notice(
-        options.noWriteNotice ??
-          `VaultGuard Sync: Skipped upload of "${path}" — you do not have write permission. The file stays in this folder but is not synced.`
-      );
-      return "skipped";
-    }
-    const encrypted = await this.encryptContent(content);
-    const response = await this.apiRequest("PUT", this.vaultPath(`/files/${encodeURIComponent(path)}`), {
-      content: encrypted,
-      hash: await this.computeHash(content),
-    });
-    if (!response.success) {
-      throw new Error(response.error?.message ?? `Upload of "${path}" failed.`);
-    }
-    await this.emitAuditEvent("file.write", path, { reconciliation: true });
-    return "uploaded";
+    return this.ensureSyncRuntime().uploadReconciledFile(path, content, options);
   }
 
   private async removeUnsyncedLocalFile(path: string): Promise<boolean> {
-    if (!this.originalAdapterMethods.remove) {
-      this.log(`Catch-up: could not remove local-only "${path}" — adapter remove unavailable.`);
-      return false;
-    }
-
-    try {
-      await this.originalAdapterMethods.remove(path);
-      this.permissionStore.emit("changed", { path });
-      return true;
-    } catch (err) {
-      this.logError(`Catch-up: failed to remove local-only "${path}"`, err);
-      return false;
-    }
+    return this.ensureSyncRuntime().removeUnsyncedLocalFile(path);
   }
 
   /**
@@ -8096,115 +5002,7 @@ export default class VaultGuardPlugin extends Plugin {
     failedFiles: number;
     failedFolders: number;
   } | null> {
-    if (!this.session || !this.settings.serverVaultId || !this.hasValidKeyLease()) return null;
-    if (!this.originalAdapterMethods.read) return null;
-
-    let inventory: { path: string; action: string }[] | null = null;
-    try {
-      const response = await this.apiRequest<{
-        deltas: Array<{ path: string; action: string }>;
-      }>("POST", this.vaultPath("/files/sync"), {
-        lastSyncTimestamp: new Date(0).toISOString(),
-        fileChecksums: {},
-      });
-      if (!response.success || !response.data) {
-        this.log("Catch-up: could not fetch server inventory, skipping.");
-        return null;
-      }
-      inventory = response.data.deltas;
-    } catch (err) {
-      this.logError("Catch-up: server inventory fetch failed", err);
-      return null;
-    }
-
-    const serverFilePaths = new Set<string>();
-    const serverFolderPaths = new Set<string>();
-    for (const delta of inventory) {
-      if (delta.action === "deleted") continue;
-      const normalized = this.normalizeVaultPath(delta.path);
-      if (this.isFolderMarkerPath(normalized)) {
-        serverFolderPaths.add(this.folderPathFromMarkerPath(normalized));
-      } else {
-        serverFilePaths.add(`/${normalized}`);
-      }
-    }
-
-    // ── Files ────────────────────────────────────────────────────────────
-    const localFiles = this.app.vault.getFiles();
-    let uploaded = 0;
-    let removedLocal = 0;
-    let failed = 0;
-    let skipped = 0;
-    for (const file of localFiles) {
-      const normalized = this.normalizeVaultPath(file.path);
-      // Skip our own marker files if any happen to exist on disk — they're
-      // server-only infrastructure and must never be treated as user content.
-      if (this.isFolderMarkerPath(normalized)) continue;
-      // Local-only opt-out: never push excluded paths up to the server.
-      if (this.isPathExcluded(normalized)) continue;
-      const lookupKey = `/${normalized}`;
-      if (serverFilePaths.has(lookupKey)) continue;
-
-      try {
-        const content = await this.readPlainFromDisk(file.path);
-        const outcome = await this.uploadReconciledFile(normalized, content, {
-          noWriteNotice:
-            `VaultGuard Sync: Removed local-only "${normalized}" because this server vault ` +
-            "does not contain it and you do not have write permission to add it.",
-        });
-        if (outcome === "uploaded") {
-          uploaded += 1;
-        } else {
-          skipped += 1;
-          if (await this.removeUnsyncedLocalFile(normalized)) {
-            removedLocal += 1;
-          }
-        }
-      } catch (err) {
-        failed += 1;
-        this.logError(`Catch-up: upload of "${file.path}" failed`, err);
-      }
-    }
-
-    // ── Folders ──────────────────────────────────────────────────────────
-    // S3 has no native folder concept, so empty Obsidian folders disappear
-    // from the admin panel unless we plant a sentinel object inside them.
-    // Mirror every local folder that lacks a server-side marker.
-    let foldersUploaded = 0;
-    let foldersFailed = 0;
-    for (const folderPath of this.collectLocalFolderPaths()) {
-      if (serverFolderPaths.has(folderPath)) continue;
-      if (this.isPathExcluded(folderPath)) continue;
-      try {
-        const ok = await this.uploadFolderMarker(folderPath);
-        if (ok) foldersUploaded += 1;
-      } catch (err) {
-        foldersFailed += 1;
-        this.logError(`Catch-up: folder marker upload for "${folderPath}" failed`, err);
-      }
-    }
-
-    const totalChanges = uploaded + removedLocal + skipped + failed + foldersUploaded + foldersFailed;
-    if (totalChanges > 0) {
-      const parts: string[] = [];
-      if (uploaded > 0) parts.push(`${uploaded} files uploaded`);
-      if (removedLocal > 0) parts.push(`${removedLocal} local-only files removed`);
-      if (foldersUploaded > 0) parts.push(`${foldersUploaded} folders preserved`);
-      if (skipped > 0) parts.push(`${skipped} skipped (no write permission)`);
-      if (failed > 0) parts.push(`${failed} files failed`);
-      if (foldersFailed > 0) parts.push(`${foldersFailed} folders failed`);
-      const message = `VaultGuard Sync: Caught up local-only items — ${parts.join(", ")}.`;
-      this.log(message);
-    }
-
-    return {
-      uploadedFiles: uploaded,
-      uploadedFolders: foldersUploaded,
-      removedLocalFiles: removedLocal,
-      skippedFiles: skipped,
-      failedFiles: failed,
-      failedFolders: foldersFailed,
-    };
+    return this.ensureSyncRuntime().uploadLocalOnlyFiles();
   }
 
   /**
@@ -8220,89 +5018,7 @@ export default class VaultGuardPlugin extends Plugin {
     failedFiles: number;
     failedFolders: number;
   } | null> {
-    if (!this.session || !this.settings.serverVaultId) return null;
-    if (!this.originalAdapterMethods.write) return null;
-
-    const response = await this.apiRequest<{
-      deltas: Array<{ path: string; action: string; size?: number }>;
-    }>("POST", this.vaultPath("/files/sync"), {
-      lastSyncTimestamp: new Date(0).toISOString(),
-      fileChecksums: {},
-    });
-
-    if (!response.success || !response.data) {
-      throw new Error(response.error?.message ?? "Could not fetch the server vault inventory.");
-    }
-
-    const serverFiles: Array<{ path: string; size: number }> = [];
-    const serverFolderPaths = new Set<string>();
-
-    for (const delta of response.data.deltas) {
-      if (delta.action === "deleted") continue;
-
-      const normalizedPath = this.normalizeVaultPath(delta.path);
-      if (!normalizedPath) continue;
-
-      if (this.isFolderMarkerPath(normalizedPath)) {
-        const folderPath = this.folderPathFromMarkerPath(normalizedPath);
-        if (folderPath) serverFolderPaths.add(folderPath);
-        continue;
-      }
-
-      for (const folderPath of this.parentFolderPathsFor(normalizedPath)) {
-        serverFolderPaths.add(folderPath);
-      }
-      serverFiles.push({ path: normalizedPath, size: delta.size ?? 0 });
-    }
-
-    let downloadedFolders = 0;
-    let failedFolders = 0;
-    const foldersByDepth = [...serverFolderPaths].sort(
-      (a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b)
-    );
-
-    for (const folderPath of foldersByDepth) {
-      if (this.isPathExcluded(folderPath)) continue;
-      try {
-        const created = await this.ensureLocalFolderPath(folderPath);
-        if (created) downloadedFolders += 1;
-      } catch (err) {
-        failedFolders += 1;
-        this.logError(`Remote repair: mkdir for "${folderPath}" failed`, err);
-      }
-    }
-
-    let downloadedFiles = 0;
-    let failedFiles = 0;
-    for (const file of serverFiles) {
-      if (this.isPathExcluded(file.path)) continue;
-      if (await this.localPathExists(file.path)) continue;
-
-      try {
-        await this.applyRemoteChange(file);
-        downloadedFiles += 1;
-      } catch (err) {
-        failedFiles += 1;
-        this.logError(`Remote repair: download of "${file.path}" failed`, err);
-      }
-    }
-
-    const totalChanges = downloadedFiles + downloadedFolders + failedFiles + failedFolders;
-    if (totalChanges > 0) {
-      const parts: string[] = [];
-      if (downloadedFiles > 0) parts.push(`${downloadedFiles} files downloaded`);
-      if (downloadedFolders > 0) parts.push(`${downloadedFolders} folders created`);
-      if (failedFiles > 0) parts.push(`${failedFiles} files failed`);
-      if (failedFolders > 0) parts.push(`${failedFolders} folders failed`);
-      this.log(`VaultGuard Sync: Repaired missing remote items — ${parts.join(", ")}.`);
-    }
-
-    return {
-      downloadedFiles,
-      downloadedFolders,
-      failedFiles,
-      failedFolders,
-    };
+    return this.ensureSyncRuntime().repairMissingRemoteItems();
   }
 
   /**
@@ -8326,16 +5042,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private parentFolderPathsFor(path: string): string[] {
-    const segments = this.normalizeVaultPath(path).split("/").filter(Boolean);
-    segments.pop();
-
-    const folders: string[] = [];
-    let current = "";
-    for (const segment of segments) {
-      current = current ? `${current}/${segment}` : segment;
-      folders.push(current);
-    }
-    return folders;
+    return this.ensureSyncRuntime().parentFolderPathsFor(path);
   }
 
   private async localPathExists(path: string): Promise<boolean> {
@@ -8384,43 +5091,17 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private async writeLocalFileFromRemote(path: string, content: string): Promise<void> {
-    const normalized = this.normalizeVaultPath(path);
-    await this.ensureParentFoldersForPath(normalized);
-
-    this.applyingRemoteWrite = true;
-    try {
-      const existing = this.app.vault.getAbstractFileByPath(normalized);
-      if (existing instanceof TFile) {
-        await this.app.vault.modify(existing, content);
-        return;
-      }
-
-      try {
-        await this.app.vault.create(normalized, content);
-      } catch (err) {
-        if (!this.originalAdapterMethods.write) throw err;
-        // Fall back to direct adapter write — but route through the at-rest
-        // helper so the on-disk bytes stay encrypted. Using the raw write
-        // here is the bug that produced "Finder shows plaintext".
-        await this.writePlainToDisk(normalized, content);
-      }
-    } finally {
-      this.applyingRemoteWrite = false;
-    }
+    return this.ensureSyncRuntime().writeLocalFileFromRemote(path, content);
   }
 
   /** True if `path` (no leading slash) ends in the folder-marker basename. */
   private isFolderMarkerPath(path: string): boolean {
-    if (!path) return false;
-    const segments = path.split("/").filter(Boolean);
-    return segments.length > 0 && segments[segments.length - 1] === FOLDER_MARKER_NAME;
+    return this.ensureSyncRuntime().isFolderMarkerPath(path);
   }
 
   /** Strips the marker basename to recover the parent folder's vault-relative path. */
   private folderPathFromMarkerPath(markerPath: string): string {
-    const segments = markerPath.split("/").filter(Boolean);
-    segments.pop();
-    return segments.join("/");
+    return this.ensureSyncRuntime().folderPathFromMarkerPath(markerPath);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -8440,16 +5121,7 @@ export default class VaultGuardPlugin extends Plugin {
    * tombstoned or retried). Persists fire-and-forget.
    */
   private recordDeletionTombstone(path: string): void {
-    const normalized = this.normalizeVaultPath(path);
-    if (!normalized) return;
-    if (this.isPathExcluded(normalized)) return;
-    if (this.isFolderMarkerPath(normalized)) return;
-    if (!this.settings.deletionTombstones) this.settings.deletionTombstones = {};
-    this.settings.deletionTombstones[normalized] = new Date().toISOString();
-    this.log(`Recorded deletion tombstone for "${normalized}".`);
-    void this.saveSettings().catch((error) => {
-      this.logError("Failed to persist deletion tombstone", error);
-    });
+    return this.ensureSyncRuntime().recordDeletionTombstone(path);
   }
 
   /**
@@ -8457,39 +5129,21 @@ export default class VaultGuardPlugin extends Plugin {
    * already-gone), or rejects it permanently (401/403). No-op if absent.
    */
   private clearDeletionTombstone(path: string): void {
-    const normalized = this.normalizeVaultPath(path);
-    if (!normalized) return;
-    if (!this.settings.deletionTombstones) return;
-    if (this.settings.deletionTombstones[normalized] === undefined) return;
-    delete this.settings.deletionTombstones[normalized];
-    this.log(`Cleared deletion tombstone for "${normalized}".`);
-    void this.saveSettings().catch((error) => {
-      this.logError("Failed to persist deletion tombstone removal", error);
-    });
+    return this.ensureSyncRuntime().clearDeletionTombstone(path);
   }
 
   /** True if a tombstone exists for the given (normalized) path. */
   private isPathTombstoned(path: string): boolean {
-    const normalized = this.normalizeVaultPath(path);
-    if (!normalized) return false;
-    return Boolean(this.settings.deletionTombstones?.[normalized]);
+    return this.ensureSyncRuntime().isPathTombstoned(path);
   }
 
   /**
-   * Drop tombstones older than DELETION_TOMBSTONE_TTL_MS (and any malformed /
+   * Drop tombstones older than the 30-day retention window (and any malformed /
    * unparseable timestamps). Called once at the end of loadSettings; does NOT
    * save — the next normal save persists the pruned set.
    */
   private pruneDeletionTombstones(): void {
-    const tombstones = this.settings.deletionTombstones;
-    if (!tombstones) return;
-    const now = Date.now();
-    for (const [path, deletedAt] of Object.entries(tombstones)) {
-      const ts = Date.parse(deletedAt);
-      if (Number.isNaN(ts) || now - ts > DELETION_TOMBSTONE_TTL_MS) {
-        delete tombstones[path];
-      }
-    }
+    return this.ensureSyncRuntime().pruneDeletionTombstones();
   }
 
   /**
@@ -8501,46 +5155,7 @@ export default class VaultGuardPlugin extends Plugin {
    * online); 401/403 clears it (the server decided).
    */
   private async retryOutstandingDeletions(): Promise<void> {
-    if (!this.session || !this.settings.serverVaultId || !this.isOnline()) return;
-    const tombstones = this.settings.deletionTombstones;
-    if (!tombstones) return;
-    const paths = Object.keys(tombstones);
-    if (paths.length === 0) return;
-
-    for (const path of paths) {
-      const normalized = this.normalizeVaultPath(path);
-      if (!normalized) {
-        this.clearDeletionTombstone(path);
-        continue;
-      }
-      if (this.isPathExcluded(normalized) || this.isFolderMarkerPath(normalized)) {
-        this.clearDeletionTombstone(normalized);
-        continue;
-      }
-      const response = await this.apiRequest(
-        "DELETE",
-        this.vaultPath(`/files/${encodeURIComponent(normalized)}`)
-      );
-      if (response.success || response.error?.statusCode === 404) {
-        this.clearDeletionTombstone(normalized);
-        continue;
-      }
-      if (response.error?.statusCode === 0) {
-        // Transient — stop and retry on the next online sync.
-        this.setConnectionStatus("offline");
-        return;
-      }
-      if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
-        // The server permanently rejected the delete — do not loop forever.
-        this.clearDeletionTombstone(normalized);
-        continue;
-      }
-      // Other failures (5xx etc.): leave the tombstone in place to retry later.
-      this.logError(
-        `Deletion retry: DELETE "${normalized}" failed`,
-        new Error(response.error?.message ?? "unknown")
-      );
-    }
+    return this.ensureSyncRuntime().retryOutstandingDeletions();
   }
 
   /**
@@ -8552,28 +5167,7 @@ export default class VaultGuardPlugin extends Plugin {
    * `normalized` must be a vault-relative path with no leading slash.
    */
   private async deleteTombstonedServerPath(normalized: string): Promise<boolean> {
-    if (!normalized) return false;
-    try {
-      const response = await this.apiRequest(
-        "DELETE",
-        this.vaultPath(`/files/${encodeURIComponent(normalized)}`)
-      );
-      if (response.success || response.error?.statusCode === 404) {
-        this.clearDeletionTombstone(normalized);
-        this.log(`Reconciliation: deleted tombstoned server path "${normalized}".`);
-        return true;
-      }
-      this.logError(
-        `Reconciliation: server delete of tombstoned path "${normalized}" failed`,
-        new Error(response.error?.message ?? "unknown")
-      );
-    } catch (err) {
-      this.logError(
-        `Reconciliation: server delete of tombstoned path "${normalized}" threw`,
-        err
-      );
-    }
-    return false;
+    return this.ensureSyncRuntime().deleteTombstonedServerPath(normalized);
   }
 
   /**
@@ -8582,11 +5176,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Throws if asked for the root marker — root is implicit and never marked.
    */
   private folderMarkerPath(folderPath: string): string {
-    const normalized = this.normalizeVaultPath(folderPath);
-    if (!normalized) {
-      throw new Error("VaultGuard Sync: refused to plant a folder marker at the vault root.");
-    }
-    return `${normalized}/${FOLDER_MARKER_NAME}`;
+    return this.ensureSyncRuntime().folderMarkerPath(folderPath);
   }
 
   /**
@@ -8601,36 +5191,10 @@ export default class VaultGuardPlugin extends Plugin {
    * presence.
    */
   private buildLocalSyncManifest(): Record<string, string> {
-    const manifest: Record<string, string> = {};
-    const seen = new Set<string>();
-
-    const addPath = (rawPath: string): void => {
-      const normalized = this.normalizeVaultPath(rawPath);
-      if (!normalized) return;
-      if (this.isPathExcluded(normalized)) return;
-      const key = `/${normalized}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      manifest[key] = "";
-    };
-
-    for (const file of this.app.vault.getFiles()) {
-      addPath(file.path);
-    }
-
-    // Folder markers are server-only sentinels; produce them from local
-    // folders so the server doesn't see the marker as "deleted" just because
-    // we didn't enumerate it.
-    for (const folderPath of this.collectLocalFolderPaths()) {
-      if (this.isPathExcluded(folderPath)) continue;
-      try {
-        addPath(this.folderMarkerPath(folderPath));
-      } catch {
-        // Root folder has no marker — skip silently.
-      }
-    }
-
-    return manifest;
+    return this.ensureSyncRuntime().buildLocalSyncManifest({
+      filePaths: this.app.vault.getFiles().map((file) => file.path),
+      folderPaths: this.collectLocalFolderPaths(),
+    });
   }
 
   /**
@@ -8639,36 +5203,7 @@ export default class VaultGuardPlugin extends Plugin {
    * path. Network failures throw and are caught by the caller.
    */
   private async uploadFolderMarker(folderPath: string): Promise<boolean> {
-    if (!this.session || !this.settings.serverVaultId) return false;
-    const normalized = this.normalizeVaultPath(folderPath);
-    if (!normalized) return false;
-
-    const permission = await this.getEffectivePermission(normalized);
-    if (permission < PermissionLevel.WRITE) {
-      this.log(`Folder marker: skipping "${normalized}" — no write permission.`);
-      return false;
-    }
-
-    const markerPath = this.folderMarkerPath(normalized);
-    // The server's required-field validator rejects empty strings, so we
-    // can't send `content: ""` even though the marker is conceptually
-    // zero-byte. Send a single newline as a placeholder — the body is only
-    // ever read to verify the folder's existence, never displayed.
-    const markerBody = "\n";
-    const markerBase64 = this.bytesToBase64(new TextEncoder().encode(markerBody));
-    const response = await this.apiRequest(
-      "PUT",
-      this.vaultPath(`/files/${encodeURIComponent(markerPath)}`),
-      {
-        content: markerBase64,
-        contentType: "application/x-vaultguard-folder-marker",
-        hash: await this.computeHash(markerBody),
-      }
-    );
-    if (!response.success) {
-      throw new Error(response.error?.message ?? `Folder marker upload for "${normalized}" failed.`);
-    }
-    return true;
+    return this.ensureSyncRuntime().uploadFolderMarker(folderPath);
   }
 
   /**
@@ -8676,21 +5211,7 @@ export default class VaultGuardPlugin extends Plugin {
    * marker may have never been planted, which is harmless.
    */
   private async deleteFolderMarker(folderPath: string): Promise<void> {
-    if (!this.session || !this.settings.serverVaultId) return;
-    const normalized = this.normalizeVaultPath(folderPath);
-    if (!normalized) return;
-
-    const markerPath = this.folderMarkerPath(normalized);
-    const response = await this.apiRequest(
-      "DELETE",
-      this.vaultPath(`/files/${encodeURIComponent(markerPath)}`)
-    );
-    if (!response.success && response.error?.statusCode !== 404) {
-      this.logError(
-        `Folder marker delete for "${normalized}" failed`,
-        new Error(response.error?.message ?? "unknown")
-      );
-    }
+    return this.ensureSyncRuntime().deleteFolderMarker(folderPath);
   }
 
   /**
@@ -8713,64 +5234,7 @@ export default class VaultGuardPlugin extends Plugin {
    * `requestUrl`), `isPathExcluded`, and `isFolderMarkerPath`.
    */
   private async deleteFolderContentsOnServer(folderPath: string): Promise<void> {
-    if (!this.session || !this.settings.serverVaultId) return;
-    const normalized = this.normalizeVaultPath(folderPath);
-    if (!normalized) return;
-
-    // When offline we cannot enumerate the server side; fall back to removing
-    // just the marker (which itself tombstones/queues nothing — markers never
-    // do). The per-child listener's offline branch already tombstoned each
-    // child it saw, and retryOutstandingDeletions() will flush those on
-    // reconnect, so children are not lost.
-    if (!this.isOnline()) {
-      await this.deleteFolderMarker(normalized);
-      return;
-    }
-
-    // Trailing slash so we match only objects INSIDE this folder, never a
-    // sibling whose name merely shares the prefix (e.g. "Notes" vs "Notes2").
-    const prefix = `${normalized}/`;
-
-    let childPaths: string[] = [];
-    try {
-      const inventory = await this.apiRequest<{
-        deltas: Array<{ path: string; action: string }>;
-      }>("POST", this.vaultPath("/files/sync"), {
-        lastSyncTimestamp: new Date(0).toISOString(),
-        fileChecksums: {},
-        prefix,
-      });
-      if (inventory.success && inventory.data?.deltas) {
-        childPaths = inventory.data.deltas.map((d) => d.path);
-      } else if (inventory.error?.statusCode === 0) {
-        // Transient — treat as offline: drop the marker and let the per-child
-        // tombstones (recorded by the file listener) retry on reconnect.
-        this.setConnectionStatus("offline");
-        await this.deleteFolderMarker(normalized);
-        return;
-      }
-    } catch (err) {
-      this.logError(`Folder delete: could not enumerate "${normalized}" on server`, err);
-    }
-
-    for (const rawPath of childPaths) {
-      const childNormalized = this.normalizeVaultPath(rawPath);
-      if (!childNormalized) continue;
-      if (this.isPathExcluded(childNormalized)) continue;
-      if (this.isFolderMarkerPath(childNormalized)) {
-        // A marker delta is a (sub-)folder's sentinel. Remove via the marker
-        // path so it is not tombstoned/retried like a real file.
-        const subFolder = this.folderPathFromMarkerPath(childNormalized);
-        await this.deleteFolderMarker(subFolder);
-        continue;
-      }
-      // syncFileDeleteToServer owns the DELETE + tombstone + offline-queue
-      // semantics; reusing it keeps deletion behavior in exactly one place.
-      await this.syncFileDeleteToServer(childNormalized);
-    }
-
-    // Finally remove the deleted folder's own marker.
-    await this.deleteFolderMarker(normalized);
+    return this.ensureSyncRuntime().deleteFolderContentsOnServer(folderPath);
   }
 
   /**
@@ -8784,31 +5248,7 @@ export default class VaultGuardPlugin extends Plugin {
     strategy: ConflictResolutionStrategy,
     localManifest: Map<string, { content: string; hash: string }>
   ): Promise<void> {
-    const normalizedPath = this.normalizeVaultPath(path);
-    const entry = localManifest.get(path);
-
-    switch (strategy) {
-      case ConflictResolutionStrategy.KEEP_LOCAL: {
-        if (!entry) return;
-        await this.uploadReconciledFile(normalizedPath, entry.content);
-        return;
-      }
-      case ConflictResolutionStrategy.KEEP_REMOTE: {
-        await this.applyRemoteChange({ path: normalizedPath, size: 0 });
-        return;
-      }
-      case ConflictResolutionStrategy.DUPLICATE:
-      default: {
-        // Save the local copy beside the original with a conflict suffix,
-        // then bring the server copy to the original path. No data lost.
-        if (entry && this.originalAdapterMethods.write) {
-          const conflictPath = this.generateConflictPath(normalizedPath);
-          await this.writeLocalFileFromRemote(conflictPath, entry.content);
-        }
-        await this.applyRemoteChange({ path: normalizedPath, size: 0 });
-        return;
-      }
-    }
+    return this.ensureSyncRuntime().resolveReconciliationConflict(path, strategy, localManifest);
   }
 
   /**
@@ -8998,44 +5438,26 @@ export default class VaultGuardPlugin extends Plugin {
    * fires multiple focus events for one Cmd-Tab.
    */
   private registerFocusSyncHandlers(): void {
-    const trigger = (): void => {
-      if (!this.session || !this.settings.serverVaultId) return;
-      if (this.syncState.status === "syncing") return;
-      const now = Date.now();
-      if (now - this.lastFocusSyncAt < 3000) return;
-      this.lastFocusSyncAt = now;
-      void this.performSync().catch((err) =>
-        this.logError("Focus-triggered sync failed", err)
-      );
-      // Wave 2 issue D (1.0.31): self-heal the permission cache on
-      // focus. Catches the case where the initial warm-up ran while
-      // tokens were still being refreshed (Fix 1 patches the
-      // post-refresh side; this catches the longer-tail "Obsidian was
-      // backgrounded for an hour, come back to find a stale cache"
-      // case). Fires only if the store needs it — `warmed` < 5 min
-      // ago is a no-op.
-      this.maybeRewarmOnFocus();
-    };
+    registerFocusSyncHandlersLifecycle(this.createLifecycleEventsContext());
+  }
 
-    const doc = getActiveObsidianDocument();
-
-    this.registerDomEvent(window, "focus", trigger);
-    if (!doc) return;
-    this.registerDomEvent(doc, "visibilitychange", () => {
-      if (doc.visibilityState === "visible") {
-        this.resumeSyncLoop("window visible");
-        trigger();
-      } else {
-        this.pauseSyncLoop("window hidden");
-      }
-    });
-    this.registerDomEvent(window, "online", () => {
-      this.handleBrowserOnline();
-    });
-    this.registerDomEvent(window, "offline", () => {
-      this.handleBrowserOffline();
-    });
-    this.log("Focus-sync handlers registered.");
+  private handleFocusSyncTrigger(): void {
+    if (!this.session || !this.settings.serverVaultId) return;
+    if (this.syncState.status === "syncing") return;
+    const now = Date.now();
+    if (now - this.lastFocusSyncAt < 3000) return;
+    this.lastFocusSyncAt = now;
+    void this.performSync().catch((err) =>
+      this.logError("Focus-triggered sync failed", err)
+    );
+    // Wave 2 issue D (1.0.31): self-heal the permission cache on
+    // focus. Catches the case where the initial warm-up ran while
+    // tokens were still being refreshed (Fix 1 patches the
+    // post-refresh side; this catches the longer-tail "Obsidian was
+    // backgrounded for an hour, come back to find a stale cache"
+    // case). Fires only if the store needs it — `warmed` < 5 min
+    // ago is a no-op.
+    this.maybeRewarmOnFocus();
   }
 
   private handleBrowserOnline(): void {
@@ -9151,305 +5573,11 @@ export default class VaultGuardPlugin extends Plugin {
    *   no-ops after the first run.
    */
   async performSync(options: { userInitiated?: boolean; forceCatchup?: boolean } = {}): Promise<void> {
-    const { userInitiated = false, forceCatchup = false } = options;
+    return this.ensureSyncRuntime().performSync(options);
+  }
 
-    if (!this.session) {
-      const message = userInitiated
-        ? this.showLoginRequiredNotice("sync")
-        : "VaultGuard Sync: Sync skipped — not logged in.";
-      this.log(message);
-      this.syncDiagnostics.record("performSync.skipped", { reason: "notLoggedIn" });
-      return;
-    }
-    if (!this.isOnline()) {
-      const message = "VaultGuard Sync: Sync skipped — offline.";
-      this.log(message);
-      if (userInitiated) new Notice(message);
-      this.syncDiagnostics.record("performSync.skipped", { reason: "offline" });
-      return;
-    }
-    if (!this.settings.serverVaultId) {
-      const message = "VaultGuard Sync: Sync skipped — this folder is not bound to a server vault yet.";
-      this.log(message);
-      if (userInitiated) new Notice(message);
-      this.syncDiagnostics.record("performSync.skipped", { reason: "noVault" });
-      return;
-    }
-
-    if (this.syncState.status === "syncing") {
-      const message = "VaultGuard Sync: A sync is already in progress.";
-      this.log(message);
-      if (userInitiated) new Notice(message);
-      this.syncDiagnostics.record("performSync.skipped", { reason: "alreadySyncing" });
-      return;
-    }
-
-    if (userInitiated) {
-      new Notice("VaultGuard Sync: Syncing…");
-    }
-
-    const canUploadEncryptedContent = this.hasValidKeyLease();
-    if (!canUploadEncryptedContent) {
-      this.log("Sync running in limited access mode — downloads only; encrypted uploads are paused until a key lease is available.");
-      if (userInitiated) {
-        new Notice("VaultGuard Sync: Limited access — downloading accessible server changes only.");
-      }
-    }
-
-    let totalFilesUploaded = 0;
-    let totalFoldersUploaded = 0;
-    let totalFilesRemoved = 0;
-    let totalFilesDownloaded = 0;
-    let totalFoldersDownloaded = 0;
-    let totalRepairFailures = 0;
-    let deltaCount = 0;
-
-    try {
-      this.syncState.status = "syncing";
-      this.syncDiagnostics.record("performSync.start", { userInitiated });
-      this.updateStatusBar();
-
-      // Phase 1: Upload queued offline operations
-      const offlineQueueSizeBefore = this.offlineQueue.length;
-      if (canUploadEncryptedContent) {
-        await this.flushOfflineQueue();
-        // Layer 2: re-attempt any outstanding tombstoned deletes that never
-        // reached the server (e.g. a folder-child delete dropped while offline
-        // before this fix, or a delete that failed transiently). A server
-        // DELETE needs no key lease, but gating it with the flush keeps one
-        // well-understood entry point. Cleared on success/404.
-        await this.retryOutstandingDeletions();
-      } else if (offlineQueueSizeBefore > 0) {
-        this.log(
-          `Sync: ${offlineQueueSizeBefore} queued operation(s) kept pending because no encryption key lease is available.`
-        );
-      }
-      const flushedSomething = canUploadEncryptedContent && offlineQueueSizeBefore > 0;
-
-      // Phase 1b: Catch up local-only files + folders. Auto-runs once per
-      // plugin process to self-heal vaults whose first reconciliation never
-      // landed; user-initiated syncs always force a re-run so subsequent
-      // clicks aren't silent no-ops after the flag has been set.
-      let catchupChanges = 0;
-      if (canUploadEncryptedContent && (forceCatchup || !this.localOnlyCatchupCompleted)) {
-        const result = await this.uploadLocalOnlyFiles();
-        if (result) {
-          totalFilesUploaded += result.uploadedFiles;
-          totalFoldersUploaded += result.uploadedFolders;
-          totalFilesRemoved += result.removedLocalFiles;
-          catchupChanges = result.uploadedFiles + result.uploadedFolders + result.removedLocalFiles;
-          this.localOnlyCatchupCompleted = true;
-        }
-      }
-
-      // Phase 1c: Cursor short-circuit. Cheapest possible "is there anything
-      // to do?" check — one DynamoDB GetItem on the server, tiny payload.
-      // Skip the heavy `/files/sync` call entirely when:
-      //   - we didn't push anything up (so server revision can't have moved
-      //     because of us)
-      //   - we have a previously observed revision to compare against
-      //   - the user didn't ask for a force-catchup (which always runs the
-      //     full repair pass to self-heal stranded items)
-      const canShortCircuit =
-        !flushedSomething &&
-        catchupChanges === 0 &&
-        !forceCatchup &&
-        this.syncState.lastSeenRevision != null;
-
-      if (canShortCircuit) {
-        const cursor = await this.fetchSyncCursor();
-        if (cursor) {
-          // Always reflect the server's idea of "last change" so the
-          // adaptive timer scales correctly even on hot/idle vaults that
-          // never enter the full-sync branch.
-          const cursorMs = Date.parse(cursor.lastChangedAt);
-          if (Number.isFinite(cursorMs) && cursorMs > 0) {
-            this.syncState.lastObservedActivityAt = cursorMs;
-          }
-          if (cursor.revision === this.syncState.lastSeenRevision) {
-            this.syncState.status = "idle";
-            this.syncState.lastError = null;
-            this.syncState.pendingChanges = this.offlineQueue.length;
-            this.log(
-              `Sync skipped — cursor unchanged (revision ${cursor.revision}, last change ${cursor.lastChangedAt}).`
-            );
-            if (userInitiated) {
-              new Notice("VaultGuard Sync: Already in sync — nothing to do.");
-            }
-            return;
-          }
-        }
-        // Cursor differs (or fetch failed) — fall through to a full sync
-        // and trust the server to tell us what changed.
-      }
-
-      // Phase 2: Fetch remote changes since last sync
-      const response = await this.apiRequest<{
-        deltas: Array<{
-          path: string;
-          action: "created" | "modified" | "deleted";
-          lastModified: string;
-          checksum: string;
-          size: number;
-        }>;
-        syncTimestamp: string;
-        revision?: number;
-        mode?: string;
-        permissionsChanged?: boolean;
-      }>("POST", this.vaultPath('/files/sync'), {
-        lastSyncTimestamp: this.syncState.lastSync ?? new Date(0).toISOString(),
-        fileChecksums: this.buildLocalSyncManifest(),
-      });
-
-      if (!response.success || !response.data) {
-        throw new Error(response.error?.message ?? "Sync request failed.");
-      }
-
-      // The server flips this true on the cold path when one or more
-      // permission rules changed since `lastSyncTimestamp`. The local
-      // permission cache could now be lying about file accessibility, so
-      // wipe it — the next interceptedRead/Write will re-fetch from the
-      // server and reflect the new rule set.
-      if (response.data.permissionsChanged) {
-        this.log("Sync: permission rules changed on the server — emitting bus event.");
-        // Phase 9: single bus emit replaces the 5-call fan-out. Server-
-        // confirmed because the sync delta carries an authoritative
-        // permission-rules-changed signal from the server. The four init*
-        // bus subscriptions handle the surface invalidations.
-        this.permissionStore.emit("changed", { serverConfirmed: true });
-      }
-
-      deltaCount = response.data.deltas.length;
-
-      for (const delta of response.data.deltas) {
-        const normalizedPath = this.normalizeVaultPath(delta.path);
-
-        // Local-only opt-out: ignore the server's view of excluded paths
-        // entirely — neither create, modify, nor delete locally.
-        if (this.isPathExcluded(normalizedPath)) {
-          continue;
-        }
-
-        // Folder markers carry no content — mirror the folder locally if it
-        // doesn't exist yet, but never try to download or write the marker
-        // file itself.
-        if (this.isFolderMarkerPath(normalizedPath)) {
-          if (delta.action !== "deleted") {
-            const folderPath = this.folderPathFromMarkerPath(normalizedPath);
-            if (folderPath) {
-              try {
-                const created = await this.ensureLocalFolderPath(folderPath);
-                if (created) totalFoldersDownloaded += 1;
-              } catch (err) {
-                // mkdir is idempotent in Obsidian; only log unexpected failures.
-                this.log(`Sync: mkdir for "${folderPath}" no-op or failed: ${err}`);
-              }
-            }
-          }
-          continue;
-        }
-
-        if (delta.action === "deleted") {
-          if (this.originalAdapterMethods.remove) {
-            try {
-              await this.originalAdapterMethods.remove(normalizedPath);
-            } catch (err) {
-              // A not-found error is expected and benign — the file was
-              // already gone locally. Anything else (read-only FS, disk
-              // error, locked file) is a real failure that the delete
-              // silently dropped, so surface it instead of swallowing.
-              const msg = err instanceof Error ? err.message : String(err);
-              if (!/enoent|no such file|does not exist|not found/i.test(msg)) {
-                this.logError(`Sync: failed to delete "${normalizedPath}" locally`, err);
-              }
-            }
-          }
-          continue;
-        }
-
-        await this.applyRemoteChange({
-          path: normalizedPath,
-          size: delta.size,
-        });
-      }
-
-      // Phase 2b: repair missing server-side items that are older than our
-      // lastSyncTimestamp. This is what makes Sync Now self-heal after an
-      // earlier failed folder/file apply instead of becoming a silent no-op.
-      if (forceCatchup || !this.remoteInventoryRepairCompleted) {
-        const result = await this.repairMissingRemoteItems();
-        if (result) {
-          totalFilesDownloaded += result.downloadedFiles;
-          totalFoldersDownloaded += result.downloadedFolders;
-          totalRepairFailures += result.failedFiles + result.failedFolders;
-          this.remoteInventoryRepairCompleted = totalRepairFailures === 0;
-        }
-      }
-
-      this.syncState.lastSync = response.data.syncTimestamp;
-      this.syncState.pendingChanges = this.offlineQueue.length;
-      this.syncState.conflicts = [];
-      this.syncState.status = "idle";
-      this.syncState.lastError = null;
-      // Capture the revision the server saw at the moment it built this
-      // delta set so the next poll can short-circuit when nothing else
-      // changes after this one.
-      if (typeof response.data.revision === "number") {
-        this.syncState.lastSeenRevision = response.data.revision;
-      }
-      if (deltaCount > 0) {
-        this.syncState.lastObservedActivityAt = Date.now();
-      }
-      // Persist lastSync so a fresh process resumes deltas instead of
-      // re-downloading the entire vault from epoch.
-      if (this.settings.lastSyncTimestamp !== response.data.syncTimestamp) {
-        this.settings.lastSyncTimestamp = response.data.syncTimestamp;
-        void this.saveSettings().catch((err) =>
-          this.logError("Failed to persist lastSyncTimestamp", err)
-        );
-      }
-
-      if (userInitiated) {
-        const summaryParts: string[] = [];
-        if (totalFilesUploaded > 0) summaryParts.push(`${totalFilesUploaded} files uploaded`);
-        if (totalFoldersUploaded > 0) summaryParts.push(`${totalFoldersUploaded} folders preserved`);
-        if (totalFilesRemoved > 0) summaryParts.push(`${totalFilesRemoved} local-only files removed`);
-        if (totalFilesDownloaded > 0) summaryParts.push(`${totalFilesDownloaded} files downloaded`);
-        if (totalFoldersDownloaded > 0) summaryParts.push(`${totalFoldersDownloaded} folders created`);
-        if (totalRepairFailures > 0) summaryParts.push(`${totalRepairFailures} repair failures`);
-        if (deltaCount > 0) summaryParts.push(`${deltaCount} remote changes applied`);
-        if (summaryParts.length === 0) {
-          new Notice("VaultGuard Sync: Already in sync — nothing to do.");
-        } else {
-          new Notice(`VaultGuard Sync: Sync complete — ${summaryParts.join(", ")}.`);
-        }
-      }
-      this.syncDiagnostics.record("performSync.done", { ok: true });
-    } catch (error) {
-      this.syncState.status = "error";
-      this.syncState.lastError =
-        error instanceof Error ? error.message : "Unknown sync error";
-      this.logError("Sync failed", error);
-      this.syncDiagnostics.record("performSync.done", {
-        ok: false,
-        message: error instanceof Error ? error.message : String(error),
-      });
-
-      if (userInitiated) {
-        new Notice(
-          `VaultGuard Sync: Sync failed — ${
-            error instanceof Error ? error.message : "Unknown error"
-          }`,
-          10000
-        );
-      }
-
-      if (this.isNetworkError(error)) {
-        this.setConnectionStatus("offline");
-      }
-    } finally {
-      this.updateStatusBar();
-    }
+  private async applyRemoteDeletion(normalizedPath: string): Promise<void> {
+    return this.ensureSyncRuntime().applyRemoteDeletion(normalizedPath);
   }
 
   /**
@@ -9457,40 +5585,7 @@ export default class VaultGuardPlugin extends Plugin {
    * @param metadata - The remote file metadata and change information
    */
   private async applyRemoteChange(metadata: Pick<FileMetadata, "path" | "size">): Promise<void> {
-    const normalizedPath = this.normalizeVaultPath(metadata.path);
-    // Local-only opt-out: never pull excluded paths down. Defence in depth
-    // for callers that don't filter the delta list themselves.
-    if (this.isPathExcluded(normalizedPath)) {
-      this.log(`Sync: skipping excluded path "${normalizedPath}".`);
-      return;
-    }
-    // Fetch and decrypt file content. Limited-access sessions lack the
-    // client-side DEK, so `fetchRemoteFileContent` asks the server for a
-    // permission-checked plaintext envelope instead.
-    const response = await this.fetchRemoteFileContent(normalizedPath);
-
-    if (!response.success || !response.data) {
-      throw new Error(response.error?.message ?? `Failed to read ${normalizedPath} from the server.`);
-    }
-
-    if (!this.originalAdapterMethods.write) return;
-
-    let decrypted: string;
-    try {
-      decrypted = await this.decodeRemoteFileContent(normalizedPath, response.data);
-    } catch (decryptErr) {
-      // Skip the file rather than aborting the whole sync pass — a single
-      // undecryptable cloud blob (wrong-DEK upload, partial rotation) used
-      // to crash sync wholesale. Local copy stays as it was.
-      this.logError(
-        `Sync: skipping "${normalizedPath}" — cloud copy could not be decrypted.`,
-        decryptErr
-      );
-      this.notifyCloudDecryptFallback(normalizedPath);
-      return;
-    }
-    await this.writeLocalFileFromRemote(normalizedPath, decrypted);
-    this.syncState.bytesDownloaded += metadata.size ?? 0;
+    return this.ensureSyncRuntime().applyRemoteChange(metadata);
   }
 
   /**
@@ -9498,58 +5593,7 @@ export default class VaultGuardPlugin extends Plugin {
    * @param conflict - The detected sync conflict
    */
   private async handleConflict(conflict: SyncConflict): Promise<void> {
-    const strategy = this.settings.defaultConflictResolution;
-    await this.emitAuditEvent("sync.conflict", conflict.path, {
-      strategy,
-      localHash: conflict.localHash,
-      remoteHash: conflict.remoteHash,
-    });
-
-    switch (strategy) {
-      case ConflictResolutionStrategy.KEEP_LOCAL: {
-        // Re-upload local version
-        const localContent = await this.readPlainFromDisk(conflict.path);
-        const encrypted = await this.encryptContent(localContent);
-        await this.apiRequest("PUT", this.vaultPath(`/files/${encodeURIComponent(conflict.path)}`), {
-          content: encrypted,
-          hash: await this.computeHash(localContent),
-          forceOverwrite: true,
-        });
-        conflict.resolution = ConflictResolutionStrategy.KEEP_LOCAL;
-        break;
-      }
-
-      case ConflictResolutionStrategy.KEEP_REMOTE:
-        // Download remote version
-        await this.applyRemoteChange({
-          path: conflict.path,
-          size: 0,
-        });
-        conflict.resolution = ConflictResolutionStrategy.KEEP_REMOTE;
-        break;
-
-      case ConflictResolutionStrategy.DUPLICATE: {
-        // Create a conflict copy
-        const conflictPath = this.generateConflictPath(conflict.path);
-        const localContent = await this.readPlainFromDisk(conflict.path);
-        await this.writePlainToDisk(conflictPath, localContent);
-        // Then apply remote to original path
-        await this.applyRemoteChange({
-          path: conflict.path,
-          size: 0,
-        });
-        conflict.resolution = ConflictResolutionStrategy.DUPLICATE;
-        break;
-      }
-
-      case ConflictResolutionStrategy.ASK_USER:
-      default:
-        // Leave unresolved for user to handle via UI
-        new Notice(
-          `VaultGuard Sync: Sync conflict detected for "${conflict.path}". Use View Permissions to resolve.`
-        );
-        break;
-    }
+    return this.ensureSyncRuntime().handleConflict(conflict);
   }
 
   /**
@@ -9558,12 +5602,7 @@ export default class VaultGuardPlugin extends Plugin {
    * @returns A new path with conflict timestamp suffix
    */
   private generateConflictPath(originalPath: string): string {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const lastDot = originalPath.lastIndexOf(".");
-    if (lastDot > 0) {
-      return `${originalPath.slice(0, lastDot)} (conflict ${timestamp})${originalPath.slice(lastDot)}`;
-    }
-    return `${originalPath} (conflict ${timestamp})`;
+    return this.ensureSyncRuntime().generateConflictPath(originalPath);
   }
 
   /**
@@ -9572,26 +5611,11 @@ export default class VaultGuardPlugin extends Plugin {
    * changed" and fall through to a full sync rather than skipping.
    */
   private async fetchSyncCursor(): Promise<{ revision: number; lastChangedAt: string } | null> {
-    if (!this.session || !this.settings.serverVaultId) return null;
-    try {
-      const response = await this.apiRequest<{
-        revision: number;
-        lastChangedAt: string;
-        serverTime: string;
-      }>("GET", this.vaultPath("/sync-cursor"));
-      if (!response.success || !response.data) return null;
-      return {
-        revision: response.data.revision,
-        lastChangedAt: response.data.lastChangedAt,
-      };
-    } catch (err) {
-      this.logError("Sync cursor fetch failed", err);
-      return null;
-    }
+    return this.ensureSyncRuntime().fetchSyncCursor();
   }
 
   private hasValidKeyLease(): boolean {
-    return !!this.keyLease && !this.isKeyLeaseExpired();
+    return this.ensureSyncRuntime().hasValidKeyLease();
   }
 
   /**
@@ -9602,76 +5626,30 @@ export default class VaultGuardPlugin extends Plugin {
    * evaluatePermission; 404 on deny (per docs/SHARE-LINKS.md trust pattern).
    */
   private async readFileDecrypted(relPath: string): Promise<ApiResponse<RemoteFileContentResponse>> {
-    const normalizedPath = this.normalizeVaultPath(relPath);
-    const encoded = normalizedPath
-      .split("/")
-      .map((segment) => encodeURIComponent(segment))
-      .join("/");
-    return this.apiRequest<RemoteFileContentResponse>(
-      "GET",
-      this.vaultPath(`/files-decrypted/${encoded}`)
-    );
+    return this.ensureSyncRuntime().readFileDecrypted(relPath);
   }
 
   private async fetchRemoteFileContent(path: string): Promise<ApiResponse<RemoteFileContentResponse>> {
-    const normalizedPath = this.normalizeVaultPath(path);
-    const serverDecrypt = !this.hasValidKeyLease();
-    if (serverDecrypt) {
-      // Limited-access (no /** lease) — server-side decrypt sibling endpoint
-      // (Phase 8, plan 08-01). The legacy decrypt-query URL is removed from
-      // this caller; plan 08-04 deletes the Lambda branch.
-      return this.readFileDecrypted(normalizedPath);
-    }
-    // Full-access — fetch ciphertext, plugin decrypts via its own DEK.
-    return this.apiRequest<RemoteFileContentResponse>(
-      "GET",
-      this.vaultPath(`/files/${encodeURIComponent(normalizedPath)}`)
-    );
+    return this.ensureSyncRuntime().fetchRemoteFileContent(path);
   }
 
   private decodeBase64Utf8(base64: string): string {
-    return new TextDecoder().decode(this.base64ToBytes(base64));
+    return this.ensureSyncRuntime().decodeBase64Utf8(base64);
   }
 
   private remoteDecryptError(path: string, error: unknown): Error {
-    const message = error instanceof Error ? error.message : String(error);
-    const wrapped = new Error(
-      `VaultGuard Sync: could not decrypt server copy of "${path}": ${message}`
-    );
-    wrapped.name = "VaultGuardRemoteDecryptError";
-    return wrapped;
+    return this.ensureSyncRuntime().remoteDecryptError(path, error);
   }
 
   private async decodeRemoteFileContent(
     path: string,
     data: RemoteFileContentResponse
   ): Promise<string> {
-    const normalizedPath = this.normalizeVaultPath(path);
-    if (data.decrypted === true) {
-      return this.decodeBase64Utf8(data.content);
-    }
-
-    if (!this.hasValidKeyLease()) {
-      throw this.remoteDecryptError(
-        normalizedPath,
-        new Error("server returned encrypted bytes and no valid key lease is available")
-      );
-    }
-
-    try {
-      return await this.decryptContent(data.content);
-    } catch (error) {
-      throw this.remoteDecryptError(normalizedPath, error);
-    }
+    return this.ensureSyncRuntime().decodeRemoteFileContent(path, data);
   }
 
   private async readRemotePlaintext(path: string): Promise<string> {
-    const normalizedPath = this.normalizeVaultPath(path);
-    const response = await this.fetchRemoteFileContent(normalizedPath);
-    if (!response.success || !response.data) {
-      throw new Error(response.error?.message ?? `Failed to read ${normalizedPath} from the server.`);
-    }
-    return this.decodeRemoteFileContent(normalizedPath, response.data);
+    return this.ensureSyncRuntime().readRemotePlaintext(path);
   }
 
   /**
@@ -9689,62 +5667,22 @@ export default class VaultGuardPlugin extends Plugin {
    * open overnight on a vault no one else is touching.
    */
   private computeNextSyncDelayMs(): number {
-    const baseline = Math.max(this.getEffectiveSyncIntervalSeconds(), MIN_SYNC_INTERVAL) * 1000;
-    const lastActivity = this.syncState.lastObservedActivityAt;
-    if (lastActivity == null) return baseline;
-
-    const idleMs = Math.max(0, Date.now() - lastActivity);
-    if (idleMs < 60_000) return baseline;
-    if (idleMs < 5 * 60_000) return baseline;
-    if (idleMs < 30 * 60_000) return Math.min(baseline * 2, 2 * 60_000);
-    return Math.min(baseline * 4, 5 * 60_000);
+    return this.ensureSyncRuntime().computeNextSyncDelayMs();
   }
 
   /** Starts (or reschedules) the adaptive sync loop. */
   private startSyncTimer(): void {
-    this.stopSyncTimer();
-    const syncMode = this.getEffectiveSyncMode();
-    if (syncMode === "manual") {
-      this.log("Sync timer disabled by organization manual-sync policy.");
-      this.syncDiagnostics.record("startSyncTimer.skipped", { reason: "manual" });
-      return;
-    }
-    if (this.syncTimerPaused) {
-      this.log("Sync timer kept paused (window hidden / offline).");
-      this.syncDiagnostics.record("startSyncTimer.skipped", { reason: "paused" });
-      return;
-    }
-
-    const delay = this.computeNextSyncDelayMs();
-    this.syncTimer = setTimeout(() => {
-      this.syncTimer = null;
-      // Don't fire a new sync on top of an in-flight one; just reschedule.
-      if (this.syncState.status !== "syncing") {
-        void this.performSync().catch((err) =>
-          this.logError("Periodic sync failed", err)
-        );
-      }
-      // Always chain the next tick — performSync is fire-and-forget here.
-      this.startSyncTimer();
-    }, delay);
-
-    this.log(`Sync timer scheduled in ${Math.round(delay / 1000)}s (mode: ${syncMode}).`);
-    this.syncDiagnostics.record("startSyncTimer.scheduled", { delayMs: delay, syncMode });
+    this.ensureSyncRuntime().startSyncTimer();
   }
 
   /** Cancels the next scheduled sync, if any. */
   private stopSyncTimer(): void {
-    if (this.syncTimer) {
-      clearTimeout(this.syncTimer);
-      this.syncTimer = null;
-    }
+    this.ensureSyncRuntime().stopSyncTimer();
   }
 
   /** Restarts the sync loop (call when settings, mode, or session change). */
   restartSyncTimer(): void {
-    if (this.session) {
-      this.startSyncTimer();
-    }
+    this.ensureSyncRuntime().restartSyncTimer();
   }
 
   /**
@@ -9753,10 +5691,7 @@ export default class VaultGuardPlugin extends Plugin {
    * itself until `resumeSyncLoop` is called.
    */
   private pauseSyncLoop(reason: string): void {
-    if (this.syncTimerPaused) return;
-    this.syncTimerPaused = true;
-    this.stopSyncTimer();
-    this.log(`Sync loop paused (${reason}).`);
+    this.ensureSyncRuntime().pauseSyncLoop(reason);
   }
 
   /**
@@ -9765,14 +5700,7 @@ export default class VaultGuardPlugin extends Plugin {
    * see other peers' changes after returning to the window.
    */
   private resumeSyncLoop(reason: string): void {
-    if (!this.syncTimerPaused) return;
-    this.syncTimerPaused = false;
-    this.log(`Sync loop resumed (${reason}).`);
-    if (!this.session || !this.settings.serverVaultId) return;
-    void this.performSync().catch((err) =>
-      this.logError("Resume-triggered sync failed", err)
-    );
-    this.startSyncTimer();
+    this.ensureSyncRuntime().resumeSyncLoop(reason);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -9869,67 +5797,12 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * One-shot self-healing walk over the on-disk vault. Adds every file whose
-   * size is exactly 36 bytes AND whose first 4 bytes equal the VG1 magic
-   * header [0x56, 0x47, 0x31, 0x00] to placeholderPaths. Handles mid-session
-   * plugin reloads where placeholderPaths was lost from memory but on-disk
-   * placeholders remain (D-09 keeps the set in-memory only).
-   *
-   * Bounded by MAX_SWEEP_ENTRIES (5000). Walks via originalAdapterMethods.list
-   * (the raw, ciphertext-aware listing) because we are deliberately inspecting
-   * the on-disk envelope shape, NOT reading plaintext. The 4-byte magic-header
-   * read via originalAdapterMethods.readBinary is a documented exception to
-   * the at-rest rule (CLAUDE.md Local At-Rest Rule): we are inspecting
-   * ciphertext envelope bytes, not surfacing plaintext to disk.
+   * One-shot self-healing walk over on-disk limited-access placeholders.
+   * Implementation lives in AtRestAdapterRuntime; main.ts keeps the method
+   * name because key-lease recovery and tests call it directly.
    */
   private async sweepPlaceholderPaths(): Promise<void> {
-    const adapter = this.app.vault.adapter;
-    const rawList = this.originalAdapterMethods.list;
-    const rawReadBinary = this.originalAdapterMethods.readBinary;
-    if (!rawList || !rawReadBinary) return;
-    let scanned = 0;
-    let aborted = false;
-    const queue: string[] = ["/"];
-    while (queue.length > 0 && !aborted) {
-      const dir = queue.shift()!;
-      let listing: { files: string[]; folders: string[] };
-      try {
-        listing = await rawList(dir);
-      } catch {
-        continue;
-      }
-      for (const subdir of listing.folders) {
-        if (this.isPathExcluded(subdir)) continue;
-        queue.push(subdir);
-      }
-      for (const filePath of listing.files) {
-        scanned++;
-        if (scanned > MAX_SWEEP_ENTRIES) {
-          aborted = true;
-          break;
-        }
-        if (this.isPathExcluded(filePath)) continue;
-        try {
-          const stat = await adapter.stat(filePath);
-          if (!stat || stat.size !== 36) continue;
-          // Magic-byte verification (RESEARCH Q3 RESOLVED — not size-only).
-          // Read first 4 bytes via the RAW binary method since we are
-          // inspecting the ciphertext envelope, not the plaintext payload.
-          const buf = await rawReadBinary(filePath);
-          const view = new Uint8Array(buf, 0, 4);
-          if (view[0] === 0x56 && view[1] === 0x47 && view[2] === 0x31 && view[3] === 0x00) {
-            this.placeholderPaths.add(filePath);
-          }
-        } catch {
-          // ignore individual file errors
-        }
-      }
-    }
-    if (aborted) {
-      console.warn(
-        `[VaultGuard] sweepPlaceholderPaths: aborting at ${MAX_SWEEP_ENTRIES} entries; placeholderPaths.size=${this.placeholderPaths.size}`
-      );
-    }
+    return this.ensureAtRestAdapterRuntimeObject().sweepPlaceholderPaths();
   }
 
   /**
@@ -9958,51 +5831,19 @@ export default class VaultGuardPlugin extends Plugin {
    * or DEK lease expiry.
    */
   private startHeartbeatMonitor(): void {
-    this.stopHeartbeatMonitor();
-    if (!this.session) return;
-
-    this.heartbeatTimer = setInterval(
-      () => void this.checkRevocationHeartbeat(),
-      HEARTBEAT_INTERVAL_MS
-    );
-    void this.checkRevocationHeartbeat();
+    this.ensureSyncRuntime().startHeartbeatMonitor();
   }
 
   private stopHeartbeatMonitor(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
+    this.ensureSyncRuntime().stopHeartbeatMonitor();
   }
 
   private async checkRevocationHeartbeat(): Promise<void> {
-    if (!this.session) return;
-
-    const params = new URLSearchParams({ sessionId: this.session.sessionId });
-    const response = await this.apiRequest<{ active: boolean; reason?: string }>(
-      "GET",
-      `/auth/heartbeat?${params.toString()}`
-    );
-
-    if (response.success) {
-      if (response.data && response.data.active === false) {
-        await this.handleServerRevocation(response.data.reason ?? "revoked");
-      }
-      return;
-    }
-
-    const status = response.error?.statusCode ?? 0;
-    if (status === 401 || status === 403) {
-      await this.handleServerRevocation(response.error?.message ?? "revoked");
-    }
+    return this.ensureSyncRuntime().checkRevocationHeartbeat();
   }
 
   private async handleServerRevocation(reason: string): Promise<void> {
-    this.keyLease = null;
-    // Phase 9: SILENT — forceLogout below broadcasts the wildcard 'changed'
-    // (collapsed in Task 3 of plan 09-02). A broadcast here would double-fire.
-    this.permissionStore.invalidate();
-    await this.forceLogout(`VaultGuard Sync: Access revoked (${reason}). Local session cleared.`);
+    return this.ensureSyncRuntime().handleServerRevocation(reason);
   }
 
   /**
@@ -10010,21 +5851,14 @@ export default class VaultGuardPlugin extends Plugin {
    * Checks every minute if the lease needs renewal.
    */
   private startKeyRenewalMonitor(): void {
-    this.stopKeyRenewalMonitor();
-    this.keyRenewalTimer = setInterval(
-      () => this.checkKeyLeaseRenewal(),
-      60 * 1000
-    );
+    this.ensureSyncRuntime().startKeyRenewalMonitor();
   }
 
   /**
    * Stops the key lease renewal monitor.
    */
   private stopKeyRenewalMonitor(): void {
-    if (this.keyRenewalTimer) {
-      clearInterval(this.keyRenewalTimer);
-      this.keyRenewalTimer = null;
-    }
+    this.ensureSyncRuntime().stopKeyRenewalMonitor();
   }
 
   /**
@@ -10039,50 +5873,7 @@ export default class VaultGuardPlugin extends Plugin {
    * to logout/login.
    */
   private async checkKeyLeaseRenewal(): Promise<void> {
-    if (!this.session) {
-      return;
-    }
-
-    if (!this.keyLease) {
-      // Limited-access recovery path. Only retry when the previous attempt
-      // explicitly returned 403 — otherwise we'd hammer the API with lease
-      // requests for sessions that legitimately have no vault binding yet.
-      if (this.vaultLeaseDenied && this.settings.serverVaultId) {
-        try {
-          const result = await this.ensureVaultScopedKeyLease();
-          if (result === "ok") {
-            this.log("Vault-scoped key lease recovered — full access restored.");
-            new Notice("VaultGuard Sync: Full vault access restored.");
-            // Phase 9: BROADCAST — permission rules may have widened (per
-            // pre-existing comment). Surfaces must refresh, otherwise post-
-            // recovery views show stale deny-state visuals. The four init*
-            // bus subscriptions invoke readOnlyGuard / fileExplorer /
-            // sidebar / header invalidations. The explicit fan-out lines
-            // that lived here are removed in Task 3 of plan 09-02.
-            this.permissionStore.emit("changed", { serverConfirmed: true });
-            // Phase-8: clear the in-memory placeholder set so subsequent reads
-            // go through the normal readPlainFromDisk path (the on-disk VG1
-            // bytes are still placeholders until the next reconcile writes
-            // real content; that's the existing sync engine's job once the
-            // lease is back).
-            this.placeholderPaths.clear();
-          }
-        } catch (err) {
-          // Network blips and 5xxs are expected during recovery polling.
-          // Stay in limited-access state and try again next tick.
-          this.logError("Limited-access lease retry failed (will retry)", err);
-        }
-      }
-      return;
-    }
-
-    const expiresAt = new Date(this.keyLease.expiresAt).getTime();
-    const now = Date.now();
-    const timeUntilExpiry = expiresAt - now;
-
-    if (timeUntilExpiry <= KEY_RENEWAL_GRACE_MS) {
-      await this.renewKeyLease();
-    }
+    return this.ensureSyncRuntime().checkKeyLeaseRenewal();
   }
 
   /**
@@ -10196,10 +5987,7 @@ export default class VaultGuardPlugin extends Plugin {
    * @returns true if expired or no lease exists
    */
   private isKeyLeaseExpired(): boolean {
-    if (!this.keyLease) {
-      return true;
-    }
-    return new Date(this.keyLease.expiresAt).getTime() < Date.now();
+    return this.ensureSyncRuntime().isKeyLeaseExpired();
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -10373,13 +6161,7 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Re-render every open Permissions graph view (e.g. after coming online). */
   private refreshPermissionsGraph(): void {
-    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_GRAPH_VIEW_TYPE);
-    for (const leaf of leaves) {
-      const view = leaf.view;
-      if (view instanceof PermissionsGraphView) {
-        void view.refresh();
-      }
-    }
+    this.getPermissionsGraphRuntime().refreshOpenViews();
   }
 
   /**
@@ -10543,19 +6325,7 @@ export default class VaultGuardPlugin extends Plugin {
     path: string,
     data?: string
   ): void {
-    // Deduplicate: remove existing operations for the same path
-    this.offlineQueue = this.offlineQueue.filter((op) => op.path !== path);
-
-    this.offlineQueue.push({
-      operation,
-      path,
-      data,
-      timestamp: new Date().toISOString(),
-    });
-
-    this.log(
-      `Queued offline operation: ${operation} "${path}" (queue size: ${this.offlineQueue.length})`
-    );
+    return this.ensureSyncRuntime().queueOfflineOperation(operation, path, data);
   }
 
   /**
@@ -10563,104 +6333,18 @@ export default class VaultGuardPlugin extends Plugin {
    * Operations are sent in chronological order.
    */
   private async flushOfflineQueue(): Promise<void> {
-    if (this.offlineQueueFlushPromise) {
-      return this.offlineQueueFlushPromise;
-    }
-
-    const flushPromise = this.runOfflineQueueFlush();
-    this.offlineQueueFlushPromise = flushPromise;
-
-    try {
-      await flushPromise;
-    } finally {
-      if (this.offlineQueueFlushPromise === flushPromise) {
-        this.offlineQueueFlushPromise = null;
-      }
-    }
+    return this.ensureSyncRuntime().flushOfflineQueue();
   }
 
   private async runOfflineQueueFlush(): Promise<void> {
-    if (this.offlineQueue.length === 0) {
-      return;
-    }
-
-    this.log(`Flushing ${this.offlineQueue.length} queued operations...`);
-    const queue = [...this.offlineQueue];
-    this.offlineQueue = [];
-
-    for (let index = 0; index < queue.length; index++) {
-      const op = queue[index];
-      // Local-only opt-out: drop any queued op whose path the user has
-      // since added to the exclusion list, so we don't quietly upload it.
-      if (this.isPathExcluded(op.path)) {
-        continue;
-      }
-      try {
-        switch (op.operation) {
-          case "write":
-            if (op.data) {
-              const encrypted = await this.encryptContent(op.data);
-              const response = await this.apiRequest("PUT", this.vaultPath(`/files/${encodeURIComponent(op.path)}`), {
-                content: encrypted,
-                hash: await this.computeHash(op.data),
-              });
-              this.assertOfflineFlushResponse(response, op);
-            }
-            break;
-          case "delete": {
-            const response = await this.apiRequest(
-              "DELETE",
-              this.vaultPath(`/files/${encodeURIComponent(op.path)}`)
-            );
-            // Returns on success / 404 / 401 / 403 (throws on other failures,
-            // leaving the tombstone in place to retry). Any return means the
-            // server has settled this delete — clear its tombstone.
-            this.assertOfflineFlushResponse(response, op);
-            this.clearDeletionTombstone(op.path);
-            break;
-          }
-        }
-      } catch (error) {
-        // Re-queue this operation and everything after it to preserve order.
-        this.offlineQueue.push(op, ...queue.slice(index + 1));
-        this.logError(`Failed to flush operation: ${op.operation} "${op.path}"`, error);
-        if (this.isNetworkError(error)) {
-          this.setConnectionStatus("offline");
-        }
-        break;
-      }
-    }
-
-    if (this.offlineQueue.length > 0) {
-      this.log(
-        `${this.offlineQueue.length} operations remain in queue after flush.`
-      );
-    }
+    return this.ensureSyncRuntime().runOfflineQueueFlush();
   }
 
   private assertOfflineFlushResponse(
     response: ApiResponse<unknown>,
     op: { operation: "write" | "delete"; path: string }
   ): void {
-    if (response.success) {
-      return;
-    }
-
-    const status = response.error?.statusCode ?? 0;
-    if (op.operation === "delete" && status === 404) {
-      return;
-    }
-
-    const message = response.error?.message ?? "Offline operation failed.";
-    if (status === 401 || status === 403) {
-      this.logError(
-        `Dropping queued ${op.operation} for "${op.path}" after server rejection`,
-        new Error(message)
-      );
-      return;
-    }
-
-    throw new Error(message);
+    return this.ensureSyncRuntime().assertOfflineFlushResponse(response, op);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -10914,92 +6598,21 @@ export default class VaultGuardPlugin extends Plugin {
    * level, who else has access, and (for admins) a manage-access panel.
    */
   private initFilePermissionHeader(): void {
-    if (!this.apiClient) return;
+    const header = initFilePermissionHeaderWiring(this.createPermissionSurfaceContext());
+    if (header) {
+      this.filePermissionHeader = header;
+    }
+  }
 
-    this.filePermissionHeader = new FilePermissionHeader({
-      app: this.app,
-      apiClient: this.apiClient,
-      currentUserId: this.session?.userId ?? "",
-      currentUserEmail: this.session?.email ?? "",
-      // Use the effective UI role (org admin/owner > vault membership role >
-      // org role). Without this, an org "member" who is a vault "admin"
-      // would see read-only affordances.
-      currentUserRole: this.getEffectiveUiRole(),
-      isAdmin: this.isEffectiveAdmin(),
-      // Mirrors the backend OrgSettings.allowAdminPerFileRestrictions
-      // toggle so the per-file dropdown for vault admins/org owners
-      // becomes editable when the org opted in. Refreshed via
-      // applyOrgSettings() on every lease/session response that carries
-      // org settings.
-      allowAdminPerFileRestrictions:
-        this.orgSettings?.allowAdminPerFileRestrictions === true,
-      // Resolve the current user's level through the same PermissionStore the
-      // sidebar, file-explorer dots, and read-only guard use. The store owns
-      // the warm-up cache that recognises file-specific grants (matched by
-      // canonical id, email, or role) and is invalidated on the permission bus,
-      // so it stays in lockstep with those surfaces. The earlier live-only
-      // `/permissions/check` probe diverged from them: the store matches grants
-      // by email (case-insensitively) and by session roles, while the backend
-      // self-check queries the userId index by exact value and collapses the
-      // caller to their vault-membership role — so an elevated grant the store
-      // honoured showed in the sidebar but the header fell back to inherited READ.
-      getPermissionLevel: (path) => this.getEffectivePermission(path),
-      // Propagate header-side rule edits (manage panel, popover dropdown)
-      // to the rest of the UI so file-explorer dots and the read-only
-      // editor guard refresh in lockstep — without this, only the header
-      // re-renders while the sidebar still shows stale colors. Full
-      // invalidation is the safe choice: deleting a glob rule (e.g. the
-      // /** default-member rule) can affect every file, so per-path
-      // invalidation here would leave neighboring files miscolored.
-      onRulesChanged: () => {
-        // Phase 9: single bus emit replaces the 4-call fan-out. The four
-        // init* bus subscriptions handle the surface invalidations.
-        this.permissionStore.emit("changed", { serverConfirmed: true });
-      },
-    });
-
-    // Update header whenever the user switches files
-    this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => {
-        this.filePermissionHeader?.update();
-      })
-    );
-
-    // Also update on file-open (covers same-leaf file changes)
-    this.registerEvent(
-      this.app.workspace.on("file-open", () => {
-        this.filePermissionHeader?.update();
-      })
-    );
-
-    // Phase 9: subscribe to the unified permission bus. One emit fans out
-    // here + to fileExplorerDecorations + sidebar + readOnlyGuard.
-    this.registerEvent(
-      this.permissionStore.on("changed", (...args: unknown[]) => {
-        const payload = (args[0] as { path?: string } | undefined) ?? {};
-        this.filePermissionHeader?.invalidateCache(payload.path);
-        void this.filePermissionHeader?.update();
-      })
-    );
-
-    // Wave 2 Fix 2 (1.0.31): also subscribe to the lifecycle-only
-    // `state-changed` event so the header re-renders when the store
-    // flips between cold / warming / fetch-failed / warmed. Without
-    // this, a fetch-failed → warmed transition (the typical recovery
-    // after Fix 1's post-refresh re-warm) would leave the header
-    // showing whatever data it last loaded from the per-file probe
-    // path until the next file open. `state-changed` is intentionally
-    // wildcard — we invalidate the whole ruleCache so every visible
-    // surface re-renders with the warmed authoritative data.
-    this.registerEvent(
-      this.permissionStore.on("state-changed", () => {
-        this.filePermissionHeader?.invalidateCache();
-        void this.filePermissionHeader?.update();
-      })
-    );
-
-    // Initial render if a file is already open
-    this.filePermissionHeader.update();
+  /**
+   * Re-renders the per-file permission banner after the "Show permission
+   * banner in notes" setting toggles, so the change takes effect live without
+   * reopening the note. When the toggle is now off, update() tears the banner
+   * down via its isEnabled() gate.
+   */
+  refreshFilePermissionHeader(): void {
+    this.filePermissionHeader?.invalidateCache();
+    void this.filePermissionHeader?.update({ force: true });
   }
 
   /**
@@ -11010,21 +6623,7 @@ export default class VaultGuardPlugin extends Plugin {
    * `refreshAll()` is called when the permission cache is invalidated.
    */
   private initReadOnlyGuard(): void {
-    this.readOnlyGuard = new ReadOnlyGuard({
-      app: this.app,
-      plugin: this,
-      getPermissionLevel: (path) => this.getEffectivePermission(path),
-      isLoggedIn: () => this.session !== null,
-    });
-    this.readOnlyGuard.start();
-
-    // Phase 9: subscribe to the unified permission bus. readOnlyGuard
-    // doesn't take a path — it refreshes the active leaf's lock state.
-    this.registerEvent(
-      this.permissionStore.on("changed", () => {
-        this.readOnlyGuard?.refreshAll();
-      })
-    );
+    this.readOnlyGuard = initReadOnlyGuardWiring(this.createPermissionSurfaceContext());
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -11036,50 +6635,10 @@ export default class VaultGuardPlugin extends Plugin {
    * sharing indicators, and mini avatar stacks on the native file explorer items.
    */
   private initFileExplorerDecorations(): void {
-    if (!this.apiClient) return;
-
-    this.fileExplorerDecorations = new FileExplorerDecorations({
-      app: this.app,
-      apiClient: this.apiClient,
-      currentUserId: this.session?.userId ?? "",
-      // Effective role so file-explorer badges reflect per-vault permissions
-      // rather than the user's flat org role.
-      currentUserRole: this.getEffectiveUiRole(),
-      isReady: () => this.isFileExplorerDecorationDataReady(),
-      getPermissionLevel: (path) => this.getEffectivePermission(path),
-    });
-
-    // Delay to let the file explorer render first on startup. The state sync
-    // also checks auth + vault binding, so first-run/no-session startups do
-    // not fire unauthenticated permission requests.
-    setTimeout(() => {
-      this.syncFileExplorerDecorationsState();
-    }, 1000);
-
-    // Phase 9: subscribe to the unified permission bus. Per-path payload
-    // scopes the invalidation; wildcard payload (no path) re-renders all.
-    this.registerEvent(
-      this.permissionStore.on("changed", (...args: unknown[]) => {
-        const payload = (args[0] as { path?: string } | undefined) ?? {};
-        this.fileExplorerDecorations?.invalidate(payload.path);
-      })
-    );
-
-    // Re-run decoration when the file explorer becomes visible. On mobile the
-    // explorer lives in a collapsed drawer whose view is deferred until shown,
-    // so the startup pass finds no items; opening the drawer fires these events
-    // and re-attaches the observer to the now-live container. Harmless on
-    // desktop where the explorer is already mounted.
-    this.registerEvent(
-      this.app.workspace.on("layout-change", () => {
-        this.syncFileExplorerDecorationsState();
-      })
-    );
-    this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => {
-        this.syncFileExplorerDecorationsState();
-      })
-    );
+    const decorations = initFileExplorerDecorationsWiring(this.createPermissionSurfaceContext());
+    if (decorations) {
+      this.fileExplorerDecorations = decorations;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -11093,21 +6652,7 @@ export default class VaultGuardPlugin extends Plugin {
    * level chips stay in sync with rule edits made anywhere else.
    */
   private reloadVaultGuardSidebar(): void {
-    this.sidebarViewConfig = this.createSidebarViewConfig();
-    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_VIEW_TYPE);
-    for (const leaf of leaves) {
-      const view = leaf.view as
-        | (VaultGuardSidebarView & {
-            configure?: (cfg: VaultGuardSidebarViewConfig | null) => void;
-          })
-        | undefined;
-      if (view?.configure) {
-        view.configure(this.sidebarViewConfig);
-      }
-      if (view?.reload) {
-        void view.reload();
-      }
-    }
+    reloadVaultGuardSidebarView(this.createSidebarActivationContext());
   }
 
   private isFileExplorerDecorationDataReady(): boolean {
@@ -11128,11 +6673,15 @@ export default class VaultGuardPlugin extends Plugin {
 
   private syncFileExplorerDecorationsState(refresh = false): void {
     const decorations = this.fileExplorerDecorations as
-      | (Partial<Pick<FileExplorerDecorations, "enable" | "disable" | "refresh">>)
+      | (Partial<Pick<FileExplorerDecorations, "enable" | "disable" | "refresh" | "setDisplayOptions">>)
       | null;
     if (!decorations) return;
 
-    if (this.settings.showPermissionIndicators && this.isFileExplorerDecorationDataReady()) {
+    const showMyLevel = this.settings.showMyPermissionLevel;
+    const showOthersAccess = this.settings.showOthersAccess;
+
+    if ((showMyLevel || showOthersAccess) && this.isFileExplorerDecorationDataReady()) {
+      decorations.setDisplayOptions?.({ showMyLevel, showOthersAccess });
       decorations.enable?.();
       if (refresh) {
         decorations.refresh?.();
@@ -11148,54 +6697,14 @@ export default class VaultGuardPlugin extends Plugin {
    * Called on layout-ready to auto-open it, and idempotent for repeat calls.
    */
   private async ensureVaultGuardSidebar(): Promise<void> {
-    const existing = this.app.workspace.getLeavesOfType(VAULTGUARD_VIEW_TYPE);
-    if (existing.length > 0) return; // already open
-
-    const leaf = this.app.workspace.getRightLeaf(false);
-    if (leaf) {
-      await leaf.setViewState({
-        type: VAULTGUARD_VIEW_TYPE,
-        active: true,
-      });
-    }
+    await ensureVaultGuardSidebarView(this.createSidebarActivationContext());
   }
 
   /**
    * Opens (or reveals) the VaultGuard Files sidebar panel and reloads data.
    */
   private async activateVaultGuardSidebar(): Promise<void> {
-    // Update config from current session
-    const sidebarConfig = this.createSidebarViewConfig();
-    if (sidebarConfig) {
-      this.sidebarViewConfig = sidebarConfig;
-    }
-
-    const existing = this.app.workspace.getLeavesOfType(VAULTGUARD_VIEW_TYPE);
-    if (existing.length > 0) {
-      this.app.workspace.revealLeaf(existing[0]);
-      const view = existing[0].view as VaultGuardSidebarView;
-      if (this.sidebarViewConfig) {
-        view.configure(this.sidebarViewConfig);
-      }
-      await view.reload();
-      return;
-    }
-
-    // Create new leaf in the right sidebar
-    const leaf = this.app.workspace.getRightLeaf(false);
-    if (leaf) {
-      await leaf.setViewState({
-        type: VAULTGUARD_VIEW_TYPE,
-        active: true,
-      });
-      this.app.workspace.revealLeaf(leaf);
-
-      const view = leaf.view as VaultGuardSidebarView;
-      if (view?.configure && this.sidebarViewConfig) {
-        view.configure(this.sidebarViewConfig);
-        await view.reload();
-      }
-    }
+    await activateVaultGuardSidebarView(this.createSidebarActivationContext());
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -11334,8 +6843,9 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Refreshes file explorer decorations (permission indicators).
-   * Called when the showPermissionIndicators setting changes.
+   * Refreshes file explorer decorations (permission dots + avatar chips).
+   * Called when the "Show my permission level" or "Show who else has access"
+   * settings change.
    */
   refreshFileExplorerDecorations(): void {
     this.syncFileExplorerDecorationsState(true);
@@ -11621,509 +7131,55 @@ export default class VaultGuardPlugin extends Plugin {
   // Storage Helpers
   // ─────────────────────────────────────────────────────────────────────────
 
-  /** Vault-local storage key prefix for per-vault session persistence. */
-  private static readonly SESSION_STORAGE_KEY_PREFIX = "vaultguard-session:";
-
-  private buildPluginData(): VaultGuardPluginData {
-    return {
-      ...this.settings,
-      storedSessions: this.persistedSessions,
-    };
-  }
-
   private async savePluginData(): Promise<void> {
-    const saveOperation = this.pluginDataSaveQueue
-      .catch(() => undefined)
-      .then(async () => {
-        await this.saveData(this.buildPluginData());
-      });
-
-    this.pluginDataSaveQueue = saveOperation;
-    await saveOperation;
+    await this.getSettingsRuntime().savePluginData();
   }
 
-  private static generateVaultBindingId(): string {
-    if (typeof crypto.randomUUID === "function") {
-      return crypto.randomUUID();
-    }
-
-    const bytes = crypto.getRandomValues(new Uint8Array(16));
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    const hex = Array.from(bytes, (byte) =>
-      byte.toString(16).padStart(2, "0")
-    );
-
-    return [
-      hex.slice(0, 4).join(""),
-      hex.slice(4, 6).join(""),
-      hex.slice(6, 8).join(""),
-      hex.slice(8, 10).join(""),
-      hex.slice(10, 16).join(""),
-    ].join("-");
-  }
-
-  /**
-   * Derives a stable, vault-unique binding ID from runtime identifiers.
-   *
-   * Preference order:
-   *   1. Filesystem base path of the vault (desktop). Two distinct vaults
-   *      cannot share a directory, so this is collision-free even when a
-   *      vault folder is duplicated — the copy lives at a different path.
-   *   2. Obsidian's `app.appId` (set per-vault by Obsidian itself).
-   *   3. Vault display name.
-   *
-   * All available identifiers are concatenated and hashed so the resulting
-   * key is fixed-length, opaque, and never leaks the user's filesystem path
-   * into vault-local storage. If none are available we fall back to a random UUID
-   * stored in `data.json`; that keeps non-standard/test hosts working, but
-   * desktop Obsidian should always provide a runtime fingerprint.
-   */
   private async computeDerivedVaultBindingId(): Promise<string> {
-    const vault = (this.app as unknown as {
-      vault?: {
-        adapter?: Partial<{
-          getBasePath: () => string;
-          basePath: string;
-        }>;
-        getName?: () => string;
-      };
-    } | undefined)?.vault;
-    const adapter = vault?.adapter as Partial<{
-      getBasePath: () => string;
-      basePath: string;
-    }> | undefined;
-    let basePath = "";
-    try {
-      basePath =
-        typeof adapter?.getBasePath === "function"
-          ? adapter.getBasePath() ?? ""
-          : adapter?.basePath ?? "";
-    } catch {
-      basePath = "";
-    }
-    const appId = (
-      (this.app as unknown as { appId?: string } | undefined)?.appId ?? ""
-    ).toString();
-    let vaultName = "";
-    try {
-      vaultName = typeof vault?.getName === "function" ? vault.getName() ?? "" : "";
-    } catch {
-      vaultName = "";
-    }
-
-    const fingerprintInput = [basePath, appId, vaultName]
-      .map((part) => part.trim())
-      .filter((part) => part.length > 0)
-      .join("|");
-
-    if (fingerprintInput) {
-      const hash = await this.computeHash(`vaultguard-vault::${fingerprintInput}`);
-      return hash.slice(0, 32);
-    }
-
-    // No usable runtime identifier — fall back to a random ID persisted only
-    // to data.json (per-vault on disk), which still avoids the shared-storage
-    // collision because each vault generates its own.
-    if (!this.settings.vaultBindingId) {
-      this.settings.vaultBindingId = VaultGuardPlugin.generateVaultBindingId();
-      await this.savePluginData();
-    }
-    return this.settings.vaultBindingId;
+    return this.getSettingsRuntime().computeDerivedVaultBindingId();
   }
 
-  private getSessionBindingId(): string | null {
-    if (!this.derivedBindingId) {
-      this.log(
-        "Derived vault binding ID is not yet available; refusing to use shared session storage."
-      );
-      return null;
-    }
-
-    return this.derivedBindingId;
+  private protectSessionForStorage(session: UserSession) {
+    return this.getSettingsRuntime().protectSessionForStorage(session);
   }
 
-  private getSessionStorageKey(bindingId: string): string {
-    return `${VaultGuardPlugin.SESSION_STORAGE_KEY_PREFIX}${bindingId}`;
+  private async protectSessionWithAtRest(session: UserSession) {
+    return this.getSettingsRuntime().protectSessionWithAtRest(session);
   }
 
-  private removeStoredSessionKey(bindingId: string): void {
-    try {
-      this.app.saveLocalStorage(this.getSessionStorageKey(bindingId), null);
-    } catch {
-      // Storage may be unavailable in tests or restricted renderer contexts.
-    }
-  }
-
-  /**
-   * Wraps a session for at-rest storage using Electron's `safeStorage` (OS
-   * keystore: DPAPI on Windows, Keychain on macOS, kwallet/libsecret on
-   * Linux). Returns `null` only when the OS keystore is genuinely unreachable
-   * — callers must treat that as "do not persist via safeStorage" and try the
-   * AtRestCipher fallback (`protectSessionWithAtRest`) before giving up. We
-   * never fall back to plaintext on disk.
-   */
-  private protectSessionForStorage(session: UserSession): ProtectedSessionEnvelope | null {
-    const safeStorage = probeSafeStorage();
-    if (!safeStorage) return null;
-
-    try {
-      const encrypted = safeStorage.encryptString(JSON.stringify(session));
-      const bytes = encrypted instanceof Uint8Array ? encrypted : new Uint8Array(encrypted);
-      return {
-        v: 1,
-        storage: "electron-safe-storage",
-        ciphertext: this.bytesToBase64(bytes),
-      };
-    } catch (error) {
-      this.logError("Failed to protect session with safeStorage", error);
-      return null;
-    }
-  }
-
-  /**
-   * Mobile / safeStorage-less fallback: wrap the session via `AtRestCipher`.
-   * Same security ceiling as the local at-rest encryption of vault content
-   * (AES-256-GCM with the LAK, whose KEK either lives in the OS keystore on
-   * desktop or in vault-local storage on mobile). Returns `null` if the cipher
-   * isn't ready or encryption fails — the caller decides whether to warn.
-   */
-  private async protectSessionWithAtRest(
-    session: UserSession
-  ): Promise<ProtectedSessionEnvelope | null> {
-    const cipher = this.atRestCipher;
-    if (!cipher?.isReady()) return null;
-
-    try {
-      const ciphertext = await cipher.encryptString(JSON.stringify(session));
-      const bytes = new Uint8Array(ciphertext);
-      return {
-        v: 1,
-        storage: "at-rest-cipher",
-        ciphertext: this.bytesToBase64(bytes),
-      };
-    } catch (error) {
-      this.logError("Failed to protect session with AtRestCipher", error);
-      return null;
-    }
-  }
-
-  /**
-   * Unwraps a stored session envelope synchronously. Handles the
-   * `electron-safe-storage` variant only — the `at-rest-cipher` variant
-   * decrypts via WebCrypto (async) and is routed through
-   * `unprotectAtRestSession` / `loadAtRestSessionFromStore` instead.
-   * Anything else (unknown shape, future formats, truncated JSON) returns
-   * `null` and the caller falls through to the async path or forces re-auth.
-   */
   private unprotectStoredSession(value: unknown): UserSession | null {
-    if (!value || typeof value !== "object") return null;
-    const envelope = value as Partial<ProtectedSessionEnvelope>;
-    if (
-      envelope.v !== 1 ||
-      !this.isNonEmptyString(envelope.ciphertext) ||
-      envelope.storage !== "electron-safe-storage"
-    ) {
-      return null;
-    }
-
-    const safeStorage = probeSafeStorage();
-    if (!safeStorage) {
-      this.notifySafeStorageUnavailable();
-      return null;
-    }
-
-    try {
-      const plaintext = safeStorage.decryptString(this.base64ToBytes(envelope.ciphertext));
-      const parsed = JSON.parse(plaintext) as Partial<UserSession>;
-      return this.materializeSession(parsed);
-    } catch (error) {
-      this.logError("Failed to restore protected session", error);
-      return null;
-    }
+    return this.getSettingsRuntime().unprotectStoredSession(value);
   }
 
-  /**
-   * Async counterpart for the `at-rest-cipher` envelope variant. Used on
-   * mobile / safeStorage-less hosts where the LAK seals the session blob.
-   * Returns `null` if the envelope shape is wrong, the cipher isn't ready,
-   * or decryption fails.
-   */
   private async unprotectAtRestSession(value: unknown): Promise<UserSession | null> {
-    if (!value || typeof value !== "object") return null;
-    const envelope = value as Partial<ProtectedSessionEnvelope>;
-    if (
-      envelope.v !== 1 ||
-      envelope.storage !== "at-rest-cipher" ||
-      !this.isNonEmptyString(envelope.ciphertext)
-    ) {
-      return null;
-    }
-
-    const cipher = this.atRestCipher;
-    if (!cipher?.isReady()) {
-      // The LAK isn't loaded (cipher in needs-recovery / disabled state).
-      // We can't decrypt the envelope; treat it as "no session" so the
-      // user re-authenticates. No Notice — the cipher init path already
-      // surfaces its own banner when this happens.
-      return null;
-    }
-
-    try {
-      const ciphertext = this.base64ToBytes(envelope.ciphertext);
-      const plaintext = await cipher.decryptString(ciphertext);
-      const parsed = JSON.parse(plaintext) as Partial<UserSession>;
-      return this.materializeSession(parsed);
-    } catch (error) {
-      this.logError("Failed to restore at-rest-protected session", error);
-      return null;
-    }
+    return this.getSettingsRuntime().unprotectAtRestSession(value);
   }
 
-  /**
-   * Loads a stored session via the synchronous safeStorage path. Returns
-   * `null` for the `at-rest-cipher` variant; callers should chain
-   * `loadAtRestSessionFromStore()` to cover that case.
-   */
   private loadSessionFromStore(): UserSession | null {
-    const bindingId = this.getSessionBindingId();
-    if (!bindingId) return null;
-
-    try {
-      const raw: unknown = this.app.loadLocalStorage(this.getSessionStorageKey(bindingId));
-      if (raw) {
-        const session = this.unprotectStoredSession(raw);
-        if (session) return session;
-      }
-    } catch {
-      // Fall through to data.json backup.
-    }
-
-    return this.unprotectStoredSession(this.persistedSessions[bindingId]);
+    return this.getSettingsRuntime().loadSessionFromStore();
   }
 
-  /**
-   * Async counterpart for the `at-rest-cipher` envelope. Mirror of
-   * `loadSessionFromStore` but routed through `unprotectAtRestSession`.
-   * Called after the sync path returns `null` so desktop users with a
-   * working safeStorage pay zero async cost.
-   */
   private async loadAtRestSessionFromStore(): Promise<UserSession | null> {
-    const bindingId = this.getSessionBindingId();
-    if (!bindingId) return null;
-
-    try {
-      const raw: unknown = this.app.loadLocalStorage(this.getSessionStorageKey(bindingId));
-      if (raw) {
-        const session = await this.unprotectAtRestSession(raw);
-        if (session) return session;
-      }
-    } catch {
-      // Fall through to data.json backup.
-    }
-
-    return this.unprotectAtRestSession(this.persistedSessions[bindingId]);
+    return this.getSettingsRuntime().loadAtRestSessionFromStore();
   }
 
-  /**
-   * Persists a session to Obsidian vault-local storage and the plugin data store.
-   *
-   * Write priority:
-   *   1. Electron `safeStorage` (desktop — OS keystore-backed).
-   *   2. `AtRestCipher` fallback (mobile / safeStorage-less hosts — same LAK
-   *      that encrypts vault content; on mobile its KEK lives in vault-local storage
-   *      since there's no OS keystore exposed to the renderer).
-   *
-   * If BOTH paths are unavailable we DO NOT touch existing on-disk state —
-   * the in-memory session keeps working for this run, the user is warned
-   * once, and the next plugin launch will require re-auth. We never silently
-   * delete the previously-stored session, and we never write a plaintext
-   * fallback.
-   */
   private async persistSession(session: UserSession): Promise<void> {
-    const bindingId = this.getSessionBindingId();
-    if (!bindingId) return;
-
-    // Wave 2 issue A (1.0.31): stamp the last-known vaultMemberRole
-    // onto the session before sealing. On the next plugin reload,
-    // restoreSession reads this back so the initial warmup uses the
-    // real role instead of synthesizing one from session.role —
-    // closes the race that mattered for users whose org role and
-    // vault role disagree.
-    const sessionToPersist: UserSession = {
-      ...session,
-      vaultMemberRole: this.vaultMemberRole ?? session.vaultMemberRole ?? null,
-    };
-
-    let protectedSession = this.protectSessionForStorage(sessionToPersist);
-    if (!protectedSession) {
-      // Desktop with broken keychain or mobile renderer — try the at-rest
-      // cipher before warning. On mobile this is the normal path and the
-      // user shouldn't see any Notice at all.
-      protectedSession = await this.protectSessionWithAtRest(sessionToPersist);
-    }
-    if (!protectedSession) {
-      this.notifySafeStorageUnavailable();
-      return;
-    }
-
-    this.persistedSessions[bindingId] = protectedSession;
-    try {
-      this.app.saveLocalStorage(this.getSessionStorageKey(bindingId), protectedSession);
-    } catch (error) {
-      this.logError("Failed to persist session to Obsidian local storage", error);
-    }
-
-    try {
-      await this.savePluginData();
-      this.log(`Session persisted for ${session.displayName}`);
-    } catch (error) {
-      this.logError("Failed to persist session to Obsidian data store", error);
-    }
+    await this.getSettingsRuntime().persistSession(session);
   }
 
-  /**
-   * Clears the stored session from vault-local storage and Obsidian's plugin data
-   * store. This is the explicit-logout path and IS allowed to wipe — distinct
-   * from `persistSession`'s no-silent-wipe rule on encryption failure.
-   */
   private async clearStoredSession(): Promise<void> {
-    const bindingId = this.getSessionBindingId();
-    if (!bindingId) return;
-
-    delete this.persistedSessions[bindingId];
-    this.removeStoredSessionKey(bindingId);
-
-    try {
-      await this.savePluginData();
-    } catch (error) {
-      this.logError("Failed to remove persisted session from Obsidian data store", error);
-    }
-
-    this.log("Stored session cleared.");
+    await this.getSettingsRuntime().clearStoredSession();
   }
 
-  /**
-   * One-shot user warning when *no* secure session storage is available —
-   * neither Electron's `safeStorage` nor the local `AtRestCipher`. This is
-   * the truly degraded state (e.g. broken Linux keyring AND a cipher in
-   * needs-recovery). On mobile Obsidian the at-rest cipher takes over
-   * transparently and this Notice never fires.
-   *
-   * The in-memory session keeps working for the current run; the user just
-   * has to log in again next launch.
-   */
-  private notifySafeStorageUnavailable(): void {
-    if (this.safeStorageUnavailableNotified) return;
-    this.safeStorageUnavailableNotified = true;
-    this.log(
-      "No secure session storage available (safeStorage unreachable AND at-rest cipher unavailable) — session will not be persisted to disk."
-    );
-    new Notice(
-      "VaultGuard Sync: Your platform doesn't expose secure credential storage. " +
-      "You'll need to log in each time the plugin loads — we never store " +
-      "auth tokens in plaintext.",
-      10000
-    );
-  }
-
-  /**
-   * Filters the on-load `storedSessions` map down to entries that look like
-   * a recognised envelope (either safeStorage- or AtRestCipher-sealed).
-   * Anything else is dropped — we don't carry broken or foreign blobs
-   * through to subsequent saves.
-   */
   private normalizePersistedSessions(
     storedSessions: Record<string, unknown> | undefined
   ): Record<string, unknown> {
-    if (!storedSessions || typeof storedSessions !== "object") return {};
-
-    const normalized: Record<string, unknown> = {};
-    for (const [bindingId, value] of Object.entries(storedSessions)) {
-      if (!value || typeof value !== "object") continue;
-      const envelope = value as Partial<ProtectedSessionEnvelope>;
-      const storage = envelope.storage;
-      if (
-        envelope.v === 1 &&
-        (storage === "electron-safe-storage" || storage === "at-rest-cipher") &&
-        this.isNonEmptyString(envelope.ciphertext)
-      ) {
-        normalized[bindingId] = value;
-      }
-    }
-    return normalized;
+    return this.getSettingsRuntime().normalizePersistedSessions(storedSessions);
   }
 
-  /**
-   * Validates a decrypted session payload and produces a fully-typed
-   * `UserSession`. Strict: every required field must be present and a
-   * non-empty string of the expected shape. Returns `null` on any defect
-   * so the caller forces re-auth rather than running with a partial session.
-   */
   private materializeSession(parsed: Partial<UserSession> | null): UserSession | null {
-    if (!parsed || typeof parsed !== "object") return null;
-    if (
-      !this.isNonEmptyString(parsed.userId) ||
-      !this.isNonEmptyString(parsed.refreshToken) ||
-      !this.isNonEmptyString(parsed.idToken) ||
-      !this.isNonEmptyString(parsed.accessToken) ||
-      !this.isNonEmptyString(parsed.tokenExpiresAt) ||
-      !this.isNonEmptyString(parsed.organizationId) ||
-      !this.isNonEmptyString(parsed.displayName) ||
-      !this.isNonEmptyString(parsed.email) ||
-      !this.isValidSessionRole(parsed.role) ||
-      !this.isNonEmptyString(parsed.createdAt)
-    ) {
-      return null;
-    }
-
-    const roles = Array.isArray(parsed.roles)
-      ? parsed.roles.filter((role): role is string => this.isNonEmptyString(role))
-      : [];
-
-    return {
-      sessionId: this.isNonEmptyString(parsed.sessionId) ? parsed.sessionId : "",
-      userId: parsed.userId,
-      organizationId: parsed.organizationId,
-      displayName: parsed.displayName,
-      email: parsed.email,
-      accessToken: parsed.accessToken,
-      idToken: parsed.idToken,
-      refreshToken: parsed.refreshToken,
-      tokenExpiresAt: parsed.tokenExpiresAt,
-      role: parsed.role,
-      roles: roles.length > 0 ? roles : [parsed.role],
-      createdAt: parsed.createdAt,
-      // Wave 2 issue A (1.0.31): preserve the last-known vault role
-      // across plugin reloads. Optional, so older envelopes without
-      // the field stay valid; `null` means "we don't know, fall back
-      // to the synthesized derivation".
-      vaultMemberRole: this.isValidVaultMemberRole(parsed.vaultMemberRole)
-        ? parsed.vaultMemberRole
-        : null,
-    };
+    return this.getSettingsRuntime().materializeSession(parsed);
   }
-
-  private isValidVaultMemberRole(
-    value: unknown
-  ): value is "admin" | "editor" | "viewer" {
-    return value === "admin" || value === "editor" || value === "viewer";
-  }
-
-  private isValidSessionRole(value: unknown): value is UserSession["role"] {
-    return (
-      value === "member" ||
-      value === "editor" ||
-      value === "admin" ||
-      value === "owner"
-    );
-  }
-
-  private isNonEmptyString(value: unknown): value is string {
-    return typeof value === "string" && value.trim().length > 0;
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
   // Utility Methods
   // ─────────────────────────────────────────────────────────────────────────
 

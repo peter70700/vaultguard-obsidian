@@ -18,6 +18,13 @@ import type { PermissionLevel } from "../../types";
  */
 export interface GraphPermissionDeps {
   isPathExcluded(path: string): boolean;
+  /**
+   * Optional defense-in-depth denylist maintained outside Obsidian's native
+   * metadata cache. When a permission-change sweep proves a path is NONE,
+   * VaultGuard graph/agent metadata must suppress it even if Obsidian still
+   * has stale backlinks/tags in memory.
+   */
+  isMetadataSuppressed?: (path: string) => boolean;
   getPermission(path: string): Promise<PermissionLevel>;
   matchesLeaseScope(path: string): boolean;
 }

@@ -63,6 +63,8 @@ interface HeaderContext {
    * after every org-settings refresh.
    */
   allowAdminPerFileRestrictions?: boolean;
+  /** When provided and returns false, the banner is suppressed (settings toggle). */
+  isEnabled?: () => boolean;
 }
 
 interface RuleCacheEntry {
@@ -136,6 +138,14 @@ export class FilePermissionHeader {
    * Injects (or updates) the permission header for the currently visible file.
    */
   async update(options: { force?: boolean } = {}): Promise<void> {
+    // Settings gate: when the "Show permission banner in notes" toggle is off,
+    // tear the banner down and make the file-open / active-leaf-change
+    // listeners no-ops while disabled.
+    if (this.ctx.isEnabled && !this.ctx.isEnabled()) {
+      this.remove();
+      return;
+    }
+
     const view = this.ctx.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view || !view.file) {
       this.remove();

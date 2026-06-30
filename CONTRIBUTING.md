@@ -1,7 +1,8 @@
 # Contributing to VaultGuard
 
-VaultGuard is fair-code under the [Sustainable Use License](LICENSE). Contributions
-land in the public monorepo at https://github.com/peter70700/vaultguard-obsidian.
+VaultGuard public artifacts are fair-code under Sustainable Use License terms.
+Contributions land in the public monorepo at
+https://github.com/peter70700/vaultguard-obsidian.
 
 ## Code of Conduct
 
@@ -48,6 +49,19 @@ issues Biome can fix safely. Run it before committing if your editor doesn't.
 
 The `build-test-lint` job in `.github/workflows/ci.yml` enforces all four checks
 on every PR — keep your local run green before pushing.
+
+### Documentation Changes
+
+Use [docs/INDEX.md](docs/INDEX.md) as the canonical documentation map. When a
+change affects vault scoping, file APIs, permissions, auth, security posture,
+operations, testing, or release behavior, update the relevant docs in the same
+PR and prefer repository-backed statements over roadmap language.
+
+For file, permission, audit, and share-link APIs, keep
+[docs/VAULTS.md](docs/VAULTS.md) and [docs/API.md](docs/API.md) aligned with the
+handlers. Every file/permission API path must remain under
+`/vaults/{vaultId}/...`; root `/files/*` and `/permissions/*` routes are not part
+of the current contract.
 
 ## Release Ritual (maintainer)
 

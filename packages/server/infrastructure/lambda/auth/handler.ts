@@ -4,7 +4,8 @@
  * Manages user authentication, session lifecycle, and cryptographic key leases.
  *
  * Endpoints:
- * - POST /auth/login           — Validate Cognito token, create session, return key lease
+ * - POST /auth/login           — Validate Cognito token, create session envelope
+ * - POST /auth/session         — Validate Cognito token, create session envelope
  * - POST /auth/refresh         — Refresh session and key lease
  * - POST /auth/logout          — Invalidate session, trigger client cache wipe
  * - GET  /auth/key-lease       — Issue time-limited decryption key lease

@@ -67,7 +67,9 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   cacheEncryptionStrength: "standard",
   offlineKeyLeaseDuration: 24,
   autoWipeOnAuthFailure: false,
-  showPermissionIndicators: true,
+  showMyPermissionLevel: true,
+  showOthersAccess: true,
+  showPermissionBanner: true,
   defaultConflictResolution: ConflictResolutionStrategy.ASK_USER,
   debugLogging: false,
   maxRetryAttempts: 3,
@@ -2199,17 +2201,47 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Display").setHeading();
 
     new Setting(containerEl)
-      .setName("Show permission indicators")
+      .setName("Show my permission level")
       .setDesc(
-        "Display permission level icons (lock, pencil, shield) next to files in the file explorer."
+        "Show a colored dot for your own access level (admin / write / read / none) next to each file in the file explorer."
       )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.showPermissionIndicators)
+          .setValue(this.plugin.settings.showMyPermissionLevel)
           .onChange(async (value) => {
-            this.plugin.settings.showPermissionIndicators = value;
+            this.plugin.settings.showMyPermissionLevel = value;
             await this.plugin.saveSettings();
             this.plugin.refreshFileExplorerDecorations();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Show who else has access")
+      .setDesc(
+        "Show avatar chips for other people and roles that can access a file, next to it in the file explorer."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.showOthersAccess)
+          .onChange(async (value) => {
+            this.plugin.settings.showOthersAccess = value;
+            await this.plugin.saveSettings();
+            this.plugin.refreshFileExplorerDecorations();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Show permission banner in notes")
+      .setDesc(
+        "Show a banner at the top of each open note with your access level and a quick way to manage sharing."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.showPermissionBanner)
+          .onChange(async (value) => {
+            this.plugin.settings.showPermissionBanner = value;
+            await this.plugin.saveSettings();
+            this.plugin.refreshFilePermissionHeader();
           })
       );
 

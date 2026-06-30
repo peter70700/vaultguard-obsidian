@@ -70,6 +70,10 @@ export class FileExplorerDecorations {
   private vaultMembersLoaded = false;
   private vaultMembersLoadPromise: Promise<void> | null = null;
   private batchAccessUnavailable = false;
+  /** Render the current user's own level dot. Driven by the settings toggle. */
+  private showMyLevel = true;
+  /** Render other principals' avatar chips. Driven by the settings toggle. */
+  private showOthersAccess = true;
 
   constructor(config: FileExplorerDecorationsConfig) {
     this.config = config;
@@ -156,6 +160,17 @@ export class FileExplorerDecorations {
     if (this.enabled) {
       this.scheduleDecorate();
     }
+  }
+
+  /**
+   * Toggles which indicators the decorator renders: the dot reflects the
+   * current user's own level, the avatar stack reflects others' access. The
+   * decorator itself stays active while either is on — the inaccessible-file
+   * hiding behavior is bundled with the decorator running, not with either dot.
+   */
+  setDisplayOptions(opts: { showMyLevel: boolean; showOthersAccess: boolean }): void {
+    this.showMyLevel = opts.showMyLevel;
+    this.showOthersAccess = opts.showOthersAccess;
   }
 
   /**
@@ -433,14 +448,17 @@ export class FileExplorerDecorations {
 
     const decoration = createDiv({ cls: DECORATION_CLS });
 
-    // Permission level dot
-    const levelDot = decoration.createSpan({
-      cls: `vaultguard-fe-level-dot vaultguard-fe-dot-${data.level}`,
-    });
-    levelDot.title = this.formatLevel(data.level);
+    // Permission level dot — the current user's own access level.
+    if (this.showMyLevel) {
+      const levelDot = decoration.createSpan({
+        cls: `vaultguard-fe-level-dot vaultguard-fe-dot-${data.level}`,
+      });
+      levelDot.title = this.formatLevel(data.level);
+    }
 
-    // Sharing indicator — only show if shared with others
-    if (data.sharedWith > 0) {
+    // Sharing indicator — others' access. Only when that toggle is on and the
+    // file is actually shared with someone.
+    if (this.showOthersAccess && data.sharedWith > 0) {
       const shareIndicator = decoration.createSpan({
         cls: "vaultguard-fe-share-indicator",
       });

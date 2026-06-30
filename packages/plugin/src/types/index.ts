@@ -389,8 +389,21 @@ export interface VaultGuardSettings {
   offlineKeyLeaseDuration: number;
   /** Whether to wipe local cache on authentication failure */
   autoWipeOnAuthFailure: boolean;
-  /** Show permission level indicators in the file explorer */
-  showPermissionIndicators: boolean;
+  /**
+   * @deprecated Legacy single "show permission indicators" toggle. Split into
+   * the three granular toggles below (`showMyPermissionLevel`,
+   * `showOthersAccess`, `showPermissionBanner`). Retained as optional so
+   * persisted `data.json` that predates the split still type-checks and the
+   * one-time migration in `loadSettings()` can consume it. No live code reads
+   * this field except that migration's raw-`data` read.
+   */
+  showPermissionIndicators?: boolean;
+  /** Show a colored dot for the current user's own access level in the file explorer. */
+  showMyPermissionLevel: boolean;
+  /** Show avatar chips for other principals' access next to a file in the file explorer. */
+  showOthersAccess: boolean;
+  /** Show the per-note permission banner at the top of open notes. */
+  showPermissionBanner: boolean;
   /** Default conflict resolution strategy */
   defaultConflictResolution: ConflictResolutionStrategy;
   /** Enable detailed debug logging */

@@ -22,15 +22,18 @@ export interface AuthTokens {
   expiresAt: number; // Unix timestamp in ms
 }
 
-export interface LoginRequest {
-  email: string;
-  password: string;
-  mfaCode?: string;
+export interface ServerSessionRequest {
+  /** Optional bound vault used by the backend for login audit attribution. */
+  vaultId?: string;
 }
 
-export interface LoginResponse {
-  tokens: AuthTokens;
-  user: UserInfo;
+export interface ServerSessionResponse {
+  sessionId: string;
+  userId: string;
+  email: string;
+  roles: string[];
+  expiresAt: string;
+  orgSettings: OrgSettingsResponse;
 }
 
 export interface UserInfo {
@@ -529,12 +532,9 @@ export class VaultGuardApiClient {
 
   // ─── Auth Methods ───────────────────────────────────────────────────
 
-  async login(request: LoginRequest): Promise<LoginResponse> {
-    const response = await this.rawRequest<LoginResponse>("POST", "/auth/login", request, {
-      skipAuth: true,
-    });
-    this.tokens = response.tokens;
-    return response;
+  async openServerSession(input: ServerSessionRequest = {}): Promise<ServerSessionResponse> {
+    const body = input.vaultId ? { vaultId: input.vaultId } : undefined;
+    return this.request<ServerSessionResponse>("POST", "/auth/session", body);
   }
 
   async logout(): Promise<void> {
@@ -1087,15 +1087,9 @@ export class VaultGuardApiClient {
   private async rawRequest<T>(
     method: string,
     path: string,
-    body?: unknown,
-    options?: { skipAuth?: boolean }
+    body?: unknown
   ): Promise<T> {
-    const headers: Record<string, string> = {};
-
-    if (!options?.skipAuth) {
-      const authHeaders = await this.getAuthHeaders();
-      Object.assign(headers, authHeaders);
-    }
+    const headers = await this.getAuthHeaders();
 
     const response = await this.sendRequest(method, path, {
       headers,
