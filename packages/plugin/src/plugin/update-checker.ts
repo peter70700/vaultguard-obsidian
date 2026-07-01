@@ -10,6 +10,10 @@
 
 import { Notice, requestUrl } from "obsidian";
 import type VaultGuardPlugin from "./main";
+import {
+  UpdateAvailableModal,
+  type UpdateAvailableModalData,
+} from "../ui/update-available-modal";
 
 const RELEASES_API_URL =
   "https://api.github.com/repos/peter70700/vaultguard-obsidian/releases/latest";
@@ -96,15 +100,36 @@ export class UpdateChecker {
           typeof (response.json as { html_url?: unknown }).html_url === "string"
             ? (response.json as { html_url: string }).html_url
             : RELEASES_PAGE_URL;
+        const body =
+          typeof (response.json as { body?: unknown }).body === "string"
+            ? (response.json as { body: string }).body
+            : "";
+        const name =
+          typeof (response.json as { name?: unknown }).name === "string"
+            ? (response.json as { name: string }).name
+            : "";
 
         if (tagName) {
           latest = tagName;
           const current = this.plugin.manifest.version;
           if (compareVersions(tagName, current) > 0) {
             isNewer = true;
-            if (opts.force || tagName !== state.lastSeenVersion) {
-              this.notifyNewVersion(current, tagName, htmlUrl);
+            // Rich modal on manual/force AND on the first sighting of a
+            // version; quiet toast on later background repeats of that same
+            // version. Setting lastSeenVersion inside the modal branch keeps
+            // the existing dedupe invariant intact.
+            const firstSighting = tagName !== state.lastSeenVersion;
+            if (opts.force || firstSighting) {
+              this.showUpdateModal({
+                current,
+                latest: tagName,
+                releaseUrl: htmlUrl,
+                releaseName: name,
+                notes: body,
+              });
               state.lastSeenVersion = tagName;
+            } else {
+              this.notifyNewVersion(current, tagName, htmlUrl);
             }
           }
         }
@@ -123,6 +148,24 @@ export class UpdateChecker {
     }
 
     return { latest, isNewer };
+  }
+
+  /**
+   * Opens the rich update-available modal. Kept as a thin, spy-able seam so
+   * unit tests (node env, no DOM) can stub it without constructing the modal.
+   */
+  private showUpdateModal(data: UpdateAvailableModalData): void {
+    // Attach onUpdate at construction ONLY — the parameter shape (the 5 fields
+    // current/latest/releaseUrl/releaseName/notes) stays unchanged, so the
+    // showUpdateModal spy in tests keeps matching objectContaining those fields.
+    new UpdateAvailableModal(this.plugin.app, {
+      ...data,
+      onUpdate: () => {
+        // openCommunityPluginsForUpdate is now async (it awaits a bounded
+        // update-list refresh); void the returned promise here.
+        void this.plugin.openCommunityPluginsForUpdate();
+      },
+    }).open();
   }
 
   private notifyNewVersion(current: string, latest: string, releaseUrl: string): void {

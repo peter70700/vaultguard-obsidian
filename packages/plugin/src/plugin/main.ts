@@ -3720,6 +3720,73 @@ export default class VaultGuardPlugin extends Plugin {
     new Notice("VaultGuard Sync: Open Settings → Community plugins → VaultGuard Sync.");
   }
 
+  /**
+   * Opens Obsidian's own Settings → Community plugins screen — the built-in tab
+   * that hosts each installed plugin's native Update button — after AWAITING a
+   * best-effort, read-only refresh of Obsidian's available-updates list. Waiting
+   * for the (async) refresh means the tab renders with the update already known,
+   * so Obsidian's per-plugin Update button is visible on arrival instead of
+   * appearing only after the user re-opens the tab a moment later.
+   *
+   * Policy: Obsidian's Developer Policies list updating the plugin itself under
+   * "Not allowed", so VaultGuard must never download, replace, or self-apply its
+   * own binary. This method therefore ONLY navigates to Obsidian's native
+   * updater plus a read-only refresh of the available-updates list; the real
+   * update is performed by Obsidian's built-in Update button, on the user's
+   * explicit action. It never touches the plugin binary on disk.
+   */
+  async openCommunityPluginsForUpdate(): Promise<void> {
+    // Best-effort, READ-ONLY refresh of Obsidian's available-updates list.
+    // Reaches into Obsidian's internal plugin manager the same stable way
+    // runAllowlistReconcileInternal does — not part of the public API but stable
+    // across releases for years. This only refreshes the list Obsidian shows; it
+    // is NOT an update mechanism and never installs anything.
+    const pm = (this.app as unknown as {
+      plugins?: { checkForUpdates?: () => unknown };
+    }).plugins;
+    if (pm?.checkForUpdates) {
+      // Immediate feedback while the (network) refresh runs.
+      new Notice("VaultGuard Sync: Checking for updates…");
+      try {
+        const result = pm.checkForUpdates();
+        // checkForUpdates is async (fetches the community registry to populate
+        // app.plugins.updates). AWAIT it so the Community plugins tab renders
+        // AFTER the update is known — otherwise Obsidian's per-plugin Update
+        // button isn't shown yet. Bounded so a hung network can't stall the UI.
+        if (result && typeof (result as { then?: unknown }).then === "function") {
+          await Promise.race([
+            result as Promise<unknown>,
+            new Promise<void>((resolve) => window.setTimeout(resolve, 10_000)),
+          ]);
+        }
+      } catch {
+        // Best-effort — still open the tab on failure.
+      }
+    }
+
+    const settingsApp = this.app as unknown as {
+      setting?: {
+        open?: () => void;
+        openTabById?: (id: string) => void;
+      };
+    };
+
+    try {
+      if (settingsApp.setting?.open && settingsApp.setting?.openTabById) {
+        settingsApp.setting.open();
+        // Obsidian's built-in Community plugins tab (id "community-plugins")
+        // hosts every plugin's native Update button — this is NOT the plugin's
+        // own settings tab (this.manifest.id); do not substitute it here.
+        settingsApp.setting.openTabById("community-plugins");
+        return;
+      }
+    } catch (error) {
+      this.logError("Could not open Community plugins for update", error);
+    }
+
+    new Notice("VaultGuard Sync: Open Settings → Community plugins to update VaultGuard Sync.");
+  }
+
   private showVaultGuardMenu(evt?: MouseEvent): void {
     const menu = new Menu();
     const isLoggedIn = !!this.session;

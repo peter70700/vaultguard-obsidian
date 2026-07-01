@@ -12,14 +12,25 @@ terraform {
     }
   }
 
-  # Local backend for dev/testing. Switch to S3 for shared team state:
-  #   backend "s3" {
-  #     bucket         = "your-terraform-state-bucket"
-  #     key            = "vaultguard/terraform.tfstate"
-  #     region         = "us-east-1"
-  #     dynamodb_table = "terraform-locks"
-  #     encrypt        = true
-  #   }
+  # Remote state — versioned + encrypted S3 with DynamoDB locking.
+  #
+  # The bucket and lock table are created out-of-band by
+  # scripts/bootstrap-tf-backend.sh (these names must match its defaults).
+  # After the first `terraform init -migrate-state`, the on-disk
+  # terraform.tfstate is copied here and locking is enforced.
+  #
+  # NOTE on the "prod" key: this single stack runs production
+  # (example.com) even though its `stage` variable is "dev". The state
+  # key is named prod for clarity; the `stage` var must NOT be changed —
+  # renaming would recreate every resource and destroy production.
+  # Backend blocks cannot reference variables, so these values are literal.
+  backend "s3" {
+    bucket         = "vaultguard-tfstate-eu-central-1"
+    key            = "vaultguard/prod/terraform.tfstate"
+    region         = "eu-central-1"
+    dynamodb_table = "vaultguard-terraform-locks"
+    encrypt        = true
+  }
 }
 
 provider "aws" {

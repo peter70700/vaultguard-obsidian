@@ -5016,6 +5016,32 @@ button .vaultguard-btn-spinner:only-child {
   margin: 4px 0 12px;
 }
 
+/* Update-available modal — richer "new release" surface (manual + first-per-version). */
+.modal.vaultguard-update-modal {
+  width: 560px;
+  max-width: calc(100vw - 32px);
+}
+.vaultguard-update-modal-versions {
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+.vaultguard-update-modal-notes {
+  margin: 0;
+  white-space: pre-wrap;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background-color: var(--background-secondary);
+  font-family: var(--font-text, inherit);
+  font-size: var(--font-ui-small, 12px);
+}
+.vaultguard-update-modal-notes-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small, 12px);
+  margin-bottom: 4px;
+}
+
 /* ── Vault-wide permission rules manager (admin-panel-style table) ───────── */
 .vaultguard-rules-modal {
   width: min(900px, 92vw);
