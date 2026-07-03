@@ -15,6 +15,28 @@ variable "stage" {
   }
 }
 
+variable "production_hardening" {
+  description = <<-EOT
+    Enable production-grade data-durability and log-privacy protections
+    INDEPENDENTLY of the stage name. This exists because the live production
+    stack (example.com) runs with stage="dev", so the historical
+    `stage == "prod"` gate left production without these protections.
+
+    When true (the default — secure by default): API Gateway request/response
+    body tracing is DISABLED (so plaintext key-lease DEKs are never written to
+    CloudWatch), the vault S3 bucket is force_destroy=false, DynamoDB tables get
+    PITR + deletion protection, Secrets Manager / KMS use 30-day recovery
+    windows, and S3 keeps 365-day / 10-version noncurrent history.
+
+    Set to false ONLY for genuinely disposable stacks (ephemeral CI, throwaway
+    local test envs) that must be torn down freely. Does NOT change any
+    authentication posture — Cognito MFA and advanced-security remain gated on
+    the stage name so enabling hardening never forces MFA on existing users.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "admin_email" {
   description = "Email address for admin SNS notifications"
   type        = string
@@ -84,6 +106,18 @@ variable "vaultguard_allow_public_signup" {
   description = "When true, Community Edition keeps POST /signup open after the first organization is created."
   type        = bool
   default     = false
+}
+
+variable "super_admin_emails" {
+  description = "Comma-separated lowercase emails allowed to call the /superadmin/* platform-stats API. Fail-closed: empty disables the API entirely. Set per-stage in environments/<stage>.tfvars."
+  type        = string
+  default     = ""
+}
+
+variable "billing_exempt_domains" {
+  description = "Comma-separated email domains whose new orgs are billing-exempt (owner-domain match stamps the Subscriptions row comped=true at signup). Empty disables domain exemption. Set per-stage in environments/<stage>.tfvars."
+  type        = string
+  default     = ""
 }
 
 variable "turnstile_secret_arn" {

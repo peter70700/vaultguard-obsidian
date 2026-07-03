@@ -353,7 +353,16 @@ export async function cognitoRefresh(
   const data = response.json;
 
   if (response.status < 200 || response.status >= 300) {
-    throw new Error(data.message || "Token refresh failed");
+    // PL4: carry Cognito's error __type (e.g. NotAuthorizedException for an
+    // expired/revoked refresh token or a disabled user) so callers can tell a
+    // TERMINAL rejection apart from a transient network/throttling failure.
+    const err = new Error(data.message || "Token refresh failed") as Error & {
+      cognitoErrorType?: string;
+    };
+    if (typeof data.__type === "string" && data.__type) {
+      err.cognitoErrorType = data.__type.split("#").pop();
+    }
+    throw err;
   }
 
   const result = data.AuthenticationResult;
@@ -363,6 +372,41 @@ export async function cognitoRefresh(
     refreshToken: refreshToken, // Cognito doesn't always return a new refresh token
     expiresIn: result.ExpiresIn,
   };
+}
+
+/**
+ * Revoke a Cognito refresh token (RevokeToken API). After revocation the
+ * token can never mint new access/id tokens — required so logout actually
+ * invalidates the credential rather than only deleting local copies (PL6:
+ * a lingering data.json backup otherwise stays a working key). Requires
+ * token revocation to be enabled on the app client (Cognito's default).
+ */
+export async function cognitoRevokeToken(
+  userPoolId: string,
+  clientId: string,
+  refreshToken: string
+): Promise<void> {
+  const region = userPoolId.split("_")[0];
+  const endpoint = `https://cognito-idp.${region}.amazonaws.com/`;
+
+  const response = await requestUrl({
+    url: endpoint,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-amz-json-1.1",
+      "X-Amz-Target": "AWSCognitoIdentityProviderService.RevokeToken",
+    },
+    body: JSON.stringify({
+      ClientId: clientId,
+      Token: refreshToken,
+    }),
+    throw: false,
+  });
+
+  if (response.status < 200 || response.status >= 300) {
+    const data = response.json;
+    throw new Error(data?.message || "Token revocation failed");
+  }
 }
 
 /**

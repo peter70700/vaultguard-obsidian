@@ -42,6 +42,9 @@ import {
   PLAN_LIMITS,
   VaultRecord,
   VaultMemberRecord,
+  parseExemptDomains,
+  isBillingExemptEmail,
+  isReservedGroupName,
 } from '../shared/utils';
 import { EDITION, FEATURES } from '../shared/edition';
 import { sendEmail } from '../email/handler';
@@ -52,6 +55,15 @@ const REGION = process.env.AWS_REGION || 'eu-central-1';
 const USER_POOL_ID = process.env.USER_POOL_ID!;
 const CLIENT_ID = process.env.CLIENT_ID!;
 const TURNSTILE_SECRET_ARN = process.env.TURNSTILE_SECRET_ARN || '';
+
+// Email domains flagged as internal/company accounts. LA6: a domain match is
+// NOT proof of mailbox ownership (signup never verifies email), so it no
+// longer self-grants `comped` — it only stamps an inert
+// `billingExemptDomain: true` marker on the Subscriptions row. An operator
+// flips `comped: true` deliberately (superadmin/console) after recognizing
+// the org; until then exempt-domain orgs sit in `pending_checkout` like
+// everyone else.
+const BILLING_EXEMPT_DOMAINS = parseExemptDomains(process.env.BILLING_EXEMPT_DOMAINS);
 
 const cognitoClient = new CognitoIdentityProviderClient({ region: REGION });
 
@@ -331,6 +343,11 @@ async function handleSignup(
 
   // Step 3: Create Cognito group for the org and add user
   const groupName = `org-${orgSlug}`;
+  // Reserved-group guard: request-derived group names must never collide with
+  // a privileged platform group (e.g. platform-superadmin).
+  if (isReservedGroupName(groupName) || isReservedGroupName(orgSlug)) {
+    return formatError(400, 'Requested group name is reserved', requestId);
+  }
   try {
     await cognitoClient.send(
       new CreateGroupCommand({
@@ -412,12 +429,28 @@ async function handleSignup(
     status: 'active',
   };
 
-  await docClient.send(
-    new PutCommand({
-      TableName: ORGANIZATIONS_TABLE,
-      Item: orgRecord,
-    })
-  );
+  // LA5: make slug uniqueness atomic. The Step-1 Get check is a TOCTOU — two
+  // concurrent signups for the same slug both pass it, then the second Put
+  // overwrites the first org's record (orgId/owner/tier), so the first owner's
+  // Cognito custom:org points at a row that now belongs to someone else. A
+  // conditional write makes the Put itself the uniqueness gate; the Get stays a
+  // fast-path.
+  try {
+    await docClient.send(
+      new PutCommand({
+        TableName: ORGANIZATIONS_TABLE,
+        Item: orgRecord,
+        ConditionExpression: 'attribute_not_exists(slug)',
+      })
+    );
+  } catch (err: unknown) {
+    if (err && typeof err === 'object' && (err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      // Lost the race — another concurrent signup claimed this slug between the
+      // Step-1 Get and now. Same response as the Step-1 check.
+      return formatError(409, `Organization slug "${orgSlug}" is already taken`, requestId);
+    }
+    throw err;
+  }
 
   // Step 5b: Write a `pending_checkout` Subscriptions row so the new org is
   // visible to the billing surface (so it can complete checkout) but BLOCKED
@@ -427,6 +460,12 @@ async function handleSignup(
   // (`assertSubscriptionAllowsAccess` returns early when EDITION !== 'pro'),
   // so this row is harmless on self-hosts even though SUBSCRIPTIONS_TABLE
   // exists in their schema.
+  // LA6: exempt-domain owners are NOT auto-comped — email is never verified
+  // at signup, so anyone who learns an internal domain could self-grant a
+  // free active org. The domain match only leaves an inert
+  // `billingExemptDomain` marker for the operator, who comps the org
+  // deliberately; until then it is paywalled like every other signup.
+  const billingExempt = isBillingExemptEmail(email, BILLING_EXEMPT_DOMAINS);
   await docClient.send(
     new PutCommand({
       TableName: SUBSCRIPTIONS_TABLE,
@@ -434,6 +473,7 @@ async function handleSignup(
         orgId,
         plan: tier,
         status: 'pending_checkout',
+        ...(billingExempt ? { billingExemptDomain: true } : {}),
         cancelAtPeriodEnd: false,
         quantity: 1,
         createdAt: now,

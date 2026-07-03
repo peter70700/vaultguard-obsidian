@@ -1,11 +1,12 @@
 variable "stage" { type = string }
 variable "is_prod" { type = bool }
+variable "production_hardening" { type = bool }
 variable "account_id" { type = string }
 
 resource "aws_kms_key" "master" {
   description             = "Master encryption key for Obsidian VaultGuard vault data and per-user data keys"
   enable_key_rotation     = true
-  deletion_window_in_days = var.is_prod ? 30 : 7
+  deletion_window_in_days = var.production_hardening ? 30 : 7
 
   policy = jsonencode({
     Version = "2012-10-17"

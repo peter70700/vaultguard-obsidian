@@ -31,7 +31,10 @@ function makeJwt(payload: Record<string, unknown>): string {
 function jsonResponse(status: number, json: unknown) {
   return {
     status,
-    headers: { "content-type": "application/json" },
+    // X-Request-Id mirrors SECURITY_HEADERS: every real VaultGuard Lambda
+    // response carries it, and the endpoint resolver now requires a positive
+    // VaultGuard signal (AC-API2) — bare application/json no longer passes.
+    headers: { "content-type": "application/json", "x-request-id": "req-test" },
     json,
     text: JSON.stringify(json),
   } as any;
@@ -121,6 +124,24 @@ describe("VaultGuardApiClient", () => {
       "API endpoint appears to be pointing at a website or routed page"
     );
     expect(mockRequestUrl.mock.calls.length).toBeGreaterThan(2);
+  });
+
+  it("clearTokens() de-authenticates the client so the cached idToken can't be reused (PL3)", () => {
+    const client = new VaultGuardApiClient({
+      baseUrl: "https://api.example.com",
+      orgId: "org-123",
+    });
+    client.initialize({
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      idToken: makeJwt({ sub: "user-123" }),
+      expiresAt: Date.now() + 60_000,
+    });
+
+    expect(client.isAuthenticated()).toBe(true);
+    client.clearTokens();
+    expect(client.isAuthenticated()).toBe(false);
+    expect(client.getTokens()).toBeNull();
   });
 });
 
@@ -366,5 +387,61 @@ describe("VaultGuardApiClient agent-bridge context", () => {
     await expect(
       client.postBridgeAudit("bridge.lease_created", null, {})
     ).rejects.toThrow(/not bound to a server vault/);
+  });
+});
+
+// AC-API3: a timeout/5xx does NOT mean the server skipped the work — blindly
+// re-sending a POST doubles side effects (two invite emails, two share links,
+// two re-encryption jobs). Only idempotent verbs auto-retry; the 401-refresh
+// path stays safe for every verb (pre-execution rejection).
+describe("VaultGuardApiClient retry idempotency (AC-API3)", () => {
+  function makeClient() {
+    const idToken = makeJwt({ sub: "user-123" });
+    return new VaultGuardApiClient({
+      baseUrl: "https://api.vaultguard.test",
+      orgId: "org-123",
+      maxRetries: 2,
+      baseRetryDelayMs: 1,
+      maxRetryDelayMs: 2,
+      getAuthTokens: async () => ({
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        idToken,
+        expiresAt: Date.now() + 60_000,
+      }),
+    });
+  }
+
+  it("does NOT re-send a POST after a 5xx", async () => {
+    const client = makeClient();
+    mockRequestUrl
+      // Base-URL probe.
+      .mockResolvedValueOnce(jsonResponse(200, { vaults: [] }))
+      // The POST itself → 503. No retry may follow.
+      .mockResolvedValueOnce(jsonResponse(503, { message: "upstream blew up" }));
+
+    await expect(client.triggerReEncryption("user-9")).rejects.toThrow();
+
+    const triggerCalls = mockRequestUrl.mock.calls.filter((c) =>
+      String(c[0].url).includes("/re-encryption/trigger")
+    );
+    expect(triggerCalls).toHaveLength(1);
+  });
+
+  it("still retries idempotent GETs after a 5xx", async () => {
+    const client = makeClient();
+    const settingsPayload = { orgId: "org-123", syncMode: "periodic" };
+    mockRequestUrl
+      .mockResolvedValueOnce(jsonResponse(200, { vaults: [] }))
+      .mockResolvedValueOnce(jsonResponse(503, { message: "flaky" }))
+      .mockResolvedValueOnce(jsonResponse(200, settingsPayload));
+
+    const result = await client.getOrgSettings();
+
+    expect(result).toMatchObject({ orgId: "org-123" });
+    const settingsCalls = mockRequestUrl.mock.calls.filter((c) =>
+      String(c[0].url).includes("/orgs/org-123/settings")
+    );
+    expect(settingsCalls).toHaveLength(2);
   });
 });

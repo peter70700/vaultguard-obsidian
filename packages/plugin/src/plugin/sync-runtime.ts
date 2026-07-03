@@ -19,6 +19,18 @@ export interface LocalSyncManifestInput {
 }
 
 /**
+ * Discriminated outcome of a reconciliation upload. The distinction matters for
+ * data safety (SY2): only `skipped-no-permission` — and only once the
+ * permission store has actually warmed — may lead a caller to remove a
+ * local-only file. `skipped-no-lease` is transient (a lease may still return)
+ * and must never trigger deletion.
+ */
+export type UploadReconciledOutcome =
+  | "uploaded"
+  | "skipped-no-lease"
+  | "skipped-no-permission";
+
+/**
  * Sentinel filename uploaded into every server-side folder so the empty-folder
  * case isn't lost across the round-trip. Must match the backend marker name.
  */
@@ -320,7 +332,13 @@ export class SyncRuntime {
           totalFilesRemoved += result.removedLocalFiles;
           catchupChanges =
             result.uploadedFiles + result.uploadedFolders + result.removedLocalFiles;
-          this.ctx.setLocalOnlyCatchupCompleted(true);
+          // SY7: only mark catch-up complete when nothing failed. A transient
+          // upload/folder failure previously still flipped the flag true, so
+          // catch-up never re-ran (until forceCatchup) and the affected files
+          // stayed local-only and unsynced indefinitely.
+          this.ctx.setLocalOnlyCatchupCompleted(
+            result.failedFiles === 0 && result.failedFolders === 0
+          );
         }
       }
 
@@ -404,8 +422,26 @@ export class SyncRuntime {
           continue;
         }
 
+        // SY5: a path with a pending offline op is locally DIRTY — its queued
+        // write/delete never reached the server (limited-access skips the
+        // Phase-1 flush entirely). Applying the remote delta would overwrite
+        // the user's local edit with the older server copy, or delete a file
+        // they just changed. Leave the path alone; the flush and the next
+        // sync cycle reconcile it.
+        if (this.hasPendingOfflineOperation(normalizedPath)) {
+          this.ctx.log(
+            `Sync: skipping remote delta for "${normalizedPath}" — a queued local operation is pending.`
+          );
+          continue;
+        }
+
         if (delta.action === "deleted") {
-          await this.ctx.applyRemoteDeletion(normalizedPath);
+          // Cold-path (full-scan) deletions are INFERRED from manifest-vs-S3
+          // absence and must be recoverable; warm-path (activity-log) deletions
+          // are real events and delete permanently. Anything not explicitly
+          // "activity-log" is treated as inferred (the safe, recoverable side).
+          const inferred = response.data.mode !== "activity-log";
+          await this.ctx.applyRemoteDeletion(normalizedPath, inferred);
           continue;
         }
 
@@ -584,8 +620,34 @@ export class SyncRuntime {
     return this.ctx.decodeRemoteFileContent(normalizedPath, response.data);
   }
 
-  async applyRemoteDeletion(normalizedPath: string): Promise<void> {
+  async applyRemoteDeletion(normalizedPath: string, inferred: boolean): Promise<void> {
     if (!this.ctx.hasOriginalAdapterRemove()) return;
+
+    if (inferred) {
+      // Cold-path deletions are inferred from "in your manifest but not in S3",
+      // which cannot tell a real remote delete apart from a file this client
+      // never uploaded (edits made in limited-access mode, a memory-only offline
+      // queue lost across a restart, or a catch-up upload that failed). A
+      // routine event like an admin permission-rule change forces this cold
+      // path, so hard-deleting here permanently destroys never-uploaded local
+      // content. Per the never-wipe-on-ambiguity invariant, move the file to the
+      // vault's recoverable trash instead.
+      const trashed = await this.ctx.trashLocalPath(normalizedPath);
+      if (trashed) {
+        this.ctx.log(
+          `Sync: inferred deletion of "${normalizedPath}" moved to local trash (recoverable), not permanently deleted.`
+        );
+        return;
+      }
+      // No trash support → do NOT hard-delete. Leaving the file is safe: a
+      // genuinely-deleted file will re-arrive as a warm-path delete event later,
+      // and a never-uploaded file gets picked up by the next catch-up upload.
+      this.ctx.log(
+        `Sync: skipped inferred deletion of "${normalizedPath}" (no trash support; leaving file intact).`
+      );
+      return;
+    }
+
     try {
       await this.ctx.removeLocalPath(normalizedPath);
     } catch (err) {
@@ -651,8 +713,32 @@ export class SyncRuntime {
     }
   }
 
+  /**
+   * AR1: read a local file for the string-based sync pipeline, refusing
+   * binary content. Returns the decoded text when the on-disk bytes survive
+   * the pipeline losslessly (strict UTF-8 round-trip), or null for binary
+   * files — which callers must SKIP, mirroring interceptedWriteBinary's
+   * fail-closed "binary sync unsupported" policy. Uploading a lossy decode
+   * corrupts the server copy and propagates to every other client.
+   *
+   * Adapters without readBinary (legacy mobile) cannot detect binary content
+   * without changing text behavior, so they keep the legacy string read.
+   */
+  private async readTextForSync(path: string): Promise<string | null> {
+    if (!this.ctx.hasOriginalAdapterReadBinary()) {
+      return this.ctx.readPlainFromDisk(path);
+    }
+    const bytes = await this.ctx.readPlainBinaryFromDisk(path);
+    try {
+      // Same BOM handling as readPlainFromDisk's TextDecoder; fatal:true
+      // rejects (instead of U+FFFD-mangling) anything that isn't UTF-8 text.
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return null;
+    }
+  }
+
   async syncFileRenameToServer(oldPath: string, newPath: string): Promise<void> {
-    if (!this.ctx.isOnline() || !this.ctx.getKeyLease()) return;
     if (!this.ctx.hasOriginalAdapterRead()) return;
 
     const oldNormalized = this.ctx.normalizeVaultPath(oldPath);
@@ -664,9 +750,43 @@ export class SyncRuntime {
     const permission = await this.ctx.getEffectivePermission(newNormalized);
     if (permission < PermissionLevel.WRITE) return;
 
+    if (!this.ctx.isOnline() || !this.ctx.getKeyLease()) {
+      // SY4: offline/lease-less folder renames route every child through
+      // here, and a bare return orphaned them — the server kept old/*, the
+      // next repair resurrected it locally, and new/* stayed local-only
+      // (deletion-eligible). Queue both halves like interceptedRename and
+      // tombstone the old path so repair can't resurrect it before the
+      // flush lands.
+      try {
+        const text = await this.readTextForSync(newPath);
+        if (text === null) {
+          this.ctx.log(
+            `Rename sync: "${newPath}" is binary — binary sync is unsupported; skipping queued server move.`
+          );
+          return;
+        }
+        this.queueOfflineOperation("write", newNormalized, text);
+      } catch (err) {
+        this.ctx.logError(
+          `Rename sync: failed to queue offline write for "${newPath}"`,
+          err
+        );
+      }
+      this.recordDeletionTombstone(oldNormalized);
+      this.queueOfflineOperation("delete", oldNormalized);
+      return;
+    }
+
     let content: string;
     try {
-      content = await this.ctx.readPlainFromDisk(newPath);
+      const text = await this.readTextForSync(newPath);
+      if (text === null) {
+        this.ctx.log(
+          `Rename sync: "${newPath}" is binary — binary sync is unsupported; leaving the server copy untouched.`
+        );
+        return;
+      }
+      content = text;
     } catch (err) {
       this.ctx.log(
         `Rename sync: cannot read "${newPath}" (${err}); skipping server move.`
@@ -681,10 +801,17 @@ export class SyncRuntime {
       { content: encrypted, hash: await this.ctx.computeHash(content) }
     );
     if (!putResp.success) {
+      // SY3: the new-path PUT failed (5xx/403/offline). We must NOT delete the
+      // old server path — doing so would leave the server holding neither copy
+      // and lose the file. Queue the write for retry and return before the
+      // DELETE, mirroring interceptedRename's failure handling.
       this.ctx.logError(
-        `Rename sync: PUT "${newNormalized}" failed`,
+        `Rename sync: PUT "${newNormalized}" failed; deferring server move (old path left intact)`,
         new Error(putResp.error?.message ?? "unknown")
       );
+      this.queueOfflineOperation("write", newNormalized, content);
+      this.queueOfflineOperation("delete", oldNormalized);
+      return;
     }
 
     const delResp = await this.ctx.apiRequest(
@@ -741,15 +868,34 @@ export class SyncRuntime {
 
     const localFiles = this.ctx.app.vault.getFiles();
     const localManifest = new Map<string, { content: string; hash: string }>();
+    // SY6: paths that EXIST locally but could not be read this pass (transient
+    // decrypt hiccup, partial write). They must never be classified serverOnly
+    // and overwritten/emptied — the on-disk file is real content we simply
+    // couldn't read right now. Tracked separately so the serverOnly pass skips
+    // them and leaves the file untouched.
+    const unreadable = new Set<string>();
+    // AR1: binary files can't ride the string sync pipeline losslessly, so
+    // they are excluded from the manifest entirely — never uploaded (would
+    // corrupt the server copy) and, like `unreadable`, never classified
+    // serverOnly (the local file exists; overwriting it loses data).
+    const binaryLocal = new Set<string>();
     for (const file of localFiles) {
+      const normalized = this.ctx.normalizeVaultPath(file.path);
+      if (this.ctx.isPathExcluded(normalized)) continue;
       try {
-        const normalized = this.ctx.normalizeVaultPath(file.path);
-        if (this.ctx.isPathExcluded(normalized)) continue;
-        const content = await this.ctx.readPlainFromDisk(file.path);
+        const content = await this.readTextForSync(file.path);
+        if (content === null) {
+          binaryLocal.add(`/${normalized}`);
+          this.ctx.log(
+            `Reconciliation: skipping binary "${file.path}" — binary sync is unsupported.`
+          );
+          continue;
+        }
         const hash = await this.ctx.computeHash(content);
         localManifest.set(`/${normalized}`, { content, hash });
       } catch (err) {
         this.ctx.logError(`Reconciliation: failed to read local file "${file.path}"`, err);
+        unreadable.add(`/${normalized}`);
       }
     }
 
@@ -798,9 +944,28 @@ export class SyncRuntime {
     }> = [];
 
     for (const path of serverPaths) {
-      if (!localManifest.has(path)) {
-        serverOnly.push(path);
-      }
+      if (localManifest.has(path)) continue;
+      // SY6: a path that's on the server AND unreadable locally is NOT
+      // server-only — the local file exists, we just couldn't read it. Skip it
+      // so the reconciler never overwrites/empties the on-disk content.
+      if (unreadable.has(path)) continue;
+      // AR1: same guard for local binary files — the server copy (if any) is
+      // a lossy artifact of the pre-fix pipeline; never write it over the
+      // intact local bytes.
+      if (binaryLocal.has(path)) continue;
+      serverOnly.push(path);
+    }
+    if (binaryLocal.size > 0) {
+      new Notice(
+        `VaultGuard Sync: ${binaryLocal.size} binary file(s) were left local-only — binary attachments are not yet supported for protected sync.`,
+        8000
+      );
+    }
+    if (unreadable.size > 0) {
+      new Notice(
+        `VaultGuard Sync: ${unreadable.size} local file(s) could not be read this pass and were left untouched (not overwritten). Reopen the vault to retry; they will sync once readable.`,
+        8000
+      );
     }
     for (const [path, entry] of localManifest.entries()) {
       if (!serverPaths.has(path)) {
@@ -1020,13 +1185,15 @@ export class SyncRuntime {
     path: string,
     content: string,
     options: { noWriteNotice?: string } = {}
-  ): Promise<"uploaded" | "skipped"> {
+  ): Promise<UploadReconciledOutcome> {
     if (!this.hasValidKeyLease()) {
       this.ctx.log(`Reconciliation: skipping "${path}" — no encryption key lease available.`);
       new Notice(
         `VaultGuard Sync: Skipped upload of "${path}" — limited access sessions can download accessible files, but need a key lease to encrypt uploads.`
       );
-      return "skipped";
+      // SY2: transient (lease may return). Callers must NOT treat this as a
+      // reason to delete the local-only file.
+      return "skipped-no-lease";
     }
 
     const permission = await this.ctx.getEffectivePermission(path);
@@ -1036,7 +1203,7 @@ export class SyncRuntime {
         options.noWriteNotice ??
           `VaultGuard Sync: Skipped upload of "${path}" — you do not have write permission. The file stays in this folder but is not synced.`
       );
-      return "skipped";
+      return "skipped-no-permission";
     }
     const encrypted = await this.ctx.encryptContent(content);
     const response = await this.ctx.apiRequest(
@@ -1124,7 +1291,16 @@ export class SyncRuntime {
       if (serverFilePaths.has(lookupKey)) continue;
 
       try {
-        const content = await this.ctx.readPlainFromDisk(file.path);
+        const content = await this.readTextForSync(file.path);
+        if (content === null) {
+          // AR1: binary files must never ride the string upload path — the
+          // lossy decode corrupts the server copy. Leave them local-only.
+          skipped += 1;
+          this.ctx.log(
+            `Catch-up: skipping binary "${file.path}" — binary sync is unsupported.`
+          );
+          continue;
+        }
         const outcome = await this.ctx.uploadReconciledFile(normalized, content, {
           noWriteNotice:
             `VaultGuard Sync: Removed local-only "${normalized}" because this server vault ` +
@@ -1132,10 +1308,39 @@ export class SyncRuntime {
         });
         if (outcome === "uploaded") {
           uploaded += 1;
-        } else {
+          // A local-only text file usually means it was added OUTSIDE
+          // Obsidian (Finder drop while the app was closed, git checkout),
+          // so its on-disk form is still plaintext. Now that the server has
+          // the content, flip the local copy to at-rest ciphertext.
+          // Fire-and-forget: hygiene must never fail the catch-up loop.
+          void this.ctx.ensureAtRestEncryptedInPlace(normalized);
+        } else if (outcome === "skipped-no-lease") {
+          // SY2: the key lease expired/disappeared mid-loop. This is transient
+          // and applies to EVERY remaining file — continuing would return
+          // skipped-no-lease for all of them. Never remove a never-uploaded
+          // file for a transient reason; stop the loop and leave everything
+          // intact so the next sync (with a lease) can retry.
           skipped += 1;
-          if (await this.ctx.removeUnsyncedLocalFile(normalized)) {
-            removedLocal += 1;
+          this.ctx.log(
+            "Catch-up: key lease unavailable mid-catch-up — stopping; local-only files left intact for retry."
+          );
+          break;
+        } else {
+          // outcome === "skipped-no-permission": the user genuinely lacks write
+          // permission, so the file cannot be added to this vault. Only remove
+          // it once the permission store has actually WARMED — a cold or
+          // fetch-failed store can report a spurious NONE/viewer baseline, and
+          // deleting on that is the exact data-loss class we must avoid.
+          skipped += 1;
+          const storeState = this.ctx.getPermissionStoreState();
+          if (storeState.kind === "warmed") {
+            if (await this.ctx.removeUnsyncedLocalFile(normalized)) {
+              removedLocal += 1;
+            }
+          } else {
+            this.ctx.log(
+              `Catch-up: leaving local-only "${normalized}" in place — no write permission but the permission store is "${storeState.kind}", not warmed; refusing to delete on an unconfirmed baseline.`
+            );
           }
         }
       } catch (err) {
@@ -1321,9 +1526,14 @@ export class SyncRuntime {
     );
     if (!response.success && response.error?.statusCode !== 404) {
       this.ctx.logError(
-        `Folder marker delete for "${normalized}" failed`,
+        `Folder marker delete for "${normalized}" failed; queuing retry`,
         new Error(response.error?.message ?? "unknown")
       );
+      // SY8: a transient (non-404) failure used to be logged and forgotten, so
+      // the marker persisted and repair recreated the empty folder on the next
+      // sync/restart. Queue the marker delete so it retries via the offline
+      // flush / retryOutstandingDeletions, same durability as file deletes.
+      this.queueOfflineOperation("delete", markerPath);
     }
   }
 
@@ -1601,22 +1811,32 @@ export class SyncRuntime {
 
     const keyLease = this.ctx.getKeyLease();
     if (!keyLease) {
-      // Limited-access recovery path. Only retry when the previous attempt
-      // explicitly returned 403 - otherwise we'd hammer the API with lease
-      // requests for sessions that legitimately have no vault binding yet.
-      if (this.ctx.isVaultLeaseDenied() && this.ctx.getSettings().serverVaultId) {
+      // Recovery path. Retry when the previous attempt either returned 403
+      // (limited access — permissions may have widened) OR failed transiently
+      // (PL2 — a 5xx/network blip / a deferred startup refresh left a null
+      // lease). We deliberately do NOT retry for a plain null lease with
+      // neither flag set — that's a session with no vault binding yet, and
+      // hammering the API would be wrong.
+      const wasDenied = this.ctx.isVaultLeaseDenied();
+      const retryNeeded = this.ctx.isLeaseRetryNeeded();
+      if ((wasDenied || retryNeeded) && this.ctx.getSettings().serverVaultId) {
         try {
           const result = await this.ctx.ensureVaultScopedKeyLease();
           if (result === "ok") {
-            this.ctx.log("Vault-scoped key lease recovered — full access restored.");
-            this.ctx.showNotice("VaultGuard Sync: Full vault access restored.");
+            this.ctx.log("Vault-scoped key lease recovered.");
+            // Only announce "full access restored" if the user was actually in
+            // limited-access mode — a transient-retry recovery never showed a
+            // limitation, so a restore notice would be confusing.
+            if (wasDenied) {
+              this.ctx.showNotice("VaultGuard Sync: Full vault access restored.");
+            }
             this.ctx.emitPermissionChanged({ serverConfirmed: true });
             this.ctx.clearPlaceholderPaths();
           }
         } catch (err) {
           // Network blips and 5xxs are expected during recovery polling.
-          // Stay in limited-access state and try again next tick.
-          this.ctx.logError("Limited-access lease retry failed (will retry)", err);
+          // Stay in the pending state and try again next tick.
+          this.ctx.logError("Key lease retry failed (will retry)", err);
         }
       }
       return;
@@ -1752,6 +1972,11 @@ export class SyncRuntime {
    * or folder-marker paths (those never reach the server, so they must never be
    * tombstoned or retried). Persists fire-and-forget.
    */
+  /** True when an offline write/delete for this normalized path is queued. */
+  private hasPendingOfflineOperation(path: string): boolean {
+    return this.ctx.getOfflineQueue().some((op) => op.path === path);
+  }
+
   recordDeletionTombstone(path: string): void {
     const normalized = this.ctx.normalizeVaultPath(path);
     if (!normalized) return;
@@ -2024,7 +2249,19 @@ export class SyncRuntime {
       return;
     }
 
-    throw new Error(message);
+    // AC-API1: transient failures (network / 5xx / 429) throw so the flush
+    // requeues the op and retries later.
+    if (status === 0 || status === 429 || status >= 500) {
+      throw new Error(message);
+    }
+
+    // Permanent 4xx (413 too-large, 409, 400…): the server will never accept
+    // this op — drop it instead of jamming the flush queue forever. The local
+    // file is untouched; catch-up will surface it as local-only.
+    this.ctx.logError(
+      `Dropping queued ${op.operation} for "${op.path}" after permanent server rejection (HTTP ${status})`,
+      new Error(message)
+    );
   }
 
   getSnapshot(): SyncRuntimeSnapshot {

@@ -252,6 +252,16 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       case method === 'POST' && path === '/auth/recovery-codes/verify':
         return await handleVerifyRecoveryCode(event, requestId);
 
+      // AI-chat API key cross-device sync (opaque, client-encrypted blob).
+      case method === 'GET' && path === '/auth/ai-key':
+        return await handleAiKeyGet(event, requestId);
+
+      case method === 'PUT' && path === '/auth/ai-key':
+        return await handleAiKeyPut(event, requestId);
+
+      case method === 'DELETE' && path === '/auth/ai-key':
+        return await handleAiKeyDelete(event, requestId);
+
       default:
         return formatError(404, `Route not found: ${method} ${path}`, requestId);
     }
@@ -702,6 +712,159 @@ async function handleGetKeyLease(
   return formatSuccess(200, { keyLease, orgSettings }, requestId);
 }
 
+// ─── GET/PUT/DELETE /auth/ai-key ─────────────────────────────────────────────
+
+/**
+ * Partition key for a user's cross-device AI-chat key blob.
+ *
+ * The `AICHATKEY` segment guarantees no collision with `scopeKeyPk()`'s
+ * `...#SCOPE#...` DEK rows that share the same USER_KEYS_TABLE. The row is
+ * strictly per (org, vault, user): the userId ALWAYS comes from the verified
+ * token (`user.userId`), never from client input, so one member can never read
+ * or overwrite another member's blob.
+ */
+function aiKeyPk(orgId: string, vaultId: string, userId: string): string {
+  return `ORG#${orgId}#VAULT#${vaultId}#AICHATKEY#USER#${userId}`;
+}
+
+/** Max stored blob size — a DEK-wrapped Anthropic key envelope is well under this. */
+const AI_KEY_BLOB_MAX_CHARS = 4096;
+
+/**
+ * Resolves the vaultId a /auth/ai-key call targets, from the query string
+ * (GET/DELETE) or the parsed body (PUT). Throws a ValidationError when absent
+ * or non-string so the outer catch maps it to 400 before any DynamoDB work.
+ */
+function requireAiKeyVaultId(value: unknown): string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new ValidationError('Missing or invalid vaultId');
+  }
+  return value;
+}
+
+/**
+ * GET /auth/ai-key?vaultId=... — return this user's stored (opaque, client-
+ * encrypted) blob for the vault, or 404 when none is stored. The server is
+ * zero-knowledge of the plaintext; it only echoes back the ciphertext it was
+ * handed. NOT audit-logged (a read of one's own encrypted blob is not a
+ * security-relevant event and would spam the audit log on every mobile open).
+ */
+async function handleAiKeyGet(
+  event: APIGatewayProxyEvent,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  const user = await verifyActiveUser(event);
+  const orgId = requireOrgId(user);
+  const vaultId = requireAiKeyVaultId(event.queryStringParameters?.vaultId);
+  await requireVaultMember(user, vaultId, 'viewer');
+
+  const result = await docClient.send(
+    new GetCommand({
+      TableName: USER_KEYS_TABLE,
+      Key: { pk: aiKeyPk(orgId, vaultId, user.userId), sk: 'ACTIVE' },
+    })
+  );
+
+  const blob = (result.Item as { blob?: unknown } | undefined)?.blob;
+  if (typeof blob !== 'string') {
+    return formatError(404, 'No AI key blob stored', requestId);
+  }
+
+  return formatSuccess(200, { blob }, requestId);
+}
+
+/**
+ * PUT /auth/ai-key — store this user's opaque blob for the vault (upsert).
+ * Validates shape + size BEFORE any write. NEVER logs the blob or any key
+ * material — the audit metadata carries only the vaultId.
+ */
+async function handleAiKeyPut(
+  event: APIGatewayProxyEvent,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  const user = await verifyActiveUser(event);
+  const orgId = requireOrgId(user);
+  const body = parseBody(event);
+  const vaultId = requireAiKeyVaultId(body.vaultId);
+  await requireVaultMember(user, vaultId, 'viewer');
+
+  const blob = body.blob;
+  if (typeof blob !== 'string') {
+    throw new ValidationError('AI key blob must be a string');
+  }
+  if (blob.length > AI_KEY_BLOB_MAX_CHARS) {
+    throw new ValidationError('AI key blob exceeds the maximum allowed size');
+  }
+
+  await docClient.send(
+    new PutCommand({
+      TableName: USER_KEYS_TABLE,
+      Item: {
+        pk: aiKeyPk(orgId, vaultId, user.userId),
+        sk: 'ACTIVE',
+        itemType: 'ai-chat-key',
+        orgId,
+        vaultId,
+        userId: user.userId,
+        blob,
+        updatedAt: new Date().toISOString(),
+      },
+    })
+  );
+
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId,
+    vaultId,
+    action: 'auth.ai-key.stored',
+    resourcePath: '/auth/ai-key',
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    // NEVER include the blob or any key material here.
+    metadata: { vaultId },
+  });
+
+  return formatSuccess(200, { ok: true }, requestId);
+}
+
+/**
+ * DELETE /auth/ai-key?vaultId=... — remove this user's stored blob. Idempotent
+ * (a missing blob still returns 200). Audit-logged.
+ */
+async function handleAiKeyDelete(
+  event: APIGatewayProxyEvent,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  const user = await verifyActiveUser(event);
+  const orgId = requireOrgId(user);
+  const vaultId = requireAiKeyVaultId(event.queryStringParameters?.vaultId);
+  await requireVaultMember(user, vaultId, 'viewer');
+
+  await docClient.send(
+    new DeleteCommand({
+      TableName: USER_KEYS_TABLE,
+      Key: { pk: aiKeyPk(orgId, vaultId, user.userId), sk: 'ACTIVE' },
+    })
+  );
+
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId,
+    vaultId,
+    action: 'auth.ai-key.deleted',
+    resourcePath: '/auth/ai-key',
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: { vaultId },
+  });
+
+  return formatSuccess(200, { ok: true }, requestId);
+}
+
 // ─── POST /auth/revoke ───────────────────────────────────────────────────────
 
 /**
@@ -718,6 +881,70 @@ async function handleGetKeyLease(
  * @param requestId - Request ID for tracing
  * @returns Confirmation of revocation with count of invalidated sessions
  */
+/**
+ * LA1 helper: verify a target userId (a Cognito sub) belongs to `expectedOrg`
+ * before any global (userId-only) revocation write. Resolves the user via a
+ * `sub = "..."` ListUsers filter — the username is NOT the sub in this pool —
+ * and compares its custom:org. Throws 404 when the user isn't found, 403 on an
+ * org mismatch (audited). The request-supplied sub is escaped to prevent
+ * Cognito filter injection.
+ */
+async function assertTargetInOrg(
+  targetUserId: string,
+  expectedOrg: string,
+  event: APIGatewayProxyEvent,
+  admin: { userId: string; email: string; orgId: string }
+): Promise<void> {
+  const { CognitoIdentityProviderClient, ListUsersCommand } = await import(
+    '@aws-sdk/client-cognito-identity-provider'
+  );
+  const cognitoClient = new CognitoIdentityProviderClient({
+    region: process.env.AWS_REGION || 'eu-central-1',
+  });
+  const escaped = targetUserId.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+  let found = false;
+  let targetOrg: string | undefined;
+  let paginationToken: string | undefined;
+  do {
+    const result = await cognitoClient.send(
+      new ListUsersCommand({
+        UserPoolId: USER_POOL_ID,
+        Filter: `sub = "${escaped}"`,
+        Limit: 60,
+        PaginationToken: paginationToken,
+      })
+    );
+    for (const u of result.Users || []) {
+      const sub = (u.Attributes || []).find((a) => a.Name === 'sub')?.Value;
+      if (sub === targetUserId) {
+        found = true;
+        targetOrg = (u.Attributes || []).find((a) => a.Name === 'custom:org')?.Value;
+        break;
+      }
+    }
+    paginationToken = found ? undefined : result.PaginationToken;
+  } while (paginationToken);
+
+  if (!found) {
+    throw new AuthError('Target user not found in this organization.', 404);
+  }
+  if (!targetOrg || targetOrg !== expectedOrg) {
+    await logAudit({
+      userId: admin.userId,
+      userEmail: admin.email,
+      orgId: admin.orgId,
+      action: 'auth.revoke.denied',
+      resourcePath: '/auth/revoke',
+      outcome: 'denied',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: { reason: 'cross_org_target', targetUserId },
+    });
+    throw new AuthError('Cross-org revoke denied: target user is not in your organization.', 403);
+  }
+}
+
 async function handleRevoke(
   event: APIGatewayProxyEvent,
   requestId: string
@@ -746,6 +973,17 @@ async function handleRevoke(
 
   const targetUserId = body.targetUserId as string;
   const reason = body.reason as string;
+
+  // LA1: assert the target belongs to the admin's org BEFORE any global write.
+  // The RevokedKeys row (Step 3) is keyed by userId ALONE — writing it for a
+  // user in another org would deny that victim every protected request and
+  // block all future lease issuance (a cross-tenant DoS the victim's own
+  // admins can't see the cause of). The session/lease steps are already
+  // org-filtered and no-op cross-tenant; this closes the RevokedKeys hole.
+  // NOTE: in this pool the Cognito username is NOT the sub, so we resolve the
+  // target by a `sub = "..."` ListUsers filter (mirrors findCognitoUsernameBySub
+  // in the users handler) and read its custom:org, rather than AdminGetUser.
+  await assertTargetInOrg(targetUserId, admin.orgId, event, admin);
 
   // Step 1: Find and invalidate all sessions for the target user (within admin's org)
   const sessionsResult = await docClient.send(

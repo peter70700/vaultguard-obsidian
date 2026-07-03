@@ -2094,7 +2094,7 @@ export class VaultGuardAgentBridge {
       throw new Error("VaultGuard agent lease does not allow reads.");
     }
 
-    const path = this.requireReadablePath(args.path, lease);
+    const path = await this.requireReadablePath(args.path, lease);
     if (!this.isTextPath(path)) {
       throw new Error(`VaultGuard agent bridge refuses to read non-text file "${path}".`);
     }
@@ -3659,8 +3659,21 @@ export class VaultGuardAgentBridge {
     return path;
   }
 
-  private requireReadablePath(rawPath: string, lease: AgentBridgeLease): string {
-    return this.requirePathInLease(rawPath, lease);
+  private async requireReadablePath(rawPath: string, lease: AgentBridgeLease): Promise<string> {
+    const path = this.requirePathInLease(rawPath, lease);
+
+    // AB1: mirror the per-file READ gate that list()/search() apply. An
+    // in-scope, non-blocked path the current user lacks READ permission on
+    // must NOT be readable through the agent tool surface. Without this,
+    // interceptedRead fails open to plaintext for a denied path, bypassing
+    // the per-file ACL (sharpest during revocation) and leaking confidential
+    // note content to the externally-exposed MCP/HTTP tool surface.
+    const permission = await this.deps.getPermission(path);
+    if (permission < PermissionLevel.READ) {
+      throw new Error(`VaultGuard agent bridge: no READ permission for "${path}".`);
+    }
+
+    return path;
   }
 
   private requirePathInLease(rawPath: string, lease: AgentBridgeLease): string {

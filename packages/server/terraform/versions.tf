@@ -12,25 +12,17 @@ terraform {
     }
   }
 
-  # Remote state — versioned + encrypted S3 with DynamoDB locking.
+  # State backend. With no backend configured, Terraform stores state locally in
+  # terraform.tfstate — fine for a single operator. For a team, uncomment and
+  # point at an S3 bucket + DynamoDB lock table you control:
   #
-  # The bucket and lock table are created out-of-band by
-  # scripts/bootstrap-tf-backend.sh (these names must match its defaults).
-  # After the first `terraform init -migrate-state`, the on-disk
-  # terraform.tfstate is copied here and locking is enforced.
-  #
-  # NOTE on the "prod" key: this single stack runs production
-  # (example.com) even though its `stage` variable is "dev". The state
-  # key is named prod for clarity; the `stage` var must NOT be changed —
-  # renaming would recreate every resource and destroy production.
-  # Backend blocks cannot reference variables, so these values are literal.
-  backend "s3" {
-    bucket         = "vaultguard-tfstate-eu-central-1"
-    key            = "vaultguard/prod/terraform.tfstate"
-    region         = "eu-central-1"
-    dynamodb_table = "vaultguard-terraform-locks"
-    encrypt        = true
-  }
+  # backend "s3" {
+  #   bucket         = "your-vaultguard-tfstate-bucket"
+  #   key            = "vaultguard/terraform.tfstate"
+  #   region         = "your-region"
+  #   dynamodb_table = "your-terraform-locks"
+  #   encrypt        = true
+  # }
 }
 
 provider "aws" {

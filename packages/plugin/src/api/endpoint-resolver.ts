@@ -259,10 +259,9 @@ async function isReachableVaultGuardApiBase(
   }
 }
 
-function looksLikeVaultGuardApiResponse(response: RequestUrlResponse): boolean {
+export function looksLikeVaultGuardApiResponse(response: RequestUrlResponse): boolean {
   const contentType =
     getHeaderValue(response.headers, "content-type")?.toLowerCase() ?? "";
-  const requestId = getHeaderValue(response.headers, "x-request-id");
   const jsonBody = isRecord(response.json) ? response.json : null;
   const bodyText = response.text ?? "";
   const message =
@@ -276,23 +275,36 @@ function looksLikeVaultGuardApiResponse(response: RequestUrlResponse): boolean {
     return false;
   }
 
-  if (contentType.includes("application/json")) {
+  // AC-API2: x-amzn-errortype marks a GATEWAY-generated rejection (the stock
+  // {"message":"Forbidden"} / "Missing Authentication Token" bodies) — the
+  // request never reached a VaultGuard Lambda, so this base is not ours.
+  if (hasHeader(response.headers, "x-amzn-errortype")) {
+    return false;
+  }
+
+  // From here on only POSITIVE VaultGuard signals count. Plain
+  // application/json is NOT one — API Gateway's stock errors are JSON too,
+  // which is exactly how a wrong stage/base used to "resolve" successfully.
+
+  // SECURITY_HEADERS stamps X-Request-Id on every Lambda response (its value
+  // may be empty, so presence is the signal).
+  if (hasHeader(response.headers, "x-request-id")) {
     return true;
   }
 
-  if (requestId) {
-    return true;
-  }
-
-  if (
-    jsonBody &&
-    (
-      Array.isArray(jsonBody.rules) ||
-      typeof jsonBody.message === "string" ||
-      typeof jsonBody.error === "string"
-    )
-  ) {
-    return true;
+  if (jsonBody) {
+    // formatError envelope: { statusCode, error, message }.
+    if (
+      typeof jsonBody.statusCode === "number" &&
+      typeof jsonBody.error === "string" &&
+      typeof jsonBody.message === "string"
+    ) {
+      return true;
+    }
+    // Success shapes of the default probe routes (/vaults, /permissions).
+    if (Array.isArray(jsonBody.vaults) || Array.isArray(jsonBody.rules)) {
+      return true;
+    }
   }
 
   return false;
@@ -330,6 +342,12 @@ function getHeaderValue(headers: Record<string, string>, name: string): string |
     ([headerName]) => headerName.toLowerCase() === name.toLowerCase()
   );
   return entry?.[1] ?? null;
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+  return Object.keys(headers).some(
+    (headerName) => headerName.toLowerCase() === name.toLowerCase()
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

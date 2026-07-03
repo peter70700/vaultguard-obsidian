@@ -21,6 +21,7 @@ import {
   ScanCommand,
   BatchWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { AdminGetUserCommand, CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { randomBytes, randomUUID } from 'crypto';
@@ -77,11 +78,22 @@ export interface UserContext {
   userId: string;
   email: string;
   roles: string[];
+  /**
+   * Cognito group memberships from the verified `cognito:groups` claim ONLY.
+   * Unlike `roles`, this is never polluted by the user-mutable custom:role /
+   * custom:orgRole attributes — safe for privileged (super-admin) gating.
+   */
+  groups: string[];
   sessionId: string;
   /** Organization ID from custom:org token claim. */
   orgId: string;
   /** Whether the current authentication event satisfied an MFA challenge. */
   mfaAuthenticated: boolean;
+  /**
+   * Whether the verified token carries `email_verified === true`. Access
+   * tokens lack the claim (and the email), so this is `false` for them.
+   */
+  emailVerified: boolean;
   /** Unix timestamp of the upstream Cognito authentication event, if present. */
   authTime: number | null;
 }
@@ -341,9 +353,11 @@ export async function verifyToken(event: APIGatewayProxyEvent): Promise<UserCont
         userId: payload.sub,
         email: (payload as Record<string, unknown>).email as string || '',
         roles: extractRolesFromTokenPayload(payload as Record<string, unknown>),
+        groups: extractGroupsFromTokenPayload(payload as Record<string, unknown>),
         sessionId: (payload as Record<string, unknown>).jti as string || '',
         orgId: (payload as Record<string, unknown>)['custom:org'] as string || '',
         mfaAuthenticated: extractMfaAuthenticatedFromTokenPayload(payload as Record<string, unknown>),
+        emailVerified: (payload as Record<string, unknown>).email_verified === true,
         authTime:
           typeof (payload as Record<string, unknown>).auth_time === 'number'
             ? ((payload as Record<string, unknown>).auth_time as number)
@@ -388,13 +402,182 @@ export async function verifyActiveUser(
   requireOrgId(user);
   await assertUserNotRevoked(user);
   await assertSessionActiveIfPresent(event, user);
+  await assertOrgMfaSatisfied(user);
   if (!options.allowPendingCheckout) {
     await assertSubscriptionAllowsAccess(user);
   }
   return user;
 }
 
+/**
+ * LA2: enforce the org's requireMfa policy on EVERY authenticated route, not
+ * just the auth-handler login/lease paths. Previously a non-MFA token — from a
+ * direct Cognito InitiateAuth (pool MFA is "optional", separate from this org
+ * flag) or minted before MFA was enabled — could still hit file/permission/
+ * share mutations, silently violating the compliance control the org advertised.
+ * Org settings are cached (getEffectiveOrgSettings) so this adds no per-request
+ * DB read in steady state. requireMfa defaults false, so orgs that never enable
+ * it are unaffected; when it IS on, login already requires MFA, so this only
+ * closes the stale-token / side-channel gap.
+ */
+async function assertOrgMfaSatisfied(user: UserContext): Promise<void> {
+  const settings = await getEffectiveOrgSettings(user.orgId);
+  if (settings?.requireMfa && !user.mfaAuthenticated) {
+    throw new AuthError(
+      'Multi-factor authentication is required by your organization. Sign in again with MFA.',
+      403,
+      'mfa_required'
+    );
+  }
+}
+
 const ALLOWED_SUBSCRIPTION_STATUSES = new Set(['trialing', 'active', 'past_due']);
+
+/**
+ * Parse a comma-separated list of billing-exempt email domains into a
+ * normalized Set (lower-cased, trimmed, empties dropped). Fed from the
+ * `BILLING_EXEMPT_DOMAINS` env var on the signup Lambda.
+ */
+export function parseExemptDomains(csv: string | undefined): Set<string> {
+  return new Set(
+    (csv || '')
+      .split(',')
+      .map((d) => d.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+/**
+ * True when the email's domain is exactly one of the exempt domains
+ * (case-insensitive, matched on the part after the last `@`). Sub-domains do
+ * NOT match (`sedmak.sk` matches `a@sedmak.sk` but not `a@x.sedmak.sk`). Used
+ * at signup to stamp internal/company orgs as `comped` so they are never billed.
+ */
+export function isBillingExemptEmail(email: string, exemptDomains: Set<string>): boolean {
+  if (!email || exemptDomains.size === 0) return false;
+  const at = email.lastIndexOf('@');
+  if (at < 0) return false;
+  const domain = email.slice(at + 1).trim().toLowerCase();
+  return domain.length > 0 && exemptDomains.has(domain);
+}
+
+// ─── Platform Super-Admin ────────────────────────────────────────────────────
+
+/**
+ * Cognito group that marks platform operators. Membership is assigned
+ * manually (console/CLI) — no API code path may ever add a user to it.
+ */
+export const SUPER_ADMIN_GROUP = 'platform-superadmin';
+
+/**
+ * Group names that request-derived role/group values must NEVER create or
+ * assign. Guarded (case-insensitively) at every AdminAddUserToGroup /
+ * CreateGroup call site in the users and signup handlers.
+ */
+export const RESERVED_GROUP_NAMES = [SUPER_ADMIN_GROUP] as const;
+
+/** True when a (request-derived) group name collides with a reserved group. */
+export function isReservedGroupName(name: string | undefined | null): boolean {
+  if (!name) return false;
+  const normalized = name.trim().toLowerCase();
+  return RESERVED_GROUP_NAMES.some((g) => g.toLowerCase() === normalized);
+}
+
+/**
+ * Parse the `SUPER_ADMIN_EMAILS` env var (comma-separated, lower-cased,
+ * trimmed, empties dropped). Mirrors `parseExemptDomains`.
+ */
+export function parseSuperAdminEmails(csv: string | undefined): Set<string> {
+  return new Set(
+    (csv || '')
+      .split(',')
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+/**
+ * Pure identity gate for the super-admin surface. Fail closed:
+ * - caller must be in the `platform-superadmin` Cognito group (verified claim),
+ * - the allowlist must be non-empty AND contain the caller's verified email.
+ *
+ * MFA is enforced separately (see `assertSuperAdminMfaEnrolled`) because it
+ * needs an async account lookup. The thrown `AuthError(403)` carries a generic
+ * message that never reveals which condition failed to the client; the specific
+ * reason is logged server-side for operators.
+ */
+export function assertSuperAdminIdentity(user: UserContext, allowlist: Set<string>): void {
+  const deny = (reason: string): never => {
+    console.warn('[SUPERADMIN_DENY]', reason, {
+      groups: user.groups,
+      emailVerified: user.emailVerified,
+    });
+    throw new AuthError('Super-admin access denied', 403);
+  };
+  if (!user.groups.includes(SUPER_ADMIN_GROUP)) deny('not_in_group');
+  const email = (user.email || '').trim().toLowerCase();
+  if (!email || allowlist.size === 0 || !allowlist.has(email)) deny('email_not_allowlisted');
+  if (user.emailVerified !== true) deny('email_unverified');
+}
+
+let superAdminCognitoClient: CognitoIdentityProviderClient | null = null;
+function getSuperAdminCognitoClient(): CognitoIdentityProviderClient {
+  if (!superAdminCognitoClient) {
+    superAdminCognitoClient = new CognitoIdentityProviderClient({});
+  }
+  return superAdminCognitoClient;
+}
+
+/**
+ * MFA enforcement for the super-admin surface.
+ *
+ * Cognito ID tokens do NOT reliably carry an MFA marker in `amr`, and tokens
+ * minted via refresh drop `amr` entirely — so a token-only check (the previous
+ * `user.mfaAuthenticated` gate) denies genuinely-MFA'd operators. We accept a
+ * token that already asserts MFA as a fast path, and otherwise confirm the
+ * account has an MFA method enrolled via AdminGetUser. Enrolled MFA is always
+ * challenged at login, so account-level enrollment reliably enforces the same
+ * intent without depending on fragile token claims.
+ */
+async function assertSuperAdminMfaEnrolled(user: UserContext): Promise<void> {
+  const denied = new AuthError('Super-admin access denied', 403);
+  if (user.mfaAuthenticated) return;
+  const poolId = process.env.COGNITO_USER_POOL_ID || process.env.USER_POOL_ID;
+  const username = (user.email || '').trim();
+  if (!poolId || !username) {
+    console.warn('[SUPERADMIN_DENY]', 'mfa_check_misconfigured');
+    throw denied;
+  }
+  try {
+    const res = await getSuperAdminCognitoClient().send(
+      new AdminGetUserCommand({ UserPoolId: poolId, Username: username })
+    );
+    if ((res.UserMFASettingList ?? []).length === 0) {
+      console.warn('[SUPERADMIN_DENY]', 'mfa_not_enrolled');
+      throw denied;
+    }
+  } catch (err) {
+    if (err instanceof AuthError) throw err;
+    console.warn('[SUPERADMIN_DENY]', 'mfa_lookup_failed', (err as Error)?.message);
+    throw denied;
+  }
+}
+
+/**
+ * Verifies the caller for the platform super-admin surface.
+ *
+ * Deliberately does NOT call `requireOrgId` (super-admins operate cross-org)
+ * and does NOT run the subscription gate. Revocation and server-session state
+ * are still enforced.
+ */
+export async function requireSuperAdmin(event: APIGatewayProxyEvent): Promise<UserContext> {
+  const user = await verifyToken(event);
+  assertSuperAdminIdentity(user, parseSuperAdminEmails(process.env.SUPER_ADMIN_EMAILS));
+  await assertSuperAdminMfaEnrolled(user);
+  await assertUserNotRevoked(user);
+  await assertSessionActiveIfPresent(event, user);
+  return user;
+}
 
 /**
  * Throws `AuthError(402)` when the org's subscription is missing or in a
@@ -412,6 +595,11 @@ async function assertSubscriptionAllowsAccess(user: UserContext): Promise<void> 
       Key: { orgId: user.orgId },
     })
   );
+  // Comped orgs — internal/company accounts stamped by an exempt email domain
+  // at signup (or backfilled) — are permanently exempt from the paywall,
+  // regardless of Stripe state. Pure DB flag; no Stripe object required.
+  if (result.Item?.comped === true) return;
+
   const status = result.Item?.status as string | undefined;
   if (status && ALLOWED_SUBSCRIPTION_STATUSES.has(status)) return;
 
@@ -471,6 +659,21 @@ function getSessionIdFromRequest(event: APIGatewayProxyEvent): string {
   )?.[1];
 
   return typeof headerValue === 'string' ? headerValue.trim() : '';
+}
+
+/**
+ * Extracts the verified `cognito:groups` claim as-is. Unlike
+ * `extractRolesFromTokenPayload` this deliberately ignores the user-mutable
+ * custom:role / custom:orgRole attributes and does not lower-case, so exact
+ * group membership (e.g. `platform-superadmin`) can be checked safely.
+ */
+function extractGroupsFromTokenPayload(payload: Record<string, unknown>): string[] {
+  return Array.isArray(payload['cognito:groups'])
+    ? (payload['cognito:groups'] as unknown[])
+        .filter((value): value is string => typeof value === 'string')
+        .map((value) => value.trim())
+        .filter(Boolean)
+    : [];
 }
 
 function extractRolesFromTokenPayload(payload: Record<string, unknown>): string[] {
@@ -1913,6 +2116,10 @@ export function invalidateOrgSettingsCache(orgId?: string): void {
  * Checks if adding another user would exceed the org's user limit.
  */
 export function checkUserLimit(org: OrgRecord): OrgEnforcementResult {
+  // LA4: -1 is the enterprise "unlimited" sentinel (PLAN_LIMITS.enterprise).
+  // Without this guard `currentUsers >= -1` is always true and every invite is
+  // blocked with "User limit reached (N/-1)".
+  if (org.maxUsers < 0) return { allowed: true, org };
   if (org.currentUsers >= org.maxUsers) {
     return {
       allowed: false,
@@ -1928,6 +2135,9 @@ export function checkUserLimit(org: OrgRecord): OrgEnforcementResult {
  * Checks if uploading a file of the given size would exceed storage quota.
  */
 export function checkStorageLimit(org: OrgRecord, additionalBytes: number): OrgEnforcementResult {
+  // LA4: -1 is the enterprise "unlimited" sentinel — skip the quota check so
+  // uploads aren't blocked with "Storage limit reached" on unlimited plans.
+  if (org.maxStorageBytes < 0) return { allowed: true, org };
   if (org.currentStorageBytes + additionalBytes > org.maxStorageBytes) {
     const usedMB = Math.round(org.currentStorageBytes / 1024 / 1024);
     const maxMB = Math.round(org.maxStorageBytes / 1024 / 1024);
@@ -2167,6 +2377,22 @@ export async function requireVaultMember(
   }
 
   return vault;
+}
+
+/**
+ * LF2: reject any mutation (write/delete/rename/permission-rule change) against
+ * an archived vault. The dispatch-time requireVaultMember(..., 'viewer') check
+ * intentionally allows viewers into archived vaults (read-only browse), which
+ * means its archived guard is skipped — so every write/delete/permission
+ * handler that only ran a 'viewer' membership check + evaluatePermission (which
+ * has no archived awareness) would silently mutate a "frozen" vault. Call this
+ * explicitly before any S3 mutation or permission-rule write. Archiving is a
+ * legal-hold / retention-freeze, so this is a hard 403 regardless of role.
+ */
+export function assertVaultWritable(vault: VaultRecord): void {
+  if (vault.archived) {
+    throw new AuthError(`Vault is archived and read-only: ${vault.vaultId}`, 403);
+  }
 }
 
 // ─── Vault Activity Log ──────────────────────────────────────────────────────

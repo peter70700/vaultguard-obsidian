@@ -356,6 +356,11 @@ export interface VaultGuardApiConfig {
   healthCheckIntervalMs: number;
   getAuthTokens?: (forceRefresh?: boolean) => Promise<AuthTokens | null>;
   getSessionId?: () => string | null;
+  /**
+   * Invoked when the server returns 402 `checkout_required` (subscription
+   * lapsed). The plugin uses this to surface a throttled, user-facing notice.
+   */
+  onSubscriptionRequired?: () => void;
 }
 
 const DEFAULT_CONFIG: VaultGuardApiConfig = {
@@ -541,8 +546,23 @@ export class VaultGuardApiClient {
     try {
       await this.request("POST", "/auth/logout");
     } finally {
-      this.tokens = null;
+      this.clearTokens();
     }
+  }
+
+  /**
+   * Synchronously drop all cached auth material. Called from the plugin's
+   * teardown path (forceLogout / auto-lock / unload) so no privileged request
+   * can reuse the cached idToken after the user signs out. Without this the
+   * client keeps `tokens` after logout — getAuthHeaders returns null from the
+   * provider but leaves `this.tokens` intact and serves the stale idToken until
+   * its ~1h natural expiry, so already-open admin/share modals retain backend
+   * access. Distinct from logout(), which also POSTs /auth/logout; clearTokens()
+   * is the local, network-free teardown and also cancels any in-flight refresh.
+   */
+  clearTokens(): void {
+    this.tokens = null;
+    this.refreshPromise = null;
   }
 
   async refreshTokens(): Promise<AuthTokens> {
@@ -1039,20 +1059,66 @@ export class VaultGuardApiClient {
     return this.request("POST", "/auth/recover", { targetUserId });
   }
 
+  // ─── AI-chat key cross-device sync ──────────────────────────────────
+  //
+  // Auth-scoped (NOT vault-scoped path) endpoints that store an OPAQUE,
+  // client-encrypted blob per user per vault. The plaintext Anthropic key is
+  // never sent — only a DEK-wrapped envelope produced by the plugin. A 404
+  // (no blob stored, or the routes not yet deployed) surfaces as `null` so the
+  // caller degrades gracefully to "no synced key" rather than throwing.
+
+  /**
+   * Fetch this user's stored AI-key envelope for `vaultId`, or `null` when none
+   * is stored (or the backend does not yet expose the route → 404). Never
+   * throws on 404.
+   */
+  async getAiKeyBlob(vaultId: string): Promise<string | null> {
+    try {
+      const response = await this.request<{ blob?: string }>(
+        "GET",
+        `/auth/ai-key?vaultId=${encodeURIComponent(vaultId)}`,
+      );
+      return response?.blob ?? null;
+    } catch (error) {
+      if (this.isNotFound(error)) return null;
+      throw error;
+    }
+  }
+
+  /** Store (upsert) this user's opaque AI-key envelope for `vaultId`. */
+  async putAiKeyBlob(vaultId: string, blob: string): Promise<void> {
+    await this.request<void>("PUT", "/auth/ai-key", { vaultId, blob });
+  }
+
+  /** Best-effort delete of this user's stored AI-key envelope for `vaultId`. */
+  async deleteAiKeyBlob(vaultId: string): Promise<void> {
+    await this.request<void>(
+      "DELETE",
+      `/auth/ai-key?vaultId=${encodeURIComponent(vaultId)}`,
+    );
+  }
+
+  /** True when an error is a 404 (missing blob / un-deployed route). */
+  private isNotFound(error: unknown): boolean {
+    return (
+      error instanceof VaultGuardError && error.apiError?.statusCode === 404
+    );
+  }
+
   // ─── Core Request Methods ──────────────────────────────────────────
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     return this.executeWithRetry<T>(async () => {
       const response = await this.rawRequest<T>(method, path, body);
       return response;
-    });
+    }, this.isIdempotentMethod(method));
   }
 
   private async requestBinary(method: string, path: string): Promise<ArrayBuffer> {
     return this.executeWithRetry<ArrayBuffer>(async () => {
       const response = await this.requestRaw(method, path);
       return response.arrayBuffer;
-    });
+    }, this.isIdempotentMethod(method));
   }
 
   private async requestFormData<T>(method: string, path: string, body: Record<string, unknown>): Promise<T> {
@@ -1070,7 +1136,16 @@ export class VaultGuardApiClient {
 
       const data: unknown = response.json;
       return data as T;
-    });
+    }, this.isIdempotentMethod(method));
+  }
+
+  /**
+   * AC-API3: only idempotent verbs may be auto-re-sent. A timeout or 5xx does
+   * NOT mean the server skipped the work — re-sending a POST can double the
+   * side effect (two invite emails, two share links, two re-encryption jobs).
+   */
+  private isIdempotentMethod(method: string): boolean {
+    return method.toUpperCase() !== "POST";
   }
 
   private async requestRaw(method: string, path: string): Promise<RequestUrlResponse> {
@@ -1231,13 +1306,26 @@ export class VaultGuardApiClient {
     if (response.status >= 500) {
       throw new ServerError(errorBody.message, errorBody);
     }
+    if (response.status === 402 && errorBody.code === "checkout_required") {
+      // Subscription lapsed — notify the UI (throttled there) and fail fast.
+      try {
+        this.config.onSubscriptionRequired?.();
+      } catch {
+        // Never let a notice callback break error handling.
+      }
+      throw new SubscriptionRequiredError(errorBody.message, errorBody);
+    }
 
     throw new VaultGuardError(errorBody.message, errorBody);
   }
 
   // ─── Retry Logic ───────────────────────────────────────────────────
 
-  private async executeWithRetry<T>(fn: () => Promise<T>, attempt = 0): Promise<T> {
+  private async executeWithRetry<T>(
+    fn: () => Promise<T>,
+    idempotent = true,
+    attempt = 0
+  ): Promise<T> {
     try {
       const result = await fn();
       // Successful request means we're online
@@ -1245,20 +1333,31 @@ export class VaultGuardApiClient {
       return result;
     } catch (error) {
       if (this.isNetworkError(error)) {
-        if (attempt < this.config.maxRetries) {
+        // AC-API3: a timeout/connection drop mid-flight leaves the server-side
+        // outcome UNKNOWN — the Lambda may have committed the side effect
+        // before the response was lost. Only idempotent verbs re-send.
+        if (idempotent && attempt < this.config.maxRetries) {
           const delay = this.calculateBackoff(attempt);
           await this.sleep(delay);
-          return this.executeWithRetry(fn, attempt + 1);
+          return this.executeWithRetry(fn, idempotent, attempt + 1);
         }
         this.setConnectionStatus("offline");
         throw new NetworkError("Network unavailable. Request will be retried when connection is restored.");
       }
 
-      // Retryable errors (5xx, rate limits, token refresh)
-      if (this.isRetryable(error) && attempt < this.config.maxRetries) {
+      // Retryable errors (5xx, rate limits, token refresh). The 401-refresh
+      // path (RetryableError) is a PRE-execution rejection at the authorizer,
+      // so it stays safe for every verb; 429/5xx may have executed
+      // server-side and only re-send for idempotent verbs (AC-API3).
+      const refreshRetry = error instanceof RetryableError;
+      if (
+        (idempotent || refreshRetry) &&
+        this.isRetryable(error) &&
+        attempt < this.config.maxRetries
+      ) {
         const delay = this.calculateBackoff(attempt);
         await this.sleep(delay);
-        return this.executeWithRetry(fn, attempt + 1);
+        return this.executeWithRetry(fn, idempotent, attempt + 1);
       }
 
       throw error;
@@ -1659,5 +1758,18 @@ export class NetworkError extends VaultGuardError {
   constructor(message: string) {
     super(message);
     this.name = "NetworkError";
+  }
+}
+
+/**
+ * Raised on HTTP 402 with `code: 'checkout_required'` — the org's subscription
+ * has lapsed (canceled / unpaid / never checked out). Distinct from auth so the
+ * plugin can show a clear "subscription lapsed" message instead of an opaque
+ * error, and so it is treated as non-retryable (sync fails fast, no hammering).
+ */
+export class SubscriptionRequiredError extends VaultGuardError {
+  constructor(message: string, apiError?: ApiError) {
+    super(message, apiError);
+    this.name = "SubscriptionRequiredError";
   }
 }

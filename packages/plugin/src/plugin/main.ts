@@ -19,7 +19,7 @@ import type { ConversationStore } from "../ui/chat/conversation-store";
 import { BindingReconciliationModal, ReconciliationDecision, ReconciliationPlan } from "./binding-reconciliation-modal";
 import { ShareManagementModal } from "./share-management-modal";
 import { PluginAllowlistModal, PluginAllowlistPrompt } from "./plugin-allowlist-modal";
-import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, vaultguardForgotPassword, vaultguardConfirmReset, vaultguardVerifyRecoveryCode, devServerLogin, isLocalDevAuth, CognitoAuthResult } from "./cognito-auth";
+import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoRevokeToken, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, vaultguardForgotPassword, vaultguardConfirmReset, vaultguardVerifyRecoveryCode, devServerLogin, isLocalDevAuth, CognitoAuthResult } from "./cognito-auth";
 import { MfaSetupModal } from "./mfa-setup-modal";
 import { deriveConnectionConfigFromTokenPayload } from "./session-config";
 import { AdminModal } from "../admin/admin-modal";
@@ -59,6 +59,7 @@ import {
   type PermissionsGraphDataset,
 } from "../ui/graph/permissions-graph-view";
 import { findClaudeBinary } from "../ui/chat/claude-cli/claude-detector";
+import { ApiKeySync } from "../ui/chat/api-key-sync";
 import type {
   VaultGuardSidebarAuthState,
   VaultGuardSidebarViewConfig,
@@ -218,7 +219,38 @@ const SYNC_FEATURE_REVISION = 9;
 
 type AccessTokenRefreshResult =
   | { ok: true }
-  | { ok: false; message: string; error?: unknown };
+  | { ok: false; message: string; error?: unknown; terminal?: boolean };
+
+/**
+ * PL4: Cognito refresh failures that can never succeed on retry — the refresh
+ * token is expired/revoked or the user is disabled/deleted. Everything else
+ * (network blips, throttling, Cognito 5xx) stays transient and keeps the
+ * current keep-session-and-retry behavior.
+ */
+const TERMINAL_COGNITO_REFRESH_TYPES = new Set([
+  "NotAuthorizedException",
+  "UserNotFoundException",
+  "PasswordResetRequiredException",
+  "UserNotConfirmedException",
+]);
+
+function isTerminalCognitoRefreshError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const type = (error as { cognitoErrorType?: string }).cognitoErrorType;
+  if (type) return TERMINAL_COGNITO_REFRESH_TYPES.has(type);
+  // No __type (older shims / dev): fall back to Cognito's terminal messages.
+  return /refresh token has (expired|been revoked)|user is disabled/i.test(error.message);
+}
+
+/**
+ * PL5: a Cognito challenge session (MFA / NEW_PASSWORD) lives ~3 minutes;
+ * responding with a dead one surfaces "Invalid session for the user, session
+ * is expired.". Replaying that session can never succeed — the login flow
+ * must mint a fresh challenge instead.
+ */
+function isExpiredChallengeSessionError(message: string): boolean {
+  return /session is expired|invalid session/i.test(message);
+}
 
 /**
  * Result shape for `collectRulesForWarmup` (Wave 2 Fix 2, 1.0.31).
@@ -325,6 +357,12 @@ export default class VaultGuardPlugin extends Plugin {
   /** API client for communicating with the VaultGuard backend */
   private apiClient: VaultGuardApiClient | null = null;
 
+  /**
+   * Cross-device AI-chat key sync. Instantiated in onload() once the api client
+   * and settings are ready; reads its context lazily via getAiKeySyncContext().
+   */
+  aiKeySync!: ApiKeySync;
+
   /** Last saved API endpoint, used to detect live reconfiguration changes */
   private configuredApiEndpoint = "";
 
@@ -354,6 +392,26 @@ export default class VaultGuardPlugin extends Plugin {
    * until a client-side encryption lease is available.
    */
   private vaultLeaseDenied = false;
+
+  /**
+   * PL2: distinct from `vaultLeaseDenied` (a definitive 403). Set when a
+   * key-lease acquisition fails TRANSIENTLY (5xx / network / statusCode 0) or
+   * when a stored-session token refresh is deferred at startup. Unlike a 403
+   * denial, a transient failure leaves the user with a null lease AND
+   * `vaultLeaseDenied === false`, so the key-renewal monitor's recovery branch
+   * would never retry and uploads would stay silently paused forever. The
+   * monitor retries while either flag is set; this one clears on the next
+   * successful lease acquisition.
+   */
+  private leaseRetryNeeded = false;
+
+  /**
+   * PL4: true while a terminal-refresh revocation logout is running. Breaks
+   * the recursion forceLogout → apiRequest → refreshAccessToken(terminal) →
+   * handleServerRevocation → forceLogout, and collapses concurrent callers
+   * (heartbeat/sync timers) into one logout.
+   */
+  private terminalRefreshLogoutInProgress = false;
 
   /** Debounces the "Limited access" Notice so it isn't shown more than once per minute. */
   private lastLimitedAccessNoticeAt = 0;
@@ -587,6 +645,9 @@ export default class VaultGuardPlugin extends Plugin {
     timestamp: string;
   }> = [];
 
+  /** SY5: debounce handle for persisting the offline queue envelope. */
+  private offlineQueuePersistTimer: ReturnType<typeof setTimeout> | null = null;
+
   /** Per-file permission header injected into markdown views */
   private filePermissionHeader: FilePermissionHeader | null = null;
 
@@ -708,6 +769,7 @@ export default class VaultGuardPlugin extends Plugin {
         this.keyLease = lease;
       },
       isVaultLeaseDenied: () => this.vaultLeaseDenied,
+      isLeaseRetryNeeded: () => this.leaseRetryNeeded,
       getEffectiveSyncMode: () => this.getEffectiveSyncMode(),
       getEffectiveSyncIntervalSeconds: () => this.getEffectiveSyncIntervalSeconds(),
       getSyncTimer: () => this.syncTimer,
@@ -728,6 +790,9 @@ export default class VaultGuardPlugin extends Plugin {
       getOfflineQueue: () => this.offlineQueue,
       setOfflineQueue: (queue) => {
         this.offlineQueue = queue;
+        // SY5: every queue mutation re-persists the LAK envelope (debounced)
+        // so queued edits survive a restart.
+        this.scheduleOfflineQueuePersist();
       },
       getOfflineQueueFlushPromise: () => this.offlineQueueFlushPromise,
       setOfflineQueueFlushPromise: (promise) => {
@@ -769,6 +834,8 @@ export default class VaultGuardPlugin extends Plugin {
       askReconciliationPlan: (plan) => this.askReconciliationPlan(plan),
       uploadReconciledFile: (path, content, options) =>
         this.uploadReconciledFile(path, content, options),
+      ensureAtRestEncryptedInPlace: (path) => this.ensureAtRestEncryptedInPlace(path),
+      getPermissionStoreState: () => this.permissionStore.getStoreState(),
       removeUnsyncedLocalFile: (path) => this.removeUnsyncedLocalFile(path),
       uploadLocalOnlyFiles: () => this.uploadLocalOnlyFiles(),
       repairMissingRemoteItems: () => this.repairMissingRemoteItems(),
@@ -786,7 +853,18 @@ export default class VaultGuardPlugin extends Plugin {
       deleteFolderContentsOnServer: (folderPath) =>
         this.deleteFolderContentsOnServer(folderPath),
       applyRemoteChange: (metadata) => this.applyRemoteChange(metadata),
-      applyRemoteDeletion: (path) => this.applyRemoteDeletion(path),
+      applyRemoteDeletion: (path, inferred) => this.applyRemoteDeletion(path, inferred),
+      trashLocalPath: async (path) => {
+        const adapter = this.app.vault.adapter;
+        if (typeof adapter.trashLocal !== "function") return false;
+        try {
+          await adapter.trashLocal(path);
+          return true;
+        } catch (err) {
+          this.logError(`Failed to move "${path}" to local trash`, err);
+          return false;
+        }
+      },
       readFileDecrypted: (path) => this.readFileDecrypted(path),
       fetchRemoteFileContent: (path) => this.fetchRemoteFileContent(path),
       decodeRemoteFileContent: (path, data) =>
@@ -795,6 +873,7 @@ export default class VaultGuardPlugin extends Plugin {
       resolveReconciliationConflict: (path, strategy, localManifest) =>
         this.resolveReconciliationConflict(path, strategy, localManifest),
       hasOriginalAdapterRead: () => !!this.originalAdapterMethods.read,
+      hasOriginalAdapterReadBinary: () => !!this.originalAdapterMethods.readBinary,
       hasOriginalAdapterWrite: () => !!this.originalAdapterMethods.write,
       hasOriginalAdapterRemove: () => !!this.originalAdapterMethods.remove,
       removeLocalPath: async (path) => {
@@ -802,6 +881,7 @@ export default class VaultGuardPlugin extends Plugin {
         await this.originalAdapterMethods.remove(path);
       },
       readPlainFromDisk: (path) => this.readPlainFromDisk(path),
+      readPlainBinaryFromDisk: (path) => this.readPlainBinaryFromDisk(path),
       writePlainToDisk: (path, data) => this.writePlainToDisk(path, data),
       decryptContent: (content) => this.decryptContent(content),
       bytesToBase64: (bytes) => this.bytesToBase64(bytes),
@@ -1034,8 +1114,22 @@ export default class VaultGuardPlugin extends Plugin {
       get offlineQueueLength() {
         return thisPlugin.offlineQueue.length;
       },
+      get offlineQueueSnapshot() {
+        return thisPlugin.offlineQueue.map((op) => ({
+          operation: op.operation,
+          path: op.path,
+          timestamp: op.timestamp,
+          dataBytes: op.data?.length ?? 0,
+        }));
+      },
       get deletionTombstonesCount() {
         return Object.keys(thisPlugin.settings.deletionTombstones ?? {}).length;
+      },
+      get pluginId() {
+        return thisPlugin.manifest.id;
+      },
+      get vaultMemberRole() {
+        return thisPlugin.vaultMemberRole;
       },
       get permissionStore() {
         return thisPlugin.permissionStore;
@@ -1045,6 +1139,8 @@ export default class VaultGuardPlugin extends Plugin {
       },
       handleLogin: () => this.handleLogin(),
       forceLogout: (noticeMessage) => this.forceLogout(noticeMessage),
+      isSessionTokenExpiring: () =>
+        this.session ? this.isSessionTokenExpiring(this.session) : false,
       performSync: (options) => this.performSync(options),
       getEffectivePermission: (path) => this.getEffectivePermission(path),
       runConnectionDiagnostics: () => this.runConnectionDiagnostics(),
@@ -1076,7 +1172,13 @@ export default class VaultGuardPlugin extends Plugin {
       openVaultGuardChatHistory: () => this.openVaultGuardChatHistory(),
       openNewVaultGuardChatTab: () => this.openNewVaultGuardChatTab(),
       copyVaultGuardChatDomDebugReport: () => this.copyVaultGuardChatDomDebugReport(),
-      registerChatDebugCommand: () => registerChatDebugCommand(this),
+      // Ternary (not just a guarded call) so the production define folds this
+      // to a no-op and esbuild tree-shakes the whole chat-debug-command module
+      // (incl. its prompt strings) out of the release bundle.
+      registerChatDebugCommand:
+        process.env.NODE_ENV !== "production"
+          ? () => registerChatDebugCommand(this)
+          : () => {},
       logError: (message, error) => this.logError(message, error),
     };
   }
@@ -1298,6 +1400,11 @@ export default class VaultGuardPlugin extends Plugin {
     // Create API client (tokens are set later during session restore or login)
     this.rebuildApiClient();
 
+    // Cross-device AI-chat key sync. Holds only a plugin reference and reads
+    // its context (api client / session / bound vault) lazily at call time, so
+    // it stays inert until a session + vault + lease exist (§11).
+    this.aiKeySync = new ApiKeySync(this);
+
     // Phase 9: construct the unified permission store. The store does not
     // hold an apiClient reference (see PermissionStoreConfig note) — all
     // server probes go through the injected `fetchPermissionLevelFromServer`
@@ -1327,6 +1434,12 @@ export default class VaultGuardPlugin extends Plugin {
     // the plugin remains usable while the user investigates.
     await this.initAtRestCipher();
 
+    // SY5: restore queued offline operations (LAK-encrypted envelope) so
+    // limited-access/offline edits survive a restart instead of evaporating
+    // with the in-memory queue. Fire-and-forget — it waits for cipher init
+    // internally and merges under any ops queued while it loads.
+    void this.loadPersistedOfflineQueue();
+
     // Restore session — synchronous safeStorage path first, async at-rest
     // path second. On desktop this is effectively zero-cost; on mobile it
     // adds a single AES-GCM decrypt (a few ms).
@@ -1347,6 +1460,21 @@ export default class VaultGuardPlugin extends Plugin {
       hasServerVaultId: !!this.settings.serverVaultId,
     });
     this.registerFolderLifecycleListeners();
+
+    // Auto-encrypt externally-added files (Finder drops, git checkouts,
+    // other tools writing into the vault folder): Obsidian indexes them and
+    // fires vault.on("create"), but their bytes never passed through the
+    // encrypting adapter, so they'd sit on disk as plaintext until first
+    // save (lazy migration). Re-encrypt the identical bytes in place
+    // instead. The layoutReady gate skips the initial-index flood (every
+    // existing file fires "create" at startup); files added while Obsidian
+    // was closed are covered by the catch-up hook in sync-runtime.
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        if (!this.app.workspace.layoutReady) return;
+        void this.encryptExternallyAddedFile(file.path);
+      })
+    );
 
     // Capabilities are public metadata. Refresh them in the background so
     // manual/self-hosted installs and restored sessions don't temporarily
@@ -1439,6 +1567,14 @@ export default class VaultGuardPlugin extends Plugin {
    */
   async onunload(): Promise<void> {
     this.log("Unloading VaultGuard plugin...");
+
+    // SY5: flush the pending (debounced) offline-queue persist so queued
+    // edits survive the unload instead of dying with the timer.
+    if (this.offlineQueuePersistTimer) {
+      clearTimeout(this.offlineQueuePersistTimer);
+      this.offlineQueuePersistTimer = null;
+      await this.persistOfflineQueue().catch(() => {});
+    }
 
     // Stop all timers
     this.stopSyncTimer();
@@ -2185,14 +2321,20 @@ export default class VaultGuardPlugin extends Plugin {
       async (credentials: LoginCredentials) => {
         if (manualMode) {
           const cfg = this.getEffectiveConfig();
+          // PL1: organizationId is NOT required to authenticate with Cognito —
+          // it's derived post-login from the token's custom:org claim
+          // (completeLogin → syncSettingsFromTokenPayload). The /.well-known
+          // config a CE self-hoster pastes deliberately omits orgId, so
+          // requiring it here dead-ended the well-known onboarding flow before
+          // any auth could happen. Only the Cognito endpoint/pool/client are
+          // genuinely needed up front.
           if (
             !cfg.apiEndpoint ||
-            !cfg.organizationId ||
             !cfg.cognitoUserPoolId ||
             !cfg.cognitoClientId
           ) {
             throw new Error(
-              "Manual configuration requires API endpoint, organization ID, Cognito User Pool ID, and Cognito Client ID."
+              "Manual configuration requires API endpoint, Cognito User Pool ID, and Cognito Client ID."
             );
           }
           await this.refreshServerCapabilitiesFromConfiguredEndpoint();
@@ -2372,6 +2514,22 @@ export default class VaultGuardPlugin extends Plugin {
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        if (isExpiredChallengeSessionError(message)) {
+          // PL5: the challenge session died while the user typed. Clear it and
+          // re-authenticate with the (temporary) password to mint a fresh
+          // NEW_PASSWORD_REQUIRED challenge — handleAuthResult re-drives the
+          // modal's set-password form with the new session.
+          this.pendingChallengeSession = null;
+          this.pendingNewPasswordChallenge = false;
+          const freshAuth = await cognitoLogin(
+            cfg.cognitoUserPoolId,
+            cfg.cognitoClientId,
+            credentials.email,
+            credentials.password
+          );
+          await this.handleAuthResult(freshAuth, credentials);
+          return;
+        }
         if (/invalidpassword|conform to policy|password.*(policy|requirement)/i.test(message)) {
           throw new Error(
             "That password doesn't meet the requirements. Use at least 12 characters with upper/lowercase, a number, and a symbol."
@@ -2392,16 +2550,45 @@ export default class VaultGuardPlugin extends Plugin {
 
     // If we have a pending MFA challenge, respond to it
     if (this.pendingChallengeSession && credentials.mfaCode) {
-      authResult = await cognitoRespondToChallenge(
-        cfg.cognitoUserPoolId,
-        cfg.cognitoClientId,
-        "SOFTWARE_TOKEN_MFA",
-        this.pendingChallengeSession,
-        {
-          USERNAME: credentials.email,
-          SOFTWARE_TOKEN_MFA_CODE: credentials.mfaCode,
+      try {
+        authResult = await cognitoRespondToChallenge(
+          cfg.cognitoUserPoolId,
+          cfg.cognitoClientId,
+          "SOFTWARE_TOKEN_MFA",
+          this.pendingChallengeSession,
+          {
+            USERNAME: credentials.email,
+            SOFTWARE_TOKEN_MFA_CODE: credentials.mfaCode,
+          }
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (isExpiredChallengeSessionError(message)) {
+          // PL5: the ~3-minute challenge session expired while the user typed
+          // the code. Replaying it fails forever — clear it, re-authenticate,
+          // and surface a routed MFA prompt carrying the fresh session.
+          this.pendingChallengeSession = null;
+          const freshAuth = await cognitoLogin(
+            cfg.cognitoUserPoolId,
+            cfg.cognitoClientId,
+            credentials.email,
+            credentials.password
+          );
+          try {
+            await this.handleAuthResult(freshAuth, credentials);
+          } catch (freshErr) {
+            const freshMsg = freshErr instanceof Error ? freshErr.message : String(freshErr);
+            if (freshMsg === "MFA code required") {
+              // Keep the modal on the MFA step ("mfa" routes there) but tell
+              // the user why their previous code did nothing.
+              throw new Error("Your MFA code expired — enter a fresh code to sign in.");
+            }
+            throw freshErr;
+          }
+          return;
         }
-      );
+        throw err;
+      }
       this.pendingChallengeSession = null;
     } else {
       // Initial auth with email/password
@@ -3297,6 +3484,19 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.isSessionTokenExpiring(session)) {
       const refreshResult = await this.refreshAccessToken(session);
       if (!refreshResult.ok) {
+        // PL4: a terminal rejection means the stored session is dead (refresh
+        // token revoked/expired or user disabled) — clean it up now instead of
+        // restoring a zombie session that can never talk to the backend.
+        if (refreshResult.terminal) {
+          this.syncDiagnostics.record("resumeStoredSession.return.terminalRefresh");
+          this.terminalRefreshLogoutInProgress = true;
+          try {
+            await this.handleServerRevocation("stored session expired or revoked");
+          } finally {
+            this.terminalRefreshLogoutInProgress = false;
+          }
+          return;
+        }
         // Fix 4 (1.0.30): surface the degraded state. Previously this was
         // a silent `this.log(...)` that left the user with a permission
         // cache poisoned by the earlier stale-token warm-up (Fix 1
@@ -3306,6 +3506,16 @@ export default class VaultGuardPlugin extends Plugin {
           `Stored session token refresh deferred: ${refreshResult.message}`
         );
         this.notifySessionRestoreDegraded(refreshResult.message);
+        // PL2: a transient refresh failure at startup used to return here
+        // without ever starting the key-renewal monitor — so once connectivity
+        // returned nothing re-requested the lease and uploads stayed paused.
+        // Flag a lease retry and start the monitor so its recovery branch
+        // re-attempts acquisition (apiRequest refreshes the token first) as
+        // soon as the network is back.
+        if (this.settings.serverVaultId) {
+          this.leaseRetryNeeded = true;
+          this.startKeyRenewalMonitor();
+        }
         this.syncDiagnostics.record("resumeStoredSession.return.refreshDeferred");
         return;
       }
@@ -3559,14 +3769,23 @@ export default class VaultGuardPlugin extends Plugin {
       this.log("Cognito tokens refreshed successfully.");
       return { ok: true };
     } catch (error) {
-      // Any failure: keep the session. The user stays logged in.
-      // We'll retry refresh on the next API call or sync cycle.
-      this.logError("Cognito token refresh failed, keeping session", error);
+      // Keep the session on ANY failure — only forceLogout clears it. But
+      // classify the error (PL4): a terminal Cognito rejection (revoked or
+      // expired refresh token, disabled user) is flagged so callers escalate
+      // to a revocation logout instead of retrying forever in "offline".
+      const terminal = isTerminalCognitoRefreshError(error);
+      this.logError(
+        terminal
+          ? "Cognito token refresh rejected terminally (refresh token revoked/expired or user disabled)"
+          : "Cognito token refresh failed, keeping session",
+        error
+      );
       this.session = session;
       return {
         ok: false,
         message: error instanceof Error ? error.message : "Token refresh failed",
         error,
+        terminal,
       };
     }
   }
@@ -4557,6 +4776,26 @@ export default class VaultGuardPlugin extends Plugin {
     });
     await this.agentBridgeRuntime?.stopServerIfInitialized().catch(() => {});
 
+    // PL6: actually kill the refresh token at Cognito — deleting local copies
+    // alone leaves any backup of data.json holding a credential that can mint
+    // fresh id tokens indefinitely. Best-effort (runs after every backend
+    // call that still needs a token); a failure never blocks local logout.
+    if (this.session?.refreshToken) {
+      const cfg = this.getEffectiveConfig();
+      if (cfg.cognitoUserPoolId && cfg.cognitoClientId && !isLocalDevAuth(cfg.cognitoUserPoolId)) {
+        try {
+          await cognitoRevokeToken(
+            cfg.cognitoUserPoolId,
+            cfg.cognitoClientId,
+            this.session.refreshToken
+          );
+          this.log("Cognito refresh token revoked.");
+        } catch (error) {
+          this.logError("Cognito RevokeToken failed (continuing local logout)", error);
+        }
+      }
+    }
+
     this.session = null;
     this.updateRibbonAuthIndicator();
     this.sidebarViewConfig = null;
@@ -4585,7 +4824,31 @@ export default class VaultGuardPlugin extends Plugin {
     // teardown signal.
     this.permissionStore.emit("changed", { serverConfirmed: true });
     this.reloadVaultGuardSidebar();
-    new Notice(noticeMessage);
+    this.showLogoutNotice(noticeMessage);
+  }
+
+  /**
+   * Surface the logout to the user. On desktop the status bar keeps a
+   * persistent "Logged out" indicator, so a normal transient Notice is enough.
+   * Obsidian mobile has NO status bar and the ribbon (which carries the auth
+   * indicator) lives behind the drawer, so a transient toast is easy to miss —
+   * users report not realizing they were signed out. On mobile we therefore
+   * show a STICKY notice (duration 0 = stays until tapped) that names the
+   * reason and how to get back in.
+   */
+  private showLogoutNotice(noticeMessage: string): void {
+    if (!Platform.isMobileApp) {
+      new Notice(noticeMessage);
+      return;
+    }
+    const state = this.lastLogoutAuthState;
+    const title = state?.title ?? "Logged out";
+    const detail = state?.detail ?? this.formatLogoutReason(noticeMessage);
+    // Sticky until tapped so the signed-out state is unmissable on mobile.
+    new Notice(
+      `VaultGuard Sync — ${title}.\n${detail}\nOpen the VaultGuard panel or Settings to log in again.`,
+      0,
+    );
   }
 
   /**
@@ -4726,6 +4989,14 @@ export default class VaultGuardPlugin extends Plugin {
 
   private async interceptedWriteBinary(path: string, data: ArrayBuffer): Promise<void> {
     return this.ensureAtRestAdapterRuntimeObject().interceptedWriteBinary(path, data);
+  }
+
+  private ensureAtRestEncryptedInPlace(path: string): Promise<boolean> {
+    return this.ensureAtRestAdapterRuntimeObject().ensureAtRestEncryptedInPlace(path);
+  }
+
+  private encryptExternallyAddedFile(path: string): Promise<void> {
+    return this.ensureAtRestAdapterRuntimeObject().encryptExternallyAddedFile(path);
   }
 
   private async canDeletePath(path: string): Promise<boolean> {
@@ -5043,7 +5314,7 @@ export default class VaultGuardPlugin extends Plugin {
     path: string,
     content: string,
     options: { noWriteNotice?: string } = {}
-  ): Promise<"uploaded" | "skipped"> {
+  ): Promise<"uploaded" | "skipped-no-lease" | "skipped-no-permission"> {
     return this.ensureSyncRuntime().uploadReconciledFile(path, content, options);
   }
 
@@ -5454,7 +5725,9 @@ export default class VaultGuardPlugin extends Plugin {
         );
       } else if (status >= 200 && status < 300) {
         lines.push(
-          `Verdict: BACKEND REACHABLE & AUTHORIZED (HTTP ${status}, ${latency}ms) — the offline flag is STALE. This was a transient blip; it should self-heal on the next retry. You can also run reconnectNow.`
+          this.connectionState.status === "online"
+            ? `Verdict: BACKEND REACHABLE & AUTHORIZED (HTTP ${status}, ${latency}ms) — consistent with the online status. All good.`
+            : `Verdict: BACKEND REACHABLE & AUTHORIZED (HTTP ${status}, ${latency}ms) — the "${this.connectionState.status}" flag is STALE. This was a transient blip; it should self-heal on the next retry. You can also run reconnectNow.`
         );
       } else if (status >= 500) {
         lines.push(
@@ -5643,8 +5916,11 @@ export default class VaultGuardPlugin extends Plugin {
     return this.ensureSyncRuntime().performSync(options);
   }
 
-  private async applyRemoteDeletion(normalizedPath: string): Promise<void> {
-    return this.ensureSyncRuntime().applyRemoteDeletion(normalizedPath);
+  private async applyRemoteDeletion(
+    normalizedPath: string,
+    inferred: boolean
+  ): Promise<void> {
+    return this.ensureSyncRuntime().applyRemoteDeletion(normalizedPath, inferred);
   }
 
   /**
@@ -5819,6 +6095,7 @@ export default class VaultGuardPlugin extends Plugin {
       this.keyLease = this.normalizeKeyLease(response.data.keyLease);
       this.applyOrgSettings(response.data.orgSettings ?? this.orgSettings);
       this.vaultLeaseDenied = false;
+      this.leaseRetryNeeded = false;
       this.log("Vault-scoped key lease: ok");
       return "ok";
     }
@@ -5847,11 +6124,19 @@ export default class VaultGuardPlugin extends Plugin {
       // guarding on `keyLease`.
       this.keyLease = null;
       this.vaultLeaseDenied = true;
+      // Definitive denial, not a transient failure — clear the transient-retry
+      // flag so the two recovery paths don't fight.
+      this.leaseRetryNeeded = false;
       this.log(`Vault-scoped key lease denied (limited access): status=${statusCode}, message=${message}`);
       this.notifyLimitedAccess(message);
       return "limited";
     }
 
+    // PL2: transient failure (5xx / network / statusCode 0). Leave the session
+    // intact but flag that a lease still needs acquiring so the key-renewal
+    // monitor's recovery branch retries it — otherwise the null lease would
+    // never be re-requested and uploads would stay silently paused.
+    this.leaseRetryNeeded = true;
     throw new Error(message);
   }
 
@@ -6174,6 +6459,111 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // AI-chat API key cross-device sync (crypto + context)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Wraps the plaintext Anthropic API key with the LIVE vault DEK so it can be
+   * stored server-side as an opaque, roaming envelope. Reuses the same
+   * AES-256-GCM crypto as file encryption (fresh 12-byte nonce embedded inside
+   * `ct`, matching the on-disk/cloud envelope — NOT a separate field) and the
+   * same lease/vault-binding guard. Returns null (never throws) when there is
+   * no valid, vault-matched lease, in which case the caller keeps the key
+   * device-local only. The plaintext key is never sent to the server.
+   */
+  async wrapAiKeySecret(plaintext: string): Promise<string | null> {
+    if (!this.keyLease || this.isKeyLeaseExpired() || !this.settings.serverVaultId) {
+      return null;
+    }
+    try {
+      const ct = await this.encryptContent(plaintext);
+      const dekTag = await this.aiKeyDekTag();
+      if (!dekTag) return null;
+      return JSON.stringify({ v: 1, ct, dekTag });
+    } catch (err) {
+      this.log(`AI key wrap skipped: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Reverses wrapAiKeySecret. Returns null (never throws) on a version
+   * mismatch, a rotated/retired DEK (dekTag mismatch — soft-fail, debug log
+   * only, so a device with a live key can still heal the blob), or any
+   * decrypt failure.
+   */
+  async unwrapAiKeySecret(envelope: string): Promise<string | null> {
+    let parsed: { v?: unknown; ct?: unknown; dekTag?: unknown };
+    try {
+      parsed = JSON.parse(envelope);
+    } catch {
+      return null;
+    }
+    if (parsed.v !== 1 || typeof parsed.ct !== "string") return null;
+    const currentTag = await this.aiKeyDekTag();
+    if (!currentTag || parsed.dekTag !== currentTag) {
+      this.log("AI key envelope wrapped with a stale/rotated DEK — treating as no key.");
+      return null;
+    }
+    try {
+      return await this.decryptContent(parsed.ct);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * True when `envelope` was wrapped with a DEK other than the current live one
+   * (or cannot be parsed / there is no valid lease) — i.e. a live-keyed device
+   * should re-upload to heal it. Returns false ONLY when the envelope is
+   * confidently current.
+   */
+  async isAiKeyEnvelopeStale(envelope: string): Promise<boolean> {
+    let parsed: { dekTag?: unknown };
+    try {
+      parsed = JSON.parse(envelope);
+    } catch {
+      return true;
+    }
+    const currentTag = await this.aiKeyDekTag();
+    if (!currentTag) return true;
+    return parsed.dekTag !== currentTag;
+  }
+
+  /**
+   * One-way, non-reversible 8-byte fingerprint of the live DEK
+   * (SHA-256(DEK)[:8], base64). Safe to store/transmit in plaintext — it leaks
+   * nothing usable about the 256-bit key. Used ONLY to detect DEK rotation so a
+   * blob wrapped under a retired DEK fails soft. Null when no valid lease.
+   */
+  private async aiKeyDekTag(): Promise<string | null> {
+    if (!this.keyLease || this.isKeyLeaseExpired()) return null;
+    const keyBytes = this.base64ToBytes(this.keyLease.key);
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      keyBytes.buffer.slice(keyBytes.byteOffset, keyBytes.byteOffset + keyBytes.byteLength) as ArrayBuffer
+    );
+    return this.bytesToBase64(new Uint8Array(digest).slice(0, 8));
+  }
+
+  /**
+   * Narrow accessor exposing exactly the three otherwise-private fields
+   * ApiKeySync needs (api client, session, bound vault). This getter is their
+   * only exposure to the sync module.
+   */
+  getAiKeySyncContext(): {
+    apiClient: VaultGuardApiClient | null;
+    session: UserSession | null;
+    vaultId: string;
+  } {
+    return {
+      apiClient: this.apiClient,
+      session: this.session,
+      vaultId: this.settings.serverVaultId,
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Connection Management
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -6452,6 +6842,31 @@ export default class VaultGuardPlugin extends Plugin {
       if (this.isSessionTokenExpiring(this.session)) {
         const refreshResult = await this.refreshAccessToken(this.session);
         if (!refreshResult.ok) {
+          // PL4: a TERMINAL rejection (refresh token revoked/expired, user
+          // disabled) can never heal — fail closed like a server revocation
+          // instead of parking in perpetual "offline" with a stale session.
+          // The guard flag breaks recursion: forceLogout itself POSTs
+          // /auth/logout through apiRequest with the same dead token.
+          if (refreshResult.terminal && !this.terminalRefreshLogoutInProgress) {
+            this.terminalRefreshLogoutInProgress = true;
+            try {
+              await this.handleServerRevocation("session expired or revoked");
+            } finally {
+              this.terminalRefreshLogoutInProgress = false;
+            }
+            return {
+              success: false,
+              data: null,
+              error: {
+                code: "SESSION_REVOKED",
+                message:
+                  "Your VaultGuard session has been revoked or has expired. Please sign in again.",
+                details: null,
+                statusCode: 401,
+              },
+              requestId: "",
+            };
+          }
           this.setConnectionStatus("offline");
           return {
             success: false,
@@ -6486,6 +6901,9 @@ export default class VaultGuardPlugin extends Plugin {
     const startedAt = Date.now();
     let lastError: Error | null = null;
     let sawNetworkError = false;
+    // AC-API1: the latest REAL HTTP failure (429/5xx that exhausted retries).
+    // Returned with its true status instead of collapsing to statusCode 0.
+    let lastHttpFailure: ApiResponse<T> | null = null;
 
     for (let attempt = 0; attempt < this.settings.maxRetryAttempts; attempt++) {
       try {
@@ -6526,22 +6944,44 @@ export default class VaultGuardPlugin extends Plugin {
           };
         }
 
-        // Non-retryable errors
-        if (response.status === 401 || response.status === 403) {
-          return {
-            success: false,
-            data: null,
-            error: {
-              code: (data as Record<string, unknown> | null)?.code as string ?? "AUTH_ERROR",
-              message: (data as Record<string, unknown> | null)?.message as string ?? "Authentication failed",
-              details: ((data as Record<string, unknown> | null)?.details as Record<string, unknown> | null) ?? null,
-              statusCode: response.status,
-            },
-            requestId: this.getHeaderValue(response.headers, "x-request-id") ?? "",
-          };
+        // AC-API1: every HTTP failure carries its REAL status to the caller.
+        // Permanent statuses (404/409/413/…) return immediately — retrying
+        // cannot change them, and collapsing them to statusCode 0 made
+        // callers treat "already deleted" or "note too large" as a network
+        // outage (offline flip + endless requeue). Only genuinely transient
+        // failures (429, 5xx) retry, and when exhausted they ALSO return
+        // their real status. statusCode 0 now means exactly "network
+        // failure / request never reached the server".
+        const httpFailure: ApiResponse<T> = {
+          success: false,
+          data: null,
+          error: {
+            code:
+              ((data as Record<string, unknown> | null)?.code as string) ??
+              (response.status === 401 || response.status === 403
+                ? "AUTH_ERROR"
+                : `HTTP_${response.status}`),
+            message:
+              ((data as Record<string, unknown> | null)?.message as string) ??
+              (response.status === 401 || response.status === 403
+                ? "Authentication failed"
+                : `HTTP ${response.status}: Request failed`),
+            details:
+              ((data as Record<string, unknown> | null)?.details as Record<
+                string,
+                unknown
+              > | null) ?? null,
+            statusCode: response.status,
+          },
+          requestId: this.getHeaderValue(response.headers, "x-request-id") ?? "",
+        };
+
+        if (response.status !== 429 && response.status < 500) {
+          return httpFailure;
         }
 
-        lastError = new Error(`HTTP ${response.status}: ${(data as Record<string, unknown> | null)?.message ?? "Request failed"}`);
+        lastHttpFailure = httpFailure;
+        lastError = new Error(httpFailure.error?.message ?? `HTTP ${response.status}`);
       } catch (error) {
         lastError =
           error instanceof Error ? error : new Error("Unknown network error");
@@ -6562,6 +7002,13 @@ export default class VaultGuardPlugin extends Plugin {
     // All retries exhausted
     if (sawNetworkError) {
       this.setConnectionStatus("offline");
+    }
+
+    // A real HTTP failure (429/5xx) beats the generic network shape — the
+    // caller learns the true status even when some attempts were network
+    // errors.
+    if (lastHttpFailure) {
+      return lastHttpFailure;
     }
 
     return {
@@ -7183,6 +7630,10 @@ export default class VaultGuardPlugin extends Plugin {
   private clearSensitiveData(): void {
     this.session = null;
     this.keyLease = null;
+    // Drop the API client's cached JWTs so no privileged request (an open
+    // admin/share modal, a queued call) can reuse the idToken after logout or
+    // auto-lock. getAuthHeaders then fails closed until the user re-authenticates.
+    this.apiClient?.clearTokens();
     this.orgSettings = null;
     this.vaultMemberRole = null;
     this.stopKeyRenewalMonitor();
@@ -7191,12 +7642,100 @@ export default class VaultGuardPlugin extends Plugin {
     // Phase 9: SILENT — teardown path; no subscribers to notify.
     this.permissionStore.invalidate();
     this.offlineQueue = [];
+    // SY5: an empty queue removes the persisted envelope, so a logout/lock
+    // never leaves another user's queued edits on disk for the next session.
+    this.scheduleOfflineQueuePersist();
     this.log("Sensitive data cleared from memory.");
   }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Storage Helpers
   // ─────────────────────────────────────────────────────────────────────────
+
+  // ── SY5: offline-queue persistence ──────────────────────────────────────
+  // Queued offline writes carry PLAINTEXT vault content, so they can never
+  // go into data.json (excluded from at-rest encryption). They persist as a
+  // LAK-encrypted envelope in the plugin's own config dir — the same
+  // mechanism as agent-leases.envelope — and are restored on load, so
+  // limited-access/offline edits survive a restart.
+
+  private offlineQueueEnvelopePath(): string {
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    return `${this.app.vault.configDir}/plugins/${pluginId}/offline-queue.envelope`;
+  }
+
+  private scheduleOfflineQueuePersist(): void {
+    if (this.offlineQueuePersistTimer) clearTimeout(this.offlineQueuePersistTimer);
+    this.offlineQueuePersistTimer = setTimeout(() => {
+      this.offlineQueuePersistTimer = null;
+      void this.persistOfflineQueue();
+    }, 1_000);
+  }
+
+  private async persistOfflineQueue(): Promise<void> {
+    const path = this.offlineQueueEnvelopePath();
+    try {
+      if (this.offlineQueue.length === 0) {
+        if (await this.app.vault.adapter.exists(path)) {
+          await this.app.vault.adapter.remove(path);
+        }
+        return;
+      }
+      // Fail closed: never write queued plaintext unencrypted. If the cipher
+      // or binary writes are unavailable, the queue simply stays memory-only
+      // for this launch (the pre-fix behavior).
+      if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.writeBinary) {
+        return;
+      }
+      await this.ensureParentFoldersForPath(path);
+      const envelope = await this.atRestCipher.encryptString(
+        JSON.stringify({ v: 1, ops: this.offlineQueue })
+      );
+      await this.originalAdapterMethods.writeBinary(path, envelope);
+    } catch (error) {
+      this.logError("Failed to persist the offline queue envelope", error);
+    }
+  }
+
+  private async loadPersistedOfflineQueue(): Promise<void> {
+    const readBinary = this.originalAdapterMethods.readBinary;
+    if (!readBinary) return;
+    const path = this.offlineQueueEnvelopePath();
+    try {
+      if (!(await this.app.vault.adapter.exists(path))) return;
+      await this.waitForCipherInit(10_000);
+      if (!this.atRestCipher?.isReady()) {
+        // Keep the envelope on disk — it can still be restored next launch.
+        this.log("Offline queue envelope present but the at-rest cipher is not ready; leaving it for the next launch.");
+        return;
+      }
+      const plaintext = await this.atRestCipher.decryptString(await readBinary(path));
+      const parsed = JSON.parse(plaintext) as {
+        v?: number;
+        ops?: Array<{ operation?: string; path?: string; data?: string; timestamp?: string }>;
+      };
+      if (parsed?.v !== 1 || !Array.isArray(parsed.ops)) return;
+      const restored = parsed.ops.filter(
+        (op): op is { operation: "write" | "delete"; path: string; data?: string; timestamp: string } =>
+          !!op &&
+          (op.operation === "write" || op.operation === "delete") &&
+          typeof op.path === "string" &&
+          op.path.length > 0 &&
+          typeof op.timestamp === "string"
+      );
+      if (restored.length === 0) return;
+      // Ops queued during this launch (while the load ran) are NEWER — they
+      // win per-path; restored ops go first so the flush stays chronological.
+      const livePaths = new Set(this.offlineQueue.map((op) => op.path));
+      this.offlineQueue = [
+        ...restored.filter((op) => !livePaths.has(op.path)),
+        ...this.offlineQueue,
+      ];
+      this.log(`Restored ${restored.length} queued offline operation(s) from the envelope.`);
+    } catch (error) {
+      this.logError("Failed to restore the offline queue envelope", error);
+    }
+  }
 
   private async savePluginData(): Promise<void> {
     await this.getSettingsRuntime().savePluginData();

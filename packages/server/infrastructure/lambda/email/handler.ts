@@ -87,6 +87,24 @@ interface TrialActivationParams {
   billingUrl?: string;
 }
 
+/**
+ * Internal (team) billing alert — sent to support@, NOT to a customer. Summarizes
+ * a billing event (failed payment, cancellation, out-of-band status drift) so the
+ * team is notified independently of the customer-facing emails.
+ */
+interface InternalBillingAlertParams {
+  email: string;
+  event: 'payment_failed' | 'subscription_canceled' | 'status_drift';
+  orgName: string;
+  orgId: string;
+  ownerEmail: string;
+  status?: string;
+  amount?: string;
+  currency?: string;
+  attemptCount?: number;
+  detail?: string;
+}
+
 type EmailType =
   | 'welcome'
   | 'invitation'
@@ -94,7 +112,8 @@ type EmailType =
   | 'payment-success'
   | 'payment-failed'
   | 'subscription-cancelled'
-  | 'trial-activation';
+  | 'trial-activation'
+  | 'internal-billing-alert';
 
 type EmailParams =
   | WelcomeParams
@@ -103,7 +122,8 @@ type EmailParams =
   | PaymentSuccessParams
   | PaymentFailedParams
   | SubscriptionCancelledParams
-  | TrialActivationParams;
+  | TrialActivationParams
+  | InternalBillingAlertParams;
 
 interface EmailPayload {
   type: EmailType;
@@ -505,6 +525,41 @@ function buildPaymentFailedEmail(params: PaymentFailedParams): { subject: string
   return { subject, html: renderEmail(subject, bodyHtml) };
 }
 
+const INTERNAL_ALERT_TITLES: Record<InternalBillingAlertParams['event'], string> = {
+  payment_failed: 'Payment failed',
+  subscription_canceled: 'Subscription canceled',
+  status_drift: 'Subscription status drift corrected',
+};
+
+export function buildInternalBillingAlertEmail(params: InternalBillingAlertParams): { subject: string; html: string } {
+  const title = INTERNAL_ALERT_TITLES[params.event] || 'Billing alert';
+  const subject = `[VaultGuard billing] ${title} — ${params.orgName}`;
+  const rows: Array<[string, string | undefined]> = [
+    ['Event', params.event],
+    ['Org', `${params.orgName} (${params.orgId})`],
+    ['Owner', params.ownerEmail],
+    ['Status', params.status],
+    ['Amount', params.amount ? `${params.amount} ${(params.currency || '').toUpperCase()}` : undefined],
+    ['Attempt', params.attemptCount != null ? String(params.attemptCount) : undefined],
+    ['Detail', params.detail],
+  ];
+  const rowsHtml = rows
+    .filter(([, v]) => v)
+    .map(
+      ([k, v]) => `
+      <tr>
+        <td style="padding:4px 12px 4px 0;font-size:13px;color:${TEXT_MUTED};white-space:nowrap;vertical-align:top;">${escapeHtml(k)}</td>
+        <td style="padding:4px 0;font-size:13px;color:${TEXT_COLOR};">${escapeHtml(String(v))}</td>
+      </tr>`
+    )
+    .join('');
+  const bodyHtml = `
+    <h1 style="margin:0 0 8px 0;font-size:22px;font-weight:700;color:${TEXT_COLOR};">${escapeHtml(title)}</h1>
+    <p style="margin:0 0 20px 0;font-size:14px;color:${TEXT_MUTED};">Internal notification — no customer action taken by this email.</p>
+    ${renderInfoCard('Details', `<table style="border-collapse:collapse;">${rowsHtml}</table>`, params.event === 'payment_failed' || params.event === 'status_drift' ? DANGER : WARNING)}`;
+  return { subject, html: renderEmail(subject, bodyHtml) };
+}
+
 function buildSubscriptionCancelledEmail(params: SubscriptionCancelledParams): { subject: string; html: string } {
   const subject = `VaultGuard — Subscription Cancelled for ${params.orgName}`;
   const bodyHtml = `
@@ -639,6 +694,12 @@ export async function sendEmail(type: EmailType, params: EmailParams, options?: 
       const p = params as TrialActivationParams;
       toAddress = p.email;
       ({ subject, html } = buildTrialActivationEmail(p));
+      break;
+    }
+    case 'internal-billing-alert': {
+      const p = params as InternalBillingAlertParams;
+      toAddress = p.email;
+      ({ subject, html } = buildInternalBillingAlertEmail(p));
       break;
     }
     default:

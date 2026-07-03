@@ -131,10 +131,13 @@ const mockNotice = vi.mocked(Notice);
 function createTestPlugin() {
   const plugin = new VaultGuardPlugin() as any;
 
-  // Mock original adapter methods (the real filesystem operations)
+  // Mock original adapter methods (the real filesystem operations).
+  // writeBinary is present because writePlainToDisk fails closed without it
+  // (AR2) — encrypted content only ever lands via writeBinary.
   plugin.originalAdapterMethods = {
     read: vi.fn().mockResolvedValue('local file content'),
     write: vi.fn().mockResolvedValue(undefined),
+    writeBinary: vi.fn().mockResolvedValue(undefined),
     list: vi.fn().mockResolvedValue({
       files: ['public/doc.md', 'private/secret.md', 'shared/notes.md'],
       folders: ['public', 'private', 'shared'],
@@ -504,9 +507,12 @@ describe('File Protection: Vault Adapter Interception', () => {
 
       await plugin.interceptedWrite('docs/editable.md', 'updated content');
 
-      expect(plugin.originalAdapterMethods.write).toHaveBeenCalledWith(
-        'docs/editable.md', 'updated content'
-      );
+      // Managed writes land encrypted via writeBinary (AR2) — the passthrough
+      // cipher makes the bytes decodable back to the plaintext.
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
+      const [wbPath, wbBytes] = plugin.originalAdapterMethods.writeBinary.mock.calls[0];
+      expect(wbPath).toBe('docs/editable.md');
+      expect(new TextDecoder().decode(wbBytes)).toBe('updated content');
     });
 
     it('allows write when permission is ADMIN', async () => {
@@ -516,9 +522,24 @@ describe('File Protection: Vault Adapter Interception', () => {
 
       await plugin.interceptedWrite('docs/file.md', 'admin edit');
 
-      expect(plugin.originalAdapterMethods.write).toHaveBeenCalledWith(
-        'docs/file.md', 'admin edit'
-      );
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
+      const [wbPath, wbBytes] = plugin.originalAdapterMethods.writeBinary.mock.calls[0];
+      expect(wbPath).toBe('docs/file.md');
+      expect(new TextDecoder().decode(wbBytes)).toBe('admin edit');
+    });
+
+    it('fails closed instead of corrupting ciphertext when the adapter lacks writeBinary (AR2)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.permissionCache.set('docs/editable.md', PermissionLevel.WRITE);
+      plugin.connectionState.status = 'offline';
+      delete plugin.originalAdapterMethods.writeBinary;
+
+      // A string write() would UTF-8-encode the ciphertext (every byte >=
+      // 0x80 becomes multi-byte) and the file could never decrypt again.
+      await expect(
+        plugin.interceptedWrite('docs/editable.md', 'updated content')
+      ).rejects.toThrow('lacks binary writes');
+      expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
     });
 
     it('queues offline operation when offline', async () => {
@@ -564,6 +585,99 @@ describe('File Protection: Vault Adapter Interception', () => {
 
       expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
       expect(plugin.offlineQueue).toHaveLength(0);
+    });
+  });
+
+  // ── interceptedWriteBinary ───────────────────────────────────────────
+
+  describe('interceptedWriteBinary', () => {
+    it('rejects binary writes with a visible Notice so drag-drop is not silent', async () => {
+      plugin.session = makeSession('editor');
+      plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+      const { Notice } = await import('obsidian');
+      vi.mocked(Notice).mockClear();
+
+      // PNG magic + high bytes: real attachment content, not VG1 ciphertext.
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]).buffer;
+      await expect(plugin.interceptedWriteBinary('img/pic.png', bytes))
+        .rejects.toThrow('Binary files are not currently supported');
+
+      expect(vi.mocked(Notice)).toHaveBeenCalledWith(
+        expect.stringContaining("binary attachments aren't supported"),
+        8000
+      );
+
+      // Throttled: an immediate second drop of the same path throws again
+      // but does not stack a second notice.
+      vi.mocked(Notice).mockClear();
+      await expect(plugin.interceptedWriteBinary('img/pic.png', bytes))
+        .rejects.toThrow('Binary files are not currently supported');
+      expect(vi.mocked(Notice)).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── ensureAtRestEncryptedInPlace (externally-added files) ────────────
+
+  describe('ensureAtRestEncryptedInPlace', () => {
+    const textBytes = () => new TextEncoder().encode('# externally added note\n').buffer;
+
+    beforeEach(() => {
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(textBytes());
+    });
+
+    it('re-encrypts an externally-added plaintext text file in place with identical bytes', async () => {
+      const result = await plugin.ensureAtRestEncryptedInPlace('dropped/note.md');
+
+      expect(result).toBe(true);
+      expect(plugin.atRestCipher.encryptBinary).toHaveBeenCalledOnce();
+      const encryptedInput = plugin.atRestCipher.encryptBinary.mock.calls[0][0];
+      expect(new TextDecoder().decode(encryptedInput)).toBe('# externally added note\n');
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledOnce();
+    });
+
+    it('no-ops for files that are already VG1 ciphertext', async () => {
+      plugin.atRestCipher.isEncrypted = vi.fn(() => true);
+
+      const result = await plugin.ensureAtRestEncryptedInPlace('already/encrypted.md');
+
+      expect(result).toBe(false);
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+    });
+
+    it('deliberately leaves binary files plaintext (no server copy to recover from)', async () => {
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(
+        new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]).buffer
+      );
+
+      const result = await plugin.ensureAtRestEncryptedInPlace('img/photo.png');
+
+      expect(result).toBe(false);
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+    });
+
+    it('skips excluded paths', async () => {
+      const result = await plugin.ensureAtRestEncryptedInPlace('.obsidian/workspace.json');
+
+      expect(result).toBe(false);
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+    });
+
+    it('returns false without throwing when the cipher is not ready', async () => {
+      plugin.atRestCipher.isReady = vi.fn(() => false);
+
+      const result = await plugin.ensureAtRestEncryptedInPlace('dropped/note.md');
+
+      expect(result).toBe(false);
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+    });
+
+    it('returns false without throwing when the raw read fails', async () => {
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockRejectedValue(new Error('EBUSY'));
+
+      const result = await plugin.ensureAtRestEncryptedInPlace('dropped/note.md');
+
+      expect(result).toBe(false);
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
     });
   });
 
@@ -870,9 +984,9 @@ describe('File Protection: End-to-End Flows', () => {
     const content = await plugin.interceptedRead('project/design.md');
     expect(content).toBe('local file content');
 
-    // Can write
+    // Can write (encrypted content lands via writeBinary — AR2)
     await plugin.interceptedWrite('project/design.md', 'design update');
-    expect(plugin.originalAdapterMethods.write).toHaveBeenCalled();
+    expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalled();
 
     await expect(plugin.interceptedDelete('project/design.md')).rejects.toThrow('Access denied');
     expect(plugin.originalAdapterMethods.remove).not.toHaveBeenCalled();
@@ -888,7 +1002,7 @@ describe('File Protection: End-to-End Flows', () => {
     await plugin.interceptedDelete('any/file.md');
 
     expect(plugin.originalAdapterMethods.read).toHaveBeenCalledTimes(1);
-    expect(plugin.originalAdapterMethods.write).toHaveBeenCalledTimes(1);
+    expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
     expect(plugin.originalAdapterMethods.remove).toHaveBeenCalledTimes(1);
   });
 
@@ -899,13 +1013,13 @@ describe('File Protection: End-to-End Flows', () => {
     // Initially has WRITE
     plugin.permissionCache.set('file.md', PermissionLevel.WRITE);
     await plugin.interceptedWrite('file.md', 'allowed');
-    expect(plugin.originalAdapterMethods.write).toHaveBeenCalledTimes(1);
+    expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
 
     // Permission downgraded to READ
     plugin.permissionCache.set('file.md', PermissionLevel.READ);
     await expect(plugin.interceptedWrite('file.md', 'blocked'))
       .rejects.toThrow('Access denied');
-    expect(plugin.originalAdapterMethods.write).toHaveBeenCalledTimes(1); // not called again
+    expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1); // not called again
   });
 
   it('revoked access (NONE) blocks writes/deletes, returns disk content on reads (1.0.17 fail-open)', async () => {

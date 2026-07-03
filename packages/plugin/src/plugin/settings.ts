@@ -80,6 +80,9 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   // On by default for live token-by-token feedback. Desktop-only; mobile always
   // falls back to the Tier-1 requestUrl path (see chat-view streamingEnabled()).
   aiChatStreaming: true,
+  // On by default: a key entered on desktop auto-provisions on mobile without
+  // re-entry. Stored server-side ONLY as a DEK-wrapped envelope (zero-knowledge).
+  aiChatKeySyncEnabled: true,
   aiChatPermissionMode: "confirm",
   aiChatProvider: "apiKey",
   deletionTombstones: {},
@@ -292,6 +295,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.aiChatKeyStore.setKey(newKey);
             // Wipe the plaintext from the field immediately after storing.
             inputEl.value = "";
+            // Best-effort: push a DEK-wrapped copy to Cloud so the key roams to
+            // the user's other devices (no-op when sync is off / no lease yet).
+            void this.plugin.aiKeySync.uploadIfEnabled({ userInitiated: true });
             this.showStatus(containerEl, "Anthropic API key saved.", false);
             this.display();
           } catch (error) {
@@ -315,6 +321,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             clearBtn.disabled = true;
             try {
               await this.aiChatKeyStore.clearKey();
+              // Best-effort: remove the roaming copy from Cloud too.
+              void this.plugin.aiKeySync.deleteRemote();
               this.showStatus(containerEl, "Anthropic API key removed.", false);
               this.display();
             } catch (error) {
@@ -328,6 +336,30 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             }
           });
         }
+      });
+
+    // ── Sync API key across devices ─────────────────────────────────────────
+    new Setting(containerEl)
+      .setName("Sync API key to your other devices")
+      .setDesc(
+        "Stores an ENCRYPTED copy of your Anthropic key — wrapped with your vault's key — in " +
+          "VaultGuard Cloud, so mobile works without re-entering it. VaultGuard never sees the " +
+          "plaintext key.",
+      )
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.aiChatKeySyncEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.aiChatKeySyncEnabled = value;
+            await this.plugin.saveSettings();
+            if (value) {
+              // Turned ON: push the current local key (if any) right away.
+              void this.plugin.aiKeySync.uploadIfEnabled({ userInitiated: true });
+            } else {
+              // Turned OFF: best-effort remove the roaming copy from Cloud.
+              void this.plugin.aiKeySync.deleteRemote();
+            }
+          });
       });
 
     // ── Model ───────────────────────────────────────────────────────────────
@@ -359,17 +391,22 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       });
 
     // ── Streaming (Tier 2 — opt-in, desktop-only) ───────────────────────────
-    new Setting(containerEl)
-      .setName("Stream responses")
-      .setDesc("Desktop only; streams responses token-by-token as they arrive. On by default (mobile always uses the non-streaming path).")
-      .addToggle((toggle) => {
-        toggle
-          .setValue(this.plugin.settings.aiChatStreaming)
-          .onChange(async (value) => {
-            this.plugin.settings.aiChatStreaming = value;
-            await this.plugin.saveSettings();
-          });
-      });
+    // Hidden on mobile: streaming is force-disabled at runtime in the chat view
+    // (streamingEnabled() → !Platform.isMobileApp), so the toggle would be a
+    // dead control there. The runtime guard remains the actual enforcement.
+    if (!Platform.isMobileApp) {
+      new Setting(containerEl)
+        .setName("Stream responses")
+        .setDesc("Desktop only; streams responses token-by-token as they arrive. On by default (mobile always uses the non-streaming path).")
+        .addToggle((toggle) => {
+          toggle
+            .setValue(this.plugin.settings.aiChatStreaming)
+            .onChange(async (value) => {
+              this.plugin.settings.aiChatStreaming = value;
+              await this.plugin.saveSettings();
+            });
+        });
+    }
 
     // ── Permissions ────────────────────────────────────────────────────────
     new Setting(containerEl)
@@ -525,7 +562,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     if (onMobile) {
       statusSetting.setDesc(
-        "Subscription mode needs desktop Obsidian — switch to an API key to chat on mobile.",
+        "Subscription mode drives the Claude Code CLI, which can't run inside mobile Obsidian — so " +
+          "it's desktop-only. Use an Anthropic API key to chat on mobile. A key you saved on desktop " +
+          "syncs here automatically when “Sync API key to your other devices” is on.",
       );
       return;
     }

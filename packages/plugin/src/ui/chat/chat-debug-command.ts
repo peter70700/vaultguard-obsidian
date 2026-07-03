@@ -35,7 +35,7 @@ const DEBUG_PROMPT = "List the markdown files you can access and summarize the f
 export function registerChatDebugCommand(plugin: VaultGuardPlugin): void {
   plugin.addCommand({
     id: "vaultguard-chat-debug",
-    name: "VaultGuard Chat: run headless debug turn (debug)",
+    name: "VaultGuard (debug): Run headless chat debug turn",
     checkCallback: (checking: boolean) => {
       // Command only appears when debug logging is on.
       if (!plugin.settings.debugLogging) return false;

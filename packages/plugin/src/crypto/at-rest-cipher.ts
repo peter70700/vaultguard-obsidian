@@ -34,9 +34,46 @@ const KEY_LEN = 32;       // AES-256
  * Storage hooks injected by the plugin. We deliberately don't import Obsidian
  * here so the cipher remains testable in plain Node.
  */
+/**
+ * Result of probing for the wrapped LAK. Critically distinguishes "no envelope
+ * exists yet" (safe to provision a fresh key) from "an envelope exists but we
+ * could not read it" (a transient I/O error / truncated file — provisioning
+ * here would OVERWRITE the only wrapped copy of the LAK and orphan every
+ * at-rest ciphertext on disk). A bare `string | null` cannot express that
+ * difference, which is why `loadWrappedLak` alone is unsafe for the provisioning
+ * decision.
+ */
+export type WrappedLakProbe =
+  | { kind: "absent" }
+  | { kind: "present"; blob: string }
+  | { kind: "error"; reason: string };
+
 export interface AtRestStorage {
   /** Read the wrapped LAK blob (base64 string), or null if not yet provisioned. */
   loadWrappedLak(): Promise<string | null>;
+  /**
+   * Richer probe that distinguishes absent / present / read-error. When a
+   * storage implementation provides this, `init()` uses it INSTEAD of
+   * `loadWrappedLak()` for the provisioning decision, so a transient read
+   * failure is never mistaken for first-run and the existing envelope is never
+   * overwritten. Implementations that omit it fall back to `loadWrappedLak()`
+   * (null → absent), preserving the previous behaviour for in-memory test mocks.
+   */
+  probeWrappedLak?(): Promise<WrappedLakProbe>;
+  /**
+   * Optional guard consulted ONLY when `probeWrappedLak` reports `absent`,
+   * before a fresh LAK is provisioned. Returns true if any at-rest ciphertext
+   * (a VG1-headed file) still exists on disk. A missing envelope with existing
+   * ciphertext is NOT a first run — it's a same-id reinstall or a synced copy
+   * opened on a new device, where the plugin folder (holding the envelope) was
+   * deleted but the encrypted notes survive. Minting a new LAK there would
+   * orphan every one of those files under a key that no longer exists. When
+   * this returns true, `init()` routes to `needs-recovery` instead of
+   * provisioning. Implementations that omit it keep the previous
+   * provision-on-absent behaviour (safe for in-memory test mocks, which have no
+   * vault to scan).
+   */
+  hasExistingCiphertext?(): Promise<boolean>;
   /** Persist the wrapped LAK blob (base64). */
   saveWrappedLak(blob: string): Promise<void>;
   /** Remove the wrapped LAK blob entirely (on plugin disable / decrypt-and-leave). */
@@ -91,18 +128,56 @@ export class AtRestCipher {
   async init(): Promise<boolean> {
     this.safeStorage = probeSafeStorage();
 
-    let wrapped = await this.storage.loadWrappedLak();
+    const probe = await this.probeWrapped();
 
-    if (!wrapped) {
-      // First-time provisioning: generate a fresh LAK.
+    if (probe.kind === "error") {
+      // The envelope EXISTS but could not be read (transient I/O error,
+      // truncated/empty blob, locked file). Provisioning a fresh LAK here would
+      // overwrite the only wrapped copy of the real key and permanently orphan
+      // every at-rest ciphertext on disk. Refuse to provision; route the user
+      // to recovery instead. This is the data-loss failure mode the envelope
+      // migration guard was written to prevent, generalised to all read errors.
+      this.status = {
+        kind: "needs-recovery",
+        reason: `Could not read the local at-rest key envelope: ${probe.reason}. This is usually transient — reopen the vault to retry. If it persists, restore from your recovery code in Settings → VaultGuard. Your encrypted files are intact; VaultGuard will not overwrite the key.`,
+      };
+      return false;
+    }
+
+    if (probe.kind === "absent") {
+      // No envelope exists. Before provisioning a fresh LAK, confirm this is a
+      // genuine first run and not a same-id reinstall / fresh-device open where
+      // the plugin folder (which holds the envelope) was deleted but the
+      // vault's VG1 ciphertext survives on disk. Minting a new LAK there would
+      // orphan every encrypted note under a key that no longer exists. The
+      // prior-plugin-id envelope migration does NOT cover a same-id
+      // uninstall/reinstall, so this ciphertext scan is the backstop.
+      if (this.storage.hasExistingCiphertext) {
+        let hasCiphertext = false;
+        try {
+          hasCiphertext = await this.storage.hasExistingCiphertext();
+        } catch {
+          // If we cannot even scan for ciphertext, fail safe: assume it may
+          // exist rather than risk provisioning over it.
+          hasCiphertext = true;
+        }
+        if (hasCiphertext) {
+          this.status = {
+            kind: "needs-recovery",
+            reason:
+              "The local at-rest key is missing but this vault still contains encrypted files — this usually happens after reinstalling the plugin or opening a synced copy on a new device. Restore from your recovery code in Settings → VaultGuard to regain access. VaultGuard will not create a new key over your existing encrypted files.",
+          };
+          return false;
+        }
+      }
+      // First-time provisioning: no envelope AND no existing ciphertext.
       const fresh = crypto.getRandomValues(new Uint8Array(KEY_LEN));
       const blob = await this.wrapLak(fresh);
       await this.storage.saveWrappedLak(blob);
-      wrapped = blob;
       this.lak = fresh;
     } else {
       try {
-        this.lak = await this.unwrapLak(wrapped);
+        this.lak = await this.unwrapLak(probe.blob);
       } catch (err) {
         // The persisted blob can't be unwrapped — most likely the user moved
         // their vault to a different machine, the OS keychain entry was
@@ -130,6 +205,22 @@ export class AtRestCipher {
 
     this.status = { kind: "unlocked", method: this.method! };
     return true;
+  }
+
+  /**
+   * Resolve the wrapped-LAK state, preferring the storage's richer
+   * `probeWrappedLak()` (which separates a genuine "absent" from an unreadable
+   * envelope). Implementations that only supply `loadWrappedLak()` fall back to
+   * the legacy null→absent mapping; that is safe for the in-memory test mocks
+   * because they never throw, but the production adapter MUST implement the
+   * probe so a real disk read error surfaces as `error`, not `absent`.
+   */
+  private async probeWrapped(): Promise<WrappedLakProbe> {
+    if (this.storage.probeWrappedLak) {
+      return this.storage.probeWrappedLak();
+    }
+    const wrapped = await this.storage.loadWrappedLak();
+    return wrapped ? { kind: "present", blob: wrapped } : { kind: "absent" };
   }
 
   /** True if the cipher is unlocked and ready. */

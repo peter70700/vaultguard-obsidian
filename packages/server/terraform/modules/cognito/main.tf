@@ -1,5 +1,6 @@
 variable "stage" { type = string }
 variable "is_prod" { type = bool }
+variable "production_hardening" { type = bool }
 variable "callback_urls" { type = list(string) }
 variable "logout_urls" { type = list(string) }
 variable "ses_sender_email" { type = string }
@@ -9,9 +10,19 @@ variable "ses_sender_arn" {
 }
 
 resource "aws_cognito_user_pool" "main" {
-  name                     = "obsidian-vaultguard-${var.stage}"
-  deletion_protection      = var.is_prod ? "ACTIVE" : "INACTIVE"
+  name = "obsidian-vaultguard-${var.stage}"
+  # Deletion protection is a pure durability guard (no auth impact) → hardening
+  # flag. MFA/advanced-security below stay on is_prod so enabling hardening
+  # never forces MFA enrollment on existing users.
+  deletion_protection      = var.production_hardening ? "ACTIVE" : "INACTIVE"
   auto_verified_attributes = ["email"]
+
+  # A self-service email change must be re-verified before it replaces the
+  # verified address — otherwise email_verified could remain true for an
+  # unproven address (the super-admin gate relies on this claim).
+  user_attribute_update_settings {
+    attributes_require_verification_before_update = ["email"]
+  }
 
   email_configuration {
     email_sending_account = "COGNITO_DEFAULT"
@@ -135,6 +146,38 @@ resource "aws_cognito_user_pool_client" "plugin" {
   }
 
   prevent_user_existence_errors = "ENABLED"
+
+  # SECURITY (auth/tenant isolation): end users must NOT be able to self-write
+  # the identity/authorization claims the backend trusts. custom:org (tenant
+  # identity — shared/utils.ts:358), custom:role and custom:orgRole (org-admin
+  # authority — extractRolesFromTokenPayload → rolesIncludeOrgAdmin) are
+  # `mutable = true` at the pool level ONLY so server-side admin APIs
+  # (AdminCreateUser in signup/handler.ts, AdminUpdateUserAttributes in
+  # users/handler.ts) can set them — the admin API bypasses this per-client
+  # attribute-permission list. Without an explicit write_attributes, Cognito
+  # defaults a public client to "all mutable attributes writable", letting a
+  # member call `cognito-idp update-user-attributes --access-token <t>
+  # --user-attributes Name=custom:role,Value=admin` (self-promotion to org
+  # admin) or Name=custom:org,Value=<victimOrg> (cross-tenant takeover). This
+  # list denies every attribute NOT named; `email` stays writable to support
+  # the self-service email change flow (re-verified via
+  # user_attribute_update_settings above). Verified: zero non-admin
+  # UpdateUserAttributes call sites exist in the codebase, so no legitimate
+  # flow self-writes the custom claims through a user token.
+  # NOTE: takes effect on `terraform apply`; until deployed the pool retains
+  # the permissive default. Recommended defense-in-depth follow-up: a
+  # pre-token-generation Lambda that re-derives these claims from a
+  # server-authoritative membership record at every token mint.
+  write_attributes = ["email"]
+}
+
+# Platform super-admin group — members can access the /superadmin/* platform
+# stats API (still gated by the SUPER_ADMIN_EMAILS allowlist in the Lambda).
+resource "aws_cognito_user_group" "platform_superadmin" {
+  name         = "platform-superadmin"
+  user_pool_id = aws_cognito_user_pool.main.id
+  description  = "Platform operators with access to the /superadmin/* stats API"
+  precedence   = 0
 }
 
 resource "aws_cognito_user_pool_domain" "main" {

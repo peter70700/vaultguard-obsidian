@@ -76,6 +76,12 @@ locals {
     reencryption_job_id      = aws_api_gateway_resource.reencryption_job_id.id
     shares                   = aws_api_gateway_resource.shares.id
     shares_id                = aws_api_gateway_resource.shares_id.id
+    superadmin               = aws_api_gateway_resource.superadmin.id
+    superadmin_overview      = aws_api_gateway_resource.superadmin_overview.id
+    superadmin_orgs          = aws_api_gateway_resource.superadmin_orgs.id
+    superadmin_users         = aws_api_gateway_resource.superadmin_users.id
+    superadmin_growth        = aws_api_gateway_resource.superadmin_growth.id
+    superadmin_costs         = aws_api_gateway_resource.superadmin_costs.id
     # Note: signup already has OPTIONS defined in main.tf
   }
 }

@@ -52,6 +52,7 @@ import {
   getUserAgent,
   generateId,
   isAdmin,
+  isReservedGroupName,
   AuthError,
   ValidationError,
   QueryCommand,
@@ -265,15 +266,26 @@ async function handleListUsers(
   requestId: string
 ): Promise<APIGatewayProxyResult> {
   // List all users then filter by org — Cognito ListUsers does not support
-  // filtering on custom attributes, so we filter in code.
-  const listResult = await cognitoClient.send(
-    new ListUsersCommand({
-      UserPoolId: USER_POOL_ID,
-      Limit: 60,
-    })
-  );
+  // filtering on custom attributes, so we filter in code. LA3: the pool is
+  // shared across all orgs, so a single 60-user page silently truncates an
+  // org's member list once the pool exceeds 60 users pool-wide (member
+  // visibility became a function of pool ordering, not org size). Page through
+  // ALL users before filtering, mirroring findCognitoUsernameBySub.
+  const allUsers: NonNullable<ListUsersCommandOutput['Users']> = [];
+  let paginationToken: string | undefined;
+  do {
+    const listResult: ListUsersCommandOutput = await cognitoClient.send(
+      new ListUsersCommand({
+        UserPoolId: USER_POOL_ID,
+        Limit: 60,
+        PaginationToken: paginationToken,
+      })
+    );
+    allUsers.push(...(listResult.Users || []));
+    paginationToken = listResult.PaginationToken;
+  } while (paginationToken);
 
-  const orgUsers = (listResult.Users || []).filter((u) => {
+  const orgUsers = allUsers.filter((u) => {
     const orgAttr = (u.Attributes || []).find((a) => a.Name === 'custom:org');
     return orgAttr?.Value === admin.orgId;
   });
@@ -398,6 +410,7 @@ async function handleInviteUser(
   }
 
   // Ensure the role group exists in Cognito
+  assertNotReservedGroup(role);
   await ensureGroupExists(role);
 
   // Create user in Cognito — org is ALWAYS taken from authenticated admin context.
@@ -572,6 +585,7 @@ async function handleUpdateRole(
   }
 
   // Ensure the new role group exists and add user
+  assertNotReservedGroup(newRole);
   await ensureGroupExists(newRole);
   await cognitoClient.send(
     new AdminAddUserToGroupCommand({
@@ -900,6 +914,7 @@ async function handleReactivateUser(
   );
 
   // Add back to a role group
+  assertNotReservedGroup(role);
   await ensureGroupExists(role);
   await cognitoClient.send(
     new AdminAddUserToGroupCommand({
@@ -1362,9 +1377,21 @@ async function resolveTargetUserForOrg(
 }
 
 /**
+ * Rejects request-derived group/role names that collide (case-insensitively)
+ * with a privileged platform group (e.g. platform-superadmin). No API code
+ * path may ever create or assign a reserved group.
+ */
+function assertNotReservedGroup(groupName: string): void {
+  if (isReservedGroupName(groupName)) {
+    throw new ValidationError(`Group name "${groupName}" is reserved`);
+  }
+}
+
+/**
  * Ensures a Cognito group exists, creating it if needed.
  */
 async function ensureGroupExists(groupName: string): Promise<void> {
+  assertNotReservedGroup(groupName);
   try {
     const existing = await cognitoClient.send(
       new ListGroupsCommand({ UserPoolId: USER_POOL_ID })

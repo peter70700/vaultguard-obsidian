@@ -35,7 +35,7 @@ import type {
   VaultGuardSidebarAuthState,
   VaultGuardSidebarViewConfig,
 } from "../ui/vaultguard-sidebar-view";
-import type { PermissionStore } from "./permission-store";
+import type { PermissionStore, PermissionStoreState } from "./permission-store";
 import type { ReadOnlyGuard } from "./readonly-guard";
 import type { SyncDiagnostics } from "./sync-diagnostics";
 import type { UpdateChecker } from "./update-checker";
@@ -49,6 +49,18 @@ export const VAULTGUARD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox=
 // `message-square` icon. Stock icons are pre-registered by Obsidian, so the
 // ribbon button always carries its glyph at first paint.
 export const VAULTGUARD_CHAT_ICON_ID = "message-square";
+
+/**
+ * Metadata-only view of a queued offline operation for debug reporting.
+ * Deliberately has NO `data` field — queued write payloads are plaintext and
+ * must never reach a debug report, the console, or the clipboard.
+ */
+export interface OfflineQueueDebugEntry {
+  operation: "write" | "delete";
+  path: string;
+  timestamp: string;
+  dataBytes: number;
+}
 
 export interface VaultGuardCommandContext {
   app: App;
@@ -70,12 +82,17 @@ export interface VaultGuardCommandContext {
   readonly vaultLeaseDenied: boolean;
   readonly placeholderPathsSize: number;
   readonly offlineQueueLength: number;
+  readonly offlineQueueSnapshot: OfflineQueueDebugEntry[];
   readonly deletionTombstonesCount: number;
   readonly permissionStore: PermissionStore;
   readonly updateChecker: UpdateChecker | null;
+  readonly pluginId: string;
+  /** Live per-vault membership role (null = no explicit membership row; org role governs). */
+  readonly vaultMemberRole: VaultMemberRole | null;
 
   handleLogin(): void;
   forceLogout(noticeMessage?: string): Promise<void>;
+  isSessionTokenExpiring(): boolean;
   performSync(options?: { userInitiated?: boolean; forceCatchup?: boolean }): Promise<void>;
   getEffectivePermission(path: string): Promise<PermissionLevel>;
   runConnectionDiagnostics(): Promise<void>;
@@ -368,6 +385,8 @@ export interface SyncRuntimeContext {
   getKeyLease(): KeyLease | null;
   setKeyLease(lease: KeyLease | null): void;
   isVaultLeaseDenied(): boolean;
+  /** PL2: a lease acquisition failed transiently (not a 403) and needs retry. */
+  isLeaseRetryNeeded(): boolean;
   getEffectiveSyncMode(): OrgSettingsResponse["syncMode"];
   getEffectiveSyncIntervalSeconds(): number;
   getSyncTimer(): ReturnType<typeof setTimeout> | null;
@@ -413,7 +432,13 @@ export interface SyncRuntimeContext {
     path: string,
     content: string,
     options?: { noWriteNotice?: string },
-  ): Promise<"uploaded" | "skipped">;
+  ): Promise<"uploaded" | "skipped-no-lease" | "skipped-no-permission">;
+  /** Re-encrypts an externally-added plaintext text file in place (no-op for
+   * VG1/binary/excluded paths). Fire-and-forget hygiene after catch-up uploads. */
+  ensureAtRestEncryptedInPlace(path: string): Promise<boolean>;
+  /** Current permission-store state — used to refuse deleting local-only files
+   * on an unconfirmed (cold/warming/fetch-failed) permission baseline (SY2). */
+  getPermissionStoreState(): PermissionStoreState;
   removeUnsyncedLocalFile(path: string): Promise<boolean>;
   uploadLocalOnlyFiles(): Promise<{
     uploadedFiles: number;
@@ -440,7 +465,20 @@ export interface SyncRuntimeContext {
   deleteFolderMarker(folderPath: string): Promise<void>;
   deleteFolderContentsOnServer(folderPath: string): Promise<void>;
   applyRemoteChange(metadata: { path: string; size: number }): Promise<void>;
-  applyRemoteDeletion(path: string): Promise<void>;
+  /**
+   * Apply a server-reported deletion locally. `inferred` is true when the delta
+   * came from the COLD (full-scan) sync path, where deletion is inferred from
+   * "in your manifest but not in S3" and cannot distinguish a real remote delete
+   * from a file this client simply never uploaded — such deletions must be
+   * recoverable, never a permanent wipe.
+   */
+  applyRemoteDeletion(path: string, inferred: boolean): Promise<void>;
+  /**
+   * Move a local path to the vault's recoverable trash (`.trash`). Returns false
+   * if the adapter has no trash support, in which case the caller must NOT fall
+   * back to a permanent delete for inferred deletions.
+   */
+  trashLocalPath(path: string): Promise<boolean>;
   readFileDecrypted(path: string): Promise<ApiResponse<RemoteFileContentResponse>>;
   fetchRemoteFileContent(path: string): Promise<ApiResponse<RemoteFileContentResponse>>;
   decodeRemoteFileContent(path: string, data: RemoteFileContentResponse): Promise<string>;
@@ -451,10 +489,12 @@ export interface SyncRuntimeContext {
     localManifest: Map<string, { content: string; hash: string }>,
   ): Promise<void>;
   hasOriginalAdapterRead(): boolean;
+  hasOriginalAdapterReadBinary(): boolean;
   hasOriginalAdapterWrite(): boolean;
   hasOriginalAdapterRemove(): boolean;
   removeLocalPath(path: string): Promise<void>;
   readPlainFromDisk(path: string): Promise<string>;
+  readPlainBinaryFromDisk(path: string): Promise<ArrayBuffer>;
   writePlainToDisk(path: string, data: string): Promise<void>;
   decryptContent(content: string): Promise<string>;
   bytesToBase64(bytes: Uint8Array): string;

@@ -158,10 +158,10 @@ export interface McpConfigJson {
  * Build the strict HTTP-MCP config object pointing `claude` at VaultGuard's
  * AgentBridge MCP endpoint, authenticated with a lease bearer token.
  *
- * The returned object is passed to `claude --mcp-config '<json>'`. The lease
- * token is the AgentBridge per-lease bearer (NOT an Anthropic token) — it scopes
- * the CLI to exactly the files the lease permits, with writes governed by the
- * lease writeMode.
+ * The returned object is serialized into a 0600 temp file whose PATH is what
+ * `claude --mcp-config <path>` receives. The lease token is the AgentBridge
+ * per-lease bearer (NOT an Anthropic token) — it scopes the CLI to exactly the
+ * files the lease permits, with writes governed by the lease writeMode.
  */
 export function buildMcpConfig(mcpUrl: string, leaseToken: string): McpConfigJson {
   return {
@@ -175,7 +175,11 @@ export function buildMcpConfig(mcpUrl: string, leaseToken: string): McpConfigJso
   };
 }
 
-/** Serialize the MCP config for the `--mcp-config` CLI argument. */
+/**
+ * Serialize the MCP config for the `--mcp-config` file. Written to a 0600
+ * temp file, never passed inline on argv — command lines are world-readable
+ * via `ps`, which would leak the bearer token to every local process (AC2).
+ */
 export function serializeMcpConfig(config: McpConfigJson): string {
   return JSON.stringify(config);
 }

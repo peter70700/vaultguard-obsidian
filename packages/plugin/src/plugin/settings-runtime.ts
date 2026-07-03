@@ -47,6 +47,29 @@ export class PluginSettingsRuntime {
 
   constructor(private readonly ctx: PluginSettingsRuntimeContext) {}
 
+  /** Throttle timestamp for the "subscription lapsed" notice. */
+  private lastSubscriptionNoticeAt = 0;
+
+  /**
+   * Surface a throttled, user-facing notice when the server reports the org's
+   * subscription has lapsed (HTTP 402 `checkout_required`). Wired into the API
+   * client via `onSubscriptionRequired` so a sync burst shows one clear message
+   * — not dozens of opaque errors. Local at-rest content stays available.
+   */
+  private showSubscriptionLapsedNotice(): void {
+    const now = Date.now();
+    if (now - this.lastSubscriptionNoticeAt < 60_000) {
+      return;
+    }
+    this.lastSubscriptionNoticeAt = now;
+    new Notice(
+      "VaultGuard Sync: Your organization's subscription has lapsed, so cloud sync is paused. " +
+        "An organization admin needs to update billing in the VaultGuard admin panel. " +
+        "Your local notes remain available offline.",
+      12_000
+    );
+  }
+
   async loadSettings(): Promise<void> {
     const data = ((await this.ctx.loadData()) ?? {}) as VaultGuardPluginData;
     this.ctx.setPersistedSessions(this.normalizePersistedSessions(data.storedSessions));
@@ -258,6 +281,7 @@ export class PluginSettingsRuntime {
         };
       },
       getSessionId: () => this.ctx.session?.sessionId ?? null,
+      onSubscriptionRequired: () => this.showSubscriptionLapsedNotice(),
     });
 
     this.ctx.setApiClient(apiClient);
@@ -686,13 +710,21 @@ export class PluginSettingsRuntime {
   }
 
   async clearStoredSession(): Promise<void> {
-    const bindingId = this.getSessionBindingId();
-    if (!bindingId) return;
+    // PL6: clear EVERY sealed session envelope, not just the current
+    // binding's. Renaming/moving the vault folder changes the derived binding
+    // id, which used to orphan the previous envelope — still holding a valid
+    // refresh token — in data.json forever after "logout".
+    const bindingIds = Object.keys(this.ctx.persistedSessions);
+    const currentBindingId = this.getSessionBindingId();
+    if (currentBindingId && !bindingIds.includes(currentBindingId)) {
+      bindingIds.push(currentBindingId);
+    }
+    if (bindingIds.length === 0) return;
 
-    const persistedSessions = { ...this.ctx.persistedSessions };
-    delete persistedSessions[bindingId];
-    this.ctx.setPersistedSessions(persistedSessions);
-    this.removeStoredSessionKey(bindingId);
+    this.ctx.setPersistedSessions({});
+    for (const bindingId of bindingIds) {
+      this.removeStoredSessionKey(bindingId);
+    }
 
     try {
       await this.ctx.savePluginData();
@@ -700,7 +732,7 @@ export class PluginSettingsRuntime {
       this.ctx.logError("Failed to remove persisted session from Obsidian data store", error);
     }
 
-    this.ctx.log("Stored session cleared.");
+    this.ctx.log("Stored sessions cleared.");
   }
 
   normalizePersistedSessions(

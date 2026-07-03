@@ -1464,10 +1464,19 @@ function generateCsv(entries: AuditEntry[]): string {
  * @returns Properly escaped CSV field
  */
 function escapeCsvField(field: string): string {
-  if (field.includes(',') || field.includes('"') || field.includes('\n')) {
-    return `"${field.replace(/"/g, '""')}"`;
+  // LA7: neutralize spreadsheet formula injection. A field whose first
+  // character is =, +, -, @ (or a leading tab / CR, which Excel/Sheets treat
+  // the same) is executed as a formula on open — enabling data exfiltration of
+  // adjacent cells or DDE command execution. Prefix such a field with a single
+  // quote so the cell is imported as literal text, THEN apply RFC-4180 quoting.
+  let value = field;
+  if (/^[=+\-@\t\r]/.test(value)) {
+    value = `'${value}`;
   }
-  return field;
+  if (value.includes(',') || value.includes('"') || value.includes('\n')) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
 }
 
 /**

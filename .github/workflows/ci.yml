@@ -33,7 +33,12 @@ jobs:
       - name: Refuse Terraform state/plan/dev-tfvars in tree
         run: |
           set -euo pipefail
-          forbidden_regex='^terraform/(.*\.tfstate(\.[^/]+)?$|tfplan$|.*\.tfplan$|terraform\.tfvars$|.*\.auto\.tfvars$|\.terraform/|\.terraform\.tfstate\.lock\.info$)'
+          # (^|/)terraform/ — NOT ^terraform/. This file is exported verbatim into
+          # the public monorepo where terraform lives at packages/server/terraform/,
+          # so an apex-anchored regex would never match a nested path and the guard
+          # would be inert (RL2). The `/`-alternative catches the nested path; the
+          # `^`-alternative still catches a root-level terraform/ (private repo).
+          forbidden_regex='(^|/)terraform/(.*\.tfstate(\.[^/]+)?$|tfplan$|.*\.tfplan$|terraform\.tfvars$|.*\.auto\.tfvars$|\.terraform/|\.terraform\.tfstate\.lock\.info$)'
           violations="$(git ls-files | grep -E "$forbidden_regex" || true)"
           if [[ -n "$violations" ]]; then
             echo "::error::Tracked Terraform state/plan/dev-tfvars artifacts found:"

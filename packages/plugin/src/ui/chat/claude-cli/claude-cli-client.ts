@@ -19,7 +19,8 @@
 //   - NEVER --bare (which forces ANTHROPIC_API_KEY-only auth and defeats the
 //     subscription keychain).
 // This file itself touches NO vault files and NO fs beyond creating a throwaway
-// temp cwd dir for the child.
+// temp cwd dir for the child plus a per-turn 0600 MCP config file inside it
+// (the lease bearer token must never ride the world-readable argv — CWE-214).
 //
 // Desktop-only: `child_process` does not exist in mobile Obsidian. The caller
 // (chat-view) gates on Platform before constructing this client.
@@ -272,6 +273,7 @@ interface ChildProcessModule {
 interface FsModule {
   mkdtempSync(prefix: string): string;
   rmSync(path: string, options: { recursive: boolean; force: boolean }): void;
+  writeFileSync(path: string, data: string, options: { mode: number }): void;
 }
 
 interface OsPathModule {
@@ -363,7 +365,18 @@ export class ClaudeCliClient {
 
     // Stable cwd for the whole client lifetime (so --resume works across turns).
     const cwd = this.ensureCwd();
-    const args = this.buildArgs(text);
+    // AC2: fail closed if the 0600 config file cannot be written — falling back
+    // to inline JSON would put the lease token on the world-readable argv.
+    let mcpConfigPath: string;
+    try {
+      mcpConfigPath = this.writeMcpConfigFile();
+    } catch (e) {
+      handlers.onError?.(
+        `Could not prepare the Claude Code MCP config file: ${(e as Error).message}`,
+      );
+      return;
+    }
+    const args = this.buildArgs(text, mcpConfigPath);
 
     return new Promise<void>((resolve) => {
       let child: SpawnedChild;
@@ -379,6 +392,7 @@ export class ClaudeCliClient {
         });
       } catch (e) {
         handlers.onError?.(`Could not start Claude Code: ${(e as Error).message}`);
+        this.removeMcpConfigFile(mcpConfigPath);
         resolve();
         return;
       }
@@ -394,6 +408,9 @@ export class ClaudeCliClient {
       const finish = () => {
         if (settled) return;
         settled = true;
+        // The token-bearing MCP config file is single-turn: delete it the
+        // moment the child is gone.
+        this.removeMcpConfigFile(mcpConfigPath);
         // NOTE: do NOT delete `cwd` here — it is reused across turns so
         // `--resume` keeps working. It is removed in reset() / onClose.
         resolve();
@@ -525,9 +542,36 @@ export class ClaudeCliClient {
     return { ...process.env };
   }
 
+  // AC2 (CWE-214): the MCP config carries the AgentBridge lease bearer token,
+  // and process command lines are world-readable (`ps -ef`) on macOS/Linux —
+  // so the config is materialized as a 0600 file per turn and --mcp-config
+  // receives its PATH, never the inline JSON. The file is deleted as soon as
+  // the child exits; reset() removes the whole cwd as a backstop.
+  private mcpConfigSeq = 0;
+
+  private writeMcpConfigFile(): string {
+    const deps = this.deps!;
+    const dir = this.ensureCwd() ?? deps.tmpdir();
+    const path = deps.join(dir, `vaultguard-mcp-${++this.mcpConfigSeq}.json`);
+    deps.fs.writeFileSync(
+      path,
+      serializeMcpConfig(buildMcpConfig(this.config.mcpUrl, this.config.leaseToken)),
+      { mode: 0o600 },
+    );
+    return path;
+  }
+
+  private removeMcpConfigFile(path: string): void {
+    if (!this.deps) return;
+    try {
+      this.deps.fs.rmSync(path, { recursive: false, force: true });
+    } catch {
+      /* best-effort; reset() removes the cwd recursively anyway */
+    }
+  }
+
   // Build the argv. NOTE: NOT --bare (keeps subscription keychain auth).
-  private buildArgs(text: string): string[] {
-    const mcpJson = serializeMcpConfig(buildMcpConfig(this.config.mcpUrl, this.config.leaseToken));
+  private buildArgs(text: string, mcpConfigPath: string): string[] {
     const args: string[] = [
       "-p",
       text,
@@ -537,7 +581,7 @@ export class ClaudeCliClient {
       "--verbose",
       "--strict-mcp-config",
       "--mcp-config",
-      mcpJson,
+      mcpConfigPath,
       // Allow ONLY our mcp__vaultguard__* tools (incl. the gated import_*, which
       // stay server-gated). Combined with --permission-mode dontAsk (deny
       // anything not in the allow-list) this blocks every built-in file/bash/web

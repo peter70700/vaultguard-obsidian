@@ -15,6 +15,8 @@ locals {
 module "kms" {
   source = "./modules/kms"
 
+  production_hardening = var.production_hardening
+
   stage      = var.stage
   is_prod    = local.is_prod
   account_id = local.account_id
@@ -26,6 +28,8 @@ module "kms" {
 
 module "s3" {
   source = "./modules/s3"
+
+  production_hardening = var.production_hardening
 
   stage       = var.stage
   is_prod     = local.is_prod
@@ -43,6 +47,8 @@ module "s3" {
 module "dynamodb" {
   source = "./modules/dynamodb"
 
+  production_hardening = var.production_hardening
+
   stage       = var.stage
   is_prod     = local.is_prod
   kms_key_arn = module.kms.key_arn
@@ -54,6 +60,8 @@ module "dynamodb" {
 
 module "cognito" {
   source = "./modules/cognito"
+
+  production_hardening = var.production_hardening
 
   stage            = var.stage
   is_prod          = local.is_prod
@@ -112,11 +120,15 @@ module "lambda" {
   vault_activity_table_arn         = module.dynamodb.vault_activity_table_arn
   shares_table_name                = module.dynamodb.shares_table_name
   shares_table_arn                 = module.dynamodb.shares_table_arn
+  platform_metrics_table_name      = module.dynamodb.platform_metrics_table_name
+  platform_metrics_table_arn       = module.dynamodb.platform_metrics_table_arn
+  super_admin_emails               = var.super_admin_emails
   key_lease_duration_seconds       = var.key_lease_duration_seconds
   session_duration_seconds         = var.session_duration_seconds
   max_file_size_bytes              = var.max_file_size_bytes
   vaultguard_edition               = var.vaultguard_edition
   allow_public_signup              = var.vaultguard_allow_public_signup
+  billing_exempt_domains           = var.billing_exempt_domains
   # Pro/managed SaaS: hardcoded to the prod Turnstile Secrets Manager ARN.
   # This root module is the Pro production deployment for example.com —
   # CE consumers depend on `modules/lambda` directly with their own root and
@@ -134,6 +146,8 @@ module "lambda" {
 
 module "apigateway" {
   source = "./modules/apigateway"
+
+  production_hardening = var.production_hardening
 
   stage                          = var.stage
   is_prod                        = local.is_prod
@@ -158,6 +172,8 @@ module "apigateway" {
   vaults_lambda_name             = module.lambda.vaults_function_name
   shares_lambda_invoke_arn       = module.lambda.shares_function_invoke_arn
   shares_lambda_name             = module.lambda.shares_function_name
+  superadmin_lambda_invoke_arn   = module.lambda.superadmin_function_invoke_arn
+  superadmin_lambda_name         = module.lambda.superadmin_function_name
   domain_name                    = var.domain_name
 }
 

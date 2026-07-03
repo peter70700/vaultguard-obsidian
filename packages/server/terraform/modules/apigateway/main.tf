@@ -1,5 +1,6 @@
 variable "stage" { type = string }
 variable "is_prod" { type = bool }
+variable "production_hardening" { type = bool }
 variable "cognito_user_pool_arn" { type = string }
 variable "auth_lambda_invoke_arn" { type = string }
 variable "auth_lambda_name" { type = string }
@@ -373,6 +374,67 @@ resource "aws_api_gateway_integration" "auth_key_lease_scoped_post" {
   rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
   resource_id             = aws_api_gateway_resource.auth_key_lease_scoped.id
   http_method             = aws_api_gateway_method.auth_key_lease_scoped_post.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.auth_lambda_invoke_arn
+}
+
+# GET/PUT/DELETE /auth/ai-key — cross-device AI-chat key sync.
+# INTENTIONALLY NOT in cors.tf: this route is plugin-only (Obsidian `requestUrl`,
+# no browser origin), so it needs no CORS/OPTIONS preflight. A reviewer must NOT
+# "fix" this by adding it to cors_resources.
+resource "aws_api_gateway_resource" "auth_ai_key" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.auth.id
+  path_part   = "ai-key"
+}
+
+resource "aws_api_gateway_method" "auth_ai_key_get" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.auth_ai_key.id
+  http_method   = "GET"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+}
+
+resource "aws_api_gateway_integration" "auth_ai_key_get" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.auth_ai_key.id
+  http_method             = aws_api_gateway_method.auth_ai_key_get.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.auth_lambda_invoke_arn
+}
+
+resource "aws_api_gateway_method" "auth_ai_key_put" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.auth_ai_key.id
+  http_method   = "PUT"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+}
+
+resource "aws_api_gateway_integration" "auth_ai_key_put" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.auth_ai_key.id
+  http_method             = aws_api_gateway_method.auth_ai_key_put.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.auth_lambda_invoke_arn
+}
+
+resource "aws_api_gateway_method" "auth_ai_key_delete" {
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.auth_ai_key.id
+  http_method   = "DELETE"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+}
+
+resource "aws_api_gateway_integration" "auth_ai_key_delete" {
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = aws_api_gateway_resource.auth_ai_key.id
+  http_method             = aws_api_gateway_method.auth_ai_key_delete.http_method
   integration_http_method = "POST"
   type                    = "AWS_PROXY"
   uri                     = var.auth_lambda_invoke_arn
@@ -1412,6 +1474,9 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.auth_recover_post,
     aws_api_gateway_integration.auth_recovery_codes_post,
     aws_api_gateway_integration.auth_recovery_codes_verify_post,
+    aws_api_gateway_integration.auth_ai_key_get,
+    aws_api_gateway_integration.auth_ai_key_put,
+    aws_api_gateway_integration.auth_ai_key_delete,
     # Users
     aws_api_gateway_integration.users_get,
     aws_api_gateway_integration.users_roles_get,
@@ -1422,6 +1487,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.users_id_resend_invite_post,
     aws_api_gateway_integration.users_id_activity_get,
     aws_api_gateway_integration.users_id_reset_mfa_post,
+    aws_api_gateway_integration.users_id_profile_put,
     # Files
     aws_api_gateway_integration.vault_overview_get,
     aws_api_gateway_integration.vault_sync_cursor_get,
@@ -1485,6 +1551,12 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.shares_get,
     aws_api_gateway_integration.shares_id_get,
     aws_api_gateway_integration.shares_id_delete,
+    # Super-admin
+    aws_api_gateway_integration.superadmin_overview_get,
+    aws_api_gateway_integration.superadmin_orgs_get,
+    aws_api_gateway_integration.superadmin_users_get,
+    aws_api_gateway_integration.superadmin_growth_get,
+    aws_api_gateway_integration.superadmin_costs_get,
     # CORS — gateway error responses
     aws_api_gateway_gateway_response.cors_4xx,
     aws_api_gateway_gateway_response.cors_5xx,
@@ -1513,6 +1585,9 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.auth_recover_post.id,
       aws_api_gateway_integration.auth_recovery_codes_post.id,
       aws_api_gateway_integration.auth_recovery_codes_verify_post.id,
+      aws_api_gateway_integration.auth_ai_key_get.id,
+      aws_api_gateway_integration.auth_ai_key_put.id,
+      aws_api_gateway_integration.auth_ai_key_delete.id,
       aws_api_gateway_integration.users_get.id,
       aws_api_gateway_integration.users_roles_get.id,
       aws_api_gateway_integration.users_invite_post.id,
@@ -1522,6 +1597,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.users_id_resend_invite_post.id,
       aws_api_gateway_integration.users_id_activity_get.id,
       aws_api_gateway_integration.users_id_reset_mfa_post.id,
+      aws_api_gateway_integration.users_id_profile_put.id,
       aws_api_gateway_integration.vault_overview_get.id,
       aws_api_gateway_integration.vault_sync_cursor_get.id,
       aws_api_gateway_integration.files_get.id,
@@ -1578,6 +1654,12 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.shares_get.id,
       aws_api_gateway_integration.shares_id_get.id,
       aws_api_gateway_integration.shares_id_delete.id,
+      # Super-admin
+      aws_api_gateway_integration.superadmin_overview_get.id,
+      aws_api_gateway_integration.superadmin_orgs_get.id,
+      aws_api_gateway_integration.superadmin_users_get.id,
+      aws_api_gateway_integration.superadmin_growth_get.id,
+      aws_api_gateway_integration.superadmin_costs_get.id,
       # CORS OPTIONS — integrations AND integration responses
       values(aws_api_gateway_integration.cors_options)[*].id,
       values(aws_api_gateway_integration_response.cors_options)[*].id,
@@ -1618,7 +1700,7 @@ resource "aws_api_gateway_stage" "vaultguard" {
 
 resource "aws_cloudwatch_log_group" "api_access" {
   name              = "/aws/apigateway/vaultguard-${var.stage}"
-  retention_in_days = var.is_prod ? 365 : 7
+  retention_in_days = var.production_hardening ? 365 : 7
 }
 
 resource "aws_api_gateway_method_settings" "vaultguard" {
@@ -1631,8 +1713,154 @@ resource "aws_api_gateway_method_settings" "vaultguard" {
     throttling_burst_limit = 2000
     metrics_enabled        = true
     logging_level          = "INFO"
-    data_trace_enabled     = !var.is_prod
+    # CRITICAL: data-trace logging writes full request/response BODIES to
+    # CloudWatch, including the plaintext AES-256 DEK returned by
+    # GET /auth/key-lease. It must be OFF wherever real user data flows.
+    # Gated on production_hardening (default true) — NOT the stage name — because
+    # the live production stack runs stage="dev".
+    data_trace_enabled = !var.production_hardening
   }
+}
+
+# ─── WAF — Regional Web ACL for the API Gateway stage ────────────────────────
+# api.example.com is a REGIONAL API Gateway, so it needs a REGIONAL WAF.
+# The modules/waf CLOUDFRONT-scoped ACL only protects the legacy *.cloudfront.net
+# distribution, leaving the primary API (including the auth endpoints) with no
+# per-IP rate limit or managed-rule protection. A REGIONAL web ACL must live in
+# the same region as the resource it protects, so this uses the module's default
+# aws provider (the API region) — NOT the us-east-1 alias the CLOUDFRONT ACL
+# requires. Rules mirror that ACL so both the primary and legacy paths get
+# identical rate-limiting and managed-rule coverage, including the
+# SizeRestrictions_BODY count-mode override both ACLs need because file-sync
+# PUT bodies legitimately exceed 8 KB on either path.
+
+resource "aws_wafv2_web_acl" "api_regional" {
+  name        = "obsidian-vaultguard-api-waf-${var.stage}"
+  scope       = "REGIONAL"
+  description = "WAF for the VaultGuard REGIONAL API Gateway stage"
+
+  default_action {
+    allow {}
+  }
+
+  # AWS Managed Rules - Common Rule Set
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesCommonRuleSet"
+
+        # SizeRestrictions_BODY blocks any request body over 8 KB, but file
+        # sync PUTs (`PUT /vaults/{id}/files/{path}`) carry base64 ciphertext
+        # in the JSON body by design, up to max_file_size_bytes (10 MB) — with
+        # this rule in block mode every note larger than ~6 KB fails to
+        # upload. Count instead of block: payload size stays bounded by API
+        # Gateway's 10 MB cap plus the files Lambda's own max_file_size_bytes
+        # check, and the body is E2E ciphertext, so there is nothing for the
+        # deeper body inspections to miss beyond WAF's 8 KB inspection window.
+        rule_action_override {
+          name = "SizeRestrictions_BODY"
+          action_to_use {
+            count {}
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesCommonRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # AWS Managed Rules - Known Bad Inputs
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 2
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesKnownBadInputsRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Rate limiting: 2000 requests per 5 minutes per IP
+  rule {
+    name     = "RateLimitRule"
+    priority = 3
+
+    action {
+      block {}
+    }
+
+    statement {
+      rate_based_statement {
+        limit              = 2000
+        aggregate_key_type = "IP"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "RateLimitRule"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Geo-restriction: Block requests from sanctioned countries
+  rule {
+    name     = "GeoRestriction"
+    priority = 4
+
+    action {
+      block {}
+    }
+
+    statement {
+      geo_match_statement {
+        country_codes = ["KP", "IR", "SY", "CU"]
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "GeoRestriction"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "vaultguard-api-waf-${var.stage}"
+    sampled_requests_enabled   = true
+  }
+
+  tags = { Name = "obsidian-vaultguard-api-waf-${var.stage}" }
+}
+
+resource "aws_wafv2_web_acl_association" "api_regional" {
+  resource_arn = aws_api_gateway_stage.vaultguard.arn
+  web_acl_arn  = aws_wafv2_web_acl.api_regional.arn
 }
 
 output "api_url" {

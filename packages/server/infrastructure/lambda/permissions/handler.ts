@@ -31,6 +31,7 @@ import {
   ruleLevelRank,
   shouldRespectAdminBypassFor,
   requireVaultMember,
+  assertVaultWritable,
   pathMatchesPattern,
   getVaultMembership,
   listVaultMembers,
@@ -136,6 +137,11 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         // Mode-switching is intentionally NOT a separate API Gateway resource
         // — keeping the dispatch in code means no API Gateway / Terraform
         // change is required to ship the set-level fix.
+        // LF2: permission-rule mutations are writes — reject on an archived
+        // (read-only / legal-hold) vault. Read routes (check/access/list) stay
+        // allowed. authorizePermissionMutation ran a fresh admin membership
+        // check that swallowed the archived AuthError, so gate it here.
+        assertVaultWritable(vault);
         const probe = parseBody(event);
         if (typeof probe.level === 'string') {
           return await handleSetLevel(event, user, vault, requestId, probe);
@@ -144,9 +150,11 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       }
 
       case method === 'PUT' && resource === '/vaults/{vaultId}/permissions/{id}':
+        assertVaultWritable(vault);
         return await handleUpdatePermission(event, user, vault, requestId);
 
       case method === 'DELETE' && resource === '/vaults/{vaultId}/permissions/{id}':
+        assertVaultWritable(vault);
         return await handleDeletePermission(event, user, vault, requestId);
 
       case method === 'POST' && resource === '/vaults/{vaultId}/permissions/check':
@@ -245,7 +253,6 @@ async function handleListPermissions(
 
   const scanParams: Record<string, unknown> = {
     TableName: PERMISSIONS_TABLE,
-    Limit: limit,
     FilterExpression: filterExpression,
     ExpressionAttributeValues: expressionValues,
     ConsistentRead: true,
@@ -255,8 +262,25 @@ async function handleListPermissions(
     (scanParams as Record<string, unknown>).ExpressionAttributeNames = { '#effect': 'effect' };
   }
 
-  const result = await docClient.send(new ScanCommand(scanParams as any));
-  let rules = (result.Items || []) as PermissionRule[];
+  // LF3: PERMISSIONS_TABLE is multi-tenant, and DynamoDB applies Limit to items
+  // EVALUATED *before* the FilterExpression. A single Limit-ed Scan therefore
+  // returned only the org+vault rows that happened to fall in the first N
+  // table-wide rows and dropped the rest (deny rules could silently vanish),
+  // while the returned lastEvaluatedKey cursor was never honored on re-query.
+  // Page through the whole scan, accumulating all matching rows, THEN filter and
+  // slice. (A dedicated (orgId,vaultId) GSI would be cheaper but is a schema
+  // migration; correctness first.)
+  const collected: PermissionRule[] = [];
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  do {
+    const page = await docClient.send(
+      new ScanCommand({ ...scanParams, ExclusiveStartKey: exclusiveStartKey } as any)
+    );
+    collected.push(...((page.Items || []) as PermissionRule[]));
+    exclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (exclusiveStartKey);
+
+  let rules = collected;
   if (pathFilterTarget) {
     rules = rules.filter((rule) => permissionRuleOverlapsPath(rule, pathFilterTarget));
   }
@@ -282,7 +306,8 @@ async function handleListPermissions(
     {
       rules,
       count: rules.length,
-      lastEvaluatedKey: result.LastEvaluatedKey || null,
+      // Full result set is returned (LF3), so there is no continuation cursor.
+      lastEvaluatedKey: null,
     },
     requestId
   );

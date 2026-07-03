@@ -12,9 +12,8 @@
 // and NO vault content — vault access stays solely via the lease + tool surface.
 // It never reads settings or SafeStorage; the apiKey arrives via the caller.
 
-import { request as httpsRequest } from "https";
-
 import { NetworkError } from "../../api/client";
+import type { VaultGuardError } from "../../api/client";
 import type {
   AnthropicContentBlock,
   AnthropicMessage,
@@ -158,6 +157,8 @@ class StreamAssembler {
         this.onMessageDelta(event as SseMessageDelta);
         break;
       // content_block_stop / message_stop / ping carry nothing we accumulate.
+      // `error` events never reach the assembler — the transport rejects on
+      // them first (mapSseErrorEvent in streamMessages).
       default:
         break;
     }
@@ -290,6 +291,76 @@ function safeJson(text: string): unknown {
   }
 }
 
+// ─── Mid-stream error events (AC3) ────────────────────────────────────────────
+//
+// Anthropic can fail a stream AFTER the 200 handshake by emitting an
+// `event: error` SSE frame (e.g. overloaded_error mid-generation). Its envelope
+// mirrors the HTTP error body: {"type":"error","error":{"type","message"}}.
+// Map error.type onto the equivalent HTTP status so mapAnthropicError yields
+// the SAME domain error the non-streaming path throws for that failure.
+const SSE_ERROR_STATUS: Record<string, number> = {
+  invalid_request_error: 400,
+  authentication_error: 401,
+  permission_error: 403,
+  not_found_error: 404,
+  request_too_large: 413,
+  rate_limit_error: 429,
+  api_error: 500,
+  overloaded_error: 529,
+};
+
+/**
+ * Detect a mid-stream `error` SSE event and translate it into a domain error,
+ * or return null for every other event. Pure — exposed for unit tests.
+ */
+export function mapSseErrorEvent(event: SseEvent): VaultGuardError | null {
+  if (event.type !== "error") return null;
+  const err = (event as { error?: { type?: string } }).error;
+  const status = (err?.type && SSE_ERROR_STATUS[err.type]) || 500;
+  return mapAnthropicError(status, event);
+}
+
+// ─── Lazy Node `https` resolution (mobile-safe) ──────────────────────────────
+//
+// `https` is resolved at CALL time via a guarded `require`, never as a static
+// top-level import — mirroring agent-bridge's `loadNodeHttp()`. A static
+// `import ... from "https"` compiles to a top-level `require("https")` that runs
+// the instant Obsidian evaluates the bundle, which would touch a Node builtin on
+// mobile even though `streamMessages` is desktop-gated by the caller
+// (`shouldStream()` → `!Platform.isMobileApp`). Resolving lazily keeps the whole
+// module free of any load-time Node dependency, so the plugin bundle never
+// requires `https` on mobile.
+
+type HttpsRequestFn = typeof import("https").request;
+
+let cachedHttpsRequest: HttpsRequestFn | null = null;
+
+function loadHttpsRequest(): HttpsRequestFn {
+  if (cachedHttpsRequest) return cachedHttpsRequest;
+  const maybeWindow =
+    typeof window !== "undefined" ? (window as unknown as Record<string, unknown>) : {};
+  // Electron's renderer exposes CommonJS `require` as a global, not always on
+  // `window`; probe both (and stay unit-testable via a globalThis.require shim).
+  const maybeGlobal = globalThis as unknown as Record<string, unknown>;
+  const req =
+    typeof maybeWindow.require === "function"
+      ? maybeWindow.require
+      : typeof maybeGlobal.require === "function"
+        ? maybeGlobal.require
+        : null;
+  if (!req) {
+    throw new NetworkError(
+      "Streaming is available only in desktop Obsidian with Node integration.",
+    );
+  }
+  const https = req("https") as typeof import("https");
+  if (!https || typeof https.request !== "function") {
+    throw new NetworkError("Could not load Node's https module for streaming.");
+  }
+  cachedHttpsRequest = https.request;
+  return cachedHttpsRequest;
+}
+
 // ─── Public streaming entry point ─────────────────────────────────────────────
 
 /**
@@ -320,6 +391,14 @@ export function streamMessages(
       settled = true;
       fn();
     };
+
+    let httpsRequest: HttpsRequestFn;
+    try {
+      httpsRequest = loadHttpsRequest();
+    } catch (err) {
+      reject(err instanceof Error ? err : new NetworkError(String(err)));
+      return;
+    }
 
     const req = httpsRequest(
       {
@@ -353,7 +432,17 @@ export function streamMessages(
             const raw = buf.slice(0, idx);
             buf = buf.slice(idx + 2);
             const event = parseSseEvent(raw);
-            if (event) assembler.ingest(event);
+            if (!event) continue;
+            // AC3: a mid-stream `error` event means the reply is truncated —
+            // reject NOW instead of letting "end" resolve the partial message
+            // as if it were complete.
+            const streamError = mapSseErrorEvent(event);
+            if (streamError) {
+              finish(() => reject(streamError));
+              resp.destroy();
+              return;
+            }
+            assembler.ingest(event);
           }
         });
         resp.on("end", () => finish(() => resolve(assembler.finalize())));

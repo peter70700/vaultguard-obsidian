@@ -510,6 +510,13 @@ export interface VaultGuardSettings {
    */
   aiChatStreaming: boolean;
   /**
+   * Whether to store an ENCRYPTED (DEK-wrapped) copy of the Anthropic API key
+   * in VaultGuard Cloud so it auto-provisions on the user's other devices
+   * (e.g. mobile) without re-entry. Default true. The plaintext key is never
+   * sent to the server — only an opaque, vault-DEK-wrapped envelope.
+   */
+  aiChatKeySyncEnabled: boolean;
+  /**
    * AI Chat action permission mode.
    * - "confirm": default/recommended; writes and deletes show the in-app diff
    *   confirmation modal before touching disk.

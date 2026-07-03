@@ -49,6 +49,9 @@ export class AtRestAdapterRuntime {
   private cloudDecryptFallbackNoticeAt: Map<string, number> = new Map();
   private cipherInitPromise: Promise<boolean> | null = null;
   private corruptedWriteNoticeAt: Map<string, number> = new Map();
+  private binaryWriteNoticeAt: Map<string, number> = new Map();
+  /** Paths currently being re-encrypted in place (dedupes concurrent triggers). */
+  private inPlaceEncryptionInFlight: Set<string> = new Set();
 
   constructor(private ctx: AtRestAdapterRuntimeContext) {}
 
@@ -423,6 +426,60 @@ export class AtRestAdapterRuntime {
           this.logError(`Reading at-rest envelope at ${envelopePath} failed`, err);
           return null;
         }
+      },
+      // Provisioning-safe probe: only "absent" (envelope genuinely does not
+      // exist) may lead init() to generate a fresh LAK. A read failure, a probe
+      // failure, or an existing-but-empty envelope (truncated/crash-damaged)
+      // return "error" so init() refuses to overwrite the real key. Collapsing
+      // any of these to null via loadWrappedLak() is the data-loss bug this
+      // method exists to prevent.
+      probeWrappedLak: async () => {
+        let exists: boolean;
+        try {
+          exists = await adapter.exists(envelopePath);
+        } catch (err) {
+          this.logError(`Probing at-rest envelope existence at ${envelopePath} failed`, err);
+          return {
+            kind: "error" as const,
+            reason: err instanceof Error ? err.message : String(err),
+          };
+        }
+        if (!exists) return { kind: "absent" as const };
+        try {
+          const raw = await adapter.read(envelopePath);
+          if (raw.trim().length === 0) {
+            // The file is present but empty — it was never written empty (only
+            // saveWrappedLak writes it, always non-empty), so this indicates a
+            // truncated/corrupted envelope, NOT first-run.
+            return { kind: "error" as const, reason: "envelope file is present but empty" };
+          }
+          return { kind: "present" as const, blob: raw };
+        } catch (err) {
+          this.logError(`Reading at-rest envelope at ${envelopePath} failed`, err);
+          return {
+            kind: "error" as const,
+            reason: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+      // Consulted by init() only when the envelope is absent, before it
+      // provisions a fresh LAK. Short-circuits on the first VG1-headed file so
+      // a reinstall/fresh-device open (envelope gone, ciphertext intact) routes
+      // to recovery instead of orphaning every encrypted note. Non-managed
+      // (excluded) paths are skipped — they were never at-rest encrypted.
+      hasExistingCiphertext: async () => {
+        const readBin = this.originalAdapterMethods.readBinary;
+        if (!readBin) return false;
+        for (const file of this.app.vault.getFiles()) {
+          if (this.isAtRestExcluded(file.path)) continue;
+          try {
+            const bytes = await readBin(file.path);
+            if (this.looksLikeCiphertextBytes(bytes)) return true;
+          } catch {
+            // Unreadable file — can't confirm ciphertext here; keep scanning.
+          }
+        }
+        return false;
       },
       saveWrappedLak: async (blob: string) => {
         await adapter.write(envelopePath, blob);
@@ -1163,8 +1220,12 @@ export class AtRestAdapterRuntime {
             throw new Error(response.error.message);
           }
 
-          if (response.error?.statusCode === 0) {
-            this.setConnectionStatus("offline");
+          // AC-API1: queue only TRANSIENT failures (network / 5xx / 429) for
+          // replay. A permanent 4xx (413 note-too-large, 409) can never
+          // succeed on retry — queuing it used to jam the offline flush.
+          const status = response.error?.statusCode ?? 0;
+          if (status === 0 || status === 429 || status >= 500) {
+            if (status === 0) this.setConnectionStatus("offline");
             this.queueOfflineOperation("write", path, data);
           } else {
             throw new Error(response.error?.message ?? "Remote write failed.");
@@ -1320,15 +1381,14 @@ export class AtRestAdapterRuntime {
       await this.originalAdapterMethods.writeBinary(path, ciphertext);
       return;
     }
-    // Adapter without writeBinary — fall back to write() with the ciphertext
-    // re-encoded as a binary string. This path is rare (legacy mobile) and
-    // best-effort; modern Obsidian always exposes writeBinary.
-    if (this.originalAdapterMethods.write) {
-      const bin = new Uint8Array(ciphertext);
-      let s = "";
-      for (let i = 0; i < bin.length; i++) s += String.fromCharCode(bin[i]);
-      await this.originalAdapterMethods.write(path, s);
-    }
+    // AR2: no writeBinary means the ciphertext cannot reach disk intact —
+    // write() UTF-8-encodes the string, so every byte >= 0x80 in the
+    // fromCharCode round-trip becomes a multi-byte sequence and the stored
+    // blob can never decrypt again. Fail closed instead of corrupting; modern
+    // Obsidian (desktop + mobile) always exposes writeBinary.
+    throw new Error(
+      `VaultGuard Sync: cannot write "${path}" — this vault adapter lacks binary writes, and encrypting through a string write would corrupt the file.`
+    );
   }
 
   /**
@@ -1362,6 +1422,76 @@ export class AtRestAdapterRuntime {
    * Write raw plaintext bytes to disk, encrypting with the LAK before
    * storage. Mirror of `writePlainToDisk` for binary attachments.
    */
+  /**
+   * Re-encrypts an externally-added plaintext TEXT file in place: reads the
+   * raw on-disk bytes and, when they are UTF-8 text without a VG1 header,
+   * writes the IDENTICAL bytes back through the encrypting write path. The
+   * content never changes — only the on-disk representation flips from
+   * plaintext to ciphertext. Files written through Obsidian never need this
+   * (the adapter interceptors encrypt them); this exists for files that
+   * bypass Obsidian entirely: Finder drops, git checkouts, external tools.
+   *
+   * Deliberately SKIPS binaries: binary sync is unsupported, so a binary in
+   * the vault has no server copy — at-rest-encrypting it would make the LAK
+   * envelope a single point of failure for content that exists nowhere
+   * else (uninstall/keychain loss = permanent loss). Binaries stay
+   * plaintext until binary sync exists. Text files are safe to flip: their
+   * content reaches the server via normal sync.
+   *
+   * Never throws — background hygiene must not break its callers.
+   * Returns true when the file was re-encrypted.
+   */
+  async ensureAtRestEncryptedInPlace(path: string): Promise<boolean> {
+    const readBin = this.originalAdapterMethods.readBinary;
+    if (!readBin || !this.atRestCipher?.isReady()) return false;
+    if (this.isAtRestExcluded(path)) return false;
+    if (this.inPlaceEncryptionInFlight.has(path)) return false;
+    this.inPlaceEncryptionInFlight.add(path);
+    try {
+      const bytes = await readBin(path);
+      if (this.atRestCipher.isEncrypted(bytes)) return false;
+      try {
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        return false;
+      }
+      await this.writePlainBinaryToDisk(path, bytes);
+      this.log(`At-rest: encrypted externally added file in place: ${path}`);
+      return true;
+    } catch (err) {
+      this.logError(`At-rest: in-place encryption of externally added "${path}" failed`, err);
+      return false;
+    } finally {
+      this.inPlaceEncryptionInFlight.delete(path);
+    }
+  }
+
+  /**
+   * vault.on("create") entry point for externally-added files. Waits a beat
+   * and requires a stable stat (size + mtime unchanged across the window) so
+   * a Finder/iCloud copy still in flight is never half-encrypted — writing
+   * the ciphertext of a truncated prefix would clobber the rest of the copy.
+   * Unstable or vanished files are left alone; the local-only catch-up hook
+   * in sync-runtime retries them on the next sync.
+   */
+  async encryptExternallyAddedFile(path: string): Promise<void> {
+    try {
+      if (this.isAtRestExcluded(path)) return;
+      if (!this.atRestCipher?.isReady()) return;
+      const before = await this.app.vault.adapter.stat(path);
+      if (!before || before.type !== "file") return;
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const after = await this.app.vault.adapter.stat(path);
+      if (!after || after.size !== before.size || after.mtime !== before.mtime) {
+        this.log(`At-rest: "${path}" still changing after create event — leaving for sync catch-up.`);
+        return;
+      }
+      await this.ensureAtRestEncryptedInPlace(path);
+    } catch (err) {
+      this.logError(`At-rest: external-add encryption check failed for "${path}"`, err);
+    }
+  }
+
   async writePlainBinaryToDisk(path: string, data: ArrayBuffer): Promise<void> {
     if (this.looksLikeCiphertextBytes(data)) {
       throw new Error(
@@ -1476,6 +1606,18 @@ export class AtRestAdapterRuntime {
       );
     }
     await this.emitAuditEvent("file.write", path, { outcome: "denied", reason: "binary-sync-unsupported" });
+    // Drag-and-drop / paste of an attachment reaches this rejection through
+    // Obsidian's drop handler, which swallows the thrown error — without a
+    // Notice the drop appears to silently do nothing. Throttled per path so
+    // a multi-file drop doesn't stack notices.
+    const now = Date.now();
+    if (now - (this.binaryWriteNoticeAt.get(path) ?? 0) >= 60_000) {
+      this.binaryWriteNoticeAt.set(path, now);
+      new Notice(
+        `VaultGuard Sync: binary attachments aren't supported in protected vaults yet — "${path}" was not added.`,
+        8000
+      );
+    }
     throw new Error(
       `VaultGuard Sync: Binary files are not currently supported for protected sync. "${path}" was not written.`
     );
@@ -1521,8 +1663,14 @@ export class AtRestAdapterRuntime {
         return false;
       }
 
-      if (response.error?.statusCode !== 0) {
-        return false;
+      // AC-API1: a permanent 4xx is an authoritative "no". Transient failures
+      // (network / 5xx / 429) fall through to the cached-permission fallback,
+      // matching the pre-fix behavior when those collapsed to statusCode 0.
+      {
+        const status = response.error?.statusCode ?? 0;
+        if (status !== 0 && status !== 429 && status < 500) {
+          return false;
+        }
       }
     }
 
@@ -1599,8 +1747,11 @@ export class AtRestAdapterRuntime {
             throw new Error(response.error.message);
           }
 
-          if (response.error?.statusCode === 0) {
-            this.setConnectionStatus("offline");
+          // AC-API1: transient failures (network / 5xx / 429) queue for
+          // replay; permanent 4xx rejections fail loudly instead.
+          const status = response.error?.statusCode ?? 0;
+          if (status === 0 || status === 429 || status >= 500) {
+            if (status === 0) this.setConnectionStatus("offline");
             this.queueOfflineOperation("delete", path);
           } else {
             throw new Error(response.error?.message ?? "Remote delete failed.");

@@ -1,10 +1,11 @@
 variable "stage" { type = string }
 variable "is_prod" { type = bool }
+variable "production_hardening" { type = bool }
 variable "kms_key_arn" { type = string }
 
 locals {
-  deletion_protection = var.is_prod
-  pitr_enabled        = var.is_prod
+  deletion_protection = var.production_hardening
+  pitr_enabled        = var.production_hardening
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -890,7 +891,47 @@ resource "aws_dynamodb_table" "recovery_attempts" {
   tags = { Name = "VaultGuard-${var.stage}-RecoveryAttempts" }
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Platform Metrics Table
+#
+# Daily platform-wide snapshots for the super-admin growth dashboard.
+# The superadmin Lambda's scheduled (EventBridge) invocation writes one
+# item per day: metric="daily", date="YYYY-MM-DD", plus counters
+# {orgs, users, vaults, storageBytes, activeSubscriptions, mrrCents, computedAt}.
+#
+# PK: metric (S)   SK: date (S, YYYY-MM-DD)
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_dynamodb_table" "platform_metrics" {
+  name         = "VaultGuard-${var.stage}-PlatformMetrics"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "metric"
+  range_key    = "date"
+
+  deletion_protection_enabled = local.deletion_protection
+  point_in_time_recovery { enabled = local.pitr_enabled }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  attribute {
+    name = "metric"
+    type = "S"
+  }
+  attribute {
+    name = "date"
+    type = "S"
+  }
+
+  tags = { Name = "VaultGuard-${var.stage}-PlatformMetrics" }
+}
+
 # ─── Outputs ─────────────────────────────────────────────────────────────────
+
+output "platform_metrics_table_name" { value = aws_dynamodb_table.platform_metrics.name }
+output "platform_metrics_table_arn" { value = aws_dynamodb_table.platform_metrics.arn }
 
 output "shares_table_name" { value = aws_dynamodb_table.shares.name }
 output "shares_table_arn" { value = aws_dynamodb_table.shares.arn }

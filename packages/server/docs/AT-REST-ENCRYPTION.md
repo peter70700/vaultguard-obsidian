@@ -168,8 +168,17 @@ A file that does not start with the `VG1\0` magic is treated as legacy
 plaintext and decoded directly. This enables:
 
 - **Lazy migration**: legacy vaults still read; first write encrypts.
-- **External edits**: if a user drops a plaintext `.md` into the vault
-  folder, the next save through Obsidian encrypts it.
+- **External adds are auto-encrypted (text only)**: when a plaintext text
+  file lands in the vault folder from outside Obsidian (Finder drop, git
+  checkout), the plugin re-encrypts the identical bytes in place — via
+  `vault.on("create")` (with a stat-stability guard against mid-copy
+  clobbering) while Obsidian is running, or via the local-only catch-up
+  hook after the file's first upload when it was added while Obsidian was
+  closed. Binary files are deliberately left plaintext: binary sync is
+  unsupported, so they have no server copy, and at-rest-encrypting them
+  would make the LAK envelope a single point of failure for content that
+  exists nowhere else. First save through Obsidian still encrypts anything
+  the hooks missed (legacy lazy migration).
 - **Forward compatibility**: the version byte gives one bump for
   changing scheme without breaking existing vaults.
 

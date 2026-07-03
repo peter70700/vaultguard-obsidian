@@ -45,6 +45,7 @@ import {
   PutCommand,
   QueryCommand,
   UpdateCommand,
+  DeleteCommand,
   PERMISSIONS_TABLE,
   LEASES_TABLE,
   USER_KEYS_TABLE,
@@ -835,6 +836,35 @@ async function prepareRotatedScopeDataKey(
   const newKeyId = randomUUID();
 
   const encryptedDataKey = Buffer.from(dataKeyResponse.CiphertextBlob).toString('base64');
+
+  // RE1: persist the wrapped DEK durably BEFORE any file is re-wrapped under
+  // it. commitRotatedScopeDataKey only runs after the whole re-encrypt loop,
+  // so a mid-loop crash (15-minute Lambda timeout on a large vault) used to
+  // strand every already-re-encrypted head under a keyId with NO stored key
+  // material — unreadable except by S3 noncurrent-version rollback. The
+  // PENDING row carries keyId + encryptedDataKey + the KMS EncryptionContext
+  // fields (orgId/scope/vaultId) and is discoverable through the keyId-index
+  // GSI, so the Phase-7 restore endpoint can re-wrap stranded heads back to
+  // the ACTIVE DEK. Abandoned PENDING rows (crashed or rolled-back rotations)
+  // are intentionally kept: they are tiny and remain load-bearing for any
+  // head still stamped with that keyId.
+  await docClient.send(
+    new PutCommand({
+      TableName: USER_KEYS_TABLE,
+      Item: {
+        pk,
+        sk: `PENDING#${newKeyId}`,
+        orgId,
+        vaultId,
+        scope,
+        encryptedDataKey,
+        keyId: newKeyId,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+      },
+    })
+  );
+
   return {
     plaintextKey: Buffer.from(dataKeyResponse.Plaintext),
     encryptedDataKey,
@@ -899,6 +929,23 @@ async function commitRotatedScopeDataKey(
       },
     })
   );
+
+  // RE1: the ACTIVE row now carries this keyId — retire the PENDING
+  // placeholder. Best-effort: a leftover PENDING row is harmless (it holds
+  // the SAME encryptedDataKey, so keyId-index resolvers work with either).
+  try {
+    await docClient.send(
+      new DeleteCommand({
+        TableName: USER_KEYS_TABLE,
+        Key: { pk, sk: `PENDING#${prepared.newKeyId}` },
+      })
+    );
+  } catch (err) {
+    console.warn(
+      `[REENCRYPTION] Could not delete PENDING row for keyId ${prepared.newKeyId}:`,
+      err
+    );
+  }
 }
 
 async function listAffectedS3Objects(

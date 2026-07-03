@@ -553,6 +553,132 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(mockRequestUrl.mock.calls[0][0].url).toContain("cognito-idp");
   });
 
+  it("escalates a terminal Cognito refresh rejection to a revocation logout (PL4)", async () => {
+    const plugin = makePlugin();
+    plugin.session = {
+      ...makeSession(),
+      idToken: "expired-id-token",
+      tokenExpiresAt: new Date(Date.now() - 60_000).toISOString(),
+    };
+    plugin.connectionState.status = "online";
+    plugin.settings.apiEndpoint = "https://api.vaultguard.test";
+    plugin.resolvedApiEndpoint = "https://api.vaultguard.test";
+    plugin.settings.maxRetryAttempts = 1;
+    plugin.handleServerRevocation = vi.fn().mockResolvedValue(undefined);
+    // Cognito rejects the refresh TERMINALLY (revoked token / disabled user).
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 400,
+      json: { __type: "NotAuthorizedException", message: "Refresh Token has been revoked" },
+      text: "",
+      headers: {},
+    } as any);
+
+    const response = await plugin.apiRequest("GET", "/auth/heartbeat?sessionId=session-1");
+
+    expect(response).toMatchObject({
+      success: false,
+      error: { code: "SESSION_REVOKED", statusCode: 401 },
+    });
+    expect(plugin.handleServerRevocation).toHaveBeenCalledWith("session expired or revoked");
+    // Only the Cognito call went out — the dead token never reached the backend
+    // and the pre-fix perpetual statusCode-0 "offline" parking did not happen.
+    expect(mockRequestUrl).toHaveBeenCalledOnce();
+    expect(mockRequestUrl.mock.calls[0][0].url).toContain("cognito-idp");
+  });
+
+  it("recovers from an expired MFA challenge session by minting a fresh challenge (PL5)", async () => {
+    const plugin = makePlugin();
+    plugin.pendingChallengeSession = "dead-challenge-session";
+    mockRequestUrl
+      // RespondToAuthChallenge with the ~3-minute-old session → expired.
+      .mockResolvedValueOnce({
+        status: 400,
+        json: {
+          __type: "NotAuthorizedException",
+          message: "Invalid session for the user, session is expired.",
+        },
+        text: "",
+        headers: {},
+      } as any)
+      // Automatic re-login mints a FRESH MFA challenge.
+      .mockResolvedValueOnce({
+        status: 200,
+        json: { ChallengeName: "SOFTWARE_TOKEN_MFA", Session: "fresh-challenge-session" },
+        text: "",
+        headers: {},
+      } as any);
+
+    await expect(
+      plugin.performLogin({
+        email: "user@test.com",
+        password: "pw-123456",
+        mfaCode: "000000",
+      })
+    ).rejects.toThrow(/MFA code expired/i);
+
+    // The dead session is gone and the fresh one is armed — the next submit
+    // responds to the NEW challenge instead of replaying the dead one forever.
+    expect(plugin.pendingChallengeSession).toBe("fresh-challenge-session");
+    expect(mockRequestUrl).toHaveBeenCalledTimes(2);
+    const targets = mockRequestUrl.mock.calls.map(
+      (c) => (c[0].headers as Record<string, string>)["X-Amz-Target"]
+    );
+    expect(targets[0]).toContain("RespondToAuthChallenge");
+    expect(targets[1]).toContain("InitiateAuth");
+  });
+
+  it("returns the REAL status for permanent HTTP failures without retrying (AC-API1)", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.isSessionTokenExpiring = vi.fn(() => false);
+    plugin.connectionState.status = "online";
+    plugin.resolvedApiEndpoint = "https://api.vaultguard.test";
+    plugin.settings.maxRetryAttempts = 3;
+    mockRequestUrl.mockResolvedValue({
+      status: 404,
+      json: { message: "File not found", code: "NOT_FOUND" },
+      text: JSON.stringify({ message: "File not found" }),
+      headers: { "x-request-id": "req-404" },
+    } as any);
+
+    const response = await plugin.apiRequest("DELETE", "/vaults/vault-abc/files/x.md");
+
+    expect(response).toMatchObject({
+      success: false,
+      error: { statusCode: 404, code: "NOT_FOUND", message: "File not found" },
+    });
+    // Permanent failure: exactly ONE request — no retry storm, and the
+    // pre-fix collapse to statusCode 0 (offline + endless requeue) is gone.
+    expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+    expect(plugin.connectionState.status).toBe("online");
+  });
+
+  it("retries 5xx and then returns the real status instead of statusCode 0 (AC-API1)", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.isSessionTokenExpiring = vi.fn(() => false);
+    plugin.connectionState.status = "online";
+    plugin.resolvedApiEndpoint = "https://api.vaultguard.test";
+    plugin.settings.maxRetryAttempts = 2;
+    plugin.delay = vi.fn().mockResolvedValue(undefined);
+    mockRequestUrl.mockResolvedValue({
+      status: 503,
+      json: { message: "Service unavailable" },
+      text: JSON.stringify({ message: "Service unavailable" }),
+      headers: {},
+    } as any);
+
+    const response = await plugin.apiRequest("GET", "/vaults/vault-abc/files");
+
+    expect(mockRequestUrl).toHaveBeenCalledTimes(2);
+    expect(response).toMatchObject({
+      success: false,
+      error: { statusCode: 503 },
+    });
+    // A server-side failure is NOT a network outage.
+    expect(plugin.connectionState.status).toBe("online");
+  });
+
   it("does not schedule retry timers while the browser reports offline", () => {
     const plugin = makePlugin();
     plugin.session = makeSession();
@@ -2002,33 +2128,31 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
   // `tests/permission-store.test.ts` — search for "R-09-08 warm-up
   // sentinel" and the cache walk-up tests around `runWarm()`. (IN-04)
 
-  it("clears only the current vault session on logout", async () => {
+  it("clears EVERY stored session envelope on logout, including orphaned bindings (PL6)", async () => {
+    // Both stores (data.json + app.saveLocalStorage) are per-vault, so an
+    // "other" binding id in them is THIS vault's own orphan from a folder
+    // rename/move — an envelope still holding a valid refresh token. Logout
+    // must not leave it behind.
     const plugin = makePlugin();
     installFakeSafeStorage();
     const session = makeSession();
     const currentEnvelope = protectSessionForTest(plugin, session);
-    const otherEnvelope = protectSessionForTest(plugin, session);
+    const orphanEnvelope = protectSessionForTest(plugin, session);
     plugin.persistedSessions = {
       "test-vault-binding": currentEnvelope,
-      "other-vault-binding": otherEnvelope,
+      "other-vault-binding": orphanEnvelope,
     };
     plugin.saveData = vi.fn().mockResolvedValue(undefined);
 
     localStorage.setItem("vaultguard-session:test-vault-binding", JSON.stringify(currentEnvelope));
-    localStorage.setItem("vaultguard-session:other-vault-binding", JSON.stringify(otherEnvelope));
+    localStorage.setItem("vaultguard-session:other-vault-binding", JSON.stringify(orphanEnvelope));
 
     await plugin.clearStoredSession();
 
     expect(localStorage.getItem("vaultguard-session:test-vault-binding")).toBeNull();
-    expect(localStorage.getItem("vaultguard-session:other-vault-binding")).toBe(
-      JSON.stringify(otherEnvelope)
-    );
+    expect(localStorage.getItem("vaultguard-session:other-vault-binding")).toBeNull();
     expect(plugin.saveData).toHaveBeenCalledWith(
-      expect.objectContaining({
-        storedSessions: {
-          "other-vault-binding": otherEnvelope,
-        },
-      })
+      expect.objectContaining({ storedSessions: {} })
     );
   });
 
@@ -2064,6 +2188,54 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(mockNotice).toHaveBeenCalledWith(
       "VaultGuard Sync: Session expired. Please log in again."
     );
+  });
+
+  it("revokes the Cognito refresh token during logout, best-effort (PL6)", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    const refreshToken = plugin.session.refreshToken;
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: null,
+      error: null,
+      requestId: "req-1",
+    });
+    plugin.clearStoredSession = vi.fn().mockResolvedValue(undefined);
+    plugin.revokeAgentBridgeLeasesForSessionEnd = vi.fn().mockResolvedValue(undefined);
+    mockRequestUrl.mockResolvedValueOnce({ status: 200, json: {}, text: "", headers: {} } as any);
+
+    await plugin.forceLogout("bye");
+
+    // Without RevokeToken, any backup of data.json keeps a working refresh
+    // token after "logout".
+    const revokeCall = mockRequestUrl.mock.calls.find((c) =>
+      String((c[0].headers as Record<string, string>)?.["X-Amz-Target"] ?? "").includes(
+        "RevokeToken"
+      )
+    );
+    expect(revokeCall).toBeTruthy();
+    const body = JSON.parse(revokeCall![0].body as string);
+    expect(body).toMatchObject({ ClientId: "test-client", Token: refreshToken });
+    expect(plugin.session).toBeNull();
+  });
+
+  it("finishes local logout even when Cognito RevokeToken fails (PL6 best-effort)", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: null,
+      error: null,
+      requestId: "req-1",
+    });
+    plugin.clearStoredSession = vi.fn().mockResolvedValue(undefined);
+    plugin.revokeAgentBridgeLeasesForSessionEnd = vi.fn().mockResolvedValue(undefined);
+    mockRequestUrl.mockRejectedValueOnce(new Error("network down"));
+
+    await plugin.forceLogout("bye");
+
+    expect(plugin.session).toBeNull();
+    expect(plugin.clearStoredSession).toHaveBeenCalled();
   });
 
   it("uses the status bar to show durable logged-out feedback", () => {
@@ -2277,7 +2449,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.permissionCache.size).toBe(0);
   });
 
-  it("removes server-missing local files when the user cannot upload them", async () => {
+  it("removes server-missing local files when the user cannot upload them (permission store warmed)", async () => {
     const plugin = makePlugin();
     const localOnlyPath = "Welcome (conflict 2026-04-29T15-16-30-016Z).md";
     const remove = vi.fn().mockResolvedValue(undefined);
@@ -2315,6 +2487,10 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       throw new Error(`Unexpected API call: ${method} ${path}`);
     });
 
+    // SY2: removal of a never-uploaded local file only happens on a CONFIRMED
+    // (warmed) permission baseline.
+    await plugin.permissionStore.warm();
+
     const result = await plugin.uploadLocalOnlyFiles();
 
     expect(result?.skippedFiles).toBe(1);
@@ -2325,6 +2501,423 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       expect.any(String),
       expect.anything()
     );
+  });
+
+  it("does NOT remove a server-missing local file when the permission store has not warmed (SY2)", async () => {
+    const plugin = makePlugin();
+    const localOnlyPath = "Welcome (conflict 2026-04-29T15-16-30-016Z).md";
+    const remove = vi.fn().mockResolvedValue(undefined);
+
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.originalAdapterMethods = {
+      read: vi.fn().mockResolvedValue("local conflict content"),
+      write: null,
+      list: null,
+      remove,
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: localOnlyPath }]);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.apiRequest = vi.fn(async (method: string, path: string, body?: { action?: string }) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
+      }
+      if (method === "POST" && path.endsWith("/permissions/check")) {
+        return { success: true, data: { allowed: body?.action === "read" }, error: null, requestId: "req-perm" };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    // Permission store stays "cold" (fetch never landed). A NONE baseline here
+    // is unconfirmed and must NOT trigger a permanent local delete.
+    plugin.permissionStore.markFetchFailed(503);
+
+    const result = await plugin.uploadLocalOnlyFiles();
+
+    expect(result?.skippedFiles).toBe(1);
+    expect(result?.removedLocalFiles).toBe(0);
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  // AR1: 0x80–0xFF bytes are invalid as a UTF-8 lead sequence, so a real
+  // attachment (PNG header + high bytes) can never survive the string sync
+  // pipeline. Every string-upload path must SKIP such files, mirroring
+  // interceptedWriteBinary's "binary sync unsupported" fail-closed policy.
+  const AR1_BINARY_BYTES = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x80, 0xff, 0xfe, 0x00,
+  ]);
+
+  it("uploadLocalOnlyFiles skips binary local-only files instead of uploading a lossy decode (AR1)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/photo.png" }]);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.uploadReconciledFile = vi.fn();
+    plugin.removeUnsyncedLocalFile = vi.fn();
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    const result = await plugin.uploadLocalOnlyFiles();
+
+    expect(result?.skippedFiles).toBe(1);
+    expect(result?.uploadedFiles).toBe(0);
+    expect(result?.removedLocalFiles).toBe(0);
+    expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
+    expect(plugin.removeUnsyncedLocalFile).not.toHaveBeenCalled();
+  });
+
+  it("uploadLocalOnlyFiles re-encrypts an uploaded local-only text file in place (external-add hygiene)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(new TextEncoder().encode("# dropped in Finder").buffer),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "dropped/note.md" }]);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.uploadReconciledFile = vi.fn(async () => "uploaded");
+    plugin.ensureAtRestEncryptedInPlace = vi.fn(async () => true);
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    const result = await plugin.uploadLocalOnlyFiles();
+
+    expect(result?.uploadedFiles).toBe(1);
+    expect(plugin.ensureAtRestEncryptedInPlace).toHaveBeenCalledWith("dropped/note.md");
+  });
+
+  it("performInitialReconciliation neither uploads binary files nor overwrites them from a lossy server copy (AR1)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.vaultLeaseDenied = false;
+    const textBytes = new TextEncoder().encode("plain note");
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn(async (path: string) =>
+        path === "attachments/photo.png" ? AR1_BINARY_BYTES.buffer : textBytes.buffer
+      ),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [
+      { path: "attachments/photo.png" },
+      { path: "notes/local.md" },
+    ]);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.computeHash = vi.fn(async (content: string) => `hash:${content}`);
+    plugin.applyRemoteChange = vi.fn();
+    plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
+    plugin.askReconciliationPlan = vi
+      .fn()
+      .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            deltas: [
+              // A lossy pre-fix server copy of the SAME binary path: it must
+              // not be classified serverOnly and written over the local bytes.
+              {
+                path: "/attachments/photo.png",
+                action: "created",
+                lastModified: "2026-07-01T00:00:00.000Z",
+                checksum: "lossy",
+                size: 12,
+              },
+            ],
+            syncTimestamp: "2026-07-02T00:00:00.000Z",
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    // The binary file is invisible to the plan: not localOnly (no upload),
+    // not serverOnly (no overwrite), not a conflict.
+    expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
+      serverOnly: [],
+      localOnly: ["/notes/local.md"],
+      conflicts: [],
+    });
+    expect(plugin.uploadReconciledFile).toHaveBeenCalledTimes(1);
+    expect(plugin.uploadReconciledFile).toHaveBeenCalledWith(
+      "notes/local.md",
+      "plain note",
+      undefined
+    );
+    expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+  });
+
+  it("queues both rename halves and tombstones the old path when offline/lease-less (SY4)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = null; // lease-less: folder-rename children used to be silently dropped
+    plugin.connectionState.status = "offline";
+    plugin.settings.deletionTombstones = {};
+    plugin.offlineQueue = [];
+    const textBytes = new TextEncoder().encode("note body");
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(textBytes.buffer),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    plugin.apiRequest = vi.fn();
+
+    await plugin.syncFileRenameToServer("folder-a/note.md", "folder-b/note.md");
+
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+    expect(plugin.offlineQueue).toEqual([
+      expect.objectContaining({
+        operation: "write",
+        path: "folder-b/note.md",
+        data: "note body",
+      }),
+      expect.objectContaining({ operation: "delete", path: "folder-a/note.md" }),
+    ]);
+    // The tombstone stops repair from resurrecting the old server copy
+    // before the queued delete lands.
+    expect(typeof plugin.settings.deletionTombstones["folder-a/note.md"]).toBe("string");
+  });
+
+  it("syncFileRenameToServer leaves binary files alone instead of PUTting a lossy decode (AR1)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    plugin.apiRequest = vi.fn();
+
+    await plugin.syncFileRenameToServer("attachments/old.png", "attachments/new.png");
+
+    // Neither the PUT of decoded-as-text content nor the old-path DELETE ran.
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+  });
+
+  // Regression: cold-path (full-scan) deletions are INFERRED from manifest-vs-S3
+  // absence and can wrongly target never-uploaded local files, so they must go
+  // to recoverable trash — never a permanent wipe. Warm-path (activity-log)
+  // deletions are real events and delete permanently.
+  function setupDeletionSyncPlugin(mode: "full-scan" | "activity-log") {
+    const plugin = makePlugin();
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const trashLocal = vi.fn().mockResolvedValue(undefined);
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.offlineQueue = [];
+    plugin.localOnlyCatchupCompleted = true;
+    plugin.remoteInventoryRepairCompleted = true;
+    plugin.syncState.lastSeenRevision = 5;
+    plugin.app.vault.getFiles = vi.fn(() => []);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.originalAdapterMethods = {
+      read: null,
+      write: null,
+      list: null,
+      remove,
+      rename: null,
+    };
+    plugin.app.vault.adapter = { ...(plugin.app.vault.adapter ?? {}), trashLocal };
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (path.endsWith("/sync-cursor")) {
+        return {
+          success: true,
+          data: { revision: 6, lastChangedAt: "2026-05-01T00:00:00.000Z", serverTime: "2026-05-01T00:00:01.000Z" },
+          error: null,
+          requestId: "req-cursor",
+        };
+      }
+      if (path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            deltas: [
+              {
+                path: "/notes/todo.md",
+                action: "deleted",
+                lastModified: "2026-05-01T00:00:00.000Z",
+                checksum: "",
+                size: 0,
+              },
+            ],
+            syncTimestamp: "2026-05-01T00:00:02.000Z",
+            revision: 6,
+            mode,
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+    return { plugin, remove, trashLocal };
+  }
+
+  it("moves cold-path (full-scan) inferred deletions to trash instead of permanently deleting", async () => {
+    const { plugin, remove, trashLocal } = setupDeletionSyncPlugin("full-scan");
+
+    await plugin.performSync();
+
+    expect(trashLocal).toHaveBeenCalledWith("notes/todo.md");
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("permanently deletes warm-path (activity-log) deletions", async () => {
+    const { plugin, remove, trashLocal } = setupDeletionSyncPlugin("activity-log");
+
+    await plugin.performSync();
+
+    expect(remove).toHaveBeenCalledWith("notes/todo.md");
+    expect(trashLocal).not.toHaveBeenCalled();
+  });
+
+  it("does not apply a remote delta over a path with a pending offline operation (SY5)", async () => {
+    const { plugin, remove, trashLocal } = setupDeletionSyncPlugin("activity-log");
+    // Limited access: no lease, so the Phase-1 flush is skipped and the
+    // queued local edit of notes/todo.md has NOT reached the server.
+    plugin.keyLease = null;
+    plugin.offlineQueue = [
+      {
+        operation: "write",
+        path: "notes/todo.md",
+        data: "local edit made while limited",
+        timestamp: "2026-05-01T00:00:00.000Z",
+      },
+    ];
+    plugin.applyRemoteChange = vi.fn();
+
+    await plugin.performSync();
+
+    // The remote "deleted" delta must NOT run over the locally-dirty file —
+    // pre-fix it deleted (or overwrote) the user's unsynced edit.
+    expect(remove).not.toHaveBeenCalled();
+    expect(trashLocal).not.toHaveBeenCalled();
+    expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+    expect(plugin.offlineQueue).toHaveLength(1);
+  });
+
+  it("persists the offline queue as a LAK envelope and restores it on load (SY5)", async () => {
+    const envelopeFiles = new Map<string, ArrayBuffer>();
+    const envelopePath = ".obsidian/plugins/vaultguard-sync/offline-queue.envelope";
+
+    function wireEnvelopePlugin() {
+      const plugin = makePlugin();
+      plugin.manifest = { id: "vaultguard-sync" };
+      plugin.app.vault.configDir = ".obsidian";
+      plugin.app.vault.adapter = {
+        exists: vi.fn(async (p: string) => envelopeFiles.has(p)),
+        remove: vi.fn(async (p: string) => {
+          envelopeFiles.delete(p);
+        }),
+      };
+      plugin.originalAdapterMethods = {
+        read: null,
+        write: null,
+        list: null,
+        remove: null,
+        rename: null,
+        readBinary: vi.fn(async (p: string) => envelopeFiles.get(p)!),
+        writeBinary: vi.fn(async (p: string, bytes: ArrayBuffer) => {
+          envelopeFiles.set(p, bytes);
+        }),
+      };
+      plugin.atRestCipher = {
+        isReady: () => true,
+        encryptString: vi.fn(async (s: string) => new TextEncoder().encode(s).buffer),
+        decryptString: vi.fn(async (b: ArrayBuffer) => new TextDecoder().decode(b)),
+      };
+      plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+      plugin.waitForCipherInit = vi.fn().mockResolvedValue(true);
+      return plugin;
+    }
+
+    // Session 1: queue an op and persist.
+    const plugin1 = wireEnvelopePlugin();
+    plugin1.offlineQueue = [
+      {
+        operation: "write",
+        path: "notes/limited-edit.md",
+        data: "edited while limited-access",
+        timestamp: "2026-07-02T00:00:00.000Z",
+      },
+    ];
+    await plugin1.persistOfflineQueue();
+    expect(envelopeFiles.has(envelopePath)).toBe(true);
+
+    // Session 2 (restart): the queue restores from the envelope.
+    const plugin2 = wireEnvelopePlugin();
+    plugin2.offlineQueue = [];
+    await plugin2.loadPersistedOfflineQueue();
+    expect(plugin2.offlineQueue).toEqual([
+      expect.objectContaining({
+        operation: "write",
+        path: "notes/limited-edit.md",
+        data: "edited while limited-access",
+      }),
+    ]);
+
+    // Draining the queue removes the envelope (logout leaves nothing behind).
+    plugin2.offlineQueue = [];
+    await plugin2.persistOfflineQueue();
+    expect(envelopeFiles.has(envelopePath)).toBe(false);
   });
 
   it("preserves the local permission cache when the sync response does not signal permissionsChanged", async () => {
@@ -2580,6 +3173,40 @@ describe("VaultGuardPlugin limited-access placeholder flow", () => {
 
     expect(plugin.placeholderPaths.size).toBe(0);
     expect(plugin.permissionCache.size).toBe(0);
+  });
+
+  it("checkKeyLeaseRenewal retries a lease that failed TRANSIENTLY, not only a 403 denial (PL2)", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.keyLease = null;
+    // Transient-failure state: NOT a 403 denial, but a retry is owed.
+    plugin.vaultLeaseDenied = false;
+    plugin.leaseRetryNeeded = true;
+    plugin.settings.serverVaultId = "vault-abc";
+    const ensure = vi.fn().mockImplementation(async () => {
+      plugin.leaseRetryNeeded = false;
+      plugin.keyLease = makeKeyLease();
+      return "ok";
+    });
+    plugin.ensureVaultScopedKeyLease = ensure;
+
+    await plugin.checkKeyLeaseRenewal();
+
+    expect(ensure).toHaveBeenCalledTimes(1);
+    expect(plugin.keyLease).not.toBeNull();
+  });
+
+  it("checkKeyLeaseRenewal does NOT retry when neither denied nor retry-needed (no vault binding yet)", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.keyLease = null;
+    plugin.vaultLeaseDenied = false;
+    plugin.leaseRetryNeeded = false;
+    plugin.settings.serverVaultId = "vault-abc";
+    const ensure = vi.fn();
+    plugin.ensureVaultScopedKeyLease = ensure;
+
+    await plugin.checkKeyLeaseRenewal();
+
+    expect(ensure).not.toHaveBeenCalled();
   });
 
   it("placeholderPaths is not persisted to data.json (saveData payload never contains the set)", async () => {

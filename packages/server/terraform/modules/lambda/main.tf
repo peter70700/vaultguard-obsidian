@@ -68,6 +68,11 @@ variable "allow_public_signup" {
   default     = false
   description = "When true, Community Edition keeps public signup open after the first org."
 }
+variable "billing_exempt_domains" {
+  type        = string
+  default     = ""
+  description = "Comma-separated email domains whose new orgs are billing-exempt (stamped comped=true at signup). Empty disables domain exemption."
+}
 variable "sender_email" {
   type    = string
   default = "noreply@example.com"
@@ -75,6 +80,26 @@ variable "sender_email" {
 variable "domain_name" {
   type    = string
   default = ""
+}
+variable "super_admin_emails" {
+  type        = string
+  default     = ""
+  description = "Comma-separated lowercase emails allowed to call the /superadmin/* platform-stats API. Fail-closed: empty disables the API entirely."
+}
+variable "platform_metrics_table_name" {
+  type        = string
+  default     = ""
+  description = "PlatformMetrics table name (daily platform snapshots). Empty on Community Edition roots — the superadmin snapshot becomes a no-op."
+}
+variable "platform_metrics_table_arn" {
+  type        = string
+  default     = ""
+  description = "PlatformMetrics table ARN. Empty on Community Edition roots."
+}
+variable "superadmin_snapshot_schedule" {
+  type        = string
+  default     = "cron(0 3 * * ? *)"
+  description = "EventBridge schedule expression for the daily platform-metrics snapshot."
 }
 variable "reconciler_schedule" {
   type        = string
@@ -185,6 +210,12 @@ data "archive_file" "shares_lambda" {
   type        = "zip"
   source_dir  = "${path.module}/../../../infrastructure/dist/shares"
   output_path = "${path.module}/.build/shares.zip"
+}
+
+data "archive_file" "superadmin_lambda" {
+  type        = "zip"
+  source_dir  = "${path.module}/../../../infrastructure/dist/superadmin"
+  output_path = "${path.module}/.build/superadmin.zip"
 }
 
 # ─── IAM Roles ───────────────────────────────────────────────────────────────
@@ -849,6 +880,7 @@ resource "aws_lambda_function" "signup" {
       USER_POOL_ID                   = var.cognito_user_pool_id
       CLIENT_ID                      = var.cognito_client_id
       VAULTGUARD_ALLOW_PUBLIC_SIGNUP = tostring(var.allow_public_signup)
+      BILLING_EXEMPT_DOMAINS         = var.billing_exempt_domains
       TURNSTILE_SECRET_ARN           = var.turnstile_secret_arn
     })
   }
@@ -1442,7 +1474,156 @@ resource "aws_cloudwatch_log_group" "shares" {
   retention_in_days = local.log_retention
 }
 
+# ─── Super-admin Lambda ─────────────────────────────────────────────────────
+#
+# Platform-wide stats API (/superadmin/*) for platform operators. Access is
+# double-gated: the Cognito "platform-superadmin" group AND the
+# SUPER_ADMIN_EMAILS allowlist (fail-closed when empty). The same function
+# also runs the daily PlatformMetrics snapshot when invoked by the
+# EventBridge schedule (the handler detects event.source === "aws.events").
+# Read-only over business tables; write access is limited to the
+# PlatformMetrics table and the audit log.
+
+resource "aws_iam_role" "superadmin_lambda" {
+  name               = "vaultguard-${var.stage}-superadmin-lambda"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "superadmin_logging" {
+  role       = aws_iam_role.superadmin_lambda.name
+  policy_arn = aws_iam_policy.lambda_logging.arn
+}
+
+data "aws_iam_policy_document" "superadmin_lambda" {
+  # Read-only sweep over the platform's business tables (+ their GSIs) for
+  # the overview / orgs / growth aggregations. No write actions here — the
+  # superadmin API must never mutate tenant data.
+  statement {
+    actions = ["dynamodb:Scan", "dynamodb:Query", "dynamodb:GetItem", "dynamodb:BatchGetItem"]
+    resources = [
+      var.organizations_table_arn, "${var.organizations_table_arn}/index/*",
+      var.subscriptions_table_arn, "${var.subscriptions_table_arn}/index/*",
+      var.vaults_table_arn, "${var.vaults_table_arn}/index/*",
+      var.sessions_table_arn, "${var.sessions_table_arn}/index/*",
+      var.revoked_keys_table_arn,
+    ]
+  }
+  # PlatformMetrics — daily snapshot writes + growth-series reads.
+  # Gated on super_admin_emails (the feature's fail-closed switch, known at
+  # plan time) rather than the table ARN, which is known-after-apply for a
+  # freshly-created table and can't drive for_each. Community Edition roots
+  # leave super_admin_emails = "" and skip the whole platform surface.
+  dynamic "statement" {
+    for_each = var.super_admin_emails != "" ? [1] : []
+    content {
+      actions   = ["dynamodb:PutItem", "dynamodb:Query"]
+      resources = [var.platform_metrics_table_arn]
+    }
+  }
+  # Cognito — user totals for /superadmin/users (ListUsers) and the super-admin
+  # MFA-enrollment gate (AdminGetUser, reliable fallback when the token's `amr`
+  # claim omits MFA — see assertSuperAdminMfaEnrolled in shared/utils.ts).
+  statement {
+    actions   = ["cognito-idp:ListUsers", "cognito-idp:AdminGetUser"]
+    resources = [var.cognito_user_pool_arn]
+  }
+  # Cost Explorer — /superadmin/costs (monthly by SERVICE + daily totals).
+  # CE only supports "*" as the resource.
+  statement {
+    actions   = ["ce:GetCostAndUsage"]
+    resources = ["*"]
+  }
+  # Audit logging (logAudit in shared/utils.ts).
+  statement {
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.audit_table_arn]
+  }
+  # Secrets Manager — read Stripe secret so /superadmin/overview can report
+  # live MRR (source: "stripe"). Skipped on Community Edition where
+  # stripe_secret_arn = "" and revenue falls back to the local estimate.
+  dynamic "statement" {
+    for_each = var.stripe_secret_arn != "" ? [1] : []
+    content {
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.stripe_secret_arn]
+    }
+  }
+  # KMS — DynamoDB tables use the customer-managed key.
+  statement {
+    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+    resources = [var.kms_key_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "superadmin_lambda" {
+  name   = "superadmin-lambda-policy"
+  role   = aws_iam_role.superadmin_lambda.id
+  policy = data.aws_iam_policy_document.superadmin_lambda.json
+}
+
+resource "aws_lambda_function" "superadmin" {
+  function_name = "vaultguard-superadmin-${var.stage}"
+  description   = "Platform-wide stats API for super-admins + daily PlatformMetrics snapshot"
+  role          = aws_iam_role.superadmin_lambda.arn
+  handler       = "handler.handler"
+  runtime       = "nodejs22.x"
+  architectures = ["arm64"]
+  memory_size   = 256
+  timeout       = 30
+
+  filename         = data.archive_file.superadmin_lambda.output_path
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/superadmin/handler.js")
+
+  tracing_config { mode = "Active" }
+
+  environment {
+    variables = merge(local.common_env, {
+      SUPER_ADMIN_EMAILS     = var.super_admin_emails
+      PLATFORM_METRICS_TABLE = var.platform_metrics_table_name
+      STRIPE_SECRET_ARN      = var.stripe_secret_arn
+    })
+  }
+
+  tags = { Name = "vaultguard-superadmin-${var.stage}" }
+}
+
+resource "aws_cloudwatch_log_group" "superadmin" {
+  name              = "/aws/lambda/${aws_lambda_function.superadmin.function_name}"
+  retention_in_days = local.log_retention
+}
+
+# The daily snapshot schedule only exists when the platform surface is enabled
+# (super_admin_emails non-empty). Community Edition roots leave it empty and the
+# Lambda's snapshot path is a no-op, so skip the EventBridge plumbing entirely.
+# Gated on super_admin_emails (plan-time known) not the metrics ARN
+# (known-after-apply), which cannot drive count.
+resource "aws_cloudwatch_event_rule" "superadmin_snapshot_schedule" {
+  count               = var.super_admin_emails != "" ? 1 : 0
+  name                = "vaultguard-${var.stage}-superadmin-snapshot"
+  description         = "Daily PlatformMetrics snapshot via the superadmin Lambda"
+  schedule_expression = var.superadmin_snapshot_schedule
+}
+
+resource "aws_cloudwatch_event_target" "superadmin_snapshot" {
+  count     = var.super_admin_emails != "" ? 1 : 0
+  rule      = aws_cloudwatch_event_rule.superadmin_snapshot_schedule[0].name
+  target_id = "vaultguard-superadmin-${var.stage}"
+  arn       = aws_lambda_function.superadmin.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge_superadmin" {
+  count         = var.super_admin_emails != "" ? 1 : 0
+  statement_id  = "AllowExecutionFromSuperadminSnapshotSchedule"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.superadmin.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.superadmin_snapshot_schedule[0].arn
+}
+
 # ─── Outputs ─────────────────────────────────────────────────────────────────
+
+output "superadmin_function_invoke_arn" { value = aws_lambda_function.superadmin.invoke_arn }
+output "superadmin_function_name" { value = aws_lambda_function.superadmin.function_name }
 
 output "shares_function_invoke_arn" { value = aws_lambda_function.shares.invoke_arn }
 output "shares_function_name" { value = aws_lambda_function.shares.function_name }

@@ -4,8 +4,13 @@ dist/
 .env.*
 terraform.tfstate
 terraform.tfstate.backup
+tfplan
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
 .terraform/
 .terraform.lock.hcl
+.build/
 *.zip
 .DS_Store
 

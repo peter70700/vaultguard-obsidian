@@ -208,9 +208,11 @@ export class VaultGuardChatView extends ItemView {
   // The streaming preference baked into the current runtime, so a settings
   // change mid-session rebuilds the runtime with the new transport.
   private runtimeStreaming = false;
-  // Passive once-per-view-session guard for the mobile streaming hint (the
-  // streaming toggle is hidden on mobile and live streaming is forced off, so
-  // a single muted line explains why — never a recurring Notice).
+  // Passive once-per-view-session guard for the mobile streaming hint. The
+  // streaming toggle is hidden on mobile IN SETTINGS (settings.ts,
+  // !Platform.isMobileApp) and live streaming is force-disabled at runtime by
+  // streamingEnabled(); this hint is only a single muted line explaining that —
+  // never a recurring Notice.
   private streamHintShown = false;
 
   // ─── In-panel multi-tab state (AI chat tabs) ───────────────────────────────
@@ -379,19 +381,9 @@ export class VaultGuardChatView extends ItemView {
     void this.maybeAutoDefaultProvider()
       .catch((e) => console.error("[VaultGuard Chat] provider auto-default failed", e))
       .finally(() => {
-        // First-run hint (no network/subprocess). API-key mode: show when no key
-        // is stored. Subscription mode: the connect state is decided lazily on
-        // first submit, so nothing is spawned here.
-        try {
-          if (
-            this.plugin.settings.aiChatProvider !== "subscription" &&
-            !new AnthropicKeyStore(this.plugin).hasKey()
-          ) {
-            this.renderConnectState();
-          }
-        } catch (e) {
-          console.error("[VaultGuard Chat] connect-hint render failed", e);
-        }
+        // First-run empty state (API-key mode; subscription decides lazily on
+        // first submit). Runs the async provision-or-connect decision below.
+        void this.renderInitialEmptyState();
       });
 
     // Resolve which conversation this leaf shows. Defer one tick so a setState()
@@ -403,9 +395,11 @@ export class VaultGuardChatView extends ItemView {
     this.maybeShowMobileStreamingHint();
   }
 
-  // Passive, once-per-view-session hint: on mobile the streaming toggle is
-  // hidden and live streaming is forced off, so explain it with a single muted
-  // line rather than a per-turn Notice (which would nag).
+  // Passive, once-per-view-session hint. The streaming toggle is hidden on
+  // mobile IN SETTINGS (settings.ts, !Platform.isMobileApp) and streamingEnabled()
+  // is the actual runtime enforcement; this is only a single muted line
+  // explaining why replies aren't streamed on mobile — not a per-turn Notice
+  // (which would nag).
   private maybeShowMobileStreamingHint(): void {
     if (this.streamHintShown) return;
     if (!Platform.isMobileApp || !this.plugin.settings.aiChatStreaming) return;
@@ -462,6 +456,12 @@ export class VaultGuardChatView extends ItemView {
         "Add your Anthropic API key in VaultGuard settings → AI Chat. " +
         "Until you do, this panel stays fully offline and makes no network calls.",
     });
+    empty.createEl("p", {
+      cls: "vaultguard-chat-empty-hint",
+      text:
+        "On mobile? A key you saved on desktop appears here automatically when " +
+        "“Sync API key to your other devices” is on and you're signed in to the same vault.",
+    });
   }
 
   private renderWelcomeState(): void {
@@ -512,6 +512,47 @@ export class VaultGuardChatView extends ItemView {
       cls: "vaultguard-chat-empty-hint",
       text: "Type / for commands, $ for writing skills, @ to reference a note",
     });
+  }
+
+  /**
+   * Resolve the Anthropic API key for a turn: the device-local key first, then
+   * a one-shot Cloud provision (a key synced from another device). The provision
+   * self-gates on a session + bound vault + key sync, so a fresh, session-less
+   * install makes ZERO network calls and simply returns null (§11).
+   */
+  private async ensureApiKey(): Promise<string | null> {
+    const store = new AnthropicKeyStore(this.plugin);
+    let key = await store.getKey();
+    if (!key) key = await this.plugin.aiKeySync.provisionIfMissing();
+    return key;
+  }
+
+  /**
+   * First-open empty-state decision (API-key mode only; subscription decides
+   * lazily on first submit). With no local key, attempt a one-shot Cloud
+   * provision ONLY when a session + bound vault exist — so a fresh, session-less
+   * install stays fully offline (§11) and shows the connect state. If a key is
+   * provisioned (a quiet Notice announces it), show the welcome instead.
+   */
+  private async renderInitialEmptyState(): Promise<void> {
+    try {
+      if (this.plugin.settings.aiChatProvider === "subscription") return;
+      // A locally-stored key means the conversation-restore path renders the
+      // welcome/messages — nothing to do here (preserves prior behavior).
+      if (new AnthropicKeyStore(this.plugin).hasKey()) return;
+
+      const ctx = this.plugin.getAiKeySyncContext();
+      if (ctx.session && ctx.vaultId) {
+        const provisioned = await this.plugin.aiKeySync.provisionIfMissing();
+        if (provisioned) {
+          this.renderWelcomeState();
+          return;
+        }
+      }
+      this.renderConnectState();
+    } catch (e) {
+      console.error("[VaultGuard Chat] connect-hint render failed", e);
+    }
   }
 
   // ─── Turn handling ─────────────────────────────────────────────────────────
@@ -567,10 +608,10 @@ export class VaultGuardChatView extends ItemView {
       }),
     );
 
-    // §11: read the key first; with none, render the connect state and make
-    // ZERO outbound calls.
-    const keyStore = new AnthropicKeyStore(this.plugin);
-    const apiKey = await keyStore.getKey();
+    // §11: resolve the key first — local, then a one-shot Cloud provision (a
+    // key synced from another device) that self-gates on a session. With none,
+    // render the connect state; a fresh, session-less install makes ZERO calls.
+    const apiKey = await this.ensureApiKey();
     if (!apiKey) {
       this.renderConnectState();
       new Notice("VaultGuard Chat: add your Anthropic API key in settings → AI Chat.");
@@ -653,6 +694,10 @@ export class VaultGuardChatView extends ItemView {
       // Snapshot the runtime's message history into the conversation and
       // persist it (encrypted at rest, debounced). Fail-soft on no LAK.
       this.captureAndSave(apiKey);
+      // The key was just used — cheaply heal the roaming server blob (re-upload
+      // if it's missing or wrapped with a rotated DEK) so the user's other
+      // devices can still provision. Fire-and-forget; self-gates on sync+session.
+      void this.plugin.aiKeySync.healIfStale();
       this.flushQueuedPausedAnswer();
       this.flushQueuedConfirmDecision();
     }
@@ -670,8 +715,7 @@ export class VaultGuardChatView extends ItemView {
       return;
     }
 
-    const keyStore = new AnthropicKeyStore(this.plugin);
-    const apiKey = await keyStore.getKey();
+    const apiKey = await this.ensureApiKey();
     if (!apiKey) {
       this.renderConnectState();
       return;

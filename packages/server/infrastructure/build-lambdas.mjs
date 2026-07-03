@@ -24,6 +24,7 @@ const LAMBDAS = [
   { name: "email", entry: "lambda/email/handler.ts" },
   { name: "vaults", entry: "lambda/vaults/handler.ts" },
   { name: "shares", entry: "lambda/shares/handler.ts" },
+  { name: "superadmin", entry: "lambda/superadmin/handler.ts" },
 ];
 
 const outBase = resolve(__dirname, "dist");

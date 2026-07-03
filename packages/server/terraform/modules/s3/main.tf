@@ -1,5 +1,6 @@
 variable "stage" { type = string }
 variable "is_prod" { type = bool }
+variable "production_hardening" { type = bool }
 variable "account_id" { type = string }
 variable "region" { type = string }
 variable "kms_key_arn" { type = string }
@@ -15,7 +16,7 @@ locals {
 
 resource "aws_s3_bucket" "vault" {
   bucket        = "obsidian-vaultguard-vault-${var.stage}-${var.account_id}-${var.region}"
-  force_destroy = !var.is_prod
+  force_destroy = !var.production_hardening
 
   tags = {
     Name = "obsidian-vaultguard-vault-${var.stage}"
@@ -101,8 +102,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "vault" {
     filter {}
 
     noncurrent_version_expiration {
-      noncurrent_days           = var.is_prod ? 365 : 30
-      newer_noncurrent_versions = var.is_prod ? 10 : 3
+      noncurrent_days           = var.production_hardening ? 365 : 30
+      newer_noncurrent_versions = var.production_hardening ? 10 : 3
     }
   }
 

@@ -53,6 +53,7 @@ import {
   updateOrgStorageUsage,
   requireOrgId,
   requireVaultMember,
+  assertVaultWritable,
   getVaultMembership,
   isAdmin,
   vaultRoleMeetsRequirement,
@@ -393,25 +394,43 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       resource === '/vaults/{vaultId}/files/{path+}' ||
       resource === '/vaults/{vaultId}/files/{filePath+}';
     const actualPath = event.path || '';
-    const isHistoryResource = isFilePathResource && actualPath.endsWith('/history');
-    const isOverviewResource = resource === '/vaults/{vaultId}/overview' || actualPath.endsWith('/overview');
-    // The greedy `{filePath+}` resource also matches the `/restore-delete` suffix.
-    // The dispatch order below ensures the restore arm wins over the generic
-    // read/write/delete arms for the same resource string. Donor: isHistoryResource.
-    const isRestoreDeleteResource = isFilePathResource && actualPath.endsWith('/restore-delete');
-    // Phase 7 (Plan 07-01): cross-DEK version restore. The regex anchor `$`
-    // matches `/restore` but NOT `/restore-delete` (which doesn't end at
-    // `/restore`); the dispatch order below places this arm BEFORE the generic
-    // file-path arms but AFTER `isRestoreDeleteResource` for belt-and-suspenders
-    // mutual exclusivity.
-    const isRestoreVersionResource = isFilePathResource && /\/restore$/.test(actualPath);
+    // LF6: action suffixes (history/restore/restore-delete) ride the greedy
+    // {path+} resource — API Gateway cannot define child resources under a
+    // greedy segment — so they must be recognized from the path. But a bare
+    // `endsWith` over the whole path shadows FILES whose name is an action
+    // word (an extensionless root note called "history"/"overview"). The
+    // plugin sends the file path as ONE percent-encoded segment, so in the
+    // RAW event.path an action call always carries ≥2 segments after
+    // `/files/` (encoded file + literal action) while a plain file read has
+    // exactly one. Dispatch actions only on that ≥2-segment shape.
+    const rawPathSegments = actualPath.replace(/\/+$/, '').split('/').filter(Boolean);
+    const rawFilesIndex = rawPathSegments.indexOf('files');
+    const rawFileSegments = rawFilesIndex >= 0 ? rawPathSegments.slice(rawFilesIndex + 1) : [];
+    const rawActionSegment =
+      rawFileSegments.length >= 2 ? rawFileSegments[rawFileSegments.length - 1] : '';
+    const isHistoryResource = isFilePathResource && rawActionSegment === 'history';
+    // The dispatch order below ensures the restore arms win over the generic
+    // read/write/delete arms for the same resource string, and restore-delete
+    // is matched by exact segment so it can never fall into the `restore` arm.
+    const isRestoreDeleteResource = isFilePathResource && rawActionSegment === 'restore-delete';
+    const isRestoreVersionResource = isFilePathResource && rawActionSegment === 'restore';
+    // `/vaults/{vaultId}/overview` is its own resource; the path fallback (for
+    // deployments routing it differently) must match the EXACT 3-segment shape,
+    // not a suffix — `/files/overview` is a file named "overview".
+    const isOverviewResource =
+      resource === '/vaults/{vaultId}/overview' ||
+      (rawPathSegments.length === 3 &&
+        rawPathSegments[0] === 'vaults' &&
+        rawPathSegments[2] === 'overview');
     // Static sibling of `{filePath+}` — `GET /vaults/{vaultId}/files/deleted`
     // is its own API Gateway resource, but older/dev API Gateway deployments may
-    // still hand it through the greedy filePath route. Treat the concrete URL as
-    // authoritative so the Lambda remains compatible with either resource shape.
+    // still hand it through the greedy filePath route. On those, a root file
+    // literally named "deleted" stays shadowed by the list route (the exact
+    // URL is inherently ambiguous there); nested files named "deleted" arrive
+    // percent-encoded and dispatch as reads.
     const isDeletedListResource =
       resource === '/vaults/{vaultId}/files/deleted' ||
-      actualPath.replace(/\/+$/, '').endsWith('/files/deleted');
+      (rawFileSegments.length === 1 && rawFileSegments[0] === 'deleted');
 
     switch (true) {
       case method === 'GET' && resource === '/vaults/{vaultId}/files':
@@ -612,6 +631,25 @@ async function requireVaultOverviewAdmin(user: UserContext, vault: VaultRecord):
   }
 }
 
+/**
+ * LF1: the role namespace for per-file permission evaluation. Role-scoped rules
+ * (e.g. {role:'editor', deny, read, /secret/**}) are authored and previewed
+ * against the caller's VAULT membership role — that's what /permissions and the
+ * admin panel evaluate. File ops used to pass user.roles (the org/Cognito
+ * roles), so a role-scoped deny the UI showed as binding was silently NOT
+ * enforced on reads/sync. Mirror resolvePermissionRolesForTarget: an org
+ * admin/owner keeps their org roles (implicit admin bypass); a vault member
+ * evaluates with their vault role alone. Compute ONCE per request (hoisted out
+ * of the sync loops) — never fold the vault role into user.roles, since a vault
+ * 'admin' would otherwise be misread as an ORG admin by rolesIncludeOrgAdmin.
+ */
+async function resolveFileOpRoles(user: UserContext, vault: VaultRecord): Promise<string[]> {
+  if (isAdmin(user)) return user.roles;
+  const membership = await getVaultMembership(vault.vaultId, user.userId);
+  if (membership) return [membership.role];
+  return user.roles;
+}
+
 function parseOverviewLimit(rawLimit: string | undefined): number {
   if (!rawLimit) return DEFAULT_OVERVIEW_LIMIT;
   const parsed = Number.parseInt(rawLimit, 10);
@@ -784,7 +822,8 @@ async function handleListFiles(
     if (isClientLocalOnlyPath(relativePath)) continue;
 
     // Check if user has 'list' or 'read' permission for this path
-    const permResult = await evaluatePermission(user.userId, user.roles, 'list', '/' + relativePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+    const permRoles = await resolveFileOpRoles(user, vault);
+    const permResult = await evaluatePermission(user.userId, permRoles, 'list', '/' + relativePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
     if (permResult.allowed) {
       files.push({
@@ -849,7 +888,8 @@ async function handleReadFile(
   }
 
   // Permission check
-  const permResult = await evaluatePermission(user.userId, user.roles, 'read', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+  const permRoles = await resolveFileOpRoles(user, vault);
+  const permResult = await evaluatePermission(user.userId, permRoles, 'read', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
   if (!permResult.allowed) {
     await logAudit({
@@ -1068,6 +1108,11 @@ async function handleWriteFile(
   vault: VaultRecord,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
+  // LF2: archived vaults are read-only (legal-hold / retention freeze). The
+  // dispatch-time membership check runs at 'viewer', which skips the archived
+  // guard, so re-assert writability here before any S3 mutation.
+  assertVaultWritable(vault);
+
   const rawPath = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
   const filePath = sanitizeFilePath(rawPath);
   if (isClientLocalOnlyPath(filePath)) {
@@ -1100,7 +1145,8 @@ async function handleWriteFile(
   }
 
   // Permission check
-  const permResult = await evaluatePermission(user.userId, user.roles, 'write', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+  const permRoles = await resolveFileOpRoles(user, vault);
+  const permResult = await evaluatePermission(user.userId, permRoles, 'write', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
   if (!permResult.allowed) {
     await logAudit({
@@ -1231,11 +1277,15 @@ async function handleDeleteFile(
   vault: VaultRecord,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
+  // LF2: archived vaults are read-only — reject deletes before any S3 mutation.
+  assertVaultWritable(vault);
+
   const rawPath = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
   const filePath = sanitizeFilePath(rawPath);
 
   // Permission check
-  const permResult = await evaluatePermission(user.userId, user.roles, 'delete', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+  const permRoles = await resolveFileOpRoles(user, vault);
+  const permResult = await evaluatePermission(user.userId, permRoles, 'delete', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
   if (!permResult.allowed) {
     await logAudit({
@@ -1356,7 +1406,8 @@ async function handleGetHistory(
   }
 
   // Permission check
-  const permResult = await evaluatePermission(user.userId, user.roles, 'read', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+  const permRoles = await resolveFileOpRoles(user, vault);
+  const permResult = await evaluatePermission(user.userId, permRoles, 'read', '/' + filePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
 
   if (!permResult.allowed) {
     await logAudit({
@@ -2073,7 +2124,16 @@ const ACTIVITY_LOG_VALID_WINDOW_MS = 13 * 24 * 60 * 60 * 1000;
  */
 type ActivityLogResult =
   | { kind: 'warm'; deltas: SyncDelta[] }
-  | { kind: 'fallback'; reason: 'epoch' | 'stale-cursor' | 'permission-changed'; permissionsChanged: boolean };
+  | { kind: 'fallback'; reason: 'epoch' | 'stale-cursor' | 'permission-changed' | 'activity-overflow'; permissionsChanged: boolean };
+
+/**
+ * Maximum number of activity-log events the warm path will deliver in one
+ * response. If more than this changed since the client's cursor, we cannot
+ * return the full delta set without silently truncating (queryVaultActivity
+ * returns the OLDEST N and drops the newest), so we fall back to the cold
+ * full-S3 scan instead. LF4.
+ */
+const ACTIVITY_LOG_SYNC_CAP = 1000;
 
 /**
  * Pulls the changed-paths set from the vault activity log, dedupes by path
@@ -2097,7 +2157,13 @@ async function buildSyncDeltasFromActivityLog(
     return { kind: 'fallback', reason: 'stale-cursor', permissionsChanged: false };
   }
 
-  const events = await queryVaultActivity(vault.vaultId, lastSyncMs);
+  // Request one more than the cap so we can distinguish "exactly at the cap"
+  // from "overflowed". If we overflowed, the oldest-N truncation would silently
+  // drop the newest changes — fall back to the cold scan instead (LF4).
+  const events = await queryVaultActivity(vault.vaultId, lastSyncMs, ACTIVITY_LOG_SYNC_CAP + 1);
+  if (events.length > ACTIVITY_LOG_SYNC_CAP) {
+    return { kind: 'fallback', reason: 'activity-overflow', permissionsChanged: false };
+  }
 
   // Permission rule changes can flip every file's accessibility at once.
   // The activity log doesn't enumerate which files are affected — we'd
@@ -2119,6 +2185,7 @@ async function buildSyncDeltasFromActivityLog(
   }
 
   const deltas: SyncDelta[] = [];
+  const permRoles = await resolveFileOpRoles(user, vault);
 
   for (const event of latestByPath.values()) {
     const path = event.path;
@@ -2131,7 +2198,7 @@ async function buildSyncDeltasFromActivityLog(
         // and structure. Gate on the parent folder's read permission.
         if (!(await canSeeFolderMarker(user, vault, path))) continue;
       } else {
-        const perm = await evaluatePermission(user.userId, user.roles, 'read', path, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+        const perm = await evaluatePermission(user.userId, permRoles, 'read', path, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
         if (!perm.allowed) continue;
       }
       deltas.push({
@@ -2151,7 +2218,7 @@ async function buildSyncDeltasFromActivityLog(
     if (isMarker) {
       if (!(await canSeeFolderMarker(user, vault, path))) continue;
     } else {
-      const perm = await evaluatePermission(user.userId, user.roles, 'read', path, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+      const perm = await evaluatePermission(user.userId, permRoles, 'read', path, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
       if (!perm.allowed) continue;
     }
 
@@ -2214,6 +2281,16 @@ async function handleSync(
     return formatError(400, 'Invalid lastSyncTimestamp format', requestId);
   }
 
+  // LF5: snapshot the high-water mark (timestamp + revision) BEFORE reading any
+  // deltas. Returning a cursor captured at handler END would permanently skip a
+  // write that lands mid-handler (after the activity/S3 read but before the
+  // response): the client persists a cursor newer than that write and never
+  // re-queries it. Capturing before the read gives at-least-once delivery — a
+  // boundary write is simply re-included next sync (idempotent; a delta is just
+  // "download this path"). Both return paths use these snapshots.
+  const syncStartedAt = new Date().toISOString();
+  const cursorSnapshot = await getVaultCursor(user.orgId, vault.vaultId);
+
   // ── Warm path: activity-log-driven incremental sync ───────────────────────
   // Only attempted when the client has a recent enough cursor for the log
   // to cover the gap. The result tells us whether the warm path was
@@ -2224,7 +2301,7 @@ async function handleSync(
   if (!prefix) {
     const warm = await buildSyncDeltasFromActivityLog(user, vault, lastSyncDate.getTime());
     if (warm.kind === 'warm') {
-      const cursor = await getVaultCursor(user.orgId, vault.vaultId);
+      const cursor = cursorSnapshot;
       await logAudit({
         userId: user.userId,
         userEmail: user.email,
@@ -2247,7 +2324,7 @@ async function handleSync(
         {
           deltas: warm.deltas,
           count: warm.deltas.length,
-          syncTimestamp: new Date().toISOString(),
+          syncTimestamp: syncStartedAt,
           revision: cursor.revision,
           mode: 'activity-log',
           permissionsChanged: false,
@@ -2263,6 +2340,7 @@ async function handleSync(
   // List every file under this vault prefix, paginating through S3 so vaults
   // with more than 1000 objects still produce a complete delta set.
   const deltas: SyncDelta[] = [];
+  const permRoles = await resolveFileOpRoles(user, vault);
   const serverPaths = new Set<string>();
   let continuationToken: string | undefined;
 
@@ -2302,7 +2380,7 @@ async function handleSync(
       }
 
       // Check permission for each file
-      const permResult = await evaluatePermission(user.userId, user.roles, 'read', relativePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+      const permResult = await evaluatePermission(user.userId, permRoles, 'read', relativePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
       if (!permResult.allowed) continue;
 
       const objModified = obj.LastModified || new Date(0);
@@ -2358,7 +2436,7 @@ async function handleSync(
       }
 
       // Verify user had permission to see this file
-      const permResult = await evaluatePermission(user.userId, user.roles, 'read', clientPath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+      const permResult = await evaluatePermission(user.userId, permRoles, 'read', clientPath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
       if (permResult.allowed) {
         deltas.push({
           path: clientPath,
@@ -2371,7 +2449,7 @@ async function handleSync(
     }
   }
 
-  const cursor = await getVaultCursor(user.orgId, vault.vaultId);
+  const cursor = cursorSnapshot;
 
   await logAudit({
     userId: user.userId,
@@ -2400,7 +2478,7 @@ async function handleSync(
     {
       deltas,
       count: deltas.length,
-      syncTimestamp: new Date().toISOString(),
+      syncTimestamp: syncStartedAt,
       revision: cursor.revision,
       mode: 'full-scan',
       permissionsChanged,
