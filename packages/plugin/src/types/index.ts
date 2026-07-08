@@ -69,6 +69,12 @@ export interface FileMetadata {
   encrypted: boolean;
   /** MIME type of the file content */
   mimeType: string;
+  /** S3/object version identifier returned by the server when available */
+  versionId?: string;
+  /** Backend checksum/ETag when available */
+  checksum?: string;
+  /** MIME type as returned by newer file APIs */
+  contentType?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -146,6 +152,8 @@ export interface SyncConflict {
   localModified: string;
   /** ISO 8601 timestamp of remote modification */
   remoteModified: string;
+  /** True when the remote side of the conflict is a deletion/tombstone */
+  remoteDeleted?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -337,6 +345,40 @@ export const ASSUMED_SERVER_FEATURES: ServerFeatures = {
   webAdmin:      true,
 };
 
+export type PermissionsGraphRenderMode = "auto" | "aggregated" | "detailed";
+export type PermissionsGraphLayoutMode = "auto" | "radial" | "force" | "grid";
+export type PermissionsGraphLabelsMode = "auto" | "on" | "off";
+export type PermissionsGraphSearchScope = "all" | "user" | "file" | "folder";
+
+export interface PermissionsGraphSavedState {
+  schemaVersion?: 1;
+  renderMode?: PermissionsGraphRenderMode;
+  layoutMode?: PermissionsGraphLayoutMode;
+  labelsMode?: PermissionsGraphLabelsMode;
+  pathPrefix?: string;
+  searchQuery?: string;
+  searchScope?: PermissionsGraphSearchScope;
+  selectedUsers?: string[];
+  accessLevels?: {
+    read?: boolean;
+    write?: boolean;
+    admin?: boolean;
+  };
+  nodeTypes?: {
+    users?: boolean;
+    files?: boolean;
+    folders?: boolean;
+  };
+  expiringOnly?: boolean;
+  writableAdminOnly?: boolean;
+  explicitRulesOnly?: boolean;
+  maxFiles?: number;
+  maxEdges?: number;
+  depth?: number;
+  debugExpanded?: boolean;
+  updatedAt?: string;
+}
+
 export interface VaultGuardSettings {
   /**
    * Per-vault UUID used only as a fallback binding ID when the runtime
@@ -412,6 +454,13 @@ export interface VaultGuardSettings {
   maxRetryAttempts: number;
   /** Whether to show sync status in the status bar */
   showStatusBar: boolean;
+  /**
+   * Plaintext repo-root mode for using an Obsidian vault as local project
+   * memory. Disables local at-rest encryption, sync, sharing, and org/team
+   * management surfaces while leaving local navigation and agent-context
+   * workflows available.
+   */
+  localProjectMemoryMode: boolean;
   /** Whether to use manual connection configuration instead of org slug auto-config */
   manualConfig?: boolean;
   /**
@@ -486,6 +535,16 @@ export interface VaultGuardSettings {
    */
   disableUpdateChecks?: boolean;
   /**
+   * Global defaults for the Permissions Graph options panel. These are UI
+   * preferences only; they never store permission payloads or graph elements.
+   */
+  permissionsGraphDefaults?: PermissionsGraphSavedState;
+  /**
+   * Per-server-vault graph filters/options. Bounded and tolerant-parsed by the
+   * graph view so old, partial, or stale values never break startup.
+   */
+  permissionsGraphVaultStates?: Record<string, PermissionsGraphSavedState>;
+  /**
    * Persisted state of the update checker so the 24 h throttle and
    * already-notified-version suppression survive plugin reloads.
    */
@@ -500,10 +559,25 @@ export interface VaultGuardSettings {
    * "ss:" = OS-keychain safeStorage, "ar:" = local AtRestCipher fallback.
    */
   encryptedAnthropicKey?: string;
+  /**
+   * OpenAI API key for the AI Chat panel, stored as a method-tagged,
+   * base64-encoded encrypted envelope (never plaintext). Written and read
+   * exclusively through `OpenAiKeyStore` (src/ui/chat/api-key-store.ts):
+   * "ss:" = OS-keychain safeStorage, "ar:" = local AtRestCipher fallback.
+   */
+  encryptedOpenAiKey?: string;
   /** Anthropic model id for the AI Chat panel (default "claude-opus-4-8"). */
   aiChatModel: string;
   /** Adaptive-thinking effort level for AI Chat turns (default "high"). */
   aiChatEffort: AnthropicEffort;
+  /** OpenAI Responses API model id for the AI Chat panel (default "gpt-5.5"). */
+  openAiModel: string;
+  /** Reasoning effort for OpenAI Responses API turns (default "medium"). */
+  openAiReasoningEffort: OpenAiReasoningEffort;
+  /** Text verbosity for OpenAI Responses API turns (default "medium"). */
+  openAiVerbosity: OpenAiVerbosity;
+  /** Max output tokens for OpenAI Responses API turns (default 8192). */
+  openAiMaxOutputTokens: number;
   /**
    * Whether to stream AI Chat responses token-by-token (Tier 2). Default true;
    * desktop-only (mobile always falls back to the non-streaming requestUrl path).
@@ -531,6 +605,7 @@ export interface VaultGuardSettings {
    *      Claude Pro/Max login (desktop only; the plugin never touches the
    *      subscription token). Vault access stays MCP-only via AgentBridge.
    *   "apiKey" — call the Anthropic Messages API with the user's stored key.
+   *   "openai" — call the OpenAI Responses API with the user's stored key.
    * Defaults to "subscription" the first time a logged-in CLI subscription is
    * detected, otherwise "apiKey". The user's explicit choice is persisted.
    */
@@ -557,6 +632,33 @@ export interface VaultGuardSettings {
    * precedence and cannot be shadowed.
    */
   aiChatPromptTemplates?: ChatPromptTemplate[];
+  /**
+   * Phase 12 (vault idle-lock): device PIN-lock state. `pepperWrapped` is the
+   * safeStorage-wrapped (or, in the degraded no-keychain tier, raw base64)
+   * 32-byte device pepper — a second KDF input combined with the PIN to wrap the
+   * LAK. `enrolled` / `failedAttempts` / `lockedUntil` are the persisted
+   * rate-limit counter that must survive an app kill (12-RESEARCH.md Pitfall 5).
+   *
+   * NEVER stored here: the PIN, the derived wrapping key, or the raw LAK. The
+   * PIN-wrapped LAK lives only in `lak-pin.envelope`. Absent until the user
+   * enrolls a PIN (enrollment UI is Plan 05); read as `?? { enrolled: false, … }`.
+   */
+  pinLock?: {
+    pepperWrapped?: string;
+    enrolled: boolean;
+    failedAttempts: number;
+    lockedUntil: number | null;
+  };
+  /**
+   * Persisted, once-ever guard for the onboarding "Set a PIN" prompt (quick
+   * 260708-el6). Set to `true` the first time the soft prompt is shown OR
+   * dismissed, so it never reappears — including across a plugin reload. This is
+   * the DURABLE flag; contrast the in-memory, per-session `pinNudgeShown`
+   * backstop in main.ts (which only throttles the idle-logout Notice and resets
+   * each session). Optional so an existing data.json without the key reads as
+   * falsy = "not yet prompted".
+   */
+  pinOnboardingPromptShown?: boolean;
 }
 
 /** A user-defined slash-command prompt template for the AI Chat panel. */
@@ -568,13 +670,22 @@ export interface ChatPromptTemplate {
 }
 
 /** AI Chat transport selection. */
-export type AiChatProvider = "subscription" | "apiKey";
+export type AiChatProvider = "subscription" | "apiKey" | "openai";
 
 /** AI Chat write-confirmation behavior. */
 export type AiChatPermissionMode = "confirm" | "skip";
 
 /** Adaptive-thinking effort levels accepted by the Anthropic Messages API. */
 export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
+/** Reasoning effort levels used by the OpenAI Responses API. */
+export type OpenAiReasoningEffort = "low" | "medium" | "high";
+
+/** Text verbosity levels used by GPT models through the OpenAI Responses API. */
+export type OpenAiVerbosity = "low" | "medium" | "high";
+
+/** Union used by compact chat UI controls that render either provider's effort. */
+export type AiChatEffort = AnthropicEffort | OpenAiReasoningEffort;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API Communication

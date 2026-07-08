@@ -1795,6 +1795,14 @@ export interface OrgSettings {
   retentionDays: number;
   autoLockMinutes: number;
   /**
+   * Whether an idle timeout LOCKS the vault (evict keys + local-PIN unlock,
+   * session preserved) or fully LOGS OUT. `DEFAULT_ORG_SETTINGS` resolves an
+   * absent value to `'logout'` so orgs created before this field existed keep
+   * today's behavior; brand-new orgs are seeded `'lock'` at signup. See the
+   * D3 control model / O-1 default resolution in the phase-12 planning docs.
+   */
+  idleAction: 'lock' | 'logout';
+  /**
    * When false (default), vault admins/owners and org admins/owners bypass
    * every per-file deny rule — `evaluatePermission` short-circuits to
    * allowed=true for them. This is the safe default: lockout-prevention,
@@ -1836,6 +1844,7 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
   allowedDomains: [],
   retentionDays: 365,
   autoLockMinutes: 30,
+  idleAction: 'logout',
   allowAdminPerFileRestrictions: false,
   disabledAuditActions: [],
 };
@@ -1967,6 +1976,18 @@ export function normalizeStoredOrgSettings(
   const autoLockMinutes = parseNonNegativeInteger(rawSettings.autoLockMinutes, undefined);
   if (autoLockMinutes !== undefined) {
     normalized.autoLockMinutes = autoLockMinutes;
+  }
+
+  // idleAction: keep ONLY the two known values. Absent or garbage is left
+  // unset so buildOrgSettings falls through to DEFAULT ('logout'). New-org
+  // 'lock' is written explicitly at signup — never defaulted here — so an
+  // already-deployed org never silently switches to lock on upgrade (O-1).
+  const idleAction =
+    rawSettings.idleAction === 'lock' || rawSettings.idleAction === 'logout'
+      ? rawSettings.idleAction
+      : undefined;
+  if (idleAction !== undefined) {
+    normalized.idleAction = idleAction;
   }
 
   if (typeof rawSettings.allowAdminPerFileRestrictions === 'boolean') {

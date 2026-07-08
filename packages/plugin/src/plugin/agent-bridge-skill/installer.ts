@@ -44,7 +44,7 @@ export const VAULTGUARD_SKILL_NAME = "vaultguard";
 // schema=1 build accidentally placed an HTML comment *before* the
 // frontmatter, which made the skill listing show the marker as the
 // description.)
-const SKILL_VERSION = 2;
+const SKILL_VERSION = 3;
 
 const MANAGED_MARKER_REGEX = /vaultguard-managed:\s*true[\s\S]{0,200}?vaultguard-schema:\s*(\d+)/m;
 // Detects the legacy schema-1 marker (HTML comment before frontmatter)

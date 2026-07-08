@@ -128,6 +128,67 @@ describe("VaultGuardApiClient surface", () => {
     });
   });
 
+  it("uses the deleted-file read operation for a root file literally named deleted", async () => {
+    const client = makeClient();
+    const fileBytes = new TextEncoder().encode("root deleted");
+
+    mockRequestUrl
+      .mockResolvedValueOnce(
+        jsonResponse(200, {
+          content: Buffer.from(fileBytes).toString("base64"),
+        })
+      )
+      .mockResolvedValueOnce(jsonResponse(200, { path: "/deleted", hash: "deleted-hash" }))
+      .mockResolvedValueOnce(emptyResponse());
+
+    await expect(client.getFile("deleted")).resolves.toEqual(
+      fileBytes.buffer.slice(fileBytes.byteOffset, fileBytes.byteOffset + fileBytes.byteLength)
+    );
+    await expect(
+      client.putFile("deleted", fileBytes.buffer, { encryptedKey: "wrapped-key" })
+    ).resolves.toEqual({ path: "/deleted", hash: "deleted-hash" });
+    await expect(client.deleteFile("deleted")).resolves.toBeUndefined();
+
+    expect(mockRequestUrl.mock.calls.map((call) => [call[0].method, call[0].url])).toEqual([
+      ["GET", "https://api.vaultguard.test/vaults/vault-abc/files/deleted?operation=read"],
+      ["PUT", "https://api.vaultguard.test/vaults/vault-abc/files/deleted"],
+      ["DELETE", "https://api.vaultguard.test/vaults/vault-abc/files/deleted"],
+    ]);
+  });
+
+  it("sends expectedVersionId for guarded file writes and preserves returned version metadata", async () => {
+    const client = makeClient();
+    const fileBytes = new TextEncoder().encode("guarded");
+
+    mockRequestUrl.mockResolvedValueOnce(
+      jsonResponse(200, {
+        path: "/docs/a.md",
+        hash: "abc",
+        versionId: "v2",
+        checksum: '"etag-2"',
+      })
+    );
+
+    await expect(
+      client.putFile(
+        "/docs/a.md",
+        fileBytes.buffer,
+        { encryptedKey: "wrapped-key" },
+        { expectedVersionId: "v1" }
+      )
+    ).resolves.toMatchObject({
+      path: "/docs/a.md",
+      versionId: "v2",
+      checksum: '"etag-2"',
+    });
+
+    expect(JSON.parse(mockRequestUrl.mock.calls[0]![0].body as string)).toEqual({
+      content: Buffer.from(fileBytes).toString("base64"),
+      contentType: "application/octet-stream",
+      expectedVersionId: "v1",
+    });
+  });
+
   it("maps permission and user-management endpoints to the expected routes", async () => {
     const client = makeClient();
     const rule = {

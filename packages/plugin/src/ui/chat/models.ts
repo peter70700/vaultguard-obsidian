@@ -4,7 +4,13 @@
 // no network — pure config data.
 
 import type { AgentWriteMode } from "../../plugin/agent-bridge";
-import type { AiChatPermissionMode, AnthropicEffort } from "../../types";
+import type {
+  AiChatEffort,
+  AiChatPermissionMode,
+  AnthropicEffort,
+  OpenAiReasoningEffort,
+  OpenAiVerbosity,
+} from "../../types";
 
 export interface ChatModelOption {
   id: string;
@@ -15,6 +21,10 @@ export interface ChatPermissionModeOption {
   id: AiChatPermissionMode;
   label: string;
   statusLabel: string;
+  description: string;
+}
+
+export interface OpenAiModelOption extends ChatModelOption {
   description: string;
 }
 
@@ -33,6 +43,39 @@ export const AI_CHAT_EFFORTS: ReadonlyArray<{ id: AnthropicEffort; label: string
   { id: "high", label: "High (default)" },
   { id: "xhigh", label: "Extra high" },
   { id: "max", label: "Max" },
+];
+
+export const OPENAI_CHAT_MODELS: ReadonlyArray<OpenAiModelOption> = [
+  {
+    id: "gpt-5.5",
+    label: "GPT-5.5 (default)",
+    description: "Best default for grounded, tool-heavy VaultGuard chat sessions.",
+  },
+  {
+    id: "gpt-5.4",
+    label: "GPT-5.4",
+    description: "Balanced GPT model for general vault assistance.",
+  },
+  {
+    id: "gpt-5.4-mini",
+    label: "GPT-5.4 mini",
+    description: "Lower-latency, lower-cost GPT model for lighter work.",
+  },
+];
+
+export const OPENAI_REASONING_EFFORTS: ReadonlyArray<{
+  id: OpenAiReasoningEffort;
+  label: string;
+}> = [
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium (default)" },
+  { id: "high", label: "High" },
+];
+
+export const OPENAI_VERBOSITIES: ReadonlyArray<{ id: OpenAiVerbosity; label: string }> = [
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium (default)" },
+  { id: "high", label: "High" },
 ];
 
 export const AI_CHAT_PERMISSION_MODES: ReadonlyArray<ChatPermissionModeOption> = [
@@ -54,9 +97,15 @@ export const AI_CHAT_PERMISSION_MODES: ReadonlyArray<ChatPermissionModeOption> =
 /** Just the model ids, for membership checks (e.g. validating `/model <id>`). */
 export const AI_CHAT_MODEL_IDS: ReadonlyArray<string> = AI_CHAT_MODELS.map((m) => m.id);
 
+export const OPENAI_CHAT_MODEL_IDS: ReadonlyArray<string> = OPENAI_CHAT_MODELS.map((m) => m.id);
+
 /** Human label for a model id, falling back to the raw id for unknown models. */
 export function modelLabel(id: string): string {
-  return AI_CHAT_MODELS.find((m) => m.id === id)?.label ?? id;
+  return (
+    AI_CHAT_MODELS.find((m) => m.id === id)?.label ??
+    OPENAI_CHAT_MODELS.find((m) => m.id === id)?.label ??
+    id
+  );
 }
 
 /** Short label for compact surfaces such as the chat status footer. */
@@ -65,8 +114,12 @@ export function compactModelLabel(id: string): string {
 }
 
 /** Human label for a thinking-effort id, falling back to the raw id. */
-export function effortLabel(id: AnthropicEffort): string {
-  return AI_CHAT_EFFORTS.find((e) => e.id === id)?.label.replace(/\s+\(default\)$/, "") ?? id;
+export function effortLabel(id: AiChatEffort): string {
+  return (
+    AI_CHAT_EFFORTS.find((e) => e.id === id)?.label.replace(/\s+\(default\)$/, "") ??
+    OPENAI_REASONING_EFFORTS.find((e) => e.id === id)?.label.replace(/\s+\(default\)$/, "") ??
+    id
+  );
 }
 
 export function normalizeChatPermissionMode(value: unknown): AiChatPermissionMode {

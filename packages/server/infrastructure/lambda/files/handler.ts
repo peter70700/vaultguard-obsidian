@@ -249,6 +249,16 @@ const isReadDecryptedResource = (resource: string): boolean =>
   resource === '/vaults/{vaultId}/files-decrypted/{filePath+}' ||
   resource === '/vaults/{vaultId}/files-decrypted/{path+}';
 
+function eventWithFilePathParameter(event: APIGatewayProxyEvent, filePath: string): APIGatewayProxyEvent {
+  return {
+    ...event,
+    pathParameters: {
+      ...(event.pathParameters ?? {}),
+      filePath,
+    },
+  };
+}
+
 async function decryptCurrentVaultBlobForRead(
   ciphertext: Buffer,
   user: UserContext,
@@ -318,6 +328,11 @@ interface SyncDelta {
   lastModified: string;
   checksum: string;
   size: number;
+  // BIN-A / D-04 (additive): the S3 object's ContentType, populated on WARM-path
+  // deltas only (HeadObject already in hand). Old clients ignore it; cold-path
+  // deltas omit it (ListObjectsV2 has no ContentType — L9), so clients treat it as
+  // an optional hint and fall back to the authoritative GET-response contentType.
+  contentType?: string;
 }
 
 interface VaultOverviewFileNode {
@@ -408,6 +423,14 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     const rawFileSegments = rawFilesIndex >= 0 ? rawPathSegments.slice(rawFilesIndex + 1) : [];
     const rawActionSegment =
       rawFileSegments.length >= 2 ? rawFileSegments[rawFileSegments.length - 1] : '';
+    const isRootDeletedFilePath = rawFileSegments.length === 1 && rawFileSegments[0] === 'deleted';
+    const isDeletedStaticResource = resource === '/vaults/{vaultId}/files/deleted';
+    const isDeletedRouteResource =
+      isDeletedStaticResource || (isFilePathResource && isRootDeletedFilePath);
+    const requestedFileOperation = (event.queryStringParameters?.operation || '').toLowerCase();
+    const deletedFileEvent = isDeletedRouteResource
+      ? eventWithFilePathParameter(event, 'deleted')
+      : event;
     const isHistoryResource = isFilePathResource && rawActionSegment === 'history';
     // The dispatch order below ensures the restore arms win over the generic
     // read/write/delete arms for the same resource string, and restore-delete
@@ -423,14 +446,14 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         rawPathSegments[0] === 'vaults' &&
         rawPathSegments[2] === 'overview');
     // Static sibling of `{filePath+}` — `GET /vaults/{vaultId}/files/deleted`
-    // is its own API Gateway resource, but older/dev API Gateway deployments may
-    // still hand it through the greedy filePath route. On those, a root file
-    // literally named "deleted" stays shadowed by the list route (the exact
-    // URL is inherently ambiguous there); nested files named "deleted" arrive
-    // percent-encoded and dispatch as reads.
+    // remains the deleted-files listing for backward compatibility. A root file
+    // literally named "deleted" is read through the explicit query operation
+    // `?operation=read`; PUT/DELETE on the static resource are routed back to
+    // the normal file handlers below.
     const isDeletedListResource =
-      resource === '/vaults/{vaultId}/files/deleted' ||
-      (rawFileSegments.length === 1 && rawFileSegments[0] === 'deleted');
+      isDeletedRouteResource && requestedFileOperation !== 'read';
+    const isDeletedFileReadResource =
+      isDeletedRouteResource && requestedFileOperation === 'read';
 
     switch (true) {
       case method === 'GET' && resource === '/vaults/{vaultId}/files':
@@ -438,6 +461,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       case method === 'GET' && isOverviewResource:
         return await handleVaultOverview(event, user, vault, requestId);
+
+      case method === 'GET' && isDeletedFileReadResource:
+        return await handleReadFile(deletedFileEvent, user, vault, requestId);
 
       case method === 'GET' && isDeletedListResource:
         return await handleListDeleted(event, user, vault, requestId);
@@ -457,8 +483,14 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       case method === 'GET' && isFilePathResource:
         return await handleReadFile(event, user, vault, requestId);
 
+      case method === 'PUT' && isDeletedStaticResource:
+        return await handleWriteFile(deletedFileEvent, user, vault, requestId);
+
       case method === 'PUT' && isFilePathResource:
         return await handleWriteFile(event, user, vault, requestId);
+
+      case method === 'DELETE' && isDeletedStaticResource:
+        return await handleDeleteFile(deletedFileEvent, user, vault, requestId);
 
       case method === 'DELETE' && isFilePathResource:
         return await handleDeleteFile(event, user, vault, requestId);
@@ -1183,10 +1215,16 @@ async function handleWriteFile(
         );
       }
     } catch (err: unknown) {
-      // File doesn't exist yet — that's fine for creation
-      if (!(err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'NotFound')) {
-        throw err;
+      // A guarded write cannot silently recreate a path deleted by another client.
+      if (err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'NotFound') {
+        return formatError(
+          409,
+          'Conflict: file has been modified or deleted since your last read. ' +
+            `Expected version ${expectedVersionId}, current version is missing`,
+          requestId
+        );
       }
+      throw err;
     }
   }
 
@@ -2233,6 +2271,9 @@ async function buildSyncDeltasFromActivityLog(
         lastModified: head.LastModified?.toISOString() ?? event.changedAt,
         checksum: head.ETag ?? '',
         size: head.ContentLength ?? 0,
+        // BIN-A / D-04: the HeadObject already carries ContentType — attach it at
+        // zero extra AWS cost so the pull side can pre-sort binary vs text.
+        contentType: head.ContentType,
       });
     } catch (err: unknown) {
       const isMissing = err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'NotFound';
@@ -2391,6 +2432,11 @@ async function handleSync(
         // File was modified since last sync
         const action: SyncDelta['action'] = clientChecksum ? 'modified' : 'created';
 
+        // BIN-A / D-04 + L9: cold-path deltas deliberately DO NOT carry contentType.
+        // ListObjectsV2 Contents entries have no ContentType, and a per-object
+        // HeadObject would explode cold-scan cost (see the list route's hardcoded
+        // 'application/octet-stream' at :833). Clients fall back to the authoritative
+        // GET-response contentType, which is always present.
         deltas.push({
           path: relativePath,
           action,

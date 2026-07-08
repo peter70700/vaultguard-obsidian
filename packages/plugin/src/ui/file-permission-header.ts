@@ -7,7 +7,7 @@
  * Avatar chips are clickable — showing a user info popover.
  */
 
-import { App, MarkdownView, Notice, TFile, setIcon } from "obsidian";
+import { App, FileView, Notice, TFile, setIcon } from "obsidian";
 import {
   PathAccessPrincipal,
   PathAccessSummary,
@@ -134,6 +134,21 @@ export class FilePermissionHeader {
   }
 
   /**
+   * Resolves the active file-backed view for header injection.
+   *
+   * Generalizes the lookup from the markdown-only editor view to Obsidian's
+   * `FileView` base class, so image / PDF / audio views (all `FileView`
+   * subclasses that expose `.file: TFile | null`) get the permission header
+   * just like markdown files.
+   * Returns null for a view with no backing file — everything downstream of the
+   * lookup (rule fetch, cache, render, teardown) is path-based and view-agnostic.
+   */
+  private activeFileView(): FileView | null {
+    const view = this.ctx.app.workspace.getActiveViewOfType(FileView);
+    return view && view.file ? view : null;
+  }
+
+  /**
    * Called on active-leaf-change / file-open.
    * Injects (or updates) the permission header for the currently visible file.
    */
@@ -146,7 +161,7 @@ export class FilePermissionHeader {
       return;
     }
 
-    const view = this.ctx.app.workspace.getActiveViewOfType(MarkdownView);
+    const view = this.activeFileView();
     if (!view || !view.file) {
       this.remove();
       return;
@@ -359,7 +374,7 @@ export class FilePermissionHeader {
       if (this.activeHeader?.isConnected && this.activePath) {
         const cached = this.ruleCache.get(this.activePath);
         if (cached?.rules) {
-          const view = this.ctx.app.workspace.getActiveViewOfType(MarkdownView);
+          const view = this.activeFileView();
           if (view?.file?.path === this.activePath) {
             this.renderHeader(this.activeHeader, view.file, cached.rules, this.optionsFromData(cached));
           }
@@ -395,7 +410,7 @@ export class FilePermissionHeader {
       if (this.activeHeader?.isConnected && this.activePath) {
         const cached = this.ruleCache.get(this.activePath);
         if (cached?.rules) {
-          const view = this.ctx.app.workspace.getActiveViewOfType(MarkdownView);
+          const view = this.activeFileView();
           if (view?.file?.path === this.activePath) {
             this.renderHeader(this.activeHeader, view.file, cached.rules, this.optionsFromData(cached));
           }

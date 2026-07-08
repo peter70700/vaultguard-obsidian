@@ -11,7 +11,7 @@ import { setIcon } from "obsidian";
 
 import type { AnthropicUsage } from "./anthropic-client";
 import { compactModelLabel, effortLabel, permissionModeStatusLabel } from "./models";
-import type { AiChatPermissionMode, AnthropicEffort } from "../../types";
+import type { AiChatEffort, AiChatPermissionMode } from "../../types";
 
 const FOOTER_CLS = "vaultguard-chat-status";
 const MODEL_CLS = "vaultguard-chat-status-model";
@@ -79,10 +79,10 @@ export interface StatusPanelCallbacks {
 }
 
 export function statusModelLabel(model: string): string {
-  return compactModelLabel(model).replace(/^Claude\s+/i, "");
+  return compactModelLabel(model).replace(/^(Claude|GPT)\s+/i, "");
 }
 
-export function statusEffortLabel(effort: AnthropicEffort): string {
+export function statusEffortLabel(effort: AiChatEffort): string {
   const label = effortLabel(effort);
   return label === "Extra high" ? "X-high" : label;
 }
@@ -102,13 +102,13 @@ export class StatusPanel {
   private readonly usageEl: HTMLElement;
   private sessionCostUsd = 0;
   private model: string;
-  private effort: AnthropicEffort;
+  private effort: AiChatEffort;
   private permissionMode: AiChatPermissionMode;
 
   constructor(
     parent: HTMLElement,
     model: string,
-    effort: AnthropicEffort,
+    effort: AiChatEffort,
     permissionMode: AiChatPermissionMode,
     private readonly callbacks: StatusPanelCallbacks,
   ) {
@@ -154,7 +154,7 @@ export class StatusPanel {
     this.renderModel();
   }
 
-  setEffort(effort: AnthropicEffort): void {
+  setEffort(effort: AiChatEffort): void {
     this.effort = effort;
     this.renderEffort();
   }

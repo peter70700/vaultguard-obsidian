@@ -9,8 +9,8 @@
 // (via VaultToolRuntime). There is no raw fetch/EventSource here — the network
 // is owned entirely by AnthropicClient (requestUrl).
 //
-// §11: with no stored Anthropic key (and no active Cloud session) the view shows
-// a "connect" empty state and makes ZERO network calls.
+// §11: with no stored provider key (and no active Cloud session for Anthropic)
+// the view shows a "connect" empty state and makes ZERO model calls.
 
 import {
   ItemView,
@@ -36,7 +36,7 @@ import {
   type AnthropicMessage,
   type AnthropicToolResultBlock,
 } from "./anthropic-client";
-import { AnthropicKeyStore } from "./api-key-store";
+import { AnthropicKeyStore, OpenAiKeyStore } from "./api-key-store";
 import { ChatRuntime } from "./chat-runtime";
 import { ClaudeCliClient } from "./claude-cli/claude-cli-client";
 import {
@@ -45,6 +45,9 @@ import {
 } from "./claude-cli/claude-detector";
 import { VaultToolRuntime } from "./vault-tool-runtime";
 import { buildSystemPrompt } from "./system-prompt";
+import { OpenAiResponsesClient } from "./openai-client";
+import { OpenAiChatRuntime } from "./openai-runtime";
+import { buildOpenAiSystemInstructions } from "./openai-system-prompt";
 import {
   InputController,
   RESERVED_SLASH_COMMAND_NAMES,
@@ -102,10 +105,13 @@ import {
   AI_CHAT_EFFORTS,
   AI_CHAT_MODEL_IDS,
   AI_CHAT_PERMISSION_MODES,
+  OPENAI_CHAT_MODELS,
+  OPENAI_CHAT_MODEL_IDS,
+  OPENAI_REASONING_EFFORTS,
   chatPermissionWriteMode,
   permissionModeLabel,
 } from "./models";
-import type { AiChatPermissionMode, AnthropicEffort } from "../../types";
+import type { AiChatEffort, AiChatPermissionMode, AiChatProvider } from "../../types";
 import {
   isLocalImportAvailable,
   pickSourceFolder,
@@ -132,6 +138,9 @@ const TABS_CLS = "vaultguard-chat-tabs";
 const TAB_CLS = "vaultguard-chat-tab";
 const EXPANDED_TAB_TITLE_MAX = 32;
 
+type ApiKeyRuntime = ChatRuntime | OpenAiChatRuntime;
+type ApiKeyProvider = "anthropic" | "openai";
+
 interface ChatConversationTab {
   key: string;
   conversationId: string | null;
@@ -150,7 +159,7 @@ export class VaultGuardChatView extends ItemView {
   private nextTabSeq = 0;
   private expandedTabKeys = new Set<string>();
 
-  private runtime: ChatRuntime | null = null;
+  private runtime: ApiKeyRuntime | null = null;
   private leaseId: string | null = null;
   // True while an /import-knowledge source folder is armed on the bridge. The
   // gated vaultguard_import_* tools only work while this is active; it is
@@ -208,6 +217,7 @@ export class VaultGuardChatView extends ItemView {
   // The streaming preference baked into the current runtime, so a settings
   // change mid-session rebuilds the runtime with the new transport.
   private runtimeStreaming = false;
+  private runtimeProvider: ApiKeyProvider | null = null;
   // Passive once-per-view-session guard for the mobile streaming hint. The
   // streaming toggle is hidden on mobile IN SETTINGS (settings.ts,
   // !Platform.isMobileApp) and live streaming is force-disabled at runtime by
@@ -226,7 +236,10 @@ export class VaultGuardChatView extends ItemView {
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: VaultGuardPlugin) {
     super(leaf);
-    this.model = plugin.settings.aiChatModel;
+    this.model =
+      plugin.settings.aiChatProvider === "openai"
+        ? plugin.settings.openAiModel
+        : plugin.settings.aiChatModel;
   }
 
   getViewType(): string {
@@ -346,14 +359,14 @@ export class VaultGuardChatView extends ItemView {
           // Vision input is API-key + desktop only (subscription CLI turns keep
           // no replayable image array; mobile uses the non-streaming path).
           enableImages:
-            !Platform.isMobileApp && this.plugin.settings.aiChatProvider !== "subscription",
+            !Platform.isMobileApp && this.plugin.settings.aiChatProvider === "apiKey",
         },
       );
 
       this.statusPanel = new StatusPanel(
         container,
         this.model,
-        this.plugin.settings.aiChatEffort,
+        this.currentEffort(),
         this.plugin.settings.aiChatPermissionMode,
         {
           onModelMenu: (evt) => this.openModelMenu(evt),
@@ -471,7 +484,7 @@ export class VaultGuardChatView extends ItemView {
     // Defensive connectedness re-check so this is safe to call from any site.
     const connected =
       this.plugin.settings.aiChatProvider === "subscription" ||
-      new AnthropicKeyStore(this.plugin).hasKey();
+      this.hasCurrentProviderKey();
     if (!connected) return;
 
     // Live inside an EMPTY_CLS container so the existing first-turn removals
@@ -514,17 +527,73 @@ export class VaultGuardChatView extends ItemView {
     });
   }
 
+  private currentProvider(): AiChatProvider {
+    return this.plugin.settings.aiChatProvider;
+  }
+
+  private currentApiKeyProvider(): ApiKeyProvider {
+    return this.currentProvider() === "openai" ? "openai" : "anthropic";
+  }
+
+  private currentEffort(): AiChatEffort {
+    return this.currentProvider() === "openai"
+      ? this.plugin.settings.openAiReasoningEffort
+      : this.plugin.settings.aiChatEffort;
+  }
+
+  private currentModelSetting(): string {
+    return this.currentProvider() === "openai"
+      ? this.plugin.settings.openAiModel
+      : this.plugin.settings.aiChatModel;
+  }
+
+  private syncModelFromSettings(): void {
+    const next = this.currentModelSetting();
+    if (this.model === next) return;
+    this.model = next;
+    this.statusPanel?.setModel(next);
+    this.statusPanel?.setEffort(this.currentEffort());
+    this.runtime = null;
+    this.runtimeProvider = null;
+    this.cliClient?.reset();
+    this.cliClient = null;
+  }
+
+  private currentModelOptions() {
+    return this.currentProvider() === "openai" ? OPENAI_CHAT_MODELS : AI_CHAT_MODELS;
+  }
+
+  private currentModelIds(): ReadonlyArray<string> {
+    return this.currentProvider() === "openai" ? OPENAI_CHAT_MODEL_IDS : AI_CHAT_MODEL_IDS;
+  }
+
+  private hasCurrentProviderKey(): boolean {
+    return this.currentApiKeyProvider() === "openai"
+      ? new OpenAiKeyStore(this.plugin).hasKey()
+      : new AnthropicKeyStore(this.plugin).hasKey();
+  }
+
   /**
    * Resolve the Anthropic API key for a turn: the device-local key first, then
    * a one-shot Cloud provision (a key synced from another device). The provision
    * self-gates on a session + bound vault + key sync, so a fresh, session-less
    * install makes ZERO network calls and simply returns null (§11).
    */
-  private async ensureApiKey(): Promise<string | null> {
+  private async ensureAnthropicApiKey(): Promise<string | null> {
     const store = new AnthropicKeyStore(this.plugin);
     let key = await store.getKey();
     if (!key) key = await this.plugin.aiKeySync.provisionIfMissing();
     return key;
+  }
+
+  private async ensureOpenAiApiKey(): Promise<string | null> {
+    return new OpenAiKeyStore(this.plugin).getKey();
+  }
+
+  private async ensureProviderApiKey(): Promise<string | null> {
+    return this.currentApiKeyProvider() === "openai"
+      ? this.ensureOpenAiApiKey()
+      : this.ensureAnthropicApiKey();
   }
 
   /**
@@ -539,7 +608,12 @@ export class VaultGuardChatView extends ItemView {
       if (this.plugin.settings.aiChatProvider === "subscription") return;
       // A locally-stored key means the conversation-restore path renders the
       // welcome/messages — nothing to do here (preserves prior behavior).
-      if (new AnthropicKeyStore(this.plugin).hasKey()) return;
+      if (this.hasCurrentProviderKey()) return;
+
+      if (this.plugin.settings.aiChatProvider === "openai") {
+        this.renderConnectState();
+        return;
+      }
 
       const ctx = this.plugin.getAiKeySyncContext();
       if (ctx.session && ctx.vaultId) {
@@ -570,9 +644,18 @@ export class VaultGuardChatView extends ItemView {
       return true;
     }
 
-    if (!new AnthropicKeyStore(this.plugin).hasKey()) {
+    if (this.plugin.settings.aiChatProvider === "openai" && images && images.length) {
+      new Notice("VaultGuard Chat: image attachments are not supported by the OpenAI provider yet.");
+      if (!text.trim()) return false;
+    }
+
+    if (!this.hasCurrentProviderKey()) {
       this.renderConnectState();
-      new Notice("VaultGuard Chat: add your Anthropic API key in settings → AI Chat.");
+      new Notice(
+        this.currentApiKeyProvider() === "openai"
+          ? "VaultGuard Chat: add your OpenAI API key in settings → AI Chat."
+          : "VaultGuard Chat: add your Anthropic API key in settings → AI Chat.",
+      );
       return false;
     }
 
@@ -591,6 +674,7 @@ export class VaultGuardChatView extends ItemView {
     // silently drop after the first turn (or on reload/resume), and the agent
     // would report a phantom "expired" session on its next source read.
     await this.ensureImportSessionArmed();
+    this.syncModelFromSettings();
 
     if (this.plugin.settings.aiChatProvider === "subscription") {
       // Subscription (CLI) turns don't carry image blocks; drop with a hint.
@@ -598,6 +682,15 @@ export class VaultGuardChatView extends ItemView {
         if (!text.trim()) return;
       }
       await this.handleSubmitSubscription(text);
+      return;
+    }
+
+    if (this.plugin.settings.aiChatProvider === "openai") {
+      if (images && images.length) {
+        new Notice("VaultGuard Chat: image attachments are not supported by the OpenAI provider yet.");
+        if (!text.trim()) return;
+      }
+      await this.handleSubmitOpenAi(text);
       return;
     }
 
@@ -611,7 +704,7 @@ export class VaultGuardChatView extends ItemView {
     // §11: resolve the key first — local, then a one-shot Cloud provision (a
     // key synced from another device) that self-gates on a session. With none,
     // render the connect state; a fresh, session-less install makes ZERO calls.
-    const apiKey = await this.ensureApiKey();
+    const apiKey = await this.ensureAnthropicApiKey();
     if (!apiKey) {
       this.renderConnectState();
       new Notice("VaultGuard Chat: add your Anthropic API key in settings → AI Chat.");
@@ -650,7 +743,37 @@ export class VaultGuardChatView extends ItemView {
     const runtime = this.runtime;
     await this.executeTurn(apiKey, streaming, (signal) =>
       runtime.runTurn(text, signal, imageBlocks.length ? imageBlocks : undefined),
+      "anthropic",
     );
+  }
+
+  private async handleSubmitOpenAi(text: string): Promise<void> {
+    if (!this.listEl) return;
+
+    const apiKey = await this.ensureOpenAiApiKey();
+    if (!apiKey) {
+      this.renderConnectState();
+      new Notice("VaultGuard Chat: add your OpenAI API key in settings → AI Chat.");
+      return;
+    }
+
+    this.listEl.querySelector(`.${EMPTY_CLS}`)?.remove();
+    if (!this.convo) this.startConversation(text);
+
+    const turnIndex = this.userTurnCount();
+    renderUserMessage(this.listEl, text, this.userMessageActions(turnIndex));
+    this.scrollToBottom();
+
+    try {
+      await this.ensureOpenAiRuntime(apiKey);
+    } catch (e) {
+      this.renderError((e as Error).message || "Could not start the OpenAI chat session.");
+      return;
+    }
+    if (!this.runtime) return;
+
+    const runtime = this.runtime;
+    await this.executeTurn(apiKey, false, (signal) => runtime.runTurn(text, signal), "openai");
   }
 
   // Shared busy/pending/streaming/finalize scaffolding for an API-key turn.
@@ -660,6 +783,7 @@ export class VaultGuardChatView extends ItemView {
     apiKey: string,
     streaming: boolean,
     run: (signal: AbortSignal) => Promise<void>,
+    provider: ApiKeyProvider,
   ): Promise<void> {
     if (!this.inputController || !this.statusPanel) return;
 
@@ -693,11 +817,13 @@ export class VaultGuardChatView extends ItemView {
       this.scrollToBottom();
       // Snapshot the runtime's message history into the conversation and
       // persist it (encrypted at rest, debounced). Fail-soft on no LAK.
-      this.captureAndSave(apiKey);
-      // The key was just used — cheaply heal the roaming server blob (re-upload
-      // if it's missing or wrapped with a rotated DEK) so the user's other
-      // devices can still provision. Fire-and-forget; self-gates on sync+session.
-      void this.plugin.aiKeySync.healIfStale();
+      this.captureAndSave(apiKey, provider);
+      if (provider === "anthropic") {
+        // The key was just used — cheaply heal the roaming server blob (re-upload
+        // if it's missing or wrapped with a rotated DEK) so the user's other
+        // devices can still provision. Fire-and-forget; self-gates on sync+session.
+        void this.plugin.aiKeySync.healIfStale();
+      }
       this.flushQueuedPausedAnswer();
       this.flushQueuedConfirmDecision();
     }
@@ -715,16 +841,21 @@ export class VaultGuardChatView extends ItemView {
       return;
     }
 
-    const apiKey = await this.ensureApiKey();
+    const apiProvider = this.currentApiKeyProvider();
+    const apiKey = await this.ensureProviderApiKey();
     if (!apiKey) {
       this.renderConnectState();
       return;
     }
 
-    const streaming = this.streamingEnabled();
+    const streaming = apiProvider === "anthropic" && this.streamingEnabled();
     if (this.runtime && this.runtimeStreaming !== streaming) this.runtime = null;
     try {
-      await this.ensureRuntime(apiKey, streaming);
+      if (apiProvider === "openai") {
+        await this.ensureOpenAiRuntime(apiKey);
+      } else {
+        await this.ensureRuntime(apiKey, streaming);
+      }
     } catch (e) {
       this.renderError((e as Error).message || "Could not start the chat session.");
       return;
@@ -743,7 +874,7 @@ export class VaultGuardChatView extends ItemView {
     this.renderMessages(kept);
 
     const runtime = this.runtime;
-    await this.executeTurn(apiKey, streaming, (signal) => runtime.regenerateLast(signal));
+    await this.executeTurn(apiKey, streaming, (signal) => runtime.regenerateLast(signal), apiProvider);
   }
 
   // ─── Subscription provider (Claude Code CLI) ───────────────────────────────
@@ -811,7 +942,7 @@ export class VaultGuardChatView extends ItemView {
 
     this.statusPanel.setConnection(this.plugin.isConnectedOnline());
     this.statusPanel.setModel(this.model);
-    this.statusPanel.setEffort(this.plugin.settings.aiChatEffort);
+    this.statusPanel.setEffort(this.currentEffort());
     this.inputController.setBusy(true);
     this.showPending();
     const controller = new AbortController();
@@ -1046,7 +1177,7 @@ export class VaultGuardChatView extends ItemView {
       return;
     }
     if (cmd.kind === "model") {
-      if (!AI_CHAT_MODEL_IDS.includes(cmd.model)) {
+      if (!this.currentModelIds().includes(cmd.model)) {
         new Notice(`VaultGuard Chat: unknown model "${cmd.model}".`);
         return;
       }
@@ -1264,7 +1395,7 @@ export class VaultGuardChatView extends ItemView {
     this.persistLeafState();
     if (
       this.plugin.settings.aiChatProvider !== "subscription" &&
-      !new AnthropicKeyStore(this.plugin).hasKey()
+      !this.hasCurrentProviderKey()
     ) {
       this.renderConnectState();
     } else {
@@ -1500,13 +1631,17 @@ export class VaultGuardChatView extends ItemView {
   // (debounced). After the first successful exchange of a NEW conversation we
   // also generate a title (§4 Haiku). `apiKey` is present here because §11
   // guarantees we only reach this path when a key exists.
-  private captureAndSave(apiKey: string): void {
+  private captureAndSave(apiKey: string, provider: ApiKeyProvider): void {
     if (!this.convo || !this.runtime) return;
     this.convo.messages = this.runtime.getMessages();
     this.convo.model = this.model;
     this.convo.updatedAt = Date.now();
     this.scheduleSave();
-    this.maybeGenerateTitle(apiKey);
+    if (provider === "anthropic") {
+      this.maybeGenerateTitle(apiKey);
+    } else {
+      this.titleGenerated = true;
+    }
   }
 
   // §4 + §11: one cheap Haiku title call after the first exchange. Key-gated by
@@ -1844,7 +1979,9 @@ export class VaultGuardChatView extends ItemView {
   // ─── Runtime construction ──────────────────────────────────────────────────
 
   private async ensureRuntime(apiKey: string, streaming: boolean): Promise<void> {
-    if (this.runtime) return;
+    if (this.runtime && this.runtimeProvider === "anthropic") return;
+    this.runtime = null;
+    this.runtimeProvider = "anthropic";
     this.runtimeStreaming = streaming;
 
     // Mint a vault-wide lease for the session. The selected AI Chat permission
@@ -1919,6 +2056,65 @@ export class VaultGuardChatView extends ItemView {
     });
 
     // Rehydrate a restored conversation's history so the next turn has context.
+    if (this.pendingRestoreMessages) {
+      this.runtime.setMessages(this.pendingRestoreMessages);
+      this.pendingRestoreMessages = null;
+    }
+  }
+
+  private async ensureOpenAiRuntime(apiKey: string): Promise<void> {
+    if (this.runtime && this.runtimeProvider === "openai") return;
+    this.runtime = null;
+    this.runtimeProvider = "openai";
+    this.runtimeStreaming = false;
+
+    const lease = await this.plugin.createAgentBridgeLease({
+      agentName: "VaultGuard Chat (OpenAI)",
+      scope: "/**",
+      expiresWithSession: true,
+      allowRead: true,
+      writeMode: chatPermissionWriteMode(this.plugin.settings.aiChatPermissionMode),
+      allowAccessQueries: true,
+      allowImportRead: true,
+      allowUserInteraction: true,
+      allowPermissionWrites: true,
+      allowAuditQueries: true,
+      allowFileHistory: true,
+      allowShareManagement: true,
+      allowMembershipWrites: true,
+    });
+    this.leaseId = lease.leaseId;
+
+    const surface = this.plugin.getAgentBridge();
+    const toolRuntime = new VaultToolRuntime(surface, lease.leaseId);
+    const client = new OpenAiResponsesClient({
+      apiKey,
+      model: this.plugin.settings.openAiModel,
+      reasoningEffort: this.plugin.settings.openAiReasoningEffort,
+      verbosity: this.plugin.settings.openAiVerbosity,
+      maxOutputTokens: this.plugin.settings.openAiMaxOutputTokens,
+    });
+
+    this.runtime = new OpenAiChatRuntime({
+      client,
+      toolRuntime,
+      config: {
+        instructions: buildOpenAiSystemInstructions(
+          this.plugin.settings.aiChatSystemPrompt,
+          this.plugin.settings.aiChatPermissionMode,
+        ),
+      },
+      progress: {
+        onAssistant: (msg) => this.onAssistant(msg),
+        onText: (text) => this.onText(text),
+        onToolCall: (name, input) => this.onToolCall(name, input),
+        onToolResult: (_name, result) => this.onToolResult(result),
+        onRefusal: () => this.onRefusal(),
+        onStepLimit: () =>
+          new Notice("VaultGuard Chat: reached the step limit for one turn."),
+      },
+    });
+
     if (this.pendingRestoreMessages) {
       this.runtime.setMessages(this.pendingRestoreMessages);
       this.pendingRestoreMessages = null;
@@ -2255,7 +2451,7 @@ export class VaultGuardChatView extends ItemView {
   private openModelMenu(evt: MouseEvent): void {
     const menu = new Menu();
 
-    for (const m of AI_CHAT_MODELS) {
+    for (const m of this.currentModelOptions()) {
       menu.addItem((item) =>
         item
           .setTitle(m.label)
@@ -2271,8 +2467,10 @@ export class VaultGuardChatView extends ItemView {
 
   private openEffortMenu(evt: MouseEvent): void {
     const menu = new Menu();
-    const currentEffort = this.plugin.settings.aiChatEffort;
-    for (const e of AI_CHAT_EFFORTS) {
+    const currentEffort = this.currentEffort();
+    const efforts =
+      this.currentProvider() === "openai" ? OPENAI_REASONING_EFFORTS : AI_CHAT_EFFORTS;
+    for (const e of efforts) {
       menu.addItem((item) =>
         item
           .setTitle(e.label)
@@ -2299,13 +2497,20 @@ export class VaultGuardChatView extends ItemView {
     menu.showAtMouseEvent(evt);
   }
 
-  private async setEffort(effort: AnthropicEffort): Promise<void> {
-    if (this.plugin.settings.aiChatEffort === effort) return;
-    this.plugin.settings.aiChatEffort = effort;
+  private async setEffort(effort: AiChatEffort): Promise<void> {
+    if (this.currentProvider() === "openai") {
+      if (effort !== "low" && effort !== "medium" && effort !== "high") return;
+      if (this.plugin.settings.openAiReasoningEffort === effort) return;
+      this.plugin.settings.openAiReasoningEffort = effort;
+    } else {
+      if (this.plugin.settings.aiChatEffort === effort) return;
+      this.plugin.settings.aiChatEffort = effort as typeof this.plugin.settings.aiChatEffort;
+    }
     await this.plugin.saveSettings();
     this.statusPanel?.setEffort(effort);
     // Rebuild so the next turn's client carries the new effort.
     this.runtime = null;
+    this.runtimeProvider = null;
     this.cliClient?.reset();
     this.cliClient = null;
     new Notice(`VaultGuard Chat: thinking effort → ${effort}`);
@@ -2318,6 +2523,7 @@ export class VaultGuardChatView extends ItemView {
     this.statusPanel?.setPermissionMode(mode);
     // Rebuild so the next turn mints a lease with the new write mode.
     this.runtime = null;
+    this.runtimeProvider = null;
     this.cliClient?.reset();
     this.cliClient = null;
     new Notice(`VaultGuard Chat: permissions → ${permissionModeLabel(mode)}`);
@@ -2328,10 +2534,15 @@ export class VaultGuardChatView extends ItemView {
     this.statusPanel?.setModel(model);
     // Persist so the choice survives a panel reopen / new chat (mirrors
     // setEffort) and stays in sync with the settings dropdown.
-    this.plugin.settings.aiChatModel = model;
+    if (this.currentProvider() === "openai") {
+      this.plugin.settings.openAiModel = model;
+    } else {
+      this.plugin.settings.aiChatModel = model;
+    }
     void this.plugin.saveSettings();
     // Rebuild the runtime / CLI client on next turn so the new model applies.
     this.runtime = null;
+    this.runtimeProvider = null;
     this.cliClient?.reset();
     this.cliClient = null;
   }

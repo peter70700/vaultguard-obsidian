@@ -49,6 +49,27 @@ import {
   type ExplainTrace,
   type ExplainVaultRole,
 } from "./permission-explain";
+import {
+  DEFAULT_GRAPH_BUDGETS,
+  DEFAULT_GRAPH_OPTIONS,
+  buildAggregatedGraphElements,
+  buildGraphDebugReadoutModel,
+  capExplainRows,
+  decideGraphRender,
+  estimateDetailedGraphComplexity,
+  filterGraphDataset,
+  graphOptionsToSavedState,
+  normalizeGraphOptions,
+  normalizeOptionalGraphPath,
+  removeGraphVaultState,
+  upsertGraphVaultState,
+  type FilteredGraphDataset,
+  type GraphActualMode,
+  type GraphComplexityEstimate,
+  type GraphDebugReadoutModel,
+  type GraphRenderDecision,
+  type GraphRuntimeOptions,
+} from "./permissions-graph-scale";
 
 export const VAULTGUARD_GRAPH_VIEW_TYPE = "vaultguard-permissions-graph";
 
@@ -74,7 +95,7 @@ export interface PermissionsGraphDataset {
   summaries: GraphPathSummary[];
   /** Per-folder access summaries (access evaluated at each folder path). */
   folderSummaries: GraphPathSummary[];
-  /** Files actually scanned (≤ SWEEP_CAP) and the vault's total file count. */
+  /** Files actually scanned (bounded by graph max files) and the vault's total file count. */
   scanned: number;
   total: number;
   truncated: boolean;
@@ -82,7 +103,14 @@ export interface PermissionsGraphDataset {
 
 // ─── CSS class names (mirrors the `*_CLS` convention) ─────────────────────────
 const ROOT_CLS = "vaultguard-permissions-graph";
+const HEADER_CLS = "vaultguard-pg-header";
+const TITLE_CLS = "vaultguard-pg-title";
 const TOOLBAR_CLS = "vaultguard-pg-toolbar";
+const OPTIONS_CLS = "vaultguard-pg-options";
+const OPTIONS_SUMMARY_CLS = "vaultguard-pg-options-summary";
+const OPTIONS_GRID_CLS = "vaultguard-pg-options-grid";
+const OPTION_FIELD_CLS = "vaultguard-pg-option-field";
+const OPTION_TOGGLE_CLS = "vaultguard-pg-option-toggle";
 const LEGEND_CLS = "vaultguard-pg-legend";
 const LEGEND_CHIP_CLS = "vaultguard-pg-legend-chip";
 const LEGEND_CHIP_OFF_CLS = "is-off";
@@ -111,12 +139,14 @@ const EMPTY_CLS = "vaultguard-pg-empty";
 const EMPTY_ICON_CLS = "vaultguard-pg-empty-icon";
 const EMPTY_ACTION_CLS = "vaultguard-pg-empty-action";
 const EMPTY_ACTION_ICON_CLS = "vaultguard-pg-empty-action-icon";
+const NOTICE_CLS = "vaultguard-pg-large-notice";
+const DEBUG_CLS = "vaultguard-pg-debug";
+const DEBUG_SUMMARY_CLS = "vaultguard-pg-debug-summary";
+const DEBUG_GRID_CLS = "vaultguard-pg-debug-grid";
+const SHOW_MORE_CLS = "vaultguard-pg-show-more";
 const NOTE_CLS = "vaultguard-pg-note";
 const STATUS_CLS = "vaultguard-pg-status";
 
-// Sweep bounds — mirror the chat access-sweep (agent-bridge.ts:295) so very
-// large vaults render a bounded set with a "showing N files" note.
-const SWEEP_CAP = 1000;
 const BATCH_SIZE = 100; // server cap for POST /permissions/access/batch
 // How many 100-path batches resolve concurrently. The old sequential sweep made
 // ⌈N/100⌉ round-trips back-to-back (the dominant first-load cost); a small
@@ -135,7 +165,6 @@ const LEGEND_ITEMS: Array<{ key: string; label: string; swatch: "user" | "file" 
 ];
 
 const DEFAULT_DEPTH = 1;
-const MAX_DEPTH = 4;
 
 interface ViewerContext {
   userId: string;
@@ -154,25 +183,27 @@ export class PermissionsGraphView extends ItemView {
   private explainEl: HTMLElement | null = null;
   private statusEl: HTMLElement | null = null;
   private noteEl: HTMLElement | null = null;
+  private noticeEl: HTMLElement | null = null;
+  private debugEl: HTMLElement | null = null;
+  private userFilterSelectEl: HTMLSelectElement | null = null;
+  private optionRenderTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Legend filter state: class → enabled.
   private readonly legendState = new Map<string, boolean>(
     LEGEND_ITEMS.map((item) => [item.key, true]),
   );
-  private depth = DEFAULT_DEPTH;
+  private graphOptions: GraphRuntimeOptions = { ...DEFAULT_GRAPH_OPTIONS };
+  private renderDecision: GraphRenderDecision | null = null;
+  private lastEstimate: GraphComplexityEstimate | null = null;
+  private actualMode: GraphActualMode = "detailed";
+  private hoverHighlightEnabled = true;
   private focusedNodeId: string | null = null;
-  // Free-text node filter (matches user/file/folder labels + paths).
-  private searchQuery = "";
-  // Which node kind the free-text filter is restricted to ("all" = any kind).
-  private searchScope: SearchScope = "all";
   // The live result-count badge element + the last match count it reflects.
   private searchCountEl: HTMLElement | null = null;
   private lastSearchMatchCount: number | null = null;
-  // Layout: "radial" = files/folders on inner rings, users around the outside
-  // (the default); "force" = the organic force-directed spread.
-  private layoutMode: "radial" | "force" = "radial";
   // Lets the per-permission trace offer a "← back" to the node list it came from.
   private lastExplainContext: { kind: "path" | "user"; key: string } | null = null;
+  private currentVaultId: string | null = null;
 
   // Cached fetched data for click→explain narration.
   private rules: PermissionRule[] = [];
@@ -242,6 +273,8 @@ export class PermissionsGraphView extends ItemView {
       return;
     }
 
+    this.currentVaultId = vaultId;
+    this.loadGraphOptions(vaultId);
     this.viewer = {
       userId: session.userId,
       role: this.resolveViewerRole(),
@@ -266,23 +299,41 @@ export class PermissionsGraphView extends ItemView {
       this.cy.destroy();
       this.cy = null;
     }
+    if (this.optionRenderTimer) {
+      clearTimeout(this.optionRenderTimer);
+      this.optionRenderTimer = null;
+    }
     this.bodyEl = null;
     this.canvasEl = null;
     this.explainEl = null;
     this.statusEl = null;
     this.noteEl = null;
+    this.noticeEl = null;
+    this.debugEl = null;
+    this.userFilterSelectEl = null;
+    this.renderDecision = null;
+    this.lastEstimate = null;
+    this.actualMode = "detailed";
+    this.hoverHighlightEnabled = true;
     this.rules = [];
     this.summaryByPath.clear();
     this.folderPathSet.clear();
     this.memberById.clear();
     this.focusedNodeId = null;
-    this.searchQuery = "";
-    this.searchScope = "all";
     this.searchCountEl = null;
     this.lastSearchMatchCount = null;
-    this.layoutMode = "radial";
     this.lastExplainContext = null;
     this.viewer = null;
+    this.currentVaultId = null;
+  }
+
+  private loadGraphOptions(vaultId: string): void {
+    this.graphOptions = normalizeGraphOptions(
+      this.plugin.settings.permissionsGraphDefaults,
+      this.plugin.settings.permissionsGraphVaultStates?.[vaultId],
+      DEFAULT_GRAPH_BUDGETS,
+    );
+    this.syncLegendStateFromOptions();
   }
 
   // ─── Viewer role resolution ─────────────────────────────────────────────────
@@ -407,8 +458,12 @@ export class PermissionsGraphView extends ItemView {
   // ─── Chrome ─────────────────────────────────────────────────────────────────
 
   private buildChrome(container: HTMLElement): void {
-    // Toolbar: legend (doubles as a type/effect filter) + depth control.
+    const header = container.createDiv({ cls: HEADER_CLS });
+    header.createDiv({ cls: TITLE_CLS, text: "Permissions graph" });
+
+    // Toolbar: render options, legend filters, search, and focus controls.
     const toolbar = container.createDiv({ cls: TOOLBAR_CLS });
+    this.renderOptionsPanel(toolbar);
 
     const legend = toolbar.createDiv({ cls: LEGEND_CLS });
     for (const item of LEGEND_ITEMS) {
@@ -417,6 +472,7 @@ export class PermissionsGraphView extends ItemView {
         attr: { role: "button", tabindex: "0", "aria-label": `Toggle ${item.label}` },
       });
       chip.dataset.key = item.key;
+      chip.toggleClass(LEGEND_CHIP_OFF_CLS, !(this.legendState.get(item.key) ?? true));
       const swatch = chip.createSpan({ cls: `${LEGEND_SWATCH_CLS} is-${item.swatch}` });
       // Glyph for node types; edges use a colored bar (CSS).
       if (item.swatch === "user") setIcon(swatch, "user");
@@ -452,7 +508,7 @@ export class PermissionsGraphView extends ItemView {
     for (const opt of scopeOptions) {
       scopeSelect.createEl("option", { value: opt.value, text: opt.text });
     }
-    scopeSelect.value = this.searchScope;
+    scopeSelect.value = this.graphOptions.searchScope;
 
     // Placeholder mirrors the active scope so it's obvious the search is
     // narrowed to that kind (and that scoping works at all).
@@ -468,26 +524,19 @@ export class PermissionsGraphView extends ItemView {
     const searchInput = search.createEl("input", {
       attr: {
         type: "search",
-        placeholder: placeholderFor(this.searchScope),
+        placeholder: placeholderFor(this.graphOptions.searchScope),
         "aria-label": "Filter graph",
       },
     });
+    searchInput.value = this.graphOptions.searchQuery;
     searchInput.addEventListener("input", () => {
-      this.searchQuery = searchInput.value.trim().toLowerCase();
-      this.applyFilters();
-      // The layout is computed once and is static, so filtering alone just
-      // leaves the matched nodes wherever they were — frequently off-screen on
-      // a large vault, which reads as "search does nothing". Pan/zoom to the
-      // surviving nodes so the match is actually brought into view. When the
-      // query is cleared, this fits the whole graph back into frame.
-      this.fitToVisible();
+      this.updateGraphOptions({ searchQuery: searchInput.value.trim() }, true);
     });
 
     scopeSelect.addEventListener("change", () => {
-      this.searchScope = scopeSelect.value as SearchScope;
-      searchInput.placeholder = placeholderFor(this.searchScope);
-      this.applyFilters();
-      this.fitToVisible();
+      const nextScope = scopeSelect.value as SearchScope;
+      searchInput.placeholder = placeholderFor(nextScope);
+      this.updateGraphOptions({ searchScope: nextScope });
     });
 
     // Live result-count badge: applyFilters() drives its text/visibility.
@@ -500,16 +549,16 @@ export class PermissionsGraphView extends ItemView {
       attr: {
         type: "range",
         min: "1",
-        max: String(MAX_DEPTH),
-        value: String(this.depth),
+        max: "8",
+        value: String(this.graphOptions.depth),
         "aria-label": "Focus depth",
       },
     });
-    const depthValue = depthRow.createSpan({ cls: DEPTH_LABEL_CLS, text: String(this.depth) });
+    const depthValue = depthRow.createSpan({ cls: DEPTH_LABEL_CLS, text: String(this.graphOptions.depth) });
     slider.addEventListener("input", () => {
-      this.depth = Number(slider.value) || DEFAULT_DEPTH;
-      depthValue.setText(String(this.depth));
-      this.applyFocus();
+      const nextDepth = Number(slider.value) || DEFAULT_DEPTH;
+      depthValue.setText(String(nextDepth));
+      this.updateGraphOptions({ depth: nextDepth }, true);
     });
 
     const resetBtn = depthRow.createSpan({
@@ -535,16 +584,19 @@ export class PermissionsGraphView extends ItemView {
     // Layout toggle: radial (files inside, users around the outside) ⇄ force.
     const layoutBtn = depthRow.createSpan({
       cls: "clickable-icon",
-      attr: { "aria-label": "Toggle layout", title: "Toggle layout: radial / force" },
+      attr: { "aria-label": "Cycle layout", title: "Cycle layout" },
     });
     const syncLayoutIcon = (): void =>
-      setIcon(layoutBtn, this.layoutMode === "radial" ? "target" : "git-fork");
+      setIcon(layoutBtn, this.graphOptions.layoutMode === "force" ? "git-fork" : this.graphOptions.layoutMode === "grid" ? "grid-2x2" : "target");
     syncLayoutIcon();
     layoutBtn.addEventListener("click", () => {
-      this.layoutMode = this.layoutMode === "radial" ? "force" : "radial";
+      const order: GraphRuntimeOptions["layoutMode"][] = ["auto", "radial", "force", "grid"];
+      const idx = order.indexOf(this.graphOptions.layoutMode);
+      this.updateGraphOptions({ layoutMode: order[(idx + 1) % order.length] });
       syncLayoutIcon();
-      this.runLayout();
     });
+
+    this.noticeEl = container.createDiv({ cls: NOTICE_CLS });
 
     // Body: cytoscape canvas + explain side panel.
     this.bodyEl = container.createDiv({ cls: BODY_CLS });
@@ -555,6 +607,231 @@ export class PermissionsGraphView extends ItemView {
     // Status / "showing N files" note line.
     this.noteEl = container.createDiv({ cls: NOTE_CLS });
     this.statusEl = container.createDiv({ cls: STATUS_CLS });
+    this.debugEl = container.createDiv({ cls: DEBUG_CLS });
+  }
+
+  private renderOptionsPanel(toolbar: HTMLElement): void {
+    const details = toolbar.createEl("details", { cls: OPTIONS_CLS });
+    const summary = details.createEl("summary", { cls: OPTIONS_SUMMARY_CLS });
+    setIcon(summary.createSpan(), "sliders-horizontal");
+    summary.createSpan({ text: "Options" });
+
+    const grid = details.createDiv({ cls: OPTIONS_GRID_CLS });
+    this.addSelectOption(grid, "Mode", this.graphOptions.renderMode, [
+      ["auto", "Auto"],
+      ["aggregated", "Aggregated"],
+      ["detailed", "Detailed"],
+    ], (value) => this.updateGraphOptions({ renderMode: value as GraphRuntimeOptions["renderMode"] }));
+    this.addSelectOption(grid, "Layout", this.graphOptions.layoutMode, [
+      ["auto", "Auto"],
+      ["radial", "Radial"],
+      ["force", "Force"],
+      ["grid", "Grid"],
+    ], (value) => this.updateGraphOptions({ layoutMode: value as GraphRuntimeOptions["layoutMode"] }));
+    this.addSelectOption(grid, "Labels", this.graphOptions.labelsMode, [
+      ["auto", "Auto"],
+      ["on", "On"],
+      ["off", "Off"],
+    ], (value) => this.updateGraphOptions({ labelsMode: value as GraphRuntimeOptions["labelsMode"] }));
+
+    this.addNumberOption(grid, "Max files", this.graphOptions.maxFiles, 1, DEFAULT_GRAPH_BUDGETS.maxInitialFiles, (value) =>
+      this.updateGraphOptions({ maxFiles: value }, true),
+    );
+    this.addNumberOption(grid, "Max edges", this.graphOptions.maxEdges, 0, DEFAULT_GRAPH_BUDGETS.maxRenderedEdges, (value) =>
+      this.updateGraphOptions({ maxEdges: value }, true),
+    );
+    this.addNumberOption(grid, "Depth", this.graphOptions.depth, 1, 8, (value) =>
+      this.updateGraphOptions({ depth: value }, true),
+    );
+
+    const prefixField = grid.createEl("label", { cls: OPTION_FIELD_CLS });
+    prefixField.createSpan({ text: "Folder" });
+    const prefixInput = prefixField.createEl("input", {
+      attr: { type: "search", "aria-label": "Folder prefix" },
+    });
+    prefixInput.value = this.graphOptions.pathPrefix;
+    prefixInput.addEventListener("input", () =>
+      this.updateGraphOptions({ pathPrefix: normalizeOptionalGraphPath(prefixInput.value) }, true),
+    );
+
+    const userField = grid.createEl("label", { cls: OPTION_FIELD_CLS });
+    userField.createSpan({ text: "User" });
+    this.userFilterSelectEl = userField.createEl("select", { attr: { "aria-label": "User filter" } });
+    this.userFilterSelectEl.addEventListener("change", () => {
+      const value = this.userFilterSelectEl?.value ?? "";
+      this.updateGraphOptions({ selectedUsers: value ? [value] : [] });
+    });
+
+    this.addToggleOption(grid, "Users", this.graphOptions.nodeTypes.users, (checked) =>
+      this.updateGraphOptions({ nodeTypes: { ...this.graphOptions.nodeTypes, users: checked } }),
+    );
+    this.addToggleOption(grid, "Files", this.graphOptions.nodeTypes.files, (checked) =>
+      this.updateGraphOptions({ nodeTypes: { ...this.graphOptions.nodeTypes, files: checked } }),
+    );
+    this.addToggleOption(grid, "Folders", this.graphOptions.nodeTypes.folders, (checked) =>
+      this.updateGraphOptions({ nodeTypes: { ...this.graphOptions.nodeTypes, folders: checked } }),
+    );
+    this.addToggleOption(grid, "Read", this.graphOptions.accessLevels.read, (checked) =>
+      this.updateGraphOptions({ accessLevels: { ...this.graphOptions.accessLevels, read: checked } }),
+    );
+    this.addToggleOption(grid, "Write", this.graphOptions.accessLevels.write, (checked) =>
+      this.updateGraphOptions({ accessLevels: { ...this.graphOptions.accessLevels, write: checked } }),
+    );
+    this.addToggleOption(grid, "Admin", this.graphOptions.accessLevels.admin, (checked) =>
+      this.updateGraphOptions({ accessLevels: { ...this.graphOptions.accessLevels, admin: checked } }),
+    );
+    this.addToggleOption(grid, "Expiring", this.graphOptions.expiringOnly, (checked) =>
+      this.updateGraphOptions({ expiringOnly: checked }),
+    );
+    this.addToggleOption(grid, "Writable/admin", this.graphOptions.writableAdminOnly, (checked) =>
+      this.updateGraphOptions({ writableAdminOnly: checked }),
+    );
+    this.addToggleOption(grid, "Explicit", this.graphOptions.explicitRulesOnly, (checked) =>
+      this.updateGraphOptions({ explicitRulesOnly: checked }),
+    );
+
+    const resetCurrent = grid.createEl("button", { text: "Reset vault", cls: "mod-cta" });
+    resetCurrent.addEventListener("click", () => void this.resetCurrentVaultGraphOptions());
+    const resetDefaults = grid.createEl("button", { text: "Reset defaults" });
+    resetDefaults.addEventListener("click", () => void this.resetGlobalGraphDefaults());
+  }
+
+  private addSelectOption(
+    parent: HTMLElement,
+    label: string,
+    value: string,
+    options: Array<[string, string]>,
+    onChange: (value: string) => void,
+  ): void {
+    const field = parent.createEl("label", { cls: OPTION_FIELD_CLS });
+    field.createSpan({ text: label });
+    const select = field.createEl("select");
+    for (const [optionValue, text] of options) {
+      select.createEl("option", { value: optionValue, text });
+    }
+    select.value = value;
+    select.addEventListener("change", () => onChange(select.value));
+  }
+
+  private addNumberOption(
+    parent: HTMLElement,
+    label: string,
+    value: number,
+    min: number,
+    max: number,
+    onChange: (value: number) => void,
+  ): void {
+    const field = parent.createEl("label", { cls: OPTION_FIELD_CLS });
+    field.createSpan({ text: label });
+    const input = field.createEl("input", {
+      attr: { type: "number", min: String(min), max: String(max), value: String(value) },
+    });
+    input.addEventListener("input", () => onChange(Number(input.value) || min));
+  }
+
+  private addToggleOption(
+    parent: HTMLElement,
+    label: string,
+    checked: boolean,
+    onChange: (checked: boolean) => void,
+  ): void {
+    const field = parent.createEl("label", { cls: OPTION_TOGGLE_CLS });
+    const input = field.createEl("input", { attr: { type: "checkbox" } });
+    input.checked = checked;
+    field.createSpan({ text: label });
+    input.addEventListener("change", () => onChange(input.checked));
+  }
+
+  private updateGraphOptions(patch: Partial<GraphRuntimeOptions>, debounce = false): void {
+    const merged: GraphRuntimeOptions = {
+      ...this.graphOptions,
+      ...patch,
+      accessLevels: { ...this.graphOptions.accessLevels, ...patch.accessLevels },
+      nodeTypes: { ...this.graphOptions.nodeTypes, ...patch.nodeTypes },
+      selectedUsers: patch.selectedUsers ?? this.graphOptions.selectedUsers,
+    };
+    this.graphOptions = normalizeGraphOptions(undefined, graphOptionsToSavedState(merged), DEFAULT_GRAPH_BUDGETS);
+    this.syncLegendStateFromOptions();
+    this.persistGraphOptions();
+    this.queueGraphRender(debounce);
+  }
+
+  private persistGraphOptions(): void {
+    if (!this.currentVaultId) return;
+    this.plugin.settings.permissionsGraphVaultStates = upsertGraphVaultState(
+      this.plugin.settings.permissionsGraphVaultStates,
+      this.currentVaultId,
+      graphOptionsToSavedState(this.graphOptions),
+    );
+    void this.plugin.saveSettings();
+  }
+
+  private queueGraphRender(debounce = false): void {
+    const vaultId = this.currentVaultId;
+    if (!vaultId) return;
+    if (this.optionRenderTimer) {
+      clearTimeout(this.optionRenderTimer);
+      this.optionRenderTimer = null;
+    }
+    const run = (): void => {
+      this.optionRenderTimer = null;
+      void this.loadAndRender(vaultId).catch((err) => {
+        this.setStatus(`Could not update graph: ${(err as Error)?.message ?? String(err)}`);
+      });
+    };
+    if (debounce) {
+      this.optionRenderTimer = setTimeout(run, 250);
+      return;
+    }
+    run();
+  }
+
+  private async resetCurrentVaultGraphOptions(): Promise<void> {
+    if (!this.currentVaultId) return;
+    this.plugin.settings.permissionsGraphVaultStates = removeGraphVaultState(
+      this.plugin.settings.permissionsGraphVaultStates,
+      this.currentVaultId,
+    );
+    await this.plugin.saveSettings();
+    await this.render();
+  }
+
+  private async resetGlobalGraphDefaults(): Promise<void> {
+    this.plugin.settings.permissionsGraphDefaults = graphOptionsToSavedState(DEFAULT_GRAPH_OPTIONS);
+    if (this.currentVaultId) {
+      this.plugin.settings.permissionsGraphVaultStates = removeGraphVaultState(
+        this.plugin.settings.permissionsGraphVaultStates,
+        this.currentVaultId,
+      );
+    }
+    await this.plugin.saveSettings();
+    await this.render();
+  }
+
+  private syncLegendStateFromOptions(): void {
+    this.legendState.set("user", this.graphOptions.nodeTypes.users);
+    this.legendState.set("file", this.graphOptions.nodeTypes.files);
+    this.legendState.set("folder", this.graphOptions.nodeTypes.folders);
+    this.legendState.set("read", this.graphOptions.accessLevels.read);
+    this.legendState.set("write", this.graphOptions.accessLevels.write);
+    this.legendState.set("admin", this.graphOptions.accessLevels.admin);
+  }
+
+  private refreshUserFilterOptions(): void {
+    if (!this.userFilterSelectEl) return;
+    const selected = this.graphOptions.selectedUsers[0] ?? "";
+    this.userFilterSelectEl.empty();
+    this.userFilterSelectEl.createEl("option", { value: "", text: "All users" });
+    const members = Array.from(this.memberById.values()).sort((a, b) =>
+      this.labelForUser(a.userId).localeCompare(this.labelForUser(b.userId)),
+    );
+    for (const member of members) {
+      this.userFilterSelectEl.createEl("option", {
+        value: member.userId,
+        text: this.labelForUser(member.userId),
+      });
+    }
+    this.userFilterSelectEl.value = selected;
   }
 
   // ─── Data load + render ─────────────────────────────────────────────────────
@@ -563,12 +840,16 @@ export class PermissionsGraphView extends ItemView {
     // Use the plugin's cache (memory, then the encrypted on-disk envelope) so
     // reopening — even after a restart — is instant; only hit the network on
     // first load, after the TTL, or on an explicit refresh.
-    const cached = force ? null : await this.plugin.loadPersistedPermissionsGraphCache(vaultId);
-    const dataset = cached ?? (await this.fetchDataset(vaultId));
-    if (!cached) void this.plugin.setPermissionsGraphCache(vaultId, dataset);
+    const scopedFetch = this.graphOptions.pathPrefix.length > 0;
+    const desiredFiles = Math.min(this.graphOptions.maxFiles, DEFAULT_GRAPH_BUDGETS.maxInitialFiles);
+    let cached = force || scopedFetch ? null : await this.plugin.loadPersistedPermissionsGraphCache(vaultId);
+    if (cached && cached.scanned < Math.min(desiredFiles, cached.total)) cached = null;
+    const dataset = cached ?? (await this.fetchDataset(vaultId, scopedFetch));
+    if (!cached && !scopedFetch) void this.plugin.setPermissionsGraphCache(vaultId, dataset);
 
     this.rules = dataset.rules;
     this.memberById = new Map(dataset.members.map((m) => [m.userId, m]));
+    this.refreshUserFilterOptions();
     const folderSummaries = dataset.folderSummaries ?? [];
     // Files + folders share one lookup (paths never collide); the folder set
     // lets the explain panel label folders as folders.
@@ -577,18 +858,57 @@ export class PermissionsGraphView extends ItemView {
     );
     this.folderPathSet = new Set(folderSummaries.map((s) => normalizePath(s.path)));
 
-    const elements = buildGraphElements({
+    const filtered = filterGraphDataset({
       vaultId,
       members: dataset.members,
       summaries: dataset.summaries,
       folderSummaries,
       rules: dataset.rules as ExplainRule[],
-    });
+    }, this.graphOptions, DEFAULT_GRAPH_BUDGETS);
+    this.summaryByPath = new Map(
+      [...filtered.summaries, ...filtered.folderSummaries].map((s) => [normalizePath(s.path), s]),
+    );
+    this.folderPathSet = new Set(filtered.folderSummaries.map((s) => normalizePath(s.path)));
+    const estimate = estimateDetailedGraphComplexity(filtered, this.graphOptions);
+    const decision = decideGraphRender(estimate, this.graphOptions, DEFAULT_GRAPH_BUDGETS);
+    this.renderDecision = decision;
+    this.lastEstimate = estimate;
+    this.actualMode = decision.actualMode;
+    this.hoverHighlightEnabled = decision.hoverEnabled;
 
-    this.renderGraph(elements);
+    if (decision.actualMode === "refused") {
+      this.renderUnsafeDetailedGraph(decision, estimate);
+      this.renderLargeGraphNotice(decision, filtered);
+      this.renderDebugReadout(buildGraphDebugReadoutModel(decision, estimate, 0, 0, this.graphOptions));
+    } else {
+      const elements = decision.actualMode === "aggregated"
+        ? buildAggregatedGraphElements(filtered, this.graphOptions, DEFAULT_GRAPH_BUDGETS).elements
+        : buildGraphElements({
+            vaultId,
+            members: filtered.members,
+            summaries: filtered.summaries,
+            folderSummaries: filtered.folderSummaries,
+            rules: dataset.rules as ExplainRule[],
+            includeUsers: this.graphOptions.nodeTypes.users,
+            includeFiles: this.graphOptions.nodeTypes.files,
+            includeFolders: this.graphOptions.nodeTypes.folders,
+          });
+
+      this.renderGraph(elements);
+      this.renderLargeGraphNotice(decision, filtered);
+      this.renderDebugReadout(
+        buildGraphDebugReadoutModel(
+          decision,
+          estimate,
+          elements.filter((el) => !el.data.source && !el.data.target).length,
+          elements.filter((el) => !!el.data.source && !!el.data.target).length,
+          this.graphOptions,
+        ),
+      );
+    }
 
     // Visible-file count note (and truncation warning for large vaults).
-    const readableCount = dataset.summaries.filter((s) => s.principals && s.principals.length > 0).length;
+    const readableCount = filtered.readableFileCount;
     const cacheSuffix = cached ? " · cached" : "";
     this.setNote(
       dataset.truncated
@@ -599,7 +919,7 @@ export class PermissionsGraphView extends ItemView {
   }
 
   /** Fetch the raw dataset: members + rules + a parallel access sweep of files AND folders. */
-  private async fetchDataset(vaultId: string): Promise<PermissionsGraphDataset> {
+  private async fetchDataset(vaultId: string, scopedFetch = false): Promise<PermissionsGraphDataset> {
     const source = this.plugin.getPermissionsGraphDataSource();
     this.setStatus("Loading members and permissions…");
 
@@ -611,8 +931,12 @@ export class PermissionsGraphView extends ItemView {
 
     // Sweep the viewer's visible files, bounded by the cap.
     const allPaths = source.getAllFilePaths();
-    const capped = allPaths.slice(0, SWEEP_CAP);
-    const truncated = allPaths.length > capped.length;
+    const scopedPaths = scopedFetch
+      ? allPaths.filter((path) => pathStartsWithPrefix(path, this.graphOptions.pathPrefix))
+      : allPaths;
+    const cap = Math.min(this.graphOptions.maxFiles, DEFAULT_GRAPH_BUDGETS.maxInitialFiles);
+    const capped = scopedPaths.slice(0, cap);
+    const truncated = scopedPaths.length > capped.length;
 
     this.setStatus(`Resolving access for ${capped.length} file(s)…`);
     const summaries = await this.sweepAccess(source, capped, "file");
@@ -622,7 +946,7 @@ export class PermissionsGraphView extends ItemView {
     const readable = summaries.filter((s) => s.principals && s.principals.length > 0);
     const folderPaths = Array.from(
       new Set(readable.flatMap((s) => ancestorFolders(normalizePath(s.path)))),
-    ).slice(0, SWEEP_CAP);
+    ).slice(0, DEFAULT_GRAPH_BUDGETS.maxInitialFiles);
 
     let folderSummaries: GraphPathSummary[] = [];
     if (folderPaths.length > 0) {
@@ -636,7 +960,7 @@ export class PermissionsGraphView extends ItemView {
       summaries,
       folderSummaries,
       scanned: capped.length,
-      total: allPaths.length,
+      total: scopedPaths.length,
       truncated,
     };
   }
@@ -662,6 +986,84 @@ export class PermissionsGraphView extends ItemView {
     return summaries;
   }
 
+  private renderUnsafeDetailedGraph(
+    decision: GraphRenderDecision,
+    estimate: GraphComplexityEstimate,
+  ): void {
+    if (this.cy) {
+      this.cy.destroy();
+      this.cy = null;
+    }
+    this.canvasEl?.empty();
+    this.renderExplainMessage("Detailed graph paused", [
+      `This graph is estimated at ${estimate.nodeCount} node(s) and ${estimate.edgeCount} edge(s).`,
+      `Budget exceeded: ${decision.exceeded.join(", ") || "large graph threshold"}.`,
+      "Use folder, search, user, access-level, depth, max-file, or max-edge filters before rendering Detailed mode.",
+    ]);
+  }
+
+  private renderLargeGraphNotice(
+    decision: GraphRenderDecision,
+    filtered: FilteredGraphDataset,
+  ): void {
+    if (!this.noticeEl) return;
+    this.noticeEl.empty();
+    const shouldShow = decision.large || filtered.omittedByMaxFiles > 0 || filtered.omittedByMaxEdges > 0 || filtered.omittedByFilters > 0;
+    this.noticeEl.toggleClass("is-hidden", !shouldShow);
+    if (!shouldShow) return;
+
+    const title = decision.actualMode === "aggregated"
+      ? "Large graph shown in aggregate mode"
+      : decision.actualMode === "refused"
+        ? "Detailed graph needs narrower filters"
+        : "Graph safety limits applied";
+    this.noticeEl.createDiv({ cls: EXPLAIN_TITLE_CLS, text: title });
+    const parts: string[] = [];
+    if (decision.exceeded.length > 0) parts.push(`Exceeded: ${decision.exceeded.join(", ")}`);
+    if (filtered.omittedByMaxFiles > 0) parts.push(`${filtered.omittedByMaxFiles} file(s) skipped by max files`);
+    if (filtered.omittedByMaxEdges > 0) parts.push(`${filtered.omittedByMaxEdges} edge(s) skipped by max edges`);
+    if (filtered.omittedByFilters > 0) parts.push(`${filtered.omittedByFilters} item(s) removed by filters`);
+    parts.push("Narrow by folder, search, user, access level, depth, max files, or max edges.");
+    for (const part of parts) {
+      this.noticeEl.createDiv({ cls: NOTE_CLS, text: part });
+    }
+  }
+
+  private renderDebugReadout(model: GraphDebugReadoutModel): void {
+    if (!this.debugEl) return;
+    this.debugEl.empty();
+    const details = this.debugEl.createEl("details");
+    details.open = this.graphOptions.debugExpanded || model.actualMode !== "detailed";
+    details.addEventListener("toggle", () => {
+      this.graphOptions = { ...this.graphOptions, debugExpanded: details.open };
+      this.persistGraphOptions();
+    });
+    const summary = details.createEl("summary", { cls: DEBUG_SUMMARY_CLS });
+    setIcon(summary.createSpan(), "activity");
+    summary.createSpan({ text: "Performance" });
+
+    const grid = details.createDiv({ cls: DEBUG_GRID_CLS });
+    const rows: Array<[string, string]> = [
+      ["Requested", model.requestedMode],
+      ["Actual", model.actualMode],
+      ["Visible nodes", String(model.nodeCount)],
+      ["Visible edges", String(model.edgeCount)],
+      ["Estimated nodes", String(model.estimatedNodeCount)],
+      ["Estimated edges", String(model.estimatedEdgeCount)],
+      ["Layout", model.selectedLayout],
+      ["Labels", model.labelMode],
+      ["Depth", String(model.activeDepth)],
+      ["Max files", String(model.maxFiles)],
+      ["Max edges", String(model.maxEdges)],
+      ["Exceeded", model.exceeded.length > 0 ? model.exceeded.join(", ") : "none"],
+      ["Disabled", model.disabled.length > 0 ? model.disabled.join(", ") : "none"],
+    ];
+    for (const [label, value] of rows) {
+      grid.createDiv({ text: label });
+      grid.createDiv({ text: value });
+    }
+  }
+
   /** Force-refresh: drop the cache for this vault and re-fetch from the server. */
   private async forceReload(): Promise<void> {
     const vaultId = this.plugin.settings.serverVaultId;
@@ -680,18 +1082,28 @@ export class PermissionsGraphView extends ItemView {
   // around the outer ring (so people sit "outside the circle of files", on all
   // sides). Force = the organic cose spread.
   private buildLayout(): cytoscape.LayoutOptions {
-    if (this.layoutMode === "force") {
+    const layoutMode = this.renderDecision?.layoutModeUsed ?? "radial";
+    const animate = this.renderDecision?.animationEnabled ?? true;
+    if (layoutMode === "grid") {
+      return {
+        name: "grid",
+        animate: false,
+        padding: 32,
+        fit: true,
+      } as cytoscape.LayoutOptions;
+    }
+    if (layoutMode === "force") {
       return {
         name: "cose",
-        animate: true,
-        animationDuration: 700,
+        animate,
+        animationDuration: animate ? 350 : 0,
         padding: 30,
         nodeDimensionsIncludeLabels: true,
         randomize: true,
         fit: true,
         componentSpacing: 80,
         gravity: 0.25,
-        numIter: 1200,
+        numIter: 350,
         nodeRepulsion: () => 9000,
         idealEdgeLength: () => 90,
         edgeElasticity: () => 80,
@@ -700,8 +1112,8 @@ export class PermissionsGraphView extends ItemView {
 
     return {
       name: "concentric",
-      animate: true,
-      animationDuration: 600,
+      animate,
+      animationDuration: animate ? 250 : 0,
       padding: 36,
       fit: true,
       avoidOverlap: true,
@@ -745,6 +1157,17 @@ export class PermissionsGraphView extends ItemView {
     // focus the graph on that node.
     this.cy.on("tap", "node", (evt: cytoscape.EventObjectNode) => {
       const node = evt.target;
+      const kind = node.data("kind") as string | undefined;
+      if (this.actualMode === "aggregated" && kind === "folder") {
+        const path = node.data("path") as string | undefined;
+        if (path) this.updateGraphOptions({ pathPrefix: path, renderMode: "auto" });
+        return;
+      }
+      if (this.actualMode === "aggregated" && kind === "user") {
+        const userId = node.data("userId") as string | undefined;
+        if (userId) this.updateGraphOptions({ selectedUsers: [userId], renderMode: "auto" });
+        return;
+      }
       this.focusedNodeId = node.id();
       this.applyFocus();
       this.explainForNode(node);
@@ -764,10 +1187,12 @@ export class PermissionsGraphView extends ItemView {
     // pointer-over, fade everything outside the hovered node's closed
     // neighborhood and emphasise the rest; restore on pointer-out. Kept on a
     // separate class from the click→focus dim so the two never clobber.
-    this.cy.on("mouseover", "node", (evt: cytoscape.EventObjectNode) => {
-      this.hoverHighlight(evt.target);
-    });
-    this.cy.on("mouseout", "node", () => this.clearHover());
+    if (this.hoverHighlightEnabled) {
+      this.cy.on("mouseover", "node", (evt: cytoscape.EventObjectNode) => {
+        this.hoverHighlight(evt.target);
+      });
+      this.cy.on("mouseout", "node", () => this.clearHover());
+    }
 
     this.applyFilters();
   }
@@ -818,6 +1243,7 @@ export class PermissionsGraphView extends ItemView {
     const writeColor = cssVar("--color-yellow", "#e0a526");
     const adminColor = cssVar("--color-purple", "#a371e0");
     const denyColor = cssVar("--color-red", "#d64545");
+    const labelsOn = (this.renderDecision?.labelModeUsed ?? "on") === "on";
 
     return [
       // Base node: a circular dot with its label BELOW it (native-graph style),
@@ -830,7 +1256,7 @@ export class PermissionsGraphView extends ItemView {
           height: 16,
           "background-color": fileColor,
           "border-width": 0,
-          label: "data(label)",
+          label: labelsOn ? "data(label)" : "",
           color: textColor,
           "font-size": 10,
           "text-valign": "bottom",
@@ -909,7 +1335,7 @@ export class PermissionsGraphView extends ItemView {
       {
         selector: "edge[label]",
         style: {
-          label: "data(label)",
+          label: labelsOn ? "data(label)" : "",
           "font-size": 9,
           color: mutedColor,
           "text-rotation": "autorotate",
@@ -1011,7 +1437,12 @@ export class PermissionsGraphView extends ItemView {
     const next = !(this.legendState.get(key) ?? true);
     this.legendState.set(key, next);
     chip.toggleClass(LEGEND_CHIP_OFF_CLS, !next);
-    this.applyFilters();
+    if (key === "user") this.updateGraphOptions({ nodeTypes: { ...this.graphOptions.nodeTypes, users: next } });
+    else if (key === "file") this.updateGraphOptions({ nodeTypes: { ...this.graphOptions.nodeTypes, files: next } });
+    else if (key === "folder") this.updateGraphOptions({ nodeTypes: { ...this.graphOptions.nodeTypes, folders: next } });
+    else if (key === "read") this.updateGraphOptions({ accessLevels: { ...this.graphOptions.accessLevels, read: next } });
+    else if (key === "write") this.updateGraphOptions({ accessLevels: { ...this.graphOptions.accessLevels, write: next } });
+    else if (key === "admin") this.updateGraphOptions({ accessLevels: { ...this.graphOptions.accessLevels, admin: next } });
   }
 
   /** Apply legend visibility, then the depth focus (focus narrows the visible set). */
@@ -1037,13 +1468,13 @@ export class PermissionsGraphView extends ItemView {
       // Free-text filter: keep nodes whose label/path matches the query AND
       // their direct connections — so searching a file keeps the users who can
       // reach it, and searching a user keeps the files they can access.
-      const q = this.searchQuery;
+      const q = this.graphOptions.searchQuery.trim().toLowerCase();
       if (q && this.cy) {
         const cy = this.cy;
         const matches = cy.nodes().filter((node) => {
           // Scope gate: when not "all", only nodes of the chosen kind qualify.
           const kind = String(node.data("kind") ?? "");
-          if (this.searchScope !== "all" && kind !== this.searchScope) return false;
+          if (this.graphOptions.searchScope !== "all" && kind !== this.graphOptions.searchScope) return false;
           const label = String(node.data("label") ?? "").toLowerCase();
           const path = String(node.data("path") ?? "").toLowerCase();
           return label.includes(q) || path.includes(q);
@@ -1076,7 +1507,7 @@ export class PermissionsGraphView extends ItemView {
    */
   private updateSearchFeedback(): void {
     if (!this.searchCountEl) return;
-    if (!this.searchQuery) {
+    if (!this.graphOptions.searchQuery) {
       this.searchCountEl.setText("");
       this.searchCountEl.toggleClass("is-visible", false);
       this.searchCountEl.toggleClass("is-empty", false);
@@ -1115,10 +1546,10 @@ export class PermissionsGraphView extends ItemView {
       const focus = cy.getElementById(this.focusedNodeId);
       if (focus.empty()) return;
 
-      // BFS outward from the focused node to `this.depth` hops.
+      // BFS outward from the focused node to the configured focus depth.
       let frontier = focus;
       let neighborhood = focus;
-      for (let i = 0; i < this.depth; i++) {
+      for (let i = 0; i < this.graphOptions.depth; i++) {
         const next = frontier.closedNeighborhood();
         neighborhood = neighborhood.union(next);
         frontier = next;
@@ -1180,12 +1611,21 @@ export class PermissionsGraphView extends ItemView {
 
     this.explainEl.createDiv({ cls: EXPLAIN_SECTION_CLS, text: `Who can access · ${principals.length}` });
     const rows = this.explainEl.createDiv({ cls: EXPLAIN_ROWS_CLS });
-    for (const p of principals) {
+    const capped = capExplainRows(principals, DEFAULT_GRAPH_BUDGETS.maxExplainRows);
+    const renderPrincipal = (p: GraphPrincipal): void => {
       this.renderAccessRow(rows, {
         dotColor: colorForUser(p.userId),
         label: this.principalLabel(p),
         level: p.level,
         onClick: () => this.explainPermission(p.userId, path),
+      });
+    };
+    for (const p of capped.visible) {
+      renderPrincipal(p);
+    }
+    if (capped.hiddenCount > 0) {
+      this.addShowMore(rows, capped.hiddenCount, () => {
+        for (const p of principals.slice(capped.visible.length)) renderPrincipal(p);
       });
     }
   }
@@ -1216,7 +1656,8 @@ export class PermissionsGraphView extends ItemView {
 
     this.explainEl.createDiv({ cls: EXPLAIN_SECTION_CLS, text: `Can access · ${access.length}` });
     const rows = this.explainEl.createDiv({ cls: EXPLAIN_ROWS_CLS });
-    for (const a of access) {
+    const capped = capExplainRows(access, DEFAULT_GRAPH_BUDGETS.maxExplainRows);
+    const renderPathAccess = (a: { path: string; level: GraphAccessLevel }): void => {
       const isFolder = this.folderPathSet.has(normalizePath(a.path));
       const base = a.path.split("/").filter(Boolean).pop() || a.path;
       this.renderAccessRow(rows, {
@@ -1225,6 +1666,14 @@ export class PermissionsGraphView extends ItemView {
         sublabel: a.path,
         level: a.level,
         onClick: () => this.explainPermission(uid, a.path),
+      });
+    };
+    for (const a of capped.visible) {
+      renderPathAccess(a);
+    }
+    if (capped.hiddenCount > 0) {
+      this.addShowMore(rows, capped.hiddenCount, () => {
+        for (const a of access.slice(capped.visible.length)) renderPathAccess(a);
       });
     }
   }
@@ -1318,8 +1767,16 @@ export class PermissionsGraphView extends ItemView {
     }
 
     const list = this.explainEl.createEl("ul", { cls: EXPLAIN_STEPS_CLS });
-    for (const step of trace.steps) {
+    const capped = capExplainRows(trace.steps, DEFAULT_GRAPH_BUDGETS.maxExplainRows);
+    for (const step of capped.visible) {
       list.createEl("li", { text: step });
+    }
+    if (capped.hiddenCount > 0) {
+      this.addShowMore(this.explainEl, capped.hiddenCount, () => {
+        for (const step of trace.steps.slice(capped.visible.length)) {
+          list.createEl("li", { text: step });
+        }
+      });
     }
   }
 
@@ -1346,6 +1803,17 @@ export class PermissionsGraphView extends ItemView {
   private addBadge(parent: HTMLElement, text: string, variant: string): void {
     const badge = parent.createSpan({ cls: `${EXPLAIN_BADGE_CLS} ${variant}` });
     badge.setText(text);
+  }
+
+  private addShowMore(parent: HTMLElement, hiddenCount: number, onClick: () => void): void {
+    const button = parent.createEl("button", {
+      cls: SHOW_MORE_CLS,
+      text: `Show ${hiddenCount} more`,
+    });
+    button.addEventListener("click", () => {
+      button.remove();
+      onClick();
+    });
   }
 
   private levelBadgeClass(level: GraphAccessLevel): string {
@@ -1407,4 +1875,10 @@ export class PermissionsGraphView extends ItemView {
 function normalizePath(path: string): string {
   const p = path.replace(/\/+/g, "/").replace(/\/$/, "");
   return p.startsWith("/") ? p : `/${p}`;
+}
+
+function pathStartsWithPrefix(path: string, prefix: string): boolean {
+  const normalizedPath = normalizePath(path);
+  const normalizedPrefix = normalizePath(prefix);
+  return normalizedPath === normalizedPrefix || normalizedPath.startsWith(`${normalizedPrefix}/`);
 }

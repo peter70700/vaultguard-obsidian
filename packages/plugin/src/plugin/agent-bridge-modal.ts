@@ -6,6 +6,12 @@ import type {
   AgentBridgeServerInfo,
   AgentWriteMode,
 } from "./agent-bridge";
+import {
+  buildCodexAgentsGuidance,
+  buildCodexConfigToml,
+  buildCodexTempWorkspaceLaunchCommand,
+  buildCodexTokenEnvCommand,
+} from "./agent-bridge-codex";
 import { AtRestPasswordConfirmModal } from "./at-rest-modals";
 
 interface BridgeConnection {
@@ -257,6 +263,10 @@ export class AgentBridgeLeaseModal extends Modal {
 
     const rawJson = JSON.stringify(connection, null, 2);
     const mcpConfig = this.buildMcpServerConfig(connection);
+    const codexConfig = buildCodexConfigToml({ mcpEndpoint: connection.mcpEndpoint });
+    const codexTokenCommand = buildCodexTokenEnvCommand(connection.token);
+    const codexLaunchCommand = buildCodexTempWorkspaceLaunchCommand(connection.token);
+    const codexAgentsGuidance = buildCodexAgentsGuidance();
 
     this.renderCopyableBlock(contentEl, {
       title: "Generic agent connection (custom HTTP-RPC)",
@@ -272,6 +282,38 @@ export class AgentBridgeLeaseModal extends Modal {
         "Paste this snippet into Claudian's MCP servers settings (or into a Claude Code .mcp.json) to expose VaultGuard as an MCP server. After installing, author a slash command with `allowed-tools: mcp__vaultguard__*` so the CLI uses the bridge tools instead of its built-in Read/Glob/Grep against the encrypted vault folder.",
       json: mcpConfig,
       copyLabel: "Copy MCP config",
+    });
+
+    this.renderCopyableBlock(contentEl, {
+      title: "Codex config.toml MCP server",
+      description:
+        "Paste this into ~/.codex/config.toml, or into a trusted non-vault project .codex/config.toml. The bearer token is intentionally not stored here; set VAULTGUARD_AGENT_TOKEN in the shell that launches Codex.",
+      json: codexConfig,
+      copyLabel: "Copy Codex config",
+    });
+
+    this.renderCopyableBlock(contentEl, {
+      title: "Codex token environment command",
+      description:
+        "Run this in the same PowerShell session that launches Codex. Rotate the lease token if this command is copied somewhere you do not trust.",
+      json: codexTokenCommand,
+      copyLabel: "Copy token command",
+    });
+
+    this.renderCopyableBlock(contentEl, {
+      title: "Codex empty workspace launch",
+      description:
+        "Use this when asking Codex to work with protected vault content. It starts Codex away from the real vault folder, so vault access goes through the VaultGuard MCP tools.",
+      json: codexLaunchCommand,
+      copyLabel: "Copy launch command",
+    });
+
+    this.renderCopyableBlock(contentEl, {
+      title: "Codex AGENTS.md guidance",
+      description:
+        "Optional project guidance for non-vault workspaces. Do not save bearer tokens in AGENTS.md, skills, or repo files.",
+      json: codexAgentsGuidance,
+      copyLabel: "Copy AGENTS guidance",
     });
 
     const buttons = contentEl.createDiv({ cls: "vaultguard-modal-actions" });

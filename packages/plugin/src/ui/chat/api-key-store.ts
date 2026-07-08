@@ -22,13 +22,22 @@ const SS_PREFIX = "ss:";
 const AR_PREFIX = "ar:";
 
 export class AnthropicKeyStore {
-  private fallbackWarningLogged = false;
+  private readonly store: EncryptedApiKeyStore;
 
-  constructor(private readonly plugin: VaultGuardPlugin) {}
+  constructor(plugin: VaultGuardPlugin) {
+    this.store = new EncryptedApiKeyStore(plugin, {
+      label: "Anthropic",
+      emptyError: "Anthropic API key cannot be empty.",
+      getEnvelope: () => plugin.settings.encryptedAnthropicKey,
+      setEnvelope: (envelope) => {
+        plugin.settings.encryptedAnthropicKey = envelope;
+      },
+    });
+  }
 
   /** True if an encrypted key is currently persisted. Does not decrypt. */
   hasKey(): boolean {
-    return !!this.plugin.settings.encryptedAnthropicKey;
+    return this.store.hasKey();
   }
 
   /**
@@ -38,40 +47,7 @@ export class AnthropicKeyStore {
    * caller can surface a clear error rather than silently dropping the key.
    */
   async setKey(plain: string): Promise<void> {
-    const trimmed = plain.trim();
-    if (!trimmed) {
-      throw new Error("Anthropic API key cannot be empty.");
-    }
-
-    const safeStorage = probeSafeStorage();
-    if (safeStorage) {
-      const blob = safeStorage.encryptString(trimmed);
-      const bytes = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
-      this.plugin.settings.encryptedAnthropicKey = `${SS_PREFIX}${bytesToBase64(bytes)}`;
-      await this.plugin.saveSettings();
-      return;
-    }
-
-    const cipher = this.plugin.getAtRestCipher();
-    if (cipher?.isReady()) {
-      if (!this.fallbackWarningLogged) {
-        console.warn(
-          `${LOG_PREFIX} OS keychain (safeStorage) unavailable — storing the Anthropic API key ` +
-            "with the local at-rest key (LAK) fallback. Anyone with the full Electron profile " +
-            "directory could recover it; see docs/AT-REST-ENCRYPTION.md.",
-        );
-        this.fallbackWarningLogged = true;
-      }
-      const buf = await cipher.encryptString(trimmed);
-      this.plugin.settings.encryptedAnthropicKey = `${AR_PREFIX}${bytesToBase64(new Uint8Array(buf))}`;
-      await this.plugin.saveSettings();
-      return;
-    }
-
-    throw new Error(
-      "Cannot store the API key: neither the OS keychain nor the local at-rest cipher is available. " +
-        "Unlock VaultGuard's local encryption first.",
-    );
+    return this.store.setKey(plain);
   }
 
   /**
@@ -80,7 +56,104 @@ export class AnthropicKeyStore {
    * cross-device envelope degrades to "no key" rather than crashing the caller.
    */
   async getKey(): Promise<string | null> {
-    const envelope = this.plugin.settings.encryptedAnthropicKey;
+    return this.store.getKey();
+  }
+
+  /** Remove the stored key entirely. */
+  async clearKey(): Promise<void> {
+    return this.store.clearKey();
+  }
+}
+
+export class OpenAiKeyStore {
+  private readonly store: EncryptedApiKeyStore;
+
+  constructor(plugin: VaultGuardPlugin) {
+    this.store = new EncryptedApiKeyStore(plugin, {
+      label: "OpenAI",
+      emptyError: "OpenAI API key cannot be empty.",
+      getEnvelope: () => plugin.settings.encryptedOpenAiKey,
+      setEnvelope: (envelope) => {
+        plugin.settings.encryptedOpenAiKey = envelope;
+      },
+    });
+  }
+
+  hasKey(): boolean {
+    return this.store.hasKey();
+  }
+
+  async setKey(plain: string): Promise<void> {
+    return this.store.setKey(plain);
+  }
+
+  async getKey(): Promise<string | null> {
+    return this.store.getKey();
+  }
+
+  async clearKey(): Promise<void> {
+    return this.store.clearKey();
+  }
+}
+
+interface EncryptedApiKeyStoreConfig {
+  label: string;
+  emptyError: string;
+  getEnvelope(): string | undefined;
+  setEnvelope(envelope: string | undefined): void;
+}
+
+class EncryptedApiKeyStore {
+  private fallbackWarningLogged = false;
+
+  constructor(
+    private readonly plugin: VaultGuardPlugin,
+    private readonly config: EncryptedApiKeyStoreConfig,
+  ) {}
+
+  hasKey(): boolean {
+    return !!this.config.getEnvelope();
+  }
+
+  async setKey(plain: string): Promise<void> {
+    const trimmed = plain.trim();
+    if (!trimmed) {
+      throw new Error(this.config.emptyError);
+    }
+
+    const safeStorage = probeSafeStorage();
+    if (safeStorage) {
+      const blob = safeStorage.encryptString(trimmed);
+      const bytes = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
+      this.config.setEnvelope(`${SS_PREFIX}${bytesToBase64(bytes)}`);
+      await this.plugin.saveSettings();
+      return;
+    }
+
+    const cipher = this.plugin.getAtRestCipher();
+    if (cipher?.isReady()) {
+      if (!this.fallbackWarningLogged) {
+        console.warn(
+          `${LOG_PREFIX} OS keychain (safeStorage) unavailable — storing the ${this.config.label} API key ` +
+            "with the local at-rest key (LAK) fallback. Anyone with the full Electron profile " +
+            "directory could recover it; see docs/AT-REST-ENCRYPTION.md.",
+        );
+        this.fallbackWarningLogged = true;
+      }
+      const buf = await cipher.encryptString(trimmed);
+      this.config.setEnvelope(`${AR_PREFIX}${bytesToBase64(new Uint8Array(buf))}`);
+      await this.plugin.saveSettings();
+      return;
+    }
+
+    throw new Error(
+      "Cannot store the API key: neither the OS keychain nor the local at-rest cipher is available. " +
+      "Unlock VaultGuard's local encryption first.",
+    );
+  }
+
+  async getKey(): Promise<string | null> {
+    const envelope = this.config.getEnvelope();
     if (!envelope) return null;
 
     try {
@@ -88,7 +161,7 @@ export class AnthropicKeyStore {
         const safeStorage = probeSafeStorage();
         if (!safeStorage) {
           console.warn(
-            `${LOG_PREFIX} Stored Anthropic key was encrypted with the OS keychain, which is ` +
+            `${LOG_PREFIX} Stored ${this.config.label} key was encrypted with the OS keychain, which is ` +
               "unavailable on this device. Re-enter the key in VaultGuard settings.",
           );
           return null;
@@ -101,7 +174,7 @@ export class AnthropicKeyStore {
         const cipher = this.plugin.getAtRestCipher();
         if (!cipher?.isReady()) {
           console.warn(
-            `${LOG_PREFIX} Stored Anthropic key needs the local at-rest cipher, which is not ready. ` +
+            `${LOG_PREFIX} Stored ${this.config.label} key needs the local at-rest cipher, which is not ready. ` +
               "Unlock VaultGuard's local encryption and retry.",
           );
           return null;
@@ -110,18 +183,17 @@ export class AnthropicKeyStore {
         return cipher.decryptString(bytes);
       }
 
-      console.warn(`${LOG_PREFIX} Unrecognized Anthropic key envelope format; ignoring.`);
+      console.warn(`${LOG_PREFIX} Unrecognized ${this.config.label} key envelope format; ignoring.`);
       return null;
     } catch (e) {
-      console.warn(`${LOG_PREFIX} Could not decrypt the stored Anthropic key:`, e);
+      console.warn(`${LOG_PREFIX} Could not decrypt the stored ${this.config.label} key:`, e);
       return null;
     }
   }
 
-  /** Remove the stored key entirely. */
   async clearKey(): Promise<void> {
-    if (!this.plugin.settings.encryptedAnthropicKey) return;
-    this.plugin.settings.encryptedAnthropicKey = undefined;
+    if (!this.config.getEnvelope()) return;
+    this.config.setEnvelope(undefined);
     await this.plugin.saveSettings();
   }
 }

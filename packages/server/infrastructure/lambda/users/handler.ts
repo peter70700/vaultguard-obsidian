@@ -1477,6 +1477,7 @@ async function persistOrgSettings(org: OrgRecord, settings: OrgSettings): Promis
     allowedDomains: settings.allowedDomains,
     retentionDays: settings.retentionDays,
     autoLockMinutes: settings.autoLockMinutes,
+    idleAction: settings.idleAction,
     allowAdminPerFileRestrictions: settings.allowAdminPerFileRestrictions,
     disabledAuditActions: settings.disabledAuditActions,
   };
@@ -1560,6 +1561,10 @@ async function handleUpdateOrgSettings(
     autoLockMinutes:
       parseNonNegativeInteger(body.autoLockMinutes, currentSettings.autoLockMinutes) ??
       currentSettings.autoLockMinutes,
+    idleAction:
+      body.idleAction === 'lock' || body.idleAction === 'logout'
+        ? body.idleAction
+        : currentSettings.idleAction,
     allowAdminPerFileRestrictions:
       typeof body.allowAdminPerFileRestrictions === 'boolean'
         ? body.allowAdminPerFileRestrictions

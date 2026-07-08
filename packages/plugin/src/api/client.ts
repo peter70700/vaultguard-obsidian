@@ -50,6 +50,13 @@ export interface FileMetadata {
   size: number;
   lastModified: string;
   encryptedKey: string;
+  versionId?: string;
+  checksum?: string;
+  contentType?: string;
+}
+
+export interface PutFileOptions {
+  expectedVersionId?: string;
 }
 
 export interface PermissionRule {
@@ -306,6 +313,14 @@ export interface OrgSettingsResponse {
   retentionDays: number;
   autoLockMinutes: number;
   /**
+   * Idle-timeout policy: `"lock"` engages the cryptographic vault lock
+   * (evict the in-memory LAK, require a PIN to resume) instead of a full
+   * logout. OPTIONAL — a server that predates idle-lock omits the field;
+   * every read site treats absent as `"logout"` (`?? "logout"`) so an
+   * un-upgraded server keeps today's logout-on-idle behavior exactly.
+   */
+  idleAction?: "lock" | "logout";
+  /**
    * When true, per-file deny rules bind admins too (the backend's bypass
    * is opt-in disabled for target-side evaluation and file ops). The
    * plugin UI uses this to decide whether the per-file level dropdown is
@@ -396,6 +411,15 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes.buffer;
+}
+
+function encodeFilePathForRoute(path: string, options: { operation?: "read" } = {}): string {
+  const normalized = path.replace(/^\/+/, "");
+  if (normalized === "deleted") {
+    const operation = options.operation === "read" ? "?operation=read" : "";
+    return `deleted${operation}`;
+  }
+  return encodeURIComponent(path);
 }
 
 // ─── Agent-bridge context helpers ──────────────────────────────────────────
@@ -671,20 +695,29 @@ export class VaultGuardApiClient {
   }
 
   async getFile(path: string): Promise<ArrayBuffer> {
-    const response = await this.request<{ content: string }>("GET", `${this.vaultBase()}/files/${encodeURIComponent(path)}`);
+    const response = await this.request<{ content: string }>("GET", `${this.vaultBase()}/files/${encodeFilePathForRoute(path, { operation: "read" })}`);
     return base64ToArrayBuffer(response.content);
   }
 
-  async putFile(path: string, content: ArrayBuffer, metadata: Partial<FileMetadata>): Promise<FileMetadata> {
-    const response = await this.request<FileMetadata>("PUT", `${this.vaultBase()}/files/${encodeURIComponent(path)}`, {
+  async putFile(
+    path: string,
+    content: ArrayBuffer,
+    metadata: Partial<FileMetadata>,
+    options: PutFileOptions = {}
+  ): Promise<FileMetadata> {
+    const body: Record<string, string> = {
       content: uint8ToBase64(new Uint8Array(content)),
       contentType: metadata.encryptedKey ? "application/octet-stream" : "text/markdown",
-    });
+    };
+    if (options.expectedVersionId) {
+      body.expectedVersionId = options.expectedVersionId;
+    }
+    const response = await this.request<FileMetadata>("PUT", `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}`, body);
     return response;
   }
 
   async deleteFile(path: string): Promise<void> {
-    await this.request<void>("DELETE", `${this.vaultBase()}/files/${encodeURIComponent(path)}`);
+    await this.request<void>("DELETE", `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}`);
   }
 
   async getFileHistory(path: string): Promise<{ version: string; timestamp: string; userId: string }[]> {

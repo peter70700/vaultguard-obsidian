@@ -178,7 +178,17 @@ class MockItemView {
   }
 }
 
-class MockMarkdownView {}
+// Mirror Obsidian's real class hierarchy: MarkdownView extends FileView.
+// The header touches only `.file` and `.containerEl`, so the base exposes
+// exactly those two members. Keeping the `extends` relationship intact means
+// `getActiveViewOfType(FileView)` correctly still matches a markdown view
+// (`instanceof FileView` is true for it) while an image/pdf FileView is a
+// FileView but NOT a MarkdownView.
+class MockFileView {
+  file: unknown = null;
+  containerEl: unknown = {};
+}
+class MockMarkdownView extends MockFileView {}
 class MockWorkspaceLeaf {}
 class MockApp {}
 class MockTAbstractFile {
@@ -309,6 +319,7 @@ vi.mock('obsidian', () => ({
   TextComponent: MockTextComponent,
   ItemView: MockItemView,
   MarkdownView: MockMarkdownView,
+  FileView: MockFileView,
   WorkspaceLeaf: MockWorkspaceLeaf,
   TFile: MockTFile,
   TFolder: MockTFolder,

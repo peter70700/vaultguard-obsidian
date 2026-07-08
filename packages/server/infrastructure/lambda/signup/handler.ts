@@ -35,7 +35,6 @@ import {
   GetCommand,
   ScanCommand,
   ORGANIZATIONS_TABLE,
-  PERMISSIONS_TABLE,
   VAULTS_TABLE,
   VAULT_MEMBERS_TABLE,
   SUBSCRIPTIONS_TABLE,
@@ -210,7 +209,7 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
  * 2. Create org record in DynamoDB
  * 3. Create Cognito group for the org
  * 4. Create Cognito admin user
- * 5. Seed default wildcard permission rule
+ * 5. Seed a default vault (owner added as admin)
  */
 async function handleSignup(
   event: APIGatewayProxyEvent,
@@ -423,6 +422,11 @@ async function handleSignup(
       allowedDomains: [],
       retentionDays: 365,
       autoLockMinutes: 30,
+      // O-1 humane default: brand-new orgs LOCK (evict keys + local-PIN
+      // unlock) instead of full logout on idle. Existing orgs have no
+      // idleAction key and normalize to 'logout' via normalizeStoredOrgSettings
+      // — so shipping this never silently switches a deployed org to lock.
+      idleAction: 'lock',
     },
     createdAt: now,
     updatedAt: now,
@@ -484,8 +488,13 @@ async function handleSignup(
 
   // Step 6: Seed a default vault. Every org needs at least one vault for the
   // plugin to bind to — without it the user lands in the picker with nothing
-  // to pick. We auto-create a `default` vault, add the org owner as its admin,
-  // and seed an org-wide allow-all permission rule scoped to it.
+  // to pick. We auto-create a `default` vault and add the org owner as its
+  // admin. We deliberately do NOT seed a wildcard allow-all permission rule
+  // (one matching every user on every path): it would grant all five actions
+  // to every member and silently override viewer/editor role limits. Role
+  // enforcement instead flows through evaluatePermission's membership-baseline
+  // fallback (shared/utils.ts), and member-add / invite flows seed explicit
+  // per-user rules.
   const defaultVaultId = generateId();
   const defaultVault: VaultRecord = {
     orgId,
@@ -517,32 +526,6 @@ async function handleSignup(
     new PutCommand({
       TableName: VAULT_MEMBERS_TABLE,
       Item: ownerMembership,
-    })
-  );
-
-  // Step 7: Seed default wildcard permission inside the new vault.
-  // Permissions table uses pk (ruleId) + sk (RULE) as composite key.
-  const ruleId = generateId();
-  const defaultRule = {
-    pk: ruleId,
-    sk: `RULE`,
-    id: ruleId,
-    orgId,
-    vaultId: defaultVaultId,
-    userId: '*',
-    pathPattern: '/**',
-    actions: ['read', 'write', 'list', 'delete', 'admin'],
-    effect: 'allow',
-    priority: 1,
-    createdAt: now,
-    updatedAt: now,
-    createdBy: userId,
-  };
-
-  await docClient.send(
-    new PutCommand({
-      TableName: PERMISSIONS_TABLE,
-      Item: defaultRule,
     })
   );
 

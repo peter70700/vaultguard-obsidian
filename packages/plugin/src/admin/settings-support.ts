@@ -49,6 +49,10 @@ export function buildFallbackOrgSettings(
     allowedDomains: [],
     retentionDays: 365,
     autoLockMinutes: 30,
+    // Offline / unknown-org fallback: "logout" is the safe, no-surprise value
+    // (a cryptographically locked vault the user cannot unlock offline would be
+    // worse than a logout). Mirrors the server normalizer's absent -> "logout".
+    idleAction: "logout",
   };
 }
 

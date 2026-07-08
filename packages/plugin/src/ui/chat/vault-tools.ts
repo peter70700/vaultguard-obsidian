@@ -10,6 +10,7 @@ export type VaultToolName =
   | "vaultguard_list"
   | "vaultguard_search"
   | "vaultguard_read"
+  | "vaultguard_get_vault_orientation"
   | "vaultguard_apply_patch"
   | "vaultguard_create"
   | "vaultguard_delete"
@@ -77,6 +78,29 @@ export const VAULT_TOOL_DEFS = [
       properties: {
         path: { type: "string", description: "Vault-relative path (e.g. project-x/Plan.md)." },
         maxBytes: { type: "integer", minimum: 1, description: "Truncate the response to at most this many UTF-8 bytes." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "vaultguard_get_vault_orientation",
+    description:
+      "Return safe metadata-only orientation for the active Obsidian vault, connector path, VaultGuard protection state, and bounded Git status. Does not grant access and never exposes absolute local paths, raw Git remote URLs, tokens, or key material.",
+    input_schema: {
+      type: "object",
+      properties: {
+        includeKnownVaults: {
+          type: "boolean",
+          description: "Include bounded known-vault metadata when needed to distinguish vaults.",
+        },
+        includeGit: {
+          type: "boolean",
+          description: "Include bounded Git detection/status for the active vault root only.",
+        },
+        includeConnectorStatus: {
+          type: "boolean",
+          description: "Include the connector readiness matrix.",
+        },
       },
       additionalProperties: false,
     },

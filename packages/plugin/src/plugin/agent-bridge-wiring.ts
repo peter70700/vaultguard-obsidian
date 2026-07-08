@@ -18,6 +18,9 @@ import {
   type AgentBridgeServerInfo,
   type AgentBridgeToolSurface,
   type AccessQueryProvider,
+  type ChatGptConnectorDescription,
+  type ChatGptConnectorSessionInput,
+  type ChatGptConnectorSessionSecret,
   VaultGuardAgentBridge,
 } from "./agent-bridge";
 import {
@@ -28,6 +31,13 @@ import {
   type SkillInstallStatus,
   type SkillInstallerDeps,
 } from "./agent-bridge-skill/installer";
+import {
+  inspectCodexSkillInstall,
+  installCodexSkill,
+  uninstallCodexSkill,
+  type CodexInstallResult,
+  type CodexSkillInstallStatus,
+} from "./agent-bridge-codex-skill/installer";
 import { VaultGraph } from "./graph/vault-graph";
 import type { AgentBridgeRuntimeContext } from "./plugin-runtime-types";
 
@@ -52,6 +62,13 @@ export class AgentBridgeRuntime {
       makeVaultGraph: (graphDeps) => new VaultGraph(this.ctx.app, graphDeps),
       isMetadataSuppressed: (path) => this.ctx.isMetadataSuppressed(path),
       readText: (path) => this.ctx.readText(path),
+      getVaultOrientation: (context, options) => {
+        const service = this.ctx.getVaultOrientationService();
+        if (!service) {
+          throw new Error("Vault orientation service is not initialized.");
+        }
+        return service.getSnapshot(context, options);
+      },
       writeText: (path, content) => this.ctx.writeText(path, content),
       deleteFile: (path) => this.ctx.deleteFile(path),
       renameFile: (oldPath, newPath) => this.ctx.renameFile(oldPath, newPath),
@@ -143,6 +160,25 @@ export class AgentBridgeRuntime {
     return this.ensureBridge().createLease(input);
   }
 
+  describeChatGptConnector(): ChatGptConnectorDescription {
+    return this.ensureBridge().describeChatGptConnector();
+  }
+
+  async createChatGptConnectorSession(
+    input: ChatGptConnectorSessionInput = {},
+  ): Promise<ChatGptConnectorSessionSecret> {
+    await this.startServer();
+    return this.ensureBridge().createChatGptConnectorSession(input);
+  }
+
+  revokeChatGptConnectorSession(sessionId: string): boolean {
+    return this.ensureBridge().revokeChatGptConnectorSession(sessionId);
+  }
+
+  revokeAllChatGptConnectorSessions(): number {
+    return this.ensureBridge().revokeAllChatGptConnectorSessions();
+  }
+
   beginImportSession(absRoot: string): Promise<string> {
     return this.ensureBridge().beginImportSession(absRoot);
   }
@@ -192,7 +228,13 @@ export class AgentBridgeRuntime {
     return { ...inspectSkillInstall(deps), available: true };
   }
 
-  async installSkill(options: { overwriteUnmanaged?: boolean } = {}): Promise<InstallResult> {
+  getCodexSkillStatus(): (CodexSkillInstallStatus & { available: true }) | { available: false } {
+    const deps = this.getSkillInstallerDeps();
+    if (!deps) return { available: false };
+    return { ...inspectCodexSkillInstall(deps), available: true };
+  }
+
+  async installSkill(options: { overwriteUnmanaged?: boolean; force?: boolean } = {}): Promise<InstallResult> {
     const deps = this.getSkillInstallerDeps();
     if (!deps) {
       throw new Error(
@@ -218,6 +260,40 @@ export class AgentBridgeRuntime {
     const result = uninstallSkill(deps, options);
     if (result.removed) {
       await this.ctx.emitAudit("bridge.skill_uninstalled", result.filePath, {
+        force: options.force === true,
+      });
+    }
+    return result;
+  }
+
+  async installCodexSkill(options: { overwriteUnmanaged?: boolean; force?: boolean } = {}): Promise<CodexInstallResult> {
+    const deps = this.getSkillInstallerDeps();
+    if (!deps) {
+      throw new Error(
+        "Codex skill install requires Node filesystem access (desktop Obsidian). Skipping on this device.",
+      );
+    }
+    const result = installCodexSkill(deps, options);
+    await this.ctx.emitAudit("bridge.skill_installed", result.filePath, {
+      action: result.action,
+      client: "codex",
+      overwriteUnmanaged: options.overwriteUnmanaged === true,
+    });
+    return result;
+  }
+
+  async uninstallCodexSkill(options: { force?: boolean } = {}): Promise<{
+    filePath: string;
+    removed: boolean;
+  }> {
+    const deps = this.getSkillInstallerDeps();
+    if (!deps) {
+      throw new Error("Codex skill uninstall requires Node filesystem access (desktop Obsidian).");
+    }
+    const result = uninstallCodexSkill(deps, options);
+    if (result.removed) {
+      await this.ctx.emitAudit("bridge.skill_uninstalled", result.filePath, {
+        client: "codex",
         force: options.force === true,
       });
     }

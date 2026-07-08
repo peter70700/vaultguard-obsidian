@@ -12,14 +12,56 @@ import {
 import type {
   AtRestAdapterRuntimeContext,
   RemoteFileContentResponse,
+  RemoteFileWriteResponse,
+  RemoteWriteConflictResolutionResult,
   VaultAdapterOriginalMethods,
 } from "./plugin-runtime-types";
+// BIN-A / L1: interceptedRename's binary branch reuses the shared size ceiling,
+// upload timeout, and MIME map.
+import {
+  BINARY_PUT_TIMEOUT_MS,
+  BINARY_SYNC_MAX_BYTES,
+  contentTypeForPath,
+  isKnownBinaryExtensionPath,
+} from "./binary-content";
+import {
+  DEFAULT_LONG_OPERATION_BATCH_SIZE,
+  DEFAULT_STALLED_OPERATION_MS,
+  describeConflict,
+  evaluateWorkloadGuard,
+  isLongOperationConflict,
+  processInBatches,
+  summarizeFileLikeWorkload,
+  type LongOperationHandle,
+} from "./long-operation";
+import {
+  LOCAL_PROJECT_MEMORY_MODE_NOTICE,
+  isLocalProjectMemoryModeEnabled,
+  isLocalProjectMemoryPlaintextPath,
+} from "./local-project-memory-mode";
 
 function getActiveObsidianDocument(): Document | null {
   if (typeof activeDocument !== "undefined") {
     return activeDocument;
   }
   return null;
+}
+
+/**
+ * BIN-A / L3: chunked Uint8Array → base64 for queuing a binary rename payload.
+ * Mirrors main.ts's bytesToBase64 (0x8000-byte slices via String.fromCharCode.apply)
+ * — browser-native (no Node Buffer, mobile constraint) and GC-friendly at 7 MB.
+ * Duplicated per module per repo convention (no cross-module barrel imports for
+ * tiny helpers). Output is byte-identical to a per-byte reference loop.
+ */
+function uint8ToBase64Chunked(bytes: Uint8Array): string {
+  const CHUNK_SIZE = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    const chunk = bytes.subarray(i, i + CHUNK_SIZE);
+    binary += String.fromCharCode.apply(null, chunk as unknown as number[]);
+  }
+  return btoa(binary);
 }
 
 /**
@@ -39,11 +81,28 @@ const emptyAdapterMethods = (): VaultAdapterOriginalMethods => ({
   list: null,
   remove: null,
   rename: null,
+  getResourcePath: null,
 });
+
+export interface AtRestDecryptAndDisableResult {
+  decrypted: number;
+  skipped: number;
+  failed: number;
+  remainingCiphertextPaths: string[];
+  failures: Array<{ path: string; error: string }>;
+}
 
 export class AtRestAdapterRuntime {
   private originalAdapterMethods: VaultAdapterOriginalMethods = emptyAdapterMethods();
   private atRestCipher: AtRestCipher | null = null;
+  /**
+   * Phase 12 (vault idle-lock): fail-closed content gate. When true the LAK is
+   * evicted and every VG1 read short-circuits with a clean "vault locked" error
+   * (no 10s waitForCipherInit hang — Pitfall 4). Set by the plugin's
+   * enterLockState (via setLocked) and on a PIN-enrolled cold start
+   * (initAtRestCipher lands LOCKED, edge #6); cleared by unlockCipherWithLak.
+   */
+  private locked = false;
   private atRestFirstRunOffered = false;
   private readOnlyFallbackNoticeAt: Map<string, number> = new Map();
   private cloudDecryptFallbackNoticeAt: Map<string, number> = new Map();
@@ -52,6 +111,14 @@ export class AtRestAdapterRuntime {
   private binaryWriteNoticeAt: Map<string, number> = new Map();
   /** Paths currently being re-encrypted in place (dedupes concurrent triggers). */
   private inPlaceEncryptionInFlight: Set<string> = new Set();
+  /**
+   * BIN-A preview: path → decrypted `blob:` URL + the resource mtime it was
+   * decrypted at. `getResourcePath` (sync) serves these so at-rest-encrypted
+   * media renders; the async decrypt populates the cache and swaps the DOM src.
+   */
+  private resourcePreviewCache: Map<string, { url: string; mtime: string }> = new Map();
+  /** Paths whose decrypted blob is currently being produced (dedupes concurrent renders). */
+  private resourcePreviewInFlight: Set<string> = new Set();
 
   constructor(private ctx: AtRestAdapterRuntimeContext) {}
 
@@ -71,8 +138,55 @@ export class AtRestAdapterRuntime {
     this.atRestCipher = cipher;
   }
 
+  // ─── Phase 12 vault idle-lock: fail-closed lock state ───────────────────────
+
+  /** True while the vault is cryptographically locked (LAK evicted). */
+  isLocked(): boolean {
+    return this.locked;
+  }
+
+  /**
+   * Flip the fail-closed lock flag. Locking also revokes the decrypted-media
+   * blob-URL cache (Pitfall 1) so already-rendered images/PDFs can't leak
+   * behind the curtain. The plugin's enterLockState calls setLocked(true) AFTER
+   * evicting the in-memory LAK via `atRestCipher.lock()`; unlockCipherWithLak
+   * clears it. Distinct from `atRestCipher.lock()`: this flag makes reads fail
+   * CLOSED immediately (no waitForCipherInit), independent of cipher readiness.
+   */
+  setLocked(locked: boolean): void {
+    this.locked = locked;
+    if (locked) {
+      this.revokeAllResourcePreviews();
+    }
+  }
+
+  /**
+   * Adopt a PIN-unwrapped LAK and lift the lock: import the raw key into the
+   * cipher (without recreating the transparent `lak.envelope` — NN-1) and clear
+   * the fail-closed flag so VG1 reads succeed again. Called by the plugin's
+   * unlockWithPin once PinLockManager yields the LAK.
+   */
+  async unlockCipherWithLak(bytes: Uint8Array): Promise<void> {
+    await this.getAtRestCipher()?.unlockWithLak(bytes);
+    this.setLocked(false);
+  }
+
   getAtRestStatus(): AtRestStatus {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      return {
+        kind: "disabled",
+        reason: "Local Project Memory Mode keeps project files plaintext.",
+      };
+    }
     return this.atRestCipher?.getStatus() ?? { kind: "uninitialized" };
+  }
+
+  isLocalProjectMemoryModeEnabled(): boolean {
+    return isLocalProjectMemoryModeEnabled(this.settings);
+  }
+
+  isLocalProjectMemoryPlaintextPath(path: string): boolean {
+    return isLocalProjectMemoryPlaintextPath(path, this.app.vault.configDir);
   }
 
   async tallyAtRestState(): Promise<{
@@ -82,6 +196,9 @@ export class AtRestAdapterRuntime {
     failed: number;
     total: number;
   }> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      return this.tallyLocalProjectMemoryAtRestState();
+    }
     const cipher = this.atRestCipher;
     const readBin = this.originalAdapterMethods.readBinary;
     const files = this.app.vault.getFiles();
@@ -108,12 +225,39 @@ export class AtRestAdapterRuntime {
     return { plaintext, encrypted, excluded, failed, total: files.length };
   }
 
+  private async tallyLocalProjectMemoryAtRestState(): Promise<{
+    plaintext: number;
+    encrypted: number;
+    excluded: number;
+    failed: number;
+    total: number;
+  }> {
+    const readBin = this.originalAdapterMethods.readBinary;
+    const files = this.app.vault.getFiles();
+    let plaintext = 0;
+    let encrypted = 0;
+    let failed = 0;
+    if (!readBin) {
+      return { plaintext: 0, encrypted: 0, excluded: 0, failed: 0, total: files.length };
+    }
+    for (const file of files) {
+      try {
+        const bytes = await readBin(file.path);
+        if (this.hasVg1MagicBytes(bytes)) encrypted += 1;
+        else plaintext += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    return { plaintext, encrypted, excluded: 0, failed, total: files.length };
+  }
+
   async migrateVaultToAtRest(): Promise<void> {
     return this.encryptVaultAtRest();
   }
 
   async revertVaultFromAtRest(): Promise<void> {
-    return this.decryptVaultAtRest();
+    await this.decryptVaultAtRestAndDisableEncryption();
   }
 
   async exportAtRestRecoveryCode(): Promise<string> {
@@ -151,6 +295,11 @@ export class AtRestAdapterRuntime {
 
   private get settings() {
     return this.ctx.settings;
+  }
+
+  /** True when a device PIN currently owns the LAK (Phase 12; optional ctx signal). */
+  private isPinLockEnrolled(): boolean {
+    return this.ctx.isPinLockEnrolled?.() ?? false;
   }
 
   private get session() {
@@ -252,8 +401,85 @@ export class AtRestAdapterRuntime {
     return this.ctx.shouldUploadChangesImmediately();
   }
 
-  private queueOfflineOperation(operation: "write" | "delete", path: string, data?: string): void {
-    this.ctx.queueOfflineOperation(operation, path, data);
+  private queueOfflineOperation(
+    operation: "write" | "delete",
+    path: string,
+    data?: string,
+    // BIN-A / D-09 + version-guard: forward the optional binary-payload marker
+    // (encoding + MIME) and/or version-guard fields to the runtime queue. All
+    // existing 3-arg (text) call sites stay valid.
+    options?: {
+      encoding?: "base64";
+      contentType?: string;
+      baseVersionId?: string;
+      baseHash?: string;
+    },
+  ): void {
+    this.ctx.queueOfflineOperation(operation, path, data, options);
+  }
+
+  private getExpectedVersionId(path: string): string | undefined {
+    return this.ctx.getExpectedVersionId(path);
+  }
+
+  private recordRemoteFilePresent(
+    path: string,
+    update: {
+      versionId?: string | null;
+      baseHash?: string | null;
+      checksum?: string | null;
+      lastModified?: string | null;
+      size?: number | null;
+    } = {},
+  ): void {
+    this.ctx.recordRemoteFilePresent(path, update);
+  }
+
+  private recordRemoteFileAbsent(path: string): void {
+    this.ctx.recordRemoteFileAbsent(path);
+  }
+
+  private handleRemoteWriteConflict(
+    path: string,
+    localContent: string,
+    baseVersionId?: string | null,
+  ): Promise<RemoteWriteConflictResolutionResult> {
+    return this.ctx.handleRemoteWriteConflict(path, localContent, baseVersionId);
+  }
+
+  private buildWriteBody(
+    path: string,
+    encryptedContent: string,
+    hash: string,
+    options: { forceOverwrite?: boolean; expectedVersionId?: string | null } = {},
+  ): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      content: encryptedContent,
+      hash,
+    };
+    const expectedVersionId =
+      options.expectedVersionId === undefined
+        ? this.getExpectedVersionId(path)
+        : options.expectedVersionId ?? undefined;
+    if (!options.forceOverwrite && expectedVersionId) {
+      body.expectedVersionId = expectedVersionId;
+    }
+    return body;
+  }
+
+  private recordSuccessfulWrite(
+    path: string,
+    hash: string,
+    response: ApiResponse<RemoteFileWriteResponse>,
+  ): void {
+    if (!response.success) return;
+    this.recordRemoteFilePresent(path, {
+      versionId: response.data?.versionId,
+      baseHash: hash,
+      checksum: response.data?.checksum,
+      lastModified: response.data?.lastModified,
+      size: response.data?.size,
+    });
   }
 
   private recordDeletionTombstone(path: string): void {
@@ -276,12 +502,30 @@ export class AtRestAdapterRuntime {
     return this.ctx.computeHash(content);
   }
 
+  // BIN-A / D-02: byte-crypto wrappers mirroring the string siblings above. The
+  // ctx exposes both from plan 11-01; interceptedRename's binary branch calls
+  // these (never this.ctx.* directly) so the interception body stays uniform.
+  private encryptContentBytes(bytes: ArrayBuffer): Promise<string> {
+    return this.ctx.encryptContentBytes(bytes);
+  }
+
+  private computeHashBytes(bytes: ArrayBuffer): Promise<string> {
+    return this.ctx.computeHashBytes(bytes);
+  }
+
   private apiRequest<T>(
     method: string,
     endpoint: string,
     body?: Record<string, unknown>,
     idTokenOverride?: string,
+    // L2 (BIN-A): optional per-request timeout override for large binary PUTs.
+    // Arity-preserving: existing callers keep the exact 3/4-arg shape (trailing
+    // undefineds would break toHaveBeenCalledWith assertions — see 11-01 b5142b1).
+    options?: { timeoutMs?: number },
   ): Promise<ApiResponse<T>> {
+    if (options !== undefined) {
+      return this.ctx.apiRequest<T>(method, endpoint, body, idTokenOverride, options);
+    }
     return this.ctx.apiRequest<T>(method, endpoint, body, idTokenOverride);
   }
 
@@ -366,9 +610,40 @@ export class AtRestAdapterRuntime {
     // of the human-readable JSON document makes reviews / debugging
     // settings clearer. The plugin folder is already in `isPathExcluded`,
     // so this file never participates in vault sync.
+    // Phase 12 (edge #6 / NN-1): when a device PIN owns the LAK, the LAK lives
+    // PIN-wrapped in `lak-pin.envelope` and the transparent `lak.envelope` is
+    // absent by design. Running the normal init below would see absent-envelope
+    // + existing VG1 ciphertext and route to `needs-recovery` — wrong for this
+    // flow. We instead construct the cipher, land LOCKED, and await the PIN.
+    const pinEnrolled = this.isPinLockEnrolled();
+
     const pluginId = this.manifest?.id ?? "vaultguard-sync";
     const envelopePath = this.vaultConfigPath("plugins", pluginId, "lak.envelope");
     const adapter = this.app.vault.adapter;
+    const localProjectMemoryMode = this.isLocalProjectMemoryModeEnabled();
+
+    if (localProjectMemoryMode) {
+      let envelopeExists = false;
+      try {
+        envelopeExists = await adapter.exists(envelopePath);
+      } catch (err) {
+        this.logError(`[local-project-memory] Probing at-rest envelope at ${envelopePath} failed`, err);
+      }
+      const ciphertextExists = await this.hasAtRestCiphertextOnDisk();
+      if (!envelopeExists) {
+        this.atRestCipher = null;
+        this.cipherInitPromise = null;
+        this.app.workspace.onLayoutReady(() => {
+          void this.warnIfLocalProjectMemoryCiphertextPresent();
+        });
+        this.log(
+          ciphertextExists
+            ? "Local Project Memory Mode active: VG1 files are present, but no LAK envelope exists; cipher provisioning skipped."
+            : "Local Project Memory Mode active: local at-rest cipher provisioning skipped.",
+        );
+        return;
+      }
+    }
 
     // One-time envelope migration after a plugin-id rename. If no envelope
     // exists at the current path but one DOES exist under a historical
@@ -376,8 +651,12 @@ export class AtRestAdapterRuntime {
     // existing unwrap path picks it up and on-disk VG1 files remain
     // decryptable. See PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION and commit
     // 9495041 (2026-05-14, vaultguard -> vaultguard-sync).
+    //
+    // Skipped entirely when a PIN is enrolled: copying a prior-id `lak.envelope`
+    // back in would recreate the PIN-free auto-unwrap path NN-1 deliberately
+    // removed (a same-OS user could then decrypt without the PIN, defeating D2).
     let envelopeMigrationFailureReason: string | null = null;
-    try {
+    if (!pinEnrolled) try {
       const currentExists = await adapter.exists(envelopePath);
       if (!currentExists) {
         const priorIds = PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION[pluginId] ?? [];
@@ -507,6 +786,17 @@ export class AtRestAdapterRuntime {
 
     this.atRestCipher = new AtRestCipher(storage);
 
+    // Edge #6 / NN-1: a PIN owns the LAK. Do NOT call cipher.init() (no
+    // provisioning, no needs-recovery routing). Land LOCKED and await the PIN —
+    // the plugin's unlockWithPin path calls unlockCipherWithLak(lak) once
+    // PinLockManager unwraps `lak-pin.envelope`. The cipher stays not-ready and
+    // every managed VG1 read fails closed (see readPlainFromDisk short-circuit).
+    if (pinEnrolled) {
+      this.locked = true;
+      this.log("AtRestCipher: PIN enrolled — landing LOCKED, awaiting unlock.");
+      return;
+    }
+
     // If the envelope migration found a sibling but failed to copy it,
     // short-circuit BEFORE running init(). Running init() now would see no
     // envelope and silently generate a fresh LAK, which is the exact failure
@@ -573,11 +863,69 @@ export class AtRestAdapterRuntime {
       // we don't auto-encrypt without consent because some users keep
       // local-only vaults and may not want VaultGuard touching every file.
       this.app.workspace.onLayoutReady(() => {
+        if (this.isLocalProjectMemoryModeEnabled()) {
+          void this.warnIfLocalProjectMemoryCiphertextPresent();
+          return;
+        }
         void this.maybeOfferFirstRunMigration();
       });
     } catch (err) {
       this.logError("AtRestCipher init threw", err);
     }
+  }
+
+  private async hasAtRestCiphertextOnDisk(): Promise<boolean> {
+    const found = await this.findAtRestCiphertextFiles({ limit: 1 });
+    return found.length > 0;
+  }
+
+  private async findAtRestCiphertextFiles(options: { limit?: number } = {}): Promise<string[]> {
+    const readBin = this.originalAdapterMethods.readBinary;
+    if (!readBin) return [];
+    const limit = options.limit ?? Number.POSITIVE_INFINITY;
+    const paths: string[] = [];
+    for (const file of this.app.vault.getFiles()) {
+      try {
+        const bytes = await readBin(file.path);
+        if (this.hasVg1MagicBytes(bytes)) {
+          paths.push(file.path);
+          if (paths.length >= limit) break;
+        }
+      } catch {
+        // Warning scans should never block plugin startup.
+      }
+    }
+    return paths;
+  }
+
+  async warnIfLocalProjectMemoryCiphertextPresent(): Promise<void> {
+    if (!this.isLocalProjectMemoryModeEnabled()) return;
+    const paths = await this.findAtRestCiphertextFiles({ limit: 20 });
+    if (paths.length === 0) return;
+    const doc = getActiveObsidianDocument();
+    if (!doc) {
+      new Notice(
+        `VaultGuard Sync: Local Project Memory Mode is active, but ${paths.length} encrypted VG1 file(s) were detected. Open VaultGuard settings and run "Decrypt vault and disable at-rest encryption".`,
+        12000,
+      );
+      return;
+    }
+    const notice = new Notice("", 0);
+    const frag = doc.createDocumentFragment();
+    const strong = frag.createEl("strong");
+    strong.setText("VaultGuard Sync: encrypted repo files detected. ");
+    frag.appendText(
+      `Local Project Memory Mode will not encrypt more files, but ${paths.length} VG1 file(s) still need recovery. `,
+    );
+    const link = frag.createEl("a", {
+      text: "Open settings to decrypt →",
+      cls: "vaultguard-notice-link",
+    });
+    link.addEventListener("click", () => {
+      notice.hide();
+      this.openVaultGuardSettings();
+    });
+    notice.setMessage(frag);
   }
 
   /**
@@ -589,6 +937,7 @@ export class AtRestAdapterRuntime {
   async maybeOfferFirstRunMigration(): Promise<void> {
     if (this.atRestFirstRunOffered) return;
     this.atRestFirstRunOffered = true;
+    if (this.isLocalProjectMemoryModeEnabled()) return;
     if (this.settings.atRestFirstRunDismissed) return;
     if (!this.atRestCipher?.isReady()) return;
 
@@ -663,6 +1012,13 @@ export class AtRestAdapterRuntime {
    * adapter interceptor.
    */
   async encryptVaultAtRest(): Promise<void> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice(
+        "VaultGuard Sync: encryption is disabled in Local Project Memory Mode. Files will remain plaintext.",
+        8000,
+      );
+      return;
+    }
     if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.readBinary || !this.originalAdapterMethods.writeBinary) {
       new Notice("VaultGuard Sync: at-rest cipher not initialised — cannot run migration.");
       return;
@@ -675,31 +1031,115 @@ export class AtRestAdapterRuntime {
     let encrypted = 0;
     let skipped = 0;
     let failed = 0;
-    new Notice(`VaultGuard Sync: encrypting ${files.length} files at rest…`, 3000);
+    let processed = 0;
+    let processedBytes = 0;
+    const workload = summarizeFileLikeWorkload(files);
+    const guard = evaluateWorkloadGuard(workload);
+    const warning = guard.warnings.join(" ");
 
-    for (const file of files) {
-      if (this.isAtRestExcluded(file.path)) {
-        skipped += 1;
-        continue;
+    let operation: LongOperationHandle;
+    try {
+      operation = this.ctx.beginLongOperation({
+        kind: "vault-encrypt",
+        operationName: "Encrypt vault at rest",
+        phase: "Preparing local encryption pass",
+        placement: "protected",
+        totalItems: files.length,
+        totalBytes: workload.totalBytes,
+        warning: warning || undefined,
+        capabilities: {
+          protectedPhase: true,
+          canCancel: false,
+          canPause: false,
+        },
+        conflictsWith: ["vault-decrypt", "sync", "background-sync", "initial-reconciliation"],
+        stalledAfterMs: DEFAULT_STALLED_OPERATION_MS,
+      });
+    } catch (error) {
+      if (isLongOperationConflict(error)) {
+        new Notice(`VaultGuard Sync: ${describeConflict(error.conflict)}`, 6000);
+        return;
       }
-      try {
-        const bytes = await readBin(file.path);
-        if (cipher.isEncrypted(bytes)) {
-          skipped += 1;
-          continue;
-        }
-        const ct = await cipher.encryptBinary(bytes);
-        await writeBin(file.path, ct);
-        encrypted += 1;
-      } catch (err) {
-        failed += 1;
-        this.logError(`At-rest encrypt: failed for "${file.path}"`, err);
-      }
+      throw error;
     }
-    new Notice(
-      `VaultGuard Sync: at-rest encryption pass complete. ${encrypted} encrypted, ${skipped} already-encrypted/excluded, ${failed} failed.`,
-      8000
-    );
+
+    if (!guard.ok) {
+      operation.fail(new Error(guard.error ?? "VaultGuard workload guard blocked encryption."));
+      new Notice(guard.error ?? "VaultGuard Sync: encryption blocked by workload guard.", 10000);
+      return;
+    }
+
+    try {
+      await processInBatches(
+        files,
+        async (file) => {
+          if (this.isAtRestExcluded(file.path)) {
+            skipped += 1;
+            processed += 1;
+            processedBytes += file.stat?.size ?? 0;
+            operation.update({
+              phase: "Encrypting local files",
+              processedItems: processed,
+              processedBytes,
+              message: `${encrypted} encrypted, ${skipped} skipped, ${failed} failed.`,
+            });
+            return;
+          }
+
+          try {
+            const bytes = await readBin(file.path);
+            if (cipher.isEncrypted(bytes)) {
+              skipped += 1;
+              processed += 1;
+              processedBytes += file.stat?.size ?? bytes.byteLength;
+              operation.update({
+                phase: "Encrypting local files",
+                processedItems: processed,
+                processedBytes,
+                message: `${encrypted} encrypted, ${skipped} skipped, ${failed} failed.`,
+              });
+              return;
+            }
+            const ct = await cipher.encryptBinary(bytes);
+            await writeBin(file.path, ct);
+            encrypted += 1;
+            processed += 1;
+            processedBytes += file.stat?.size ?? bytes.byteLength;
+          } catch (err) {
+            failed += 1;
+            processed += 1;
+            processedBytes += file.stat?.size ?? 0;
+            this.logError(`At-rest encrypt: failed for "${file.path}"`, err);
+          }
+
+          operation.update({
+            phase: "Encrypting local files",
+            processedItems: processed,
+            processedBytes,
+            message: `${encrypted} encrypted, ${skipped} skipped, ${failed} failed.`,
+          });
+        },
+        {
+          batchSize: DEFAULT_LONG_OPERATION_BATCH_SIZE,
+          token: operation.token,
+        },
+      );
+      operation.complete(
+        `${encrypted} encrypted, ${skipped} already encrypted or excluded, ${failed} failed.`,
+      );
+      new Notice(
+        `VaultGuard Sync: at-rest encryption pass complete. ${encrypted} encrypted, ${skipped} already-encrypted/excluded, ${failed} failed.`,
+        8000
+      );
+    } catch (error) {
+      operation.fail(error);
+      new Notice(
+        `VaultGuard Sync: at-rest encryption failed — ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+        10000,
+      );
+    }
   }
 
   /**
@@ -709,9 +1149,29 @@ export class AtRestAdapterRuntime {
    * tools.
    */
   async decryptVaultAtRest(): Promise<void> {
+    await this.decryptVaultAtRestAndDisableEncryption();
+  }
+
+  async decryptVaultAtRestAndDisableEncryption(): Promise<AtRestDecryptAndDisableResult> {
     if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.readBinary || !this.originalAdapterMethods.writeBinary) {
-      new Notice("VaultGuard Sync: at-rest cipher not initialised — cannot decrypt.");
-      return;
+      const remaining = await this.findAtRestCiphertextFiles();
+      if (remaining.length === 0) {
+        this.settings.localProjectMemoryMode = true;
+        this.settings.atRestFirstRunDismissed = true;
+        await this.saveSettings();
+        new Notice("VaultGuard Sync: at-rest encryption disabled; no VG1 files were found.", 6000);
+        return {
+          decrypted: 0,
+          skipped: this.app.vault.getFiles().length,
+          failed: 0,
+          remainingCiphertextPaths: [],
+          failures: [],
+        };
+      }
+      const message =
+        "VaultGuard Sync: at-rest cipher not initialised — cannot decrypt existing VG1 files.";
+      new Notice(message, 10000);
+      throw new Error(message);
     }
     const cipher = this.atRestCipher;
     const readBin = this.originalAdapterMethods.readBinary;
@@ -721,31 +1181,132 @@ export class AtRestAdapterRuntime {
     let decrypted = 0;
     let skipped = 0;
     let failed = 0;
-    new Notice(`VaultGuard Sync: decrypting ${files.length} files at rest…`, 3000);
+    const failures: Array<{ path: string; error: string }> = [];
+    let processed = 0;
+    let processedBytes = 0;
+    const workload = summarizeFileLikeWorkload(files);
+    const guard = evaluateWorkloadGuard(workload);
+    const warning = guard.warnings.join(" ");
 
-    for (const file of files) {
-      if (this.isAtRestExcluded(file.path)) {
-        skipped += 1;
-        continue;
+    let operation: LongOperationHandle;
+    try {
+      operation = this.ctx.beginLongOperation({
+        kind: "vault-decrypt",
+        operationName: "Decrypt vault at rest",
+        phase: "Preparing local decryption pass",
+        placement: "protected",
+        totalItems: files.length,
+        totalBytes: workload.totalBytes,
+        warning: warning || undefined,
+        capabilities: {
+          protectedPhase: true,
+          canCancel: false,
+          canPause: false,
+        },
+        conflictsWith: ["vault-encrypt", "sync", "background-sync", "initial-reconciliation"],
+        stalledAfterMs: DEFAULT_STALLED_OPERATION_MS,
+      });
+    } catch (error) {
+      if (isLongOperationConflict(error)) {
+        new Notice(`VaultGuard Sync: ${describeConflict(error.conflict)}`, 6000);
+        return {
+          decrypted: 0,
+          skipped: files.length,
+          failed: 0,
+          remainingCiphertextPaths: [],
+          failures: [],
+        };
       }
-      try {
-        const bytes = await readBin(file.path);
-        if (!cipher.isEncrypted(bytes)) {
-          skipped += 1;
-          continue;
-        }
-        const plain = await cipher.decryptBinary(bytes);
-        await writeBin(file.path, plain);
-        decrypted += 1;
-      } catch (err) {
-        failed += 1;
-        this.logError(`At-rest decrypt: failed for "${file.path}"`, err);
-      }
+      throw error;
     }
-    new Notice(
-      `VaultGuard Sync: at-rest decryption pass complete. ${decrypted} decrypted, ${skipped} already-plaintext/excluded, ${failed} failed.`,
-      8000
+
+    if (!guard.ok) {
+      operation.fail(new Error(guard.error ?? "VaultGuard workload guard blocked decryption."));
+      new Notice(guard.error ?? "VaultGuard Sync: decryption blocked by workload guard.", 10000);
+      throw new Error(guard.error ?? "VaultGuard workload guard blocked decryption.");
+    }
+
+    this.settings.localProjectMemoryMode = true;
+    this.settings.atRestFirstRunDismissed = true;
+    await this.saveSettings();
+
+    try {
+      await processInBatches(
+        files,
+        async (file) => {
+          try {
+            const bytes = await readBin(file.path);
+            if (!cipher.isEncrypted(bytes)) {
+              skipped += 1;
+              processed += 1;
+              processedBytes += file.stat?.size ?? bytes.byteLength;
+              operation.update({
+                phase: "Decrypting local files",
+                processedItems: processed,
+                processedBytes,
+                message: `${decrypted} decrypted, ${skipped} skipped, ${failed} failed.`,
+              });
+              return;
+            }
+            const plain = await cipher.decryptBinary(bytes);
+            await writeBin(file.path, plain);
+            decrypted += 1;
+            processed += 1;
+            processedBytes += file.stat?.size ?? bytes.byteLength;
+          } catch (err) {
+            failed += 1;
+            processed += 1;
+            processedBytes += file.stat?.size ?? 0;
+            failures.push({
+              path: file.path,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            this.logError(`At-rest decrypt: failed for "${file.path}"`, err);
+          }
+
+          operation.update({
+            phase: "Decrypting local files",
+            processedItems: processed,
+            processedBytes,
+            message: `${decrypted} decrypted, ${skipped} skipped, ${failed} failed.`,
+          });
+        },
+        {
+          batchSize: DEFAULT_LONG_OPERATION_BATCH_SIZE,
+          token: operation.token,
+        },
+      );
+    } catch (error) {
+      operation.fail(error);
+      throw error;
+    }
+    const remainingCiphertextPaths = await this.findAtRestCiphertextFiles();
+    const verified = remainingCiphertextPaths.length === 0;
+    operation.complete(
+      verified
+        ? `${decrypted} decrypted, ${skipped} already plaintext, ${failed} failed.`
+        : `${remainingCiphertextPaths.length} VG1 file(s) remain after decrypt.`,
     );
+    const remainingSummary = remainingCiphertextPaths.slice(0, 5).join(", ");
+    const remainingSuffix =
+      remainingCiphertextPaths.length > 5
+        ? `; first paths: ${remainingSummary}; ${remainingCiphertextPaths.length - 5} more not shown`
+        : remainingSummary.length > 0
+          ? `: ${remainingSummary}`
+          : "";
+    new Notice(
+      verified
+        ? `VaultGuard Sync: at-rest decryption complete. ${decrypted} decrypted, ${skipped} already plaintext, ${failed} failed. Encryption remains disabled.`
+        : `VaultGuard Sync: decryption finished, but ${remainingCiphertextPaths.length} VG1 file(s) remain${remainingSuffix}. Encryption remains disabled.`,
+      verified ? 8000 : 12000,
+    );
+    return {
+      decrypted,
+      skipped,
+      failed,
+      remainingCiphertextPaths,
+      failures,
+    };
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -778,6 +1339,11 @@ export class AtRestAdapterRuntime {
     }
     if (typeof adapter.rename === "function") {
       this.originalAdapterMethods.rename = adapter.rename.bind(adapter);
+    }
+    if (typeof (adapter as unknown as Record<string, unknown>).getResourcePath === "function") {
+      this.originalAdapterMethods.getResourcePath = (
+        adapter as unknown as { getResourcePath: (p: string) => string }
+      ).getResourcePath.bind(adapter);
     }
 
     // Intercept read operations
@@ -836,6 +1402,21 @@ export class AtRestAdapterRuntime {
       };
     }
 
+    // Intercept getResourcePath so at-rest-encrypted media (images, PDFs, ...)
+    // renders. Obsidian's renderer loads media via getResourcePath()→app:// which
+    // reads the on-disk bytes directly, bypassing readBinary decryption — without
+    // this, encrypted attachments preview as broken. The override is tagged
+    // __vaultguard so the preview diagnostic reports interception as active.
+    if (this.originalAdapterMethods.getResourcePath) {
+      const override = ((normalizedPath: string): string =>
+        this.interceptedGetResourcePath(normalizedPath)) as ((p: string) => string) & {
+        __vaultguard?: boolean;
+      };
+      override.__vaultguard = true;
+      (adapter as unknown as { getResourcePath: (p: string) => string }).getResourcePath =
+        override;
+    }
+
     this.log("Vault adapter methods intercepted.");
   }
 
@@ -870,6 +1451,13 @@ export class AtRestAdapterRuntime {
     if (this.originalAdapterMethods.rename) {
       adapter.rename = this.originalAdapterMethods.rename;
     }
+    if (this.originalAdapterMethods.getResourcePath) {
+      (adapter as unknown as { getResourcePath: (p: string) => string }).getResourcePath =
+        this.originalAdapterMethods.getResourcePath;
+    }
+
+    // Revoke every decrypted blob URL so they don't leak past unload.
+    this.revokeAllResourcePreviews();
 
     this.originalAdapterMethods = {
       read: null,
@@ -879,8 +1467,54 @@ export class AtRestAdapterRuntime {
       list: null,
       remove: null,
       rename: null,
+      getResourcePath: null,
     };
     this.log("Vault adapter methods restored.");
+  }
+
+  private async readLocalProjectMemoryText(path: string): Promise<string> {
+    if (this.originalAdapterMethods.readBinary) {
+      const bytes = await this.originalAdapterMethods.readBinary(path);
+      if (this.hasVg1MagicBytes(bytes)) {
+        if (this.atRestCipher?.isReady()) {
+          return this.atRestCipher.decryptString(bytes);
+        }
+        throw new Error(
+          `VaultGuard Sync: "${path}" is still VG1 ciphertext. Run "Decrypt vault and disable at-rest encryption" before editing this repo-root vault.`,
+        );
+      }
+      return new TextDecoder().decode(bytes);
+    }
+    if (!this.originalAdapterMethods.read) {
+      throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
+    }
+    return this.originalAdapterMethods.read(path);
+  }
+
+  private async readLocalProjectMemoryBinary(path: string): Promise<ArrayBuffer> {
+    if (!this.originalAdapterMethods.readBinary) {
+      throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
+    }
+    const bytes = await this.originalAdapterMethods.readBinary(path);
+    if (this.hasVg1MagicBytes(bytes)) {
+      if (this.atRestCipher?.isReady()) {
+        return this.atRestCipher.decryptBinary(bytes);
+      }
+      throw new Error(
+        `VaultGuard Sync: "${path}" is still VG1 ciphertext. Run "Decrypt vault and disable at-rest encryption" before editing this repo-root vault.`,
+      );
+    }
+    return bytes;
+  }
+
+  private async writeLocalProjectMemoryText(path: string, data: string): Promise<void> {
+    if (!this.originalAdapterMethods.write) return;
+    await this.originalAdapterMethods.write(path, data);
+  }
+
+  private async writeLocalProjectMemoryBinary(path: string, data: ArrayBuffer): Promise<void> {
+    if (!this.originalAdapterMethods.writeBinary) return;
+    await this.originalAdapterMethods.writeBinary(path, data);
   }
 
   /**
@@ -890,6 +1524,9 @@ export class AtRestAdapterRuntime {
    * @throws Error if the user lacks READ permission
    */
   async interceptedRead(path: string): Promise<string> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      return this.readLocalProjectMemoryText(path);
+    }
     if (this.isPathExcluded(path)) {
       if (!this.originalAdapterMethods.read) {
         throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
@@ -1122,6 +1759,17 @@ export class AtRestAdapterRuntime {
     );
   }
 
+  hasVg1MagicBytes(data: ArrayBuffer | Uint8Array): boolean {
+    const view = data instanceof Uint8Array ? data : new Uint8Array(data);
+    return (
+      view.length >= 4 &&
+      view[0] === 0x56 &&
+      view[1] === 0x47 &&
+      view[2] === 0x31 &&
+      view[3] === 0x00
+    );
+  }
+
   /**
    * Binary counterpart of `looksLikeCiphertext`. Prefers the cipher's
    * own header check when available (full length + version validation),
@@ -1180,6 +1828,11 @@ export class AtRestAdapterRuntime {
       );
     }
 
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      await this.writeLocalProjectMemoryText(path, data);
+      return;
+    }
+
     if (this.applyingRemoteWrite) {
       await this.hostWritePlainToDisk(path, data);
       return;
@@ -1206,16 +1859,30 @@ export class AtRestAdapterRuntime {
       );
     }
 
+    const hash = await this.computeHash(data);
+    const baseVersionId = this.getExpectedVersionId(path);
+
     try {
       // In manual mode, defer remote writes until the user runs a sync explicitly.
       if (this.shouldUploadChangesImmediately() && this.isOnline() && this.keyLease) {
         const encrypted = await this.encryptContent(data);
-        const response = await this.apiRequest("PUT", this.vaultPath(`/files/${encodeURIComponent(path)}`), {
-          content: encrypted,
-          hash: await this.computeHash(data),
-        });
+        const response = await this.apiRequest<RemoteFileWriteResponse>(
+          "PUT",
+          this.vaultPath(`/files/${encodeURIComponent(path)}`),
+          this.buildWriteBody(path, encrypted, hash, { expectedVersionId: baseVersionId })
+        );
 
         if (!response.success) {
+          if (response.error?.statusCode === 409) {
+            const resolution = await this.handleRemoteWriteConflict(path, data, baseVersionId);
+            if (resolution === "keep-local") {
+              await this.hostWritePlainToDisk(path, data);
+              await this.emitAuditEvent("file.write", path);
+              this.updateStatusBar();
+            }
+            return;
+          }
+
           if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
             throw new Error(response.error.message);
           }
@@ -1226,16 +1893,24 @@ export class AtRestAdapterRuntime {
           const status = response.error?.statusCode ?? 0;
           if (status === 0 || status === 429 || status >= 500) {
             if (status === 0) this.setConnectionStatus("offline");
-            this.queueOfflineOperation("write", path, data);
+            this.queueOfflineOperation("write", path, data, {
+              baseVersionId,
+              baseHash: hash,
+            });
           } else {
             throw new Error(response.error?.message ?? "Remote write failed.");
           }
+        } else {
+          this.recordSuccessfulWrite(path, hash, response);
         }
 
         await this.hostWritePlainToDisk(path, data);
       } else {
         await this.hostWritePlainToDisk(path, data);
-        this.queueOfflineOperation("write", path, data);
+        this.queueOfflineOperation("write", path, data, {
+          baseVersionId,
+          baseHash: hash,
+        });
       }
 
       await this.emitAuditEvent("file.write", path);
@@ -1245,7 +1920,10 @@ export class AtRestAdapterRuntime {
       if (this.isNetworkError(error)) {
         this.setConnectionStatus("offline");
         await this.hostWritePlainToDisk(path, data);
-        this.queueOfflineOperation("write", path, data);
+        this.queueOfflineOperation("write", path, data, {
+          baseVersionId,
+          baseHash: hash,
+        });
       } else {
         throw error;
       }
@@ -1278,6 +1956,7 @@ export class AtRestAdapterRuntime {
    * exclusion list is narrower (it only covers what shouldn't go to S3).
    */
   isAtRestExcluded(path: string): boolean {
+    if (this.isLocalProjectMemoryModeEnabled()) return true;
     const normalized = path.replace(/^\/+/, "");
     if (!normalized) return false;
     const configDir = this.normalizeVaultPath(this.app.vault.configDir);
@@ -1287,6 +1966,9 @@ export class AtRestAdapterRuntime {
   }
 
   async readPlainFromDisk(path: string): Promise<string> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      return this.readLocalProjectMemoryText(path);
+    }
     if (this.isAtRestExcluded(path)) {
       if (!this.originalAdapterMethods.read) {
         throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
@@ -1298,6 +1980,14 @@ export class AtRestAdapterRuntime {
     if (this.originalAdapterMethods.readBinary) {
       const bytes = await this.originalAdapterMethods.readBinary(path);
       if (this.atRestCipher?.isEncrypted(bytes)) {
+        // Phase 12 fail-CLOSED (Pitfall 4): a locked vault rejects a managed VG1
+        // read IMMEDIATELY — no 10s waitForCipherInit hang, no plaintext
+        // fallback. This is intentional fail-CLOSED, distinct from the
+        // fail-OPEN decrypt-error path below. Excluded paths already returned
+        // above, so the plugin can still read its own config while locked.
+        if (this.locked) {
+          throw new Error("VaultGuard: vault is locked");
+        }
         if (!this.atRestCipher.isReady()) {
           await this.waitForCipherInit(10_000);
         }
@@ -1328,6 +2018,11 @@ export class AtRestAdapterRuntime {
         head[2] === 0x31 &&
         head[3] === 0x00
       ) {
+        // Phase 12 fail-CLOSED: a locked vault rejects VG1 content fast, even on
+        // this legacy no-readBinary path.
+        if (this.locked) {
+          throw new Error("VaultGuard: vault is locked");
+        }
         throw new Error(
           `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
         );
@@ -1366,6 +2061,10 @@ export class AtRestAdapterRuntime {
         `VaultGuard Sync: writePlainToDisk refused for "${path}" — content has VG1 magic header (corrupted-read cascade).`
       );
     }
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      await this.writeLocalProjectMemoryText(path, data);
+      return;
+    }
     if (this.isAtRestExcluded(path)) {
       if (!this.originalAdapterMethods.write) return;
       await this.originalAdapterMethods.write(path, data);
@@ -1400,11 +2099,19 @@ export class AtRestAdapterRuntime {
     if (!this.originalAdapterMethods.readBinary) {
       throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
     }
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      return this.readLocalProjectMemoryBinary(path);
+    }
     if (this.isAtRestExcluded(path)) {
       return this.originalAdapterMethods.readBinary(path);
     }
     const bytes = await this.originalAdapterMethods.readBinary(path);
     if (this.atRestCipher?.isEncrypted(bytes)) {
+      // Phase 12 fail-CLOSED (Pitfall 4): a locked vault rejects a managed VG1
+      // binary read immediately — no 10s wait, no plaintext fallback.
+      if (this.locked) {
+        throw new Error("VaultGuard: vault is locked");
+      }
       if (!this.atRestCipher.isReady()) {
         await this.waitForCipherInit(10_000);
       }
@@ -1418,43 +2125,224 @@ export class AtRestAdapterRuntime {
     return bytes;
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // At-rest media preview (BIN-A): serve decrypted blob URLs for getResourcePath
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Max decrypted blob URLs kept alive at once (older entries are revoked FIFO). */
+  private static readonly RESOURCE_PREVIEW_CAP = 64;
+
+  /**
+   * getResourcePath override. Obsidian's renderer loads media from the returned
+   * URL directly off disk; for at-rest-encrypted media that would be VG1
+   * ciphertext (a broken preview). On a warm-cache hit we return the decrypted
+   * `blob:` URL synchronously; on a miss we return the real (ciphertext) URL and
+   * kick off an async decrypt that repopulates the cache and swaps the rendered
+   * element's src. Non-media, excluded, or not-yet-encrypted paths pass straight
+   * through to the original method.
+   */
+  interceptedGetResourcePath(path: string): string {
+    const original = this.originalAdapterMethods.getResourcePath;
+    if (!original) return path;
+    const originalUrl = original(path);
+    if (
+      !this.atRestCipher?.isReady() ||
+      this.isAtRestExcluded(path) ||
+      !isKnownBinaryExtensionPath(path)
+    ) {
+      return originalUrl;
+    }
+    const mtime = this.parseResourceMtime(originalUrl);
+    const cached = this.resourcePreviewCache.get(path);
+    if (cached && cached.mtime === mtime) {
+      return cached.url;
+    }
+    void this.warmResourcePreview(path, mtime, originalUrl);
+    return originalUrl;
+  }
+
+  /**
+   * Pre-decrypt a media file into the blob cache before its view reads
+   * getResourcePath (e.g. on file-open), so standalone image/PDF views get a
+   * synchronous cache hit instead of the miss→fallback→swap flash.
+   */
+  async prewarmResourcePreview(path: string): Promise<void> {
+    const original = this.originalAdapterMethods.getResourcePath;
+    if (
+      !original ||
+      !this.atRestCipher?.isReady() ||
+      this.isAtRestExcluded(path) ||
+      !isKnownBinaryExtensionPath(path)
+    ) {
+      return;
+    }
+    const originalUrl = original(path);
+    const mtime = this.parseResourceMtime(originalUrl);
+    if (this.resourcePreviewCache.get(path)?.mtime === mtime) return;
+    await this.warmResourcePreview(path, mtime, originalUrl);
+  }
+
+  /** Extracts the `?<mtime>` cache-buster Obsidian appends to resource URLs. */
+  private parseResourceMtime(url: string): string {
+    const q = url.indexOf("?");
+    return q >= 0 ? url.slice(q + 1) : "";
+  }
+
+  /**
+   * Decrypts a media file, caches a `blob:` URL for it, and swaps any already-
+   * rendered element still pointing at the ciphertext URL. Fails open: on any
+   * error the ciphertext fallback stays in place (a broken preview), never a
+   * wipe. Dedupes concurrent renders of the same path.
+   */
+  private async warmResourcePreview(
+    path: string,
+    mtime: string,
+    ciphertextUrl: string
+  ): Promise<void> {
+    if (this.resourcePreviewInFlight.has(path)) return;
+    this.resourcePreviewInFlight.add(path);
+    try {
+      const existing = this.resourcePreviewCache.get(path);
+      if (existing?.mtime === mtime) return;
+      const bytes = await this.readPlainBinaryFromDisk(path);
+      if (existing) {
+        try {
+          URL.revokeObjectURL(existing.url);
+        } catch {
+          /* ignore */
+        }
+        this.resourcePreviewCache.delete(path);
+      }
+      const url = URL.createObjectURL(
+        new Blob([bytes], { type: contentTypeForPath(path) })
+      );
+      this.resourcePreviewCache.set(path, { url, mtime });
+      this.enforceResourcePreviewCap();
+      this.refreshRenderedResource(ciphertextUrl, url);
+    } catch (err) {
+      this.logError(`At-rest preview: could not decrypt "${path}" for rendering`, err);
+    } finally {
+      this.resourcePreviewInFlight.delete(path);
+    }
+  }
+
+  /**
+   * Swaps the src of any already-rendered element still pointing at the
+   * ciphertext resource URL over to the decrypted blob URL, so the broken
+   * preview repaints without a manual reload. Scoped to the workspace DOM and
+   * guarded so it no-ops when there is no document (tests / headless).
+   */
+  private refreshRenderedResource(ciphertextUrl: string, blobUrl: string): void {
+    try {
+      const base = ciphertextUrl.split("?")[0];
+      const ws = this.app?.workspace as unknown as { containerEl?: HTMLElement } | undefined;
+      const root =
+        ws?.containerEl ?? (typeof document !== "undefined" ? document.body : null);
+      if (!root || typeof root.querySelectorAll !== "function") return;
+      root
+        .querySelectorAll("img, video, audio, source, embed, iframe")
+        .forEach((el) => {
+          const src = el.getAttribute("src");
+          if (src && src.split("?")[0] === base) {
+            el.setAttribute("src", blobUrl);
+          }
+        });
+    } catch (err) {
+      this.logError("At-rest preview: DOM refresh failed", err);
+    }
+  }
+
+  /** Revokes and drops the cached blob URL for a single path (on delete/rename). */
+  private evictResourcePreview(path: string): void {
+    const entry = this.resourcePreviewCache.get(path);
+    if (!entry) return;
+    try {
+      URL.revokeObjectURL(entry.url);
+    } catch {
+      /* ignore */
+    }
+    this.resourcePreviewCache.delete(path);
+  }
+
+  /** Bounds cache memory: revokes the oldest blob URLs once over the cap (FIFO). */
+  private enforceResourcePreviewCap(): void {
+    while (this.resourcePreviewCache.size > AtRestAdapterRuntime.RESOURCE_PREVIEW_CAP) {
+      const oldest = this.resourcePreviewCache.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.evictResourcePreview(oldest);
+    }
+  }
+
+  /** Revokes every cached blob URL (plugin unload / adapter restore). */
+  private revokeAllResourcePreviews(): void {
+    for (const entry of this.resourcePreviewCache.values()) {
+      try {
+        URL.revokeObjectURL(entry.url);
+      } catch {
+        /* ignore */
+      }
+    }
+    this.resourcePreviewCache.clear();
+    this.resourcePreviewInFlight.clear();
+  }
+
   /**
    * Write raw plaintext bytes to disk, encrypting with the LAK before
    * storage. Mirror of `writePlainToDisk` for binary attachments.
    */
   /**
-   * Re-encrypts an externally-added plaintext TEXT file in place: reads the
-   * raw on-disk bytes and, when they are UTF-8 text without a VG1 header,
-   * writes the IDENTICAL bytes back through the encrypting write path. The
-   * content never changes — only the on-disk representation flips from
-   * plaintext to ciphertext. Files written through Obsidian never need this
-   * (the adapter interceptors encrypt them); this exists for files that
-   * bypass Obsidian entirely: Finder drops, git checkouts, external tools.
+   * Re-encrypts an externally-added plaintext file in place: reads the raw
+   * on-disk bytes and, when they are not already VG1, writes the IDENTICAL
+   * bytes back through the encrypting write path. The content never changes —
+   * only the on-disk representation flips from plaintext to ciphertext. Files
+   * written through Obsidian never need this (the adapter interceptors encrypt
+   * them); this exists for files that bypass Obsidian entirely: Finder drops,
+   * git checkouts, external tools.
    *
-   * Deliberately SKIPS binaries: binary sync is unsupported, so a binary in
-   * the vault has no server copy — at-rest-encrypting it would make the LAK
-   * envelope a single point of failure for content that exists nowhere
-   * else (uninstall/keychain loss = permanent loss). Binaries stay
-   * plaintext until binary sync exists. Text files are safe to flip: their
-   * content reaches the server via normal sync.
+   * BIN-A contract (replaces the old binary-skip policy): text files AND
+   * binaries up to BINARY_SYNC_MAX_BYTES are encrypted in place. Both now have
+   * a server copy path — text via normal sync, in-size binaries via the BIN-A
+   * byte push (catch-up upload + reconciliation, 11-03) — so the LAK envelope
+   * is never the single copy. OVERSIZE binaries (> BINARY_SYNC_MAX_BYTES) are
+   * deliberately LEFT PLAINTEXT until the BIN-B presigned-URL path exists:
+   * at-rest-encrypting content that has no server copy would recreate the
+   * CR-1 data-loss class (envelope/keychain loss = permanent loss — L10).
    *
-   * Never throws — background hygiene must not break its callers.
-   * Returns true when the file was re-encrypted.
+   * `isEncrypted` is checked FIRST so a file already carrying the VG1 magic
+   * (e.g. one written through the now-unblocked interceptedWriteBinary) is a
+   * no-op — no double-encryption hazard. Never throws — background hygiene
+   * must not break its callers. Returns true when the file was re-encrypted.
    */
   async ensureAtRestEncryptedInPlace(path: string): Promise<boolean> {
     const readBin = this.originalAdapterMethods.readBinary;
+    if (this.isLocalProjectMemoryModeEnabled()) return false;
     if (!readBin || !this.atRestCipher?.isReady()) return false;
     if (this.isAtRestExcluded(path)) return false;
     if (this.inPlaceEncryptionInFlight.has(path)) return false;
     this.inPlaceEncryptionInFlight.add(path);
     try {
       const bytes = await readBin(path);
+      // isEncrypted FIRST (research §5): an already-VG1 file is a no-op.
       if (this.atRestCipher.isEncrypted(bytes)) return false;
+      // Content-based classify via a strict UTF-8 probe (never extension-based).
+      let isText = true;
       try {
         new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       } catch {
+        isText = false;
+      }
+      // BIN-A / L10 / CR-1: an oversize binary cannot reach the server until
+      // BIN-B, so LAK-encrypting it in place would recreate the CR-1 data-loss
+      // class. Leave it readable plaintext on disk.
+      if (!isText && bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+        this.log(
+          `At-rest: leaving oversize binary "${path}" plaintext (${bytes.byteLength} bytes > ${BINARY_SYNC_MAX_BYTES} — no server copy until BIN-B).`
+        );
         return false;
       }
+      // In-size binaries are now safe to encrypt in place: the sync engine can
+      // upload them (11-03 catch-up / reconciliation push), so the on-disk VG1
+      // copy is never the sole copy. Text files were always safe.
       await this.writePlainBinaryToDisk(path, bytes);
       this.log(`At-rest: encrypted externally added file in place: ${path}`);
       return true;
@@ -1476,6 +2364,7 @@ export class AtRestAdapterRuntime {
    */
   async encryptExternallyAddedFile(path: string): Promise<void> {
     try {
+      if (this.isLocalProjectMemoryModeEnabled()) return;
       if (this.isAtRestExcluded(path)) return;
       if (!this.atRestCipher?.isReady()) return;
       const before = await this.app.vault.adapter.stat(path);
@@ -1497,6 +2386,10 @@ export class AtRestAdapterRuntime {
       throw new Error(
         `VaultGuard Sync: writePlainBinaryToDisk refused for "${path}" — content has VG1 magic header (corrupted-read cascade).`
       );
+    }
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      await this.writeLocalProjectMemoryBinary(path, data);
+      return;
     }
     if (this.isAtRestExcluded(path)) {
       if (!this.originalAdapterMethods.writeBinary) return;
@@ -1543,6 +2436,9 @@ export class AtRestAdapterRuntime {
     if (!this.originalAdapterMethods.readBinary) {
       throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
     }
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      return this.readLocalProjectMemoryBinary(path);
+    }
     if (this.isPathExcluded(path)) {
       return this.originalAdapterMethods.readBinary(path);
     }
@@ -1568,11 +2464,15 @@ export class AtRestAdapterRuntime {
   }
 
   /**
-   * Permission-checked at-rest encrypted binary write.
+   * Permission-checked at-rest encrypted binary write (BIN-A / D-08).
    *
-   * Mirrors `interceptedWrite` for binary content. Managed binary writes fail
-   * closed until the backend supports binary sync; silently keeping encrypted
-   * attachments local would create a false sense of protected backup.
+   * Mirrors `interceptedWrite` for binary content: permission check → E2E PUT
+   * (or offline queue with encoding:"base64") → VG1 at-rest write to disk. This
+   * is the drag-drop / paste ingestion path. Oversize (> BINARY_SYNC_MAX_BYTES)
+   * drops are rejected fail-closed (OD-1) — never written, never queued —
+   * because a LAK-only binary with no server copy is unrecoverable if the
+   * envelope is lost (the CR-1 data-loss class this phase's ordering prevents).
+   * Legacy adapters without writeBinary keep today's silent return (D-10).
    */
   async interceptedWriteBinary(path: string, data: ArrayBuffer): Promise<void> {
     if (!this.originalAdapterMethods.writeBinary) return;
@@ -1590,6 +2490,10 @@ export class AtRestAdapterRuntime {
         `VaultGuard Sync: refusing to write "${path}" — content looks like at-rest ciphertext (corrupted-read cascade). File preserved.`
       );
     }
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      await this.writeLocalProjectMemoryBinary(path, data);
+      return;
+    }
     if (this.applyingRemoteWrite || this.isPathExcluded(path)) {
       await this.hostWritePlainBinaryToDisk(path, data);
       return;
@@ -1605,22 +2509,111 @@ export class AtRestAdapterRuntime {
         `VaultGuard Sync: Access denied. You do not have write permission for "${path}".`
       );
     }
-    await this.emitAuditEvent("file.write", path, { outcome: "denied", reason: "binary-sync-unsupported" });
-    // Drag-and-drop / paste of an attachment reaches this rejection through
-    // Obsidian's drop handler, which swallows the thrown error — without a
-    // Notice the drop appears to silently do nothing. Throttled per path so
-    // a multi-file drop doesn't stack notices.
-    const now = Date.now();
-    if (now - (this.binaryWriteNoticeAt.get(path) ?? 0) >= 60_000) {
-      this.binaryWriteNoticeAt.set(path, now);
-      new Notice(
-        `VaultGuard Sync: binary attachments aren't supported in protected vaults yet — "${path}" was not added.`,
-        8000
+    // OD-1 / L10 (BIN-A): an oversize binary cannot ride the JSON path until
+    // BIN-B, so reject fail-closed BEFORE any disk or queue mutation. Never
+    // write it (a LAK-only local copy with no server path is the CR-1 data-loss
+    // class) and never queue it (every catch-up pass would trip over a
+    // landed-but-unsyncable file). The throw is swallowed by Obsidian's drop
+    // handler exactly as the retired block's throw was; the throttled Notice
+    // (reusing the binaryWriteNoticeAt per-path map) is what the user sees.
+    if (data.byteLength > BINARY_SYNC_MAX_BYTES) {
+      await this.emitAuditEvent("file.write", path, {
+        outcome: "denied",
+        reason: "binary-too-large",
+      });
+      const now = Date.now();
+      if (now - (this.binaryWriteNoticeAt.get(path) ?? 0) >= 60_000) {
+        this.binaryWriteNoticeAt.set(path, now);
+        new Notice(
+          `VaultGuard Sync: "${path}" is larger than the ${Math.round(
+            BINARY_SYNC_MAX_BYTES / (1024 * 1024)
+          )} MB attachment sync limit — it was not added. Large-file support arrives with BIN-B.`,
+          10000
+        );
+      }
+      throw new Error(
+        `VaultGuard Sync: "${path}" exceeds the ${Math.round(
+          BINARY_SYNC_MAX_BYTES / (1024 * 1024)
+        )} MB attachment sync limit and was not written.`
       );
     }
-    throw new Error(
-      `VaultGuard Sync: Binary files are not currently supported for protected sync. "${path}" was not written.`
-    );
+
+    // BIN-A / D-08: in-size binary ingestion mirrors interceptedWrite exactly,
+    // with byte substitutions (encryptContentBytes / computeHashBytes /
+    // hostWritePlainBinaryToDisk) + a real contentType label + the large-body
+    // upload timeout. AC-API1 status discipline is copied verbatim.
+    const contentType = contentTypeForPath(path);
+    try {
+      // In manual mode, defer remote writes until the user runs a sync explicitly.
+      if (this.shouldUploadChangesImmediately() && this.isOnline() && this.keyLease) {
+        const encrypted = await this.encryptContentBytes(data);
+        const response = await this.apiRequest(
+          "PUT",
+          this.vaultPath(`/files/${encodeURIComponent(path)}`),
+          {
+            content: encrypted,
+            hash: await this.computeHashBytes(data),
+            contentType,
+          },
+          undefined,
+          { timeoutMs: BINARY_PUT_TIMEOUT_MS }
+        );
+
+        if (!response.success) {
+          if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
+            throw new Error(response.error.message);
+          }
+
+          // AC-API1: queue only TRANSIENT failures (network / 5xx / 429) for
+          // replay. A permanent 4xx (413 too-large, 409) can never succeed on
+          // retry — queuing it would jam the offline flush.
+          const status = response.error?.statusCode ?? 0;
+          if (status === 0 || status === 429 || status >= 500) {
+            if (status === 0) this.setConnectionStatus("offline");
+            this.queueOfflineOperation(
+              "write",
+              path,
+              uint8ToBase64Chunked(new Uint8Array(data)),
+              { encoding: "base64", contentType }
+            );
+          } else {
+            throw new Error(response.error?.message ?? "Remote write failed.");
+          }
+        }
+
+        // CR-1: PUT first, local VG1 write second. A permanent PUT failure
+        // throws above before we reach here, so we never leave an orphaned
+        // local-only LAK-encrypted binary with no server copy.
+        await this.hostWritePlainBinaryToDisk(path, data);
+      } else {
+        // Manual / offline / no-lease: the local VG1 write is safe here because
+        // the queued op IS the server-copy path (CR-1 satisfied by the queue).
+        await this.hostWritePlainBinaryToDisk(path, data);
+        this.queueOfflineOperation(
+          "write",
+          path,
+          uint8ToBase64Chunked(new Uint8Array(data)),
+          { encoding: "base64", contentType }
+        );
+      }
+
+      await this.emitAuditEvent("file.write", path);
+      this.syncState.pendingChanges++;
+      this.updateStatusBar();
+    } catch (error) {
+      if (this.isNetworkError(error)) {
+        this.setConnectionStatus("offline");
+        await this.hostWritePlainBinaryToDisk(path, data);
+        this.queueOfflineOperation(
+          "write",
+          path,
+          uint8ToBase64Chunked(new Uint8Array(data)),
+          { encoding: "base64", contentType }
+        );
+      } else {
+        throw error;
+      }
+    }
   }
 
   /**
@@ -1706,6 +2699,13 @@ export class AtRestAdapterRuntime {
    * @throws Error if the user lacks DELETE permission
    */
   async interceptedDelete(path: string): Promise<void> {
+    this.evictResourcePreview(path);
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      if (this.originalAdapterMethods.remove) {
+        await this.originalAdapterMethods.remove(path);
+      }
+      return;
+    }
     if (this.isPathExcluded(path)) {
       if (this.originalAdapterMethods.remove) {
         await this.originalAdapterMethods.remove(path);
@@ -1742,6 +2742,7 @@ export class AtRestAdapterRuntime {
         if (response.success || response.error?.statusCode === 404) {
           // Success or already-gone == done — clear the tombstone for this path.
           this.clearDeletionTombstone(path);
+          this.recordRemoteFileAbsent(path);
         } else {
           if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
             throw new Error(response.error.message);
@@ -1789,12 +2790,20 @@ export class AtRestAdapterRuntime {
   async interceptedRename(oldPath: string, newPath: string): Promise<void> {
     const oldNormalized = this.normalizeVaultPath(oldPath);
     const newNormalized = this.normalizeVaultPath(newPath);
+    // The old path's decrypted blob is stale after a rename; drop it (the new
+    // path re-warms on next render).
+    this.evictResourcePreview(oldNormalized);
+    this.evictResourcePreview(oldPath);
 
     // Local rename happens first regardless of permissions or network — the
     // existing adapter behaviour the user expects. Server reconciliation is
     // best-effort on top.
     if (this.originalAdapterMethods.rename) {
       await this.originalAdapterMethods.rename(oldPath, newPath);
+    }
+
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      return;
     }
 
     // Skip server work for binding-less / offline / non-bound states. We
@@ -1842,11 +2851,88 @@ export class AtRestAdapterRuntime {
       return;
     }
 
+    // BIN-A / L1: fix the live binary-corruption bug. Before this, BOTH the
+    // offline-queue branch and the online PUT read the just-renamed file via
+    // hostReadPlainFromDisk (a NON-fatal UTF-8 decode) and pushed the mangled
+    // result — silently corrupting the server copy of any binary (photo.png,
+    // *.pdf, …). Route capable adapters through a content probe: text keeps the
+    // exact string flow; binary rides the byte path (encryptContentBytes /
+    // computeHashBytes / queue with encoding:"base64"). Legacy adapters (no
+    // readBinary — D-10 / AR2) keep today's string-only flow verbatim.
+    if (!this.originalAdapterMethods.readBinary) {
+      await this.pushRenamedStringToServer(
+        oldNormalized,
+        newNormalized,
+        oldPath,
+        newPath,
+        () => this.hostReadPlainFromDisk(newPath),
+      );
+      return;
+    }
+
+    let renamedBytes: ArrayBuffer;
+    try {
+      renamedBytes = await this.readPlainBinaryFromDisk(newPath);
+    } catch (err) {
+      // Can't read the renamed file's plaintext bytes — nothing safe to push.
+      // The local rename already happened; surface the OLD path for cache
+      // invalidation and bail (matches the offline read-failure handling).
+      this.logError(`Rename: failed to read "${newPath}" for server sync`, err);
+      this.permissionStore.emit("changed", { path: oldNormalized });
+      return;
+    }
+
+    let decodedText: string | null;
+    try {
+      // fatal:true rejects (instead of U+FFFD-mangling) anything that isn't valid
+      // UTF-8 — the exact content-based text/binary split readTextForSync uses.
+      decodedText = new TextDecoder("utf-8", { fatal: true }).decode(renamedBytes);
+    } catch {
+      decodedText = null;
+    }
+
+    if (decodedText === null) {
+      await this.pushRenamedBinaryToServer(
+        oldNormalized,
+        newNormalized,
+        oldPath,
+        newPath,
+        renamedBytes,
+      );
+      return;
+    }
+
+    // TEXT on a capable adapter: reuse the already-decoded string (no second disk
+    // read) and run the identical string push flow.
+    const decoded = decodedText;
+    await this.pushRenamedStringToServer(
+      oldNormalized,
+      newNormalized,
+      oldPath,
+      newPath,
+      () => Promise.resolve(decoded),
+    );
+  }
+
+  /**
+   * Existing string rename push (offline-queue + online PUT + network-error
+   * fallback), factored out of interceptedRename so both the legacy-adapter path
+   * (readContent = hostReadPlainFromDisk) and the capable-adapter TEXT path
+   * (readContent = the already-decoded string) share one implementation.
+   * Behavior is byte-identical to the pre-BIN-A inline flow.
+   */
+  private async pushRenamedStringToServer(
+    oldNormalized: string,
+    newNormalized: string,
+    oldPath: string,
+    newPath: string,
+    readContent: () => Promise<string>,
+  ): Promise<void> {
     if (!this.shouldUploadChangesImmediately() || !this.isOnline() || !this.keyLease) {
       // Queue both halves: read content from the just-renamed local file so the
       // queued write carries the right bytes when connectivity returns.
       try {
-        const content = await this.hostReadPlainFromDisk(newPath);
+        const content = await readContent();
         this.queueOfflineOperation("write", newNormalized, content);
       } catch (err) {
         this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
@@ -1858,16 +2944,136 @@ export class AtRestAdapterRuntime {
     }
 
     try {
-      const content = await this.hostReadPlainFromDisk(newPath);
+      const content = await readContent();
       const encrypted = await this.encryptContent(content);
+      const hash = await this.computeHash(content);
+      const baseVersionId = this.getExpectedVersionId(newNormalized);
+
+      const putResp = await this.apiRequest<RemoteFileWriteResponse>(
+        "PUT",
+        this.vaultPath(`/files/${encodeURIComponent(newNormalized)}`),
+        this.buildWriteBody(newNormalized, encrypted, hash, { expectedVersionId: baseVersionId })
+      );
+
+      if (!putResp.success) {
+        if (putResp.error?.statusCode === 409) {
+          await this.handleRemoteWriteConflict(newNormalized, content, baseVersionId);
+          return;
+        }
+        throw new Error(putResp.error?.message ?? `Rename: writing "${newPath}" failed.`);
+      }
+      this.recordSuccessfulWrite(newNormalized, hash, putResp);
+
+      const delResp = await this.apiRequest(
+        "DELETE",
+        this.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`)
+      );
+
+      if (!delResp.success && delResp.error?.statusCode !== 404) {
+        // New path is on the server but the old one wasn't deleted. Queue the
+        // delete so the next flush retries — without this the admin panel
+        // shows both names forever, which is exactly the duplicate-after-
+        // rename bug we're fixing.
+        this.logError(
+          `Rename: DELETE of old path "${oldNormalized}" failed`,
+          new Error(delResp.error?.message ?? "unknown")
+        );
+        this.queueOfflineOperation("delete", oldNormalized);
+      } else {
+        this.recordRemoteFileAbsent(oldNormalized);
+      }
+
+      // Pitfall 5: rename emits OLD path.
+      this.permissionStore.emit("changed", { path: oldNormalized });
+      await this.emitAuditEvent("file.rename", oldNormalized, { newPath: newNormalized });
+      this.syncState.pendingChanges = this.offlineQueue.length;
+      this.updateStatusBar();
+    } catch (error) {
+      if (this.isNetworkError(error)) {
+        this.setConnectionStatus("offline");
+        try {
+          const content = await readContent();
+          this.queueOfflineOperation("write", newNormalized, content);
+        } catch (err) {
+          this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
+        }
+        this.queueOfflineOperation("delete", oldNormalized);
+        // Pitfall 5: rename emits OLD path.
+        this.permissionStore.emit("changed", { path: oldNormalized });
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * BIN-A / L1: byte-safe rename push for binary content. Mirrors the string flow
+   * but (a) size-gates against the JSON-path ceiling, (b) encrypts/hashes RAW
+   * bytes (no lossy UTF-8 decode — the L1 corruption fix), (c) sends a real
+   * contentType + the large-body timeout, and (d) queues base64 with
+   * encoding:"base64" when offline.
+   */
+  private async pushRenamedBinaryToServer(
+    oldNormalized: string,
+    newNormalized: string,
+    oldPath: string,
+    newPath: string,
+    bytes: ArrayBuffer,
+  ): Promise<void> {
+    // Size gate (L10 / OD-1): an oversize binary can't ride the JSON path until
+    // BIN-B. Skip ALL server ops — no PUT, no queued write, and crucially do NOT
+    // delete/queue-delete the old server path (never remove a server copy without
+    // a replacement). The local rename already happened; leave it. Throttled
+    // Notice reuses the binaryWriteNoticeAt per-path map.
+    if (bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+      const now = Date.now();
+      if (now - (this.binaryWriteNoticeAt.get(newNormalized) ?? 0) >= 60_000) {
+        this.binaryWriteNoticeAt.set(newNormalized, now);
+        new Notice(
+          `VaultGuard Sync: "${newPath}" is larger than the ${Math.round(
+            BINARY_SYNC_MAX_BYTES / (1024 * 1024)
+          )} MB attachment sync limit — the local rename is kept, but the server copy was not moved. Large-file support arrives with BIN-B.`,
+          10000
+        );
+      }
+      this.logError(
+        `Rename: skipping server sync for oversize binary "${newNormalized}" (${bytes.byteLength} bytes > ${BINARY_SYNC_MAX_BYTES})`,
+        new Error("binary exceeds BINARY_SYNC_MAX_BYTES")
+      );
+      // Pitfall 5: rename emits OLD path.
+      this.permissionStore.emit("changed", { path: oldNormalized });
+      return;
+    }
+
+    const contentType = contentTypeForPath(newNormalized);
+
+    if (!this.shouldUploadChangesImmediately() || !this.isOnline() || !this.keyLease) {
+      // Offline / manual: queue the byte write (base64 + encoding marker) and the
+      // old-path delete, exactly as the string flow queues its two halves.
+      const base64 = uint8ToBase64Chunked(new Uint8Array(bytes));
+      this.queueOfflineOperation("write", newNormalized, base64, {
+        encoding: "base64",
+        contentType,
+      });
+      this.queueOfflineOperation("delete", oldNormalized);
+      // Pitfall 5: rename emits OLD path.
+      this.permissionStore.emit("changed", { path: oldNormalized });
+      return;
+    }
+
+    try {
+      const encrypted = await this.encryptContentBytes(bytes);
 
       const putResp = await this.apiRequest(
         "PUT",
         this.vaultPath(`/files/${encodeURIComponent(newNormalized)}`),
         {
           content: encrypted,
-          hash: await this.computeHash(content),
-        }
+          hash: await this.computeHashBytes(bytes),
+          contentType,
+        },
+        undefined,
+        { timeoutMs: BINARY_PUT_TIMEOUT_MS }
       );
 
       if (!putResp.success) {
@@ -1880,10 +3086,6 @@ export class AtRestAdapterRuntime {
       );
 
       if (!delResp.success) {
-        // New path is on the server but the old one wasn't deleted. Queue the
-        // delete so the next flush retries — without this the admin panel
-        // shows both names forever, which is exactly the duplicate-after-
-        // rename bug we're fixing.
         this.logError(
           `Rename: DELETE of old path "${oldNormalized}" failed`,
           new Error(delResp.error?.message ?? "unknown")
@@ -1899,12 +3101,11 @@ export class AtRestAdapterRuntime {
     } catch (error) {
       if (this.isNetworkError(error)) {
         this.setConnectionStatus("offline");
-        try {
-          const content = await this.hostReadPlainFromDisk(newPath);
-          this.queueOfflineOperation("write", newNormalized, content);
-        } catch (err) {
-          this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
-        }
+        const base64 = uint8ToBase64Chunked(new Uint8Array(bytes));
+        this.queueOfflineOperation("write", newNormalized, base64, {
+          encoding: "base64",
+          contentType,
+        });
         this.queueOfflineOperation("delete", oldNormalized);
         // Pitfall 5: rename emits OLD path.
         this.permissionStore.emit("changed", { path: oldNormalized });

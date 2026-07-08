@@ -53,6 +53,7 @@ credentials.json
 
 # Cache
 .vaultguard-cache/
+.vaultguard-long-operation-stress/
 
 # Private-only tooling — planning + AI-assistant configs.
 # Mirrors scripts/templates/public-gitignore.txt; see also

@@ -4,7 +4,7 @@ description: "Read, search, and edit files inside an Obsidian vault that's prote
 metadata:
   origin: "VaultGuard Obsidian plugin"
   vaultguard-managed: true
-  vaultguard-schema: 2
+  vaultguard-schema: 3
 ---
 
 # VaultGuard agent bridge
@@ -25,6 +25,8 @@ If the MCP server is not registered, **stop** and tell the user: "Your vault app
 
 All paths are vault-relative (no leading `/`, no absolute filesystem paths). Hidden directories like `.obsidian/`, `.trash/`, `.git/` are always blocked — do not try to read them.
 
+- **`mcp__vaultguard__get_vault_orientation({ includeKnownVaults?, includeGit?, includeConnectorStatus? })`** — get a safe metadata-only snapshot of the active vault, known VaultGuard vaults, connector path, Local Project Memory Mode, protected/encrypted state, bounded Git status, and write-safety profile. It never grants access and never returns absolute local paths, raw Git remote URLs, tokens, or key material. Call this first when the task may involve multiple vaults, protected content, Git state, connector readiness, or write safety. Treat the active vault as the default target unless the user names another vault, and confirm the target vault before cross-vault writes.
+
 - **`mcp__vaultguard__list({ scope?, limit? })`** — list visible files in the vault. Use first when the user asks "find X" or names a file you don't have an exact path for. `scope` is an optional vault-relative glob (e.g. `project-x/**`) to narrow within the lease scope. The result includes a `permission` label per file (`read` / `write` / `admin`) — that's the user's *file-level* permission, separate from the lease.
 
 - **`mcp__vaultguard__search({ query, scope?, limit? })`** — case-insensitive substring search across visible text files. Returns `{ path, line, snippet }` per match. Always prefer this to listing every file and reading them.
@@ -34,6 +36,12 @@ All paths are vault-relative (no leading `/`, no absolute filesystem paths). Hid
 - **`mcp__vaultguard__apply_patch({ path, diff })`** — apply a unified diff (with `@@` hunks) to an existing text file. Hunks must match the current file exactly. Subject to the permission stack below.
 
 - **`mcp__vaultguard__create({ path, content })`** — create a new text file. Refuses to overwrite existing files; use `apply_patch` for edits. Subject to the permission stack below.
+
+- **`mcp__vaultguard__delete({ path })`** — delete a note. Subject to the permission stack below and the stricter delete checks in VaultGuard.
+
+- **`mcp__vaultguard__rename({ path, newPath })`** — rename or move a note. Refuses to overwrite existing files. Subject to the permission stack below.
+
+- **`mcp__vaultguard__graph({ op, path?, tag?, depth?, limit? })`** — explore links, backlinks, tags, orphan notes, hubs, or an overview without reading whole files. Use this to narrow candidates before reading.
 
 ## Permission stack (READ THIS BEFORE SUGGESTING FIXES)
 
@@ -84,7 +92,7 @@ Independent of the lease, VaultGuard enforces per-file permissions (NONE / READ 
 
 3. **Don't mix transports for the same vault.** If you read a file via `mcp__vaultguard__read`, edit it via `mcp__vaultguard__apply_patch` — not via the built-in `Edit` tool. Otherwise the at-rest encryption layer breaks: built-in `Edit` would write the new content as plaintext, and the next time the Obsidian plugin opens the file it would see plaintext where ciphertext is expected.
 
-4. **Check the `permission` label from `list` before attempting a write.** When you call `mcp__vaultguard__list`, each entry includes a `permission` label. If it's `"read"`, don't even try `apply_patch` / `create` — you'll hit a Layer-3 error and waste the round-trip. Tell the user up front: "I see you have read-only access to `X` according to VaultGuard. I can read it but can't edit it without a permission change."
+4. **Check the `permission` label from `list` before attempting a write.** When you call `mcp__vaultguard__list`, each entry includes a `permission` label. If it's `"read"`, don't even try `apply_patch` / `create` / `delete` / `rename` — you'll hit a Layer-3 error and waste the round-trip. Tell the user up front: "I see you have read-only access to `X` according to VaultGuard. I can read it but can't edit it without a permission change."
 
 5. **Patch carefully.** `apply_patch` expects a strict unified diff. Read the file first, compute the diff against that exact content, then patch. If `apply_patch` returns "does not apply cleanly", re-read the file (it may have changed) and recompute.
 

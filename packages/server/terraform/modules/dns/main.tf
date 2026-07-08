@@ -232,10 +232,155 @@ resource "aws_route53_record" "ses_verification" {
 # `include:amazonses.com` term is dropped, so audit this record after any
 # DNS change.
 
-# DMARC record — email authentication policy
+# DMARC record — email authentication policy.
+# `sp=quarantine` sets the policy for any subdomain that lacks its own _dmarc
+# record. The dedicated sending subdomains below publish their OWN _dmarc
+# records (so this is belt-and-suspenders for them), but sp= closes the gap for
+# every other subdomain so none can be spoofed under a looser default.
 resource "aws_route53_record" "dmarc" {
   zone_id = data.aws_route53_zone.main.zone_id
   name    = "_dmarc.${var.domain_name}"
+  type    = "TXT"
+  ttl     = 600
+  records = ["v=DMARC1; p=quarantine; sp=quarantine; rua=mailto:dmarc@${var.domain_name}; pct=100"]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dedicated sending subdomains (reputation isolation)
+#
+# Outbound app mail is moved OFF the apex onto dedicated SES sending subdomains
+# so their reputation is isolated from (a) the apex — which carries Google
+# Workspace corporate mail + the website — and (b) each other:
+#   mail.<domain>  — transactional (password resets, invites, receipts). The
+#                    email Lambda + Cognito send as noreply@mail.<domain>.
+#   news.<domain>  — bulk/marketing blasts. The blast scripts send as
+#                    hello@news.<domain>.
+# A spam-complaint hit on the marketing lane can therefore never drag down
+# transactional deliverability or the corporate/apex domain.
+#
+# Each subdomain also gets a custom MAIL FROM (Return-Path) domain
+# (bounce.<subdomain>) so SPF authenticates against our domain (aligned) rather
+# than the default amazonses.com — strengthening DMARC and inbox placement.
+# behavior_on_mx_failure = "RejectMessage" fails CLOSED: if the MAIL FROM MX/SPF
+# is ever unverified, SES rejects the send instead of silently reverting to
+# amazonses.com and breaking SPF alignment. Confirm the MAIL FROM domain shows
+# "Success" in SES before cutting a sender over to it.
+#
+# The apex SES identity above is intentionally LEFT verified during migration:
+# a sender rolls back to the apex instantly by flipping var.sender_email /
+# var.sender_domain — no destroy/recreate required.
+# ─────────────────────────────────────────────────────────────────────────────
+
+data "aws_region" "current" {}
+
+locals {
+  # logical key => sending subdomain FQDN
+  ses_sending_subdomains = {
+    transactional = "mail.${var.domain_name}"
+    marketing     = "news.${var.domain_name}"
+  }
+  # logical key => custom MAIL FROM (Return-Path) FQDN
+  ses_mail_from_domains = {
+    for key, domain in local.ses_sending_subdomains : key => "bounce.${domain}"
+  }
+}
+
+resource "aws_ses_domain_identity" "sending" {
+  for_each = local.ses_sending_subdomains
+  domain   = each.value
+}
+
+resource "aws_ses_domain_dkim" "sending" {
+  for_each = aws_ses_domain_identity.sending
+  domain   = each.value.domain
+}
+
+resource "aws_ses_domain_mail_from" "sending" {
+  for_each               = aws_ses_domain_identity.sending
+  domain                 = each.value.domain
+  mail_from_domain       = local.ses_mail_from_domains[each.key]
+  behavior_on_mx_failure = "RejectMessage"
+}
+
+# SES identity verification TXT — _amazonses.<subdomain>
+resource "aws_route53_record" "sending_ses_verification" {
+  for_each = aws_ses_domain_identity.sending
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = "_amazonses.${each.value.domain}"
+  type    = "TXT"
+  ttl     = 600
+  records = [each.value.verification_token]
+}
+
+# DKIM CNAMEs (3 per subdomain). SES exposes dkim_tokens only at apply time, so
+# — exactly like the apex ses_dkim block above — these use count, not for_each
+# (a for_each over a computed-length list errors at plan time).
+resource "aws_route53_record" "sending_dkim_transactional" {
+  count = 3
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = "${aws_ses_domain_dkim.sending["transactional"].dkim_tokens[count.index]}._domainkey.${local.ses_sending_subdomains["transactional"]}"
+  type    = "CNAME"
+  ttl     = 600
+  records = ["${aws_ses_domain_dkim.sending["transactional"].dkim_tokens[count.index]}.dkim.amazonses.com"]
+}
+
+resource "aws_route53_record" "sending_dkim_marketing" {
+  count = 3
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = "${aws_ses_domain_dkim.sending["marketing"].dkim_tokens[count.index]}._domainkey.${local.ses_sending_subdomains["marketing"]}"
+  type    = "CNAME"
+  ttl     = 600
+  records = ["${aws_ses_domain_dkim.sending["marketing"].dkim_tokens[count.index]}.dkim.amazonses.com"]
+}
+
+# SPF TXT on each sending subdomain — only SES sends from these names, so no
+# Google include is needed here (unlike the apex, which Google Workspace shares).
+resource "aws_route53_record" "sending_spf" {
+  for_each = local.ses_sending_subdomains
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = each.value
+  type    = "TXT"
+  ttl     = 600
+  records = ["v=spf1 include:amazonses.com -all"]
+}
+
+# Custom MAIL FROM MX — routes bounces/complaints to SES's regional feedback
+# endpoint. No trailing dot on the target (same Route53 normalization quirk the
+# apex MX comment documents).
+resource "aws_route53_record" "sending_mail_from_mx" {
+  for_each = aws_ses_domain_mail_from.sending
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = each.value.mail_from_domain
+  type    = "MX"
+  ttl     = 600
+  records = ["10 feedback-smtp.${data.aws_region.current.name}.amazonses.com"]
+}
+
+# Custom MAIL FROM SPF TXT — authorizes SES for the Return-Path domain so SPF
+# aligns to our domain.
+resource "aws_route53_record" "sending_mail_from_spf" {
+  for_each = aws_ses_domain_mail_from.sending
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = each.value.mail_from_domain
+  type    = "TXT"
+  ttl     = 600
+  records = ["v=spf1 include:amazonses.com -all"]
+}
+
+# Explicit DMARC per sending subdomain. Aggregate reports go to the same inbox
+# as the apex (same org domain → no external _report._dmarc authorization
+# needed).
+resource "aws_route53_record" "sending_dmarc" {
+  for_each = local.ses_sending_subdomains
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = "_dmarc.${each.value}"
   type    = "TXT"
   ttl     = 600
   records = ["v=DMARC1; p=quarantine; rua=mailto:dmarc@${var.domain_name}; pct=100"]

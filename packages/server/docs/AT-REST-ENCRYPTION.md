@@ -39,7 +39,7 @@ own keys, its own recovery story, its own threat model.
 │  CLOUD LAYER (server / sync wire)                                 │
 │  ─ Per-vault CMK in AWS KMS                                       │
 │  ─ Per-file DEKs wrapped by CMK                                   │
-│  ─ Per-session lease tokens (TTL ~4h)                             │
+│  ─ Per-session lease tokens (1h default, configurable)             │
 │  ─ Hybrid ZK mode: per-user UMK derived from passphrase           │
 │  Recovery: Manage Organization → Recovery (admin only, escrow)    │
 │  See: docs/KEY-LEASE-AND-ZK-IMPLEMENTATION.md                     │
@@ -60,6 +60,33 @@ or decrypting at one layer does not affect the other.
 
 See the [§ "Org recovery vs at-rest recovery"](#org-recovery-vs-at-rest-recovery)
 table below for the side-by-side comparison.
+
+---
+
+## Repository-root vaults and Local Project Memory Mode
+
+Local at-rest encryption is not safe for Obsidian vaults whose root is also a
+development repository root. In that layout, source files, package files,
+tests, Terraform, docs, reports, and agent-memory files must remain plaintext
+for Git, editors, package managers, CI-style checks, and coding agents that
+read files directly from disk.
+
+Use [Local Project Memory Mode](LOCAL-PROJECT-MEMORY-MODE.md) for repo-root
+vaults. That mode disables the at-rest layer, encrypt-on-write behavior,
+encrypt-all/background migration jobs, sync, share links, server vault binding,
+and organization/company/team controls for the current vault.
+
+"Local-only" by itself does not mean plaintext. Organization sharing and remote
+sync are cloud-layer features, while at-rest encryption is a separate local
+disk layer. A vault can be local-only and still write `VG1\0` ciphertext unless
+at-rest encryption is explicitly disabled. Local Project Memory Mode is the
+repo-root-safe way to make that distinction explicit.
+
+If a repository-root vault already contains `VG1\0` files, use **Decrypt vault
+and disable at-rest encryption**. That flow persists encryption-disabled state
+before plaintext writes, uses raw non-encrypting adapter writes, keeps
+encryption disabled after completion, and reports any remaining ciphertext
+paths.
 
 ---
 
@@ -131,7 +158,8 @@ OS keychain (macOS Keychain / Windows DPAPI / Linux libsecret)
 ```
 
 The LAK is **not** the cloud-layer key lease. The lease encrypts
-content for transit and S3 storage and rotates every 4 hours. The LAK
+content for transit and S3 storage and defaults to a 1-hour lease
+(configurable by the server deployment). The LAK
 encrypts local-disk content, is stable for the life of the device-vault
 binding, and never participates in sync.
 
@@ -168,17 +196,28 @@ A file that does not start with the `VG1\0` magic is treated as legacy
 plaintext and decoded directly. This enables:
 
 - **Lazy migration**: legacy vaults still read; first write encrypts.
-- **External adds are auto-encrypted (text only)**: when a plaintext text
-  file lands in the vault folder from outside Obsidian (Finder drop, git
-  checkout), the plugin re-encrypts the identical bytes in place — via
-  `vault.on("create")` (with a stat-stability guard against mid-copy
-  clobbering) while Obsidian is running, or via the local-only catch-up
-  hook after the file's first upload when it was added while Obsidian was
-  closed. Binary files are deliberately left plaintext: binary sync is
-  unsupported, so they have no server copy, and at-rest-encrypting them
-  would make the LAK envelope a single point of failure for content that
-  exists nowhere else. First save through Obsidian still encrypts anything
-  the hooks missed (legacy lazy migration).
+- **External adds are auto-encrypted (text and in-size binaries — BIN-A)**:
+  when a plaintext file lands in the vault folder from outside Obsidian
+  (Finder drop, git checkout), the plugin re-encrypts the identical bytes in
+  place — via `vault.on("create")` (with a stat-stability guard against
+  mid-copy clobbering) while Obsidian is running, or via the local-only
+  catch-up hook after the file's first upload when it was added while
+  Obsidian was closed. This now covers **binaries up to `BINARY_SYNC_MAX_BYTES`
+  (~7 MiB — the JSON-path transport ceiling: API Gateway's 10 MB body cap
+  minus base64 inflation)**, because BIN-A gives in-size binaries a server
+  copy path (byte push + reconciliation), so the LAK envelope is no longer
+  their only copy. **Oversize binaries (> `BINARY_SYNC_MAX_BYTES`) are
+  deliberately left plaintext on disk until the BIN-B presigned-URL path
+  ships**: at-rest-encrypting content that has no server copy would make the
+  LAK envelope a single point of failure — envelope/keychain loss = permanent
+  loss (the CR-1 data-loss class). First save through Obsidian still encrypts
+  anything the hooks missed (legacy lazy migration).
+- **Drag-dropped binaries are ingested end-to-end (BIN-A)**: a binary pasted
+  or dropped into a protected vault flows through `interceptedWriteBinary` —
+  permission check → E2E-encrypted upload (or an offline queue entry encoded
+  base64) → VG1 at-rest write to disk — the same shape as `interceptedWrite`
+  for text. Oversize drops are rejected fail-closed with a Notice naming the
+  ~7 MiB limit (OD-1); nothing lands on disk or in the offline queue.
 - **Forward compatibility**: the version byte gives one bump for
   changing scheme without breaking existing vaults.
 
@@ -196,6 +235,48 @@ The plugin never at-rest-encrypts:
 
 The check is `isAtRestExcluded()` in `main.ts`, a superset of the
 sync-level `isPathExcluded()`.
+
+---
+
+## Media preview (encrypted attachments render decrypted)
+
+At-rest encryption stores every attachment (images, PDFs, audio, video)
+as VG1 ciphertext on disk. But Obsidian's renderer does **not** read media
+through the intercepted `readBinary` — it loads media from the URL returned
+by `adapter.getResourcePath(path)`, an `app://…/<abs-path>?<mtime>` URL that
+Electron reads **directly from disk**. Left alone, the renderer would decode
+raw VG1 ciphertext → a broken/blank preview. (Text notes are unaffected: they
+render through the intercepted `adapter.read`, which decrypts.)
+
+The fix is a **`getResourcePath` override** (`interceptedGetResourcePath` in
+`src/plugin/at-rest-adapter-runtime.ts`) that serves a decrypted `blob:` URL:
+
+- **Cache hit** → returns the cached `blob:` URL synchronously (instant render).
+- **Cold miss** → `getResourcePath` is synchronous but decryption is async, so
+  it returns the real (ciphertext) URL immediately, then decrypts in the
+  background, caches a `blob:` URL, and swaps the rendered element's `src` so
+  the broken preview repaints itself. A `file-open` pre-warm decrypts opened
+  media ahead of standalone image/PDF views to avoid the first-view flash.
+- **Passthrough** for non-media, excluded, or not-yet-encrypted paths.
+
+The files **stay VG1-encrypted on disk** — the at-rest guarantee is preserved;
+only the in-memory rendered copy is plaintext (a `blob:` URL, same trust
+boundary as the decrypted JS string a markdown note already becomes).
+
+**Blob lifecycle:** the cache is keyed by path + resource mtime (so an edited
+file re-decrypts), bounded FIFO at 64 entries, and every `blob:` URL is revoked
+on eviction, delete, rename, and adapter restore (unload) — no leaks. Decrypt
+failures **fail open** (the ciphertext fallback stays; a broken preview, never
+a wipe), mirroring the at-rest read philosophy.
+
+The dev-only command *"VaultGuard (debug): Diagnose attachment preview"* reports
+the on-disk (VG1) vs decrypted (real magic) header per attachment and whether
+the override is active.
+
+> **Known limitation (tracked):** the file **permission header/banner** is
+> injected only into `MarkdownView`, so it does not appear on image/PDF/other
+> non-markdown file views even though those files now render. See
+> `reports/permission-header-non-md-HANDOFF.md`.
 
 ---
 
@@ -415,10 +496,16 @@ people. They are complementary, not redundant.
 
 - `src/crypto/at-rest-cipher.ts` — owns the LAK, file format, recovery
   code export/import, safeStorage probe, fallback logic.
-- `src/plugin/main.ts` — `interceptVaultAdapter()` (wires the
-  read/write/readBinary/writeBinary hooks), `readPlainFromDisk()` /
-  `writePlainToDisk()` helpers, `initAtRestCipher()`, migration
-  commands, first-run prompt, recovery banner, `verifyAccountPassword()`.
+- `src/plugin/at-rest-adapter-runtime.ts` — `interceptVaultAdapter()`
+  (wires the read/write/readBinary/writeBinary/rename/**getResourcePath**
+  hooks), the `interceptedRead/Write/…` methods, `readPlainFromDisk()` /
+  `readPlainBinaryFromDisk()` / `writePlainToDisk()` /
+  `writePlainBinaryToDisk()`, `ensureAtRestEncryptedInPlace()`, and the
+  media-preview blob cache (`interceptedGetResourcePath`,
+  `prewarmResourcePreview`, `revokeAllResourcePreviews`).
+- `src/plugin/main.ts` — thin delegates to the runtime above, plus
+  `initAtRestCipher()`, migration commands, first-run prompt, recovery
+  banner, `verifyAccountPassword()`, and the `file-open` preview pre-warm.
 - `src/plugin/at-rest-modals.ts` — `AtRestRecoveryCodeModal` (display),
   `AtRestRestoreModal` (input), `AtRestPasswordConfirmModal` (re-auth
   gate).

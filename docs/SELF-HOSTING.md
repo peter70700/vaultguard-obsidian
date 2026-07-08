@@ -135,7 +135,7 @@ defaults are sensible for a first deployment; you only need to change
 - **`cognito_callback_urls` / `cognito_logout_urls`** — OAuth redirect URIs.
   The defaults point at `http://localhost:5173` for local development.
 - **`key_lease_duration_seconds`** — How long a cloud DEK lease is valid before
-  the plugin must renew. Default `14400` (4 hours).
+  the plugin must renew. Default `3600` (1 hour).
 - **`session_duration_seconds`** — How long a user session token is valid.
   Default `28800` (8 hours).
 - **`max_file_size_bytes`** — Hard upload ceiling. Default `26214400` (25 MiB).

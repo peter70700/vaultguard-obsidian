@@ -130,6 +130,8 @@ const mockNotice = vi.mocked(Notice);
  */
 function createTestPlugin() {
   const plugin = new VaultGuardPlugin() as any;
+  plugin.app.vault.configDir = '.obsidian';
+  plugin.app.vault.adapter.exists = vi.fn().mockResolvedValue(false);
 
   // Mock original adapter methods (the real filesystem operations).
   // writeBinary is present because writePlainToDisk fails closed without it
@@ -546,12 +548,74 @@ describe('File Protection: Vault Adapter Interception', () => {
       plugin.session = makeSession('editor');
       plugin.permissionCache.set('notes.md', PermissionLevel.WRITE);
       plugin.connectionState.status = 'offline';
+      plugin.remoteFileState.recordPresent('notes.md', { versionId: 'v-base' });
 
       await plugin.interceptedWrite('notes.md', 'offline edit');
 
       expect(plugin.offlineQueue.length).toBe(1);
       expect(plugin.offlineQueue[0].operation).toBe('write');
       expect(plugin.offlineQueue[0].path).toBe('notes.md');
+      expect(plugin.offlineQueue[0].baseVersionId).toBe('v-base');
+    });
+
+    it('sends expectedVersionId for online writes with known remote state', async () => {
+      plugin.session = makeSession('editor');
+      plugin.permissionCache.set('notes.md', PermissionLevel.WRITE);
+      plugin.connectionState.status = 'online';
+      plugin.keyLease = makeKeyLease();
+      plugin.remoteFileState.recordPresent('notes.md', { versionId: 'v1' });
+      plugin.apiRequest = vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          path: '/notes.md',
+          versionId: 'v2',
+          checksum: '"etag-2"',
+          size: 42,
+          lastModified: '2026-07-03T00:00:00.000Z',
+        },
+        error: null,
+        requestId: 'req-write',
+      });
+
+      await plugin.interceptedWrite('notes.md', 'online edit');
+
+      expect(plugin.apiRequest).toHaveBeenCalledWith(
+        'PUT',
+        '/vaults/vault-test-001/files/notes.md',
+        expect.objectContaining({ expectedVersionId: 'v1' })
+      );
+      expect(plugin.remoteFileState.getExpectedVersionId('notes.md')).toBe('v2');
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledOnce();
+    });
+
+    it('routes online write 409 responses to conflict handling without writing or queuing blindly', async () => {
+      plugin.session = makeSession('editor');
+      plugin.permissionCache.set('notes.md', PermissionLevel.WRITE);
+      plugin.connectionState.status = 'online';
+      plugin.keyLease = makeKeyLease();
+      plugin.remoteFileState.recordPresent('notes.md', { versionId: 'v1' });
+      plugin.handleRemoteWriteConflict = vi.fn().mockResolvedValue('pending');
+      plugin.apiRequest = vi.fn().mockResolvedValue({
+        success: false,
+        data: null,
+        error: {
+          code: 'CONFLICT',
+          message: 'stale version',
+          details: null,
+          statusCode: 409,
+        },
+        requestId: 'req-conflict',
+      });
+
+      await plugin.interceptedWrite('notes.md', 'conflicting edit');
+
+      expect(plugin.handleRemoteWriteConflict).toHaveBeenCalledWith(
+        'notes.md',
+        'conflicting edit',
+        'v1'
+      );
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+      expect(plugin.offlineQueue).toHaveLength(0);
     });
 
     it('does not call original write when permission denied', async () => {
@@ -590,29 +654,352 @@ describe('File Protection: Vault Adapter Interception', () => {
 
   // ── interceptedWriteBinary ───────────────────────────────────────────
 
-  describe('interceptedWriteBinary', () => {
-    it('rejects binary writes with a visible Notice so drag-drop is not silent', async () => {
+  describe('interceptedWriteBinary (BIN-A / D-08)', () => {
+    // PNG magic + invalid-UTF-8 continuation bytes: real attachment content,
+    // NOT VG1 ciphertext and NOT valid UTF-8 (so it is a genuine binary drop).
+    const PNG = () =>
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x80, 0xff, 0xfe, 0x00]);
+
+    it('uploads an in-size binary via the byte PUT, then writes VG1 to disk (PUT first — CR-1)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+
+      const bytes = PNG();
+      const puts: any[] = [];
+      const callOrder: string[] = [];
+      plugin.apiRequest = vi.fn(async (method: string, endpoint: string, body: any, _id?: unknown, options?: unknown) => {
+        if (method === 'PUT' && endpoint.includes('/files/')) {
+          puts.push({ endpoint, body, options });
+          callOrder.push('PUT');
+        }
+        return { success: true, data: {}, error: null, requestId: 'r' };
+      });
+      plugin.originalAdapterMethods.writeBinary = vi.fn(async () => { callOrder.push('writeBinary'); });
+
+      await plugin.interceptedWriteBinary('img/pic.png', bytes.buffer);
+
+      expect(puts).toHaveLength(1);
+      expect(puts[0].endpoint).toContain('img%2Fpic.png');
+      expect(puts[0].body.contentType).toBe('image/png');
+      expect(puts[0].options).toEqual({ timeoutMs: 120_000 });
+      // The PUT hash is the byte hash of the PLAINTEXT bytes…
+      expect(puts[0].body.hash).toBe(await plugin.computeHashBytes(bytes.buffer));
+      // …and the ciphertext decrypts back to the EXACT original bytes (no lossy
+      // UTF-8 decode — the AR1 corruption class stays gone).
+      const decrypted = await plugin.decryptContentBytes(puts[0].body.content);
+      expect(new Uint8Array(decrypted)).toEqual(bytes);
+      // CR-1 ordering: successful/queued PUT first, local VG1 write second.
+      expect(callOrder).toEqual(['PUT', 'writeBinary']);
+    });
+
+    it('queues an in-size binary (base64 + encoding + contentType) and writes VG1 when offline', async () => {
+      plugin.session = makeSession('editor');
+      plugin.connectionState.status = 'offline';
+      plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
+      plugin.apiRequest = vi.fn();
+
+      await plugin.interceptedWriteBinary('img/pic.png', bytes.buffer);
+
+      // No PUT offline. The local VG1 write is safe: the queued op IS the
+      // server-copy path (CR-1 satisfied by the queue).
+      expect(plugin.apiRequest).not.toHaveBeenCalled();
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
+      const writeOp = plugin.offlineQueue.find((op: any) => op.operation === 'write');
+      expect(writeOp).toMatchObject({ path: 'img/pic.png', encoding: 'base64', contentType: 'image/png' });
+      expect(new Uint8Array(Buffer.from(writeOp.data, 'base64'))).toEqual(bytes);
+    });
+
+    it('rejects an oversize binary fail-closed: throw + throttled Notice + zero disk + zero queue (OD-1)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('img/huge.bin', PermissionLevel.WRITE);
+      plugin.apiRequest = vi.fn();
+      mockNotice.mockClear();
+
+      const huge = new Uint8Array(7 * 1024 * 1024 + 16);
+      huge[0] = 0xff;
+      huge[1] = 0xfe;
+
+      await expect(plugin.interceptedWriteBinary('img/huge.bin', huge.buffer))
+        .rejects.toThrow(/attachment sync limit/);
+
+      // OD-1: nothing lands on disk, nothing queues, no PUT ever fires.
+      expect(plugin.apiRequest).not.toHaveBeenCalled();
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+      expect(plugin.offlineQueue).toHaveLength(0);
+      expect(mockNotice).toHaveBeenCalledTimes(1);
+      expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining('7 MB'), 10000);
+
+      // Throttled: a second oversize drop of the same path throws again but
+      // does not stack a second Notice.
+      mockNotice.mockClear();
+      await expect(plugin.interceptedWriteBinary('img/huge.bin', huge.buffer))
+        .rejects.toThrow(/attachment sync limit/);
+      expect(mockNotice).not.toHaveBeenCalled();
+    });
+
+    it('AC-API1: a permanent 4xx (413) throws and queues nothing (no local VG1 orphan)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+      plugin.apiRequest = vi.fn().mockResolvedValue({
+        success: false,
+        data: null,
+        error: { code: 'PAYLOAD_TOO_LARGE', message: 'Payload too large', details: null, statusCode: 413 },
+        requestId: 'req-413',
+      });
+
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
+      await expect(plugin.interceptedWriteBinary('img/pic.png', bytes.buffer))
+        .rejects.toThrow('Payload too large');
+
+      // Permanent failure: no local VG1 write (CR-1 — never orphan a copy the
+      // server refused), nothing queued (AC-API1).
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+      expect(plugin.offlineQueue).toHaveLength(0);
+    });
+
+    it('AC-API1: statusCode 0 flips offline, queues (base64 + encoding), then writes VG1', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+      plugin.setConnectionStatus = vi.fn();
+      plugin.apiRequest = vi.fn().mockResolvedValue({
+        success: false,
+        data: null,
+        error: { code: 'NETWORK', message: 'network', details: null, statusCode: 0 },
+        requestId: 'req-0',
+      });
+
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
+      await plugin.interceptedWriteBinary('img/pic.png', bytes.buffer);
+
+      // The ctx setConnectionStatus lambda forwards a trailing options arg.
+      expect(plugin.setConnectionStatus).toHaveBeenCalledWith('offline', undefined);
+      const writeOp = plugin.offlineQueue.find((op: any) => op.operation === 'write');
+      expect(writeOp).toMatchObject({ path: 'img/pic.png', encoding: 'base64', contentType: 'image/png' });
+      // A transient failure still lands the local VG1 copy (the queued op is
+      // the server-copy path).
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
+    });
+
+    it('AC-API1: 401/403 throws and never queues (auth is permanent)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+      plugin.apiRequest = vi.fn().mockResolvedValue({
+        success: false,
+        data: null,
+        error: { code: 'AUTH_ERROR', message: 'Access denied', details: null, statusCode: 403 },
+        requestId: 'req-403',
+      });
+
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
+      await expect(plugin.interceptedWriteBinary('img/pic.png', bytes.buffer))
+        .rejects.toThrow('Access denied');
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+      expect(plugin.offlineQueue).toHaveLength(0);
+    });
+
+    it('refuses bytes that already carry the VG1 magic (guard kept verbatim)', async () => {
       plugin.session = makeSession('editor');
       plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
-      const { Notice } = await import('obsidian');
-      vi.mocked(Notice).mockClear();
+      // Force the cipher to recognise these bytes as at-rest ciphertext.
+      plugin.atRestCipher.isEncrypted = vi.fn(() => true);
+      const vg1 = new Uint8Array([0x56, 0x47, 0x31, 0x00, 0x01, 0x02]).buffer;
 
-      // PNG magic + high bytes: real attachment content, not VG1 ciphertext.
+      await expect(plugin.interceptedWriteBinary('img/pic.png', vg1))
+        .rejects.toThrow(/at-rest ciphertext/);
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+    });
+
+    it('bypasses upload/permission during an applyingRemoteWrite (writes VG1 directly)', async () => {
+      // A remote pull sets applyingRemoteWrite; the interceptor must pass the
+      // bytes straight to the at-rest disk write with no PUT / permission gate.
+      plugin.applyingRemoteWrite = true;
+      plugin.apiRequest = vi.fn();
       const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]).buffer;
-      await expect(plugin.interceptedWriteBinary('img/pic.png', bytes))
-        .rejects.toThrow('Binary files are not currently supported');
 
-      expect(vi.mocked(Notice)).toHaveBeenCalledWith(
-        expect.stringContaining("binary attachments aren't supported"),
-        8000
-      );
+      await plugin.interceptedWriteBinary('img/pic.png', bytes);
 
-      // Throttled: an immediate second drop of the same path throws again
-      // but does not stack a second notice.
-      vi.mocked(Notice).mockClear();
-      await expect(plugin.interceptedWriteBinary('img/pic.png', bytes))
-        .rejects.toThrow('Binary files are not currently supported');
-      expect(vi.mocked(Notice)).not.toHaveBeenCalled();
+      expect(plugin.apiRequest).not.toHaveBeenCalled();
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
+    });
+
+    it('silently returns on a legacy adapter without writeBinary (D-10, byte-identical to today)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+      plugin.originalAdapterMethods.writeBinary = null;
+      plugin.apiRequest = vi.fn();
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]).buffer;
+
+      // No throw, no PUT, no queue — exactly today's behavior.
+      await expect(plugin.interceptedWriteBinary('img/pic.png', bytes)).resolves.toBeUndefined();
+      expect(plugin.apiRequest).not.toHaveBeenCalled();
+      expect(plugin.offlineQueue).toHaveLength(0);
+    });
+  });
+
+  // ── interceptedRename binary (BIN-A / L1) ────────────────────────────
+
+  describe('interceptedRename binary (BIN-A/L1)', () => {
+    // AR1-style: PNG magic + invalid-UTF-8 continuation bytes. A lossy UTF-8
+    // decode (the pre-fix bug) would mangle these into U+FFFD before the PUT.
+    const PNG = () =>
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x80, 0xff, 0xfe, 0x00]);
+
+    // Capture only file-PUTs, tolerant of a 5th (timeout options) arg.
+    function capturingApiRequest(puts: any[]) {
+      return vi.fn(async (method: string, endpoint: string, body: any, _id?: unknown, options?: unknown) => {
+        if (method === 'PUT' && endpoint.includes('/files/')) puts.push({ endpoint, body, options });
+        return { success: true, data: {}, error: null, requestId: 'r' };
+      });
+    }
+
+    beforeEach(() => {
+      // interceptedRename probes for a folder rename (TFolder) before touching
+      // content — the base app mock has no vault.getAbstractFileByPath, so a
+      // plain-file stand-in (null ⇒ not a folder) lets the file path proceed.
+      plugin.app.vault.getAbstractFileByPath = vi.fn(() => null);
+    });
+
+    it('renames a binary via the byte PUT — contentType, byte hash, round-trips (no lossy decode)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('img/new.png', PermissionLevel.WRITE);
+
+      const bytes = PNG();
+      plugin.originalAdapterMethods.rename = vi.fn().mockResolvedValue(undefined);
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(bytes.buffer);
+
+      const puts: any[] = [];
+      plugin.apiRequest = capturingApiRequest(puts);
+
+      await plugin.interceptedRename('img/old.png', 'img/new.png');
+
+      expect(puts).toHaveLength(1);
+      expect(puts[0].endpoint).toContain('img%2Fnew.png');
+      expect(puts[0].body.contentType).toBe('image/png');
+      expect(puts[0].options).toEqual({ timeoutMs: 120_000 });
+      // Byte hash of the plain bytes…
+      expect(puts[0].body.hash).toBe(await plugin.computeHashBytes(bytes.buffer));
+      // …and the ciphertext decrypts back to the EXACT original bytes — proving
+      // the L1 lossy-decode corruption is gone (byte-identical server copy).
+      const decrypted = await plugin.decryptContentBytes(puts[0].body.content);
+      expect(new Uint8Array(decrypted)).toEqual(bytes);
+    });
+
+    it('queues a binary rename as base64 (encoding + contentType) when offline', async () => {
+      plugin.session = makeSession('editor');
+      plugin.connectionState.status = 'offline';
+      plugin.permissionCache.set('img/new.png', PermissionLevel.WRITE);
+
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
+      plugin.originalAdapterMethods.rename = vi.fn().mockResolvedValue(undefined);
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(bytes.buffer);
+      plugin.apiRequest = vi.fn();
+
+      await plugin.interceptedRename('img/old.png', 'img/new.png');
+
+      expect(plugin.apiRequest).not.toHaveBeenCalled();
+      const writeOp = plugin.offlineQueue.find((op: any) => op.operation === 'write');
+      const deleteOp = plugin.offlineQueue.find((op: any) => op.operation === 'delete');
+      expect(writeOp).toMatchObject({ path: 'img/new.png', encoding: 'base64', contentType: 'image/png' });
+      expect(deleteOp).toMatchObject({ path: 'img/old.png' });
+      // The queued base64 decodes back to the original bytes.
+      expect(new Uint8Array(Buffer.from(writeOp.data, 'base64'))).toEqual(bytes);
+    });
+
+    it('skips ALL server ops for an oversize binary rename and Notices once (throttled)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('img/huge.bin', PermissionLevel.WRITE);
+
+      // > 7 MiB and invalid UTF-8 (leading 0xff) so it is probed as binary.
+      const huge = new Uint8Array(7 * 1024 * 1024 + 16);
+      huge[0] = 0xff;
+      huge[1] = 0xfe;
+      plugin.originalAdapterMethods.rename = vi.fn().mockResolvedValue(undefined);
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(huge.buffer);
+      plugin.apiRequest = vi.fn();
+      mockNotice.mockClear();
+
+      await plugin.interceptedRename('img/old.bin', 'img/huge.bin');
+
+      // No PUT, no queued write, and NO delete of the old server path.
+      expect(plugin.apiRequest).not.toHaveBeenCalled();
+      expect(plugin.offlineQueue).toHaveLength(0);
+      expect(mockNotice).toHaveBeenCalledTimes(1);
+      expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining('7 MB'), 10000);
+
+      // Second rename onto the SAME new path within 60 s: throttle suppresses it.
+      mockNotice.mockClear();
+      await plugin.interceptedRename('img/old2.bin', 'img/huge.bin');
+      expect(mockNotice).not.toHaveBeenCalled();
+      expect(plugin.apiRequest).not.toHaveBeenCalled();
+      expect(plugin.offlineQueue).toHaveLength(0);
+    });
+
+    it('keeps the legacy string rename path when the adapter lacks readBinary (D-10)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('notes/new.md', PermissionLevel.WRITE);
+
+      // Legacy adapter: no readBinary → today's string flow verbatim.
+      plugin.originalAdapterMethods.readBinary = null;
+      plugin.originalAdapterMethods.rename = vi.fn().mockResolvedValue(undefined);
+      plugin.readPlainFromDisk = vi.fn().mockResolvedValue('# renamed note');
+
+      const puts: any[] = [];
+      plugin.apiRequest = capturingApiRequest(puts);
+
+      await plugin.interceptedRename('notes/old.md', 'notes/new.md');
+
+      // The STRING read path ran (proving the legacy branch)…
+      expect(plugin.readPlainFromDisk).toHaveBeenCalledWith('notes/new.md');
+      // …and the PUT body is today's { content, hash } shape (no contentType, no
+      // timeout override) — legacy behavior unchanged.
+      expect(puts).toHaveLength(1);
+      expect(puts[0].body).toEqual({ content: expect.any(String), hash: expect.any(String) });
+      expect(puts[0].body).not.toHaveProperty('contentType');
+      expect(puts[0].options).toBeUndefined();
+    });
+
+    it('renames a TEXT file via the string flow even on a capable adapter (no contentType/timeout)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('notes/new.md', PermissionLevel.WRITE);
+
+      // Valid UTF-8 → probed as text; a capable adapter still routes through the
+      // string path (reusing the decoded string, no double read).
+      const text = new TextEncoder().encode('# hello world\n');
+      plugin.originalAdapterMethods.rename = vi.fn().mockResolvedValue(undefined);
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(text.buffer);
+
+      const puts: any[] = [];
+      plugin.apiRequest = capturingApiRequest(puts);
+
+      await plugin.interceptedRename('notes/old.md', 'notes/new.md');
+
+      expect(puts).toHaveLength(1);
+      expect(puts[0].body).toEqual({ content: expect.any(String), hash: expect.any(String) });
+      expect(puts[0].body).not.toHaveProperty('contentType');
+      expect(puts[0].options).toBeUndefined();
+      // The PUT content decrypts via the STRING decrypt back to the text.
+      const decrypted = await plugin.decryptContent(puts[0].body.content);
+      expect(decrypted).toBe('# hello world\n');
     });
   });
 
@@ -644,10 +1031,38 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
     });
 
-    it('deliberately leaves binary files plaintext (no server copy to recover from)', async () => {
-      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(
-        new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]).buffer
-      );
+    it('encrypts an in-size external binary in place (VG1) now that BIN-A can sync it', async () => {
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(bytes.buffer);
+
+      const result = await plugin.ensureAtRestEncryptedInPlace('img/photo.png');
+
+      expect(result).toBe(true);
+      // The RAW binary bytes were handed to the at-rest cipher, byte-identical.
+      expect(plugin.atRestCipher.encryptBinary).toHaveBeenCalledOnce();
+      expect(new Uint8Array(plugin.atRestCipher.encryptBinary.mock.calls[0][0])).toEqual(bytes);
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledOnce();
+    });
+
+    it('leaves an OVERSIZE external binary plaintext — provably NOT LAK-encrypted (L10 / CR-1)', async () => {
+      // > 7 MiB and invalid UTF-8 (leading 0xff) → classified binary. Until BIN-B
+      // it has no server copy, so LAK-encrypting it would be the CR-1 data-loss
+      // class: envelope loss = permanent loss.
+      const huge = new Uint8Array(7 * 1024 * 1024 + 16);
+      huge[0] = 0xff;
+      huge[1] = 0xfe;
+      plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(huge.buffer);
+
+      const result = await plugin.ensureAtRestEncryptedInPlace('img/huge.bin');
+
+      expect(result).toBe(false);
+      // No cipher call, no disk write — the oversize binary stays readable plaintext.
+      expect(plugin.atRestCipher.encryptBinary).not.toHaveBeenCalled();
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+    });
+
+    it('skips binary in-place encryption on a legacy adapter without readBinary (D-10)', async () => {
+      plugin.originalAdapterMethods.readBinary = null;
 
       const result = await plugin.ensureAtRestEncryptedInPlace('img/photo.png');
 
@@ -1071,5 +1486,77 @@ describe('File Protection: End-to-End Flows', () => {
     const notesOps = plugin.offlineQueue.filter((op: any) => op.path === 'notes.md');
     expect(notesOps).toHaveLength(1);
     expect(notesOps[0].data).toBe('version 3');
+  });
+});
+
+describe('File Protection: at-rest media preview (BIN-A / getResourcePath)', () => {
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+  let plugin: any;
+  let runtime: any;
+  let createObjectURL: ReturnType<typeof vi.fn>;
+  let revokeObjectURL: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    plugin = createTestPlugin();
+    plugin.app.vault.configDir = '.obsidian';
+    // Media read primitives the default harness omits: readBinary (raw on-disk)
+    // and getResourcePath (the sync URL Obsidian's renderer loads).
+    const methods = plugin.originalAdapterMethods;
+    methods.readBinary = vi.fn(async () => PNG.buffer.slice(0));
+    methods.getResourcePath = vi.fn((p: string) => `app://host/${p}?42`);
+    runtime = plugin.ensureAtRestAdapterRuntimeObject();
+
+    createObjectURL = vi.fn(() => 'blob:vg/1');
+    revokeObjectURL = vi.fn();
+    (globalThis.URL as any).createObjectURL = createObjectURL;
+    (globalThis.URL as any).revokeObjectURL = revokeObjectURL;
+  });
+
+  afterEach(() => {
+    delete (globalThis.URL as any).createObjectURL;
+    delete (globalThis.URL as any).revokeObjectURL;
+  });
+
+  it('passes text/non-media paths straight through to the original getResourcePath', () => {
+    expect(runtime.interceptedGetResourcePath('notes/foo.md')).toBe('app://host/notes/foo.md?42');
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it('passes through unchanged when the at-rest cipher is not ready', () => {
+    plugin.atRestCipher.isReady = vi.fn(() => false);
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('app://host/img/pic.png?42');
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it('prewarm decrypts a media file into a blob URL that getResourcePath then serves synchronously', async () => {
+    await runtime.prewarmResourcePreview('img/pic.png');
+    expect(plugin.originalAdapterMethods.readBinary).toHaveBeenCalledWith('img/pic.png');
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    // Now the sync render path gets the decrypted blob URL, not the ciphertext.
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('blob:vg/1');
+  });
+
+  it('a cold getResourcePath miss returns the ciphertext URL but warms the cache for next time', async () => {
+    // First (cold) call: sync fallback to the real URL, warm fired in the background.
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('app://host/img/pic.png?42');
+    await new Promise((r) => setTimeout(r, 0)); // let the fire-and-forget decrypt settle
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    // Warm hit: now the decrypted blob URL is served.
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('blob:vg/1');
+  });
+
+  it('revokes every cached blob URL on adapter restore (no leak past unload)', async () => {
+    await runtime.prewarmResourcePreview('img/pic.png');
+    runtime.revokeAllResourcePreviews();
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:vg/1');
+    // Cache cleared → next call is a cold miss again.
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('app://host/img/pic.png?42');
+  });
+
+  it('evicts and revokes a file\'s cached blob on delete', async () => {
+    await runtime.prewarmResourcePreview('img/pic.png');
+    runtime.evictResourcePreview('img/pic.png');
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:vg/1');
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('app://host/img/pic.png?42');
   });
 });

@@ -41,6 +41,15 @@ import type { SyncDiagnostics } from "./sync-diagnostics";
 import type { UpdateChecker } from "./update-checker";
 import type { AtRestCipher } from "../crypto/at-rest-cipher";
 import type { BridgeAuditAction } from "./agent-bridge";
+import type {
+  RemoteFileStateEntry,
+  RemoteFileStateUpdate,
+} from "./remote-file-state";
+import type {
+  LongOperationHandle,
+  LongOperationStartOptions,
+} from "./long-operation";
+import type { VaultOrientationService } from "./vault-orientation";
 
 // Shield icon SVG for the ribbon.
 export const VAULTGUARD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>`;
@@ -60,6 +69,47 @@ export interface OfflineQueueDebugEntry {
   path: string;
   timestamp: string;
   dataBytes: number;
+  // BIN-A / D-11: discriminant only (never the payload). "base64" means the
+  // queued write rides the byte pipeline (offline-queue v2); undefined means a
+  // text (string-pipeline) write. Lets the attachment report tell a legitimate
+  // byte-path binary write apart from a binary that leaked into the string queue.
+  encoding?: "base64";
+}
+
+/**
+ * One analyzed attachment in the preview diagnostic. Header hex only — never
+ * more than the first handful of bytes, so no note plaintext reaches the report.
+ * `onDiskHeaderHex` is what Obsidian's app:// renderer actually reads off disk;
+ * `decryptedHeaderHex` is the real content after at-rest decryption. When at-rest
+ * encryption is on, the two differ (VG1 vs the true PNG/PDF magic), which is
+ * exactly why encrypted attachments fail to preview.
+ */
+export interface AttachmentPreviewDatum {
+  path: string;
+  /** The URL Obsidian's renderer loads for this file (adapter.getResourcePath). */
+  resourceUrl: string;
+  /** First bytes as they sit on disk — what the app:// renderer decodes. */
+  onDiskHeaderHex: string;
+  /** True when the on-disk bytes carry the VG1 at-rest magic (renderer can't decode). */
+  onDiskEncrypted: boolean;
+  /** First bytes after at-rest decryption — the real file content. null if decrypt failed. */
+  decryptedHeaderHex: string | null;
+  /** Set when a raw or decrypt read threw. */
+  error?: string;
+}
+
+/** Structured result of the attachment-preview diagnostic (see collectAttachmentPreviewData). */
+export interface AttachmentPreviewReport {
+  /** Whether the plugin overrides adapter.getResourcePath (the render path). False until a preview fix lands. */
+  getResourcePathIntercepted: boolean;
+  /** Whether adapter.readBinary is intercepted (decrypts). True in normal operation. */
+  readBinaryIntercepted: boolean;
+  /** Whether at-rest encryption is active (files are VG1 on disk). */
+  atRestActive: boolean;
+  /** Total renderable-media attachments found in the vault. */
+  totalAttachments: number;
+  /** The subset actually analyzed (capped for cost). */
+  analyzed: AttachmentPreviewDatum[];
 }
 
 export interface VaultGuardCommandContext {
@@ -87,6 +137,7 @@ export interface VaultGuardCommandContext {
   readonly permissionStore: PermissionStore;
   readonly updateChecker: UpdateChecker | null;
   readonly pluginId: string;
+  readonly localProjectMemoryMode: boolean;
   /** Live per-vault membership role (null = no explicit membership row; org role governs). */
   readonly vaultMemberRole: VaultMemberRole | null;
 
@@ -112,6 +163,8 @@ export interface VaultGuardCommandContext {
   stopAgentBridgeServer(): Promise<void>;
   encryptVaultAtRest(): Promise<void>;
   decryptVaultAtRest(): Promise<void>;
+  decryptVaultAndDisableAtRestEncryption(): Promise<void>;
+  enableLocalProjectMemoryMode(): Promise<void>;
   switchServerVault(): Promise<boolean>;
   showAdminPanel(): void;
   showPathPermissionsModal(path: string, isFolder: boolean, initialExplain?: boolean): void;
@@ -123,6 +176,13 @@ export interface VaultGuardCommandContext {
   openNewVaultGuardChatTab(): Promise<void>;
   copyVaultGuardChatDomDebugReport(): Promise<void>;
   registerChatDebugCommand(): void;
+  /**
+   * BIN-A preview diagnostic: gathers, for up to `limit` renderable attachments,
+   * the on-disk header (what the app:// renderer reads) vs the decrypted header
+   * (the real content). Encapsulates the raw + decrypt reads so the general
+   * command surface never gains a raw-disk-read capability.
+   */
+  collectAttachmentPreviewData(limit: number): Promise<AttachmentPreviewReport>;
   logError(message: string, error: unknown): void;
 }
 
@@ -262,7 +322,41 @@ export interface RemoteFileContentResponse {
   content: string;
   encoding?: string;
   decrypted?: boolean;
+  // BIN-A / D-04 (additive): the GET /files response already returns the S3
+  // object's contentType (files/handler.ts:947). The pull side uses it as the
+  // authoritative binary discriminator (isBinaryContentType) — always present,
+  // unlike cold-path delta contentType (L9).
+  contentType?: string;
+  path?: string;
+  size?: number;
+  lastModified?: string;
+  versionId?: string;
+  checksum?: string;
+  encrypted?: boolean;
 }
+
+export interface RemoteFileWriteResponse {
+  path?: string;
+  size?: number;
+  lastModified?: string;
+  versionId?: string;
+  checksum?: string;
+}
+
+/**
+ * BIN-A / D-05 (wave 5): a reconciliation local-manifest entry, discriminated by
+ * `kind`. TEXT entries carry the decoded string + its SHA-256 (computeHash);
+ * BINARY entries carry the raw PLAIN bytes + their byte SHA-256 (computeHashBytes).
+ * The `kind` discriminant lets every reconciliation pass (both-exist byte compare,
+ * localOnly upload, conflict strategies) narrow type-safely, so a binary can never
+ * be routed through the lossy string pipeline — the AR1 failure class (L4).
+ *
+ * Defined here, not module-local in sync-runtime, because the type crosses the ctx
+ * boundary: resolveReconciliationConflict receives the manifest Map.
+ */
+export type LocalManifestEntry =
+  | { kind: "text"; content: string; hash: string }
+  | { kind: "binary"; bytes: ArrayBuffer; hash: string };
 
 export interface VaultAdapterOriginalMethods {
   read: ((normalizedPath: string) => Promise<string>) | null;
@@ -276,6 +370,10 @@ export interface VaultAdapterOriginalMethods {
     | null;
   remove: ((normalizedPath: string) => Promise<void>) | null;
   rename: ((oldPath: string, newPath: string) => Promise<void>) | null;
+  // BIN-A preview: getResourcePath is the sync method Obsidian's renderer calls
+  // to load media (returns an app://… URL read directly from disk). Captured so
+  // the interceptor can serve at-rest-encrypted images/PDFs as decrypted blobs.
+  getResourcePath: ((normalizedPath: string) => string) | null;
 }
 
 export interface OfflineQueueOperation {
@@ -283,12 +381,38 @@ export interface OfflineQueueOperation {
   path: string;
   data?: string;
   timestamp: string;
+  // BIN-A / D-09 (offline-queue v2): when encoding === "base64", `data` holds the
+  // base64 of the PLAIN attachment bytes (never the UTF-8 string path), and
+  // `contentType` is the MIME label for the eventual byte PUT. Absent for text
+  // ops (v1-compatible: an undefined encoding means "text", flushed as today).
+  encoding?: "base64";
+  contentType?: string;
+  // Version-guard (optimistic concurrency): the server version + plaintext hash
+  // this queued edit was based on, so a replay can detect a conflicting write.
+  baseVersionId?: string;
+  baseHash?: string;
 }
+
+export type RemoteWriteConflictResolutionResult =
+  | "keep-local"
+  | "keep-remote"
+  | "duplicate"
+  | "pending";
 
 export interface AtRestAdapterRuntimeContext {
   app: App;
   readonly manifestId: string | undefined;
   readonly settings: VaultGuardSettings;
+
+  /**
+   * Phase 12 (vault idle-lock): true when a device PIN currently owns the LAK.
+   * Optional so pre-existing ctx builders/tests keep compiling. When true,
+   * `initAtRestCipher` skips provisioning (the LAK lives PIN-wrapped in
+   * `lak-pin.envelope`; `lak.envelope` is absent by design — NN-1) and lands
+   * the adapter LOCKED until the plugin calls `unlockCipherWithLak` with the
+   * PIN-unwrapped LAK (edge #6).
+   */
+  isPinLockEnrolled?(): boolean;
 
   getSession(): UserSession | null;
   getKeyLease(): KeyLease | null;
@@ -320,6 +444,8 @@ export interface AtRestAdapterRuntimeContext {
   writePlainBinaryToDisk(path: string, data: ArrayBuffer): Promise<void>;
   notifyCloudDecryptFallback(path: string): void;
   notifyCorruptedWrite(path: string): void;
+  beginLongOperation(options: LongOperationStartOptions): LongOperationHandle;
+  getLongOperationConflictKey(): string;
 
   isOnline(): boolean;
   isNetworkError(error: unknown): boolean;
@@ -328,18 +454,45 @@ export interface AtRestAdapterRuntimeContext {
     options?: { scheduleRetry?: boolean; notify?: boolean },
   ): void;
   shouldUploadChangesImmediately(): boolean;
-  queueOfflineOperation(operation: "write" | "delete", path: string, data?: string): void;
+  queueOfflineOperation(
+    operation: "write" | "delete",
+    path: string,
+    data?: string,
+    // BIN-A / D-09 + version-guard: binary payloads stamp encoding "base64" + a
+    // MIME contentType; version-guard writes stamp baseVersionId/baseHash.
+    options?: {
+      encoding?: "base64";
+      contentType?: string;
+      baseVersionId?: string;
+      baseHash?: string;
+    },
+  ): void;
+  getRemoteFileState(path: string): RemoteFileStateEntry | null;
+  getExpectedVersionId(path: string): string | undefined;
+  recordRemoteFilePresent(path: string, update?: RemoteFileStateUpdate): void;
+  recordRemoteFileAbsent(path: string): void;
+  handleRemoteWriteConflict(
+    path: string,
+    localContent: string,
+    baseVersionId?: string | null,
+  ): Promise<RemoteWriteConflictResolutionResult>;
   recordDeletionTombstone(path: string): void;
   clearDeletionTombstone(path: string): void;
   updateStatusBar(): void;
 
   encryptContent(content: string): Promise<string>;
   computeHash(content: string): Promise<string>;
+  // BIN-A / D-02: byte-crypto declarations beside the string versions.
+  encryptContentBytes(content: ArrayBuffer): Promise<string>;
+  decryptContentBytes(encryptedContent: string): Promise<ArrayBuffer>;
+  computeHashBytes(content: ArrayBuffer): Promise<string>;
   apiRequest<T>(
     method: string,
     endpoint: string,
     body?: Record<string, unknown>,
     idTokenOverride?: string,
+    // L2 (BIN-A): optional per-request timeout override threaded to requestWithTimeout.
+    options?: { timeoutMs?: number },
   ): Promise<ApiResponse<T>>;
   vaultPath(suffix?: string): string;
   readFileDecrypted(path: string): Promise<ApiResponse<RemoteFileContentResponse>>;
@@ -385,6 +538,14 @@ export interface SyncRuntimeContext {
   getKeyLease(): KeyLease | null;
   setKeyLease(lease: KeyLease | null): void;
   isVaultLeaseDenied(): boolean;
+  /**
+   * Phase 12 (vault idle-lock): true while the vault is cryptographically locked.
+   * The revocation heartbeat deliberately keeps running while locked (NN-2), but
+   * the key-renewal monitor must be a no-op — the lease is evicted, so a renewal
+   * tick while locked would spuriously log out or re-acquire a lease the lock
+   * just dropped. checkKeyLeaseRenewal consults this to early-return.
+   */
+  isVaultLocked(): boolean;
   /** PL2: a lease acquisition failed transiently (not a 403) and needs retry. */
   isLeaseRetryNeeded(): boolean;
   getEffectiveSyncMode(): OrgSettingsResponse["syncMode"];
@@ -423,6 +584,10 @@ export interface SyncRuntimeContext {
     status: ConnectionStatus,
     options?: { scheduleRetry?: boolean; notify?: boolean },
   ): void;
+  getRemoteFileState(path: string): RemoteFileStateEntry | null;
+  getExpectedVersionId(path: string): string | undefined;
+  recordRemoteFilePresent(path: string, update?: RemoteFileStateUpdate): void;
+  recordRemoteFileAbsent(path: string): void;
   performInitialReconciliation(): Promise<boolean>;
   registerFolderLifecycleListeners(): void;
   performSync(options?: { userInitiated?: boolean; forceCatchup?: boolean }): Promise<void>;
@@ -486,17 +651,28 @@ export interface SyncRuntimeContext {
   resolveReconciliationConflict(
     path: string,
     strategy: import("../types").ConflictResolutionStrategy,
-    localManifest: Map<string, { content: string; hash: string }>,
+    localManifest: Map<string, LocalManifestEntry>,
   ): Promise<void>;
   hasOriginalAdapterRead(): boolean;
   hasOriginalAdapterReadBinary(): boolean;
+  // BIN-A / L13: wave-4 pull gate needs write-binary capability so a legacy
+  // adapter without writeBinary can never silently drop a downloaded binary.
+  hasOriginalAdapterWriteBinary(): boolean;
   hasOriginalAdapterWrite(): boolean;
   hasOriginalAdapterRemove(): boolean;
   removeLocalPath(path: string): Promise<void>;
   readPlainFromDisk(path: string): Promise<string>;
   readPlainBinaryFromDisk(path: string): Promise<ArrayBuffer>;
   writePlainToDisk(path: string, data: string): Promise<void>;
+  // BIN-A / L13 (wave-4 pull): byte sibling of writePlainToDisk — the fallback
+  // disk write for writeLocalBinaryFileFromRemote when the vault binary API is
+  // unavailable. VG1-encrypts before disk; refuses VG1-magic plaintext.
+  writePlainBinaryToDisk(path: string, data: ArrayBuffer): Promise<void>;
   decryptContent(content: string): Promise<string>;
+  // BIN-A / D-02: byte-crypto declarations beside the string versions.
+  encryptContentBytes(content: ArrayBuffer): Promise<string>;
+  decryptContentBytes(encryptedContent: string): Promise<ArrayBuffer>;
+  computeHashBytes(content: ArrayBuffer): Promise<string>;
   bytesToBase64(bytes: Uint8Array): string;
   notifyCloudDecryptFallback(path: string): void;
   getEffectivePermission(path: string): Promise<PermissionLevel>;
@@ -512,10 +688,14 @@ export interface SyncRuntimeContext {
     endpoint: string,
     body?: Record<string, unknown>,
     idTokenOverride?: string,
+    // L2 (BIN-A): optional per-request timeout override threaded to requestWithTimeout.
+    options?: { timeoutMs?: number },
   ): Promise<ApiResponse<T>>;
   vaultPath(suffix?: string): string;
   isNetworkError(error: unknown): boolean;
   recordSyncDiagnostic(event: string, detail?: Record<string, unknown>): void;
+  beginLongOperation(options: LongOperationStartOptions): LongOperationHandle;
+  getLongOperationConflictKey(): string;
   showNotice(message: string, timeout?: number): void;
   showLoginRequiredNotice(
     action: "open" | "browse" | "edit" | "delete" | "sync" | "view permissions",
@@ -540,6 +720,7 @@ export interface AgentBridgeRuntimeContext {
   getServerVaultId(): string;
   getApiClient(): VaultGuardApiClient | null;
   getAtRestCipher(): AtRestCipher | null;
+  getVaultOrientationService(): VaultOrientationService | null;
   getAdapterReadBinary(): ((normalizedPath: string) => Promise<ArrayBuffer>) | null;
   getAdapterWriteBinary():
     | ((normalizedPath: string, data: ArrayBuffer) => Promise<void>)

@@ -24,7 +24,13 @@ import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
-const SENDER_EMAIL = process.env.SENDER_EMAIL || 'noreply@example.com';
+// Transactional From lives on the dedicated `mail.` sending subdomain so its
+// reputation is isolated from the apex (Google Workspace + website) and from
+// the marketing lane (`news.`). Overridable via env for other stages/rollback.
+const SENDER_EMAIL = process.env.SENDER_EMAIL || 'noreply@mail.example.com';
+// Replies go to the apex mailbox (Google Workspace), NOT the send-only
+// subdomain — so a user hitting "reply" reaches a monitored inbox.
+const REPLY_TO_EMAIL = process.env.REPLY_TO_EMAIL || 'support@example.com';
 const SES_CONFIGURATION_SET = process.env.SES_CONFIGURATION_SET || '';
 const REGION = process.env.AWS_REGION || 'eu-central-1';
 
@@ -708,6 +714,7 @@ export async function sendEmail(type: EmailType, params: EmailParams, options?: 
 
   const commandInput: Record<string, unknown> = {
     Source: SENDER_EMAIL,
+    ReplyToAddresses: [REPLY_TO_EMAIL],
     Destination: {
       ToAddresses: [toAddress],
     },

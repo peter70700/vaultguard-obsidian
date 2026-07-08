@@ -12,7 +12,7 @@
  * - Offline support: Graceful degradation with cached keys and queued changes.
  */
 
-import { Notice, Plugin, Platform, TFile, TFolder, Menu, normalizePath, requestUrl, RequestUrlResponse } from "obsidian";
+import { Modal, Notice, Plugin, Platform, TFile, TFolder, Menu, normalizePath, requestUrl, RequestUrlResponse } from "obsidian";
 import { VaultGuardSettingTab, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
 import type { ConversationStore } from "../ui/chat/conversation-store";
@@ -35,6 +35,7 @@ import type {
   VaultRecord,
 } from "../api/client";
 import {
+  looksLikeAwsSignatureError,
   normalizeVaultGuardApiBaseUrl,
   resolveVaultGuardApiBaseUrl,
 } from "../api/endpoint-resolver";
@@ -46,9 +47,21 @@ import { UpdateChecker } from "./update-checker";
 import { SyncDiagnostics } from "./sync-diagnostics";
 import type { AtRestCipher } from "../crypto/at-rest-cipher";
 import {
+  PinLockManager,
+  type PinLockStorage,
+} from "../crypto/pin-lock-manager";
+import { probeSafeStorage } from "../crypto/safe-storage";
+import { LockCurtain, type LockCurtainController } from "../ui/lock/lock-curtain";
+import { PinOnboardingPromptModal, SetPinModal } from "../ui/lock/pin-modals";
+import {
   createAtRestAdapterRuntime,
+  type AtRestDecryptAndDisableResult,
   type AtRestAdapterRuntime,
 } from "./at-rest-adapter-runtime";
+import {
+  LOCAL_PROJECT_MEMORY_MODE_NOTICE,
+  isLocalProjectMemoryModeEnabled,
+} from "./local-project-memory-mode";
 import { PathPermissionsModal } from "../ui/path-permissions-modal";
 import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
@@ -69,6 +82,9 @@ import type {
   AgentBridgeLeaseSecret,
   AgentBridgeServerInfo,
   AgentBridgeToolSurface,
+  ChatGptConnectorDescription,
+  ChatGptConnectorSessionInput,
+  ChatGptConnectorSessionSecret,
 } from "./agent-bridge";
 import {
   createAgentBridgeRuntime,
@@ -78,7 +94,11 @@ import type {
   InstallResult,
   SkillInstallStatus,
 } from "./agent-bridge-skill/installer";
-import { registerVaultGuardCommands } from "./commands";
+import type {
+  CodexInstallResult,
+  CodexSkillInstallStatus,
+} from "./agent-bridge-codex-skill/installer";
+import { collectAttachmentPreviewData, registerVaultGuardCommands } from "./commands";
 import {
   registerFocusSyncHandlers as registerFocusSyncHandlersLifecycle,
   registerFolderLifecycleListeners as registerFolderLifecycleListenersLifecycle,
@@ -106,13 +126,17 @@ import {
   type AtRestAdapterRuntimeContext,
   type AgentBridgeRuntimeContext,
   type LifecycleEventsContext,
+  type LocalManifestEntry,
   type PermissionStoreFactoryContext,
   type PermissionSurfaceContext,
   type PermissionsGraphRuntimeContext,
   type SyncRuntimeContext,
   type VaultAdapterOriginalMethods,
+  type OfflineQueueOperation,
   type PluginSettingsRuntimeContext,
+  type RemoteWriteConflictResolutionResult,
   type VaultGuardCommandContext,
+  type AttachmentPreviewReport,
   type VaultGuardRibbonContext,
   type VaultGuardSidebarActivationContext,
   type VaultGuardViewRegistrationContext,
@@ -125,6 +149,26 @@ import {
   createSyncRuntime,
   type SyncRuntime,
 } from "./sync-runtime";
+import {
+  RemoteFileStateStore,
+  type RemoteFileStateEntry,
+  type RemoteFileStateUpdate,
+} from "./remote-file-state";
+import {
+  LongOperationManager,
+  type LongOperationHandle,
+  type LongOperationStartOptions,
+} from "./long-operation";
+import {
+  LongOperationUiController,
+  renderLongOperationStatusBar,
+} from "../ui/long-operation-progress";
+import {
+  VaultOrientationService,
+  type ConnectorStatusMatrix,
+  type VaultOrientationSnapshot,
+  diagnosticsConnectorContext,
+} from "./vault-orientation";
 import {
   activatePermissionsGraph as activatePermissionsGraphView,
   activateVaultGuardChat as activateVaultGuardChatView,
@@ -267,6 +311,13 @@ interface RemoteFileContentResponse {
   content: string;
   encoding?: string;
   decrypted?: boolean;
+  path?: string;
+  contentType?: string;
+  size?: number;
+  lastModified?: string;
+  versionId?: string;
+  checksum?: string;
+  encrypted?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -310,7 +361,29 @@ export default class VaultGuardPlugin extends Plugin {
    * haven't been resolved yet — historic default is Pro.
    */
   featureEnabled(name: keyof ServerFeatures): boolean {
+    if (this.isLocalProjectMemoryModeEnabled()) return false;
     return this.serverFeatures ? this.serverFeatures[name] : ASSUMED_SERVER_FEATURES[name];
+  }
+
+  isLocalProjectMemoryModeEnabled(): boolean {
+    return isLocalProjectMemoryModeEnabled(this.settings);
+  }
+
+  async enableLocalProjectMemoryMode(): Promise<void> {
+    this.settings.localProjectMemoryMode = true;
+    this.settings.atRestFirstRunDismissed = true;
+    this.keyLease = null;
+    this.vaultLeaseDenied = false;
+    this.stopSyncTimer();
+    this.stopKeyRenewalMonitor();
+    this.stopHeartbeatMonitor();
+    this.agentBridgeRuntime?.revokeAllLeases();
+    await this.agentBridgeRuntime?.stopServerIfInitialized().catch((err) => {
+      this.logError("Stopping agent bridge server for Local Project Memory Mode failed", err);
+    });
+    await this.saveSettings();
+    this.updateStatusBar();
+    new Notice(`VaultGuard Sync: ${LOCAL_PROJECT_MEMORY_MODE_NOTICE}`, 8000);
   }
 
   /** Restart-safe, protected session backups persisted through Obsidian's plugin data file */
@@ -412,6 +485,31 @@ export default class VaultGuardPlugin extends Plugin {
    * (heartbeat/sync timers) into one logout.
    */
   private terminalRefreshLogoutInProgress = false;
+
+  /**
+   * Phase 12 (vault idle-lock): true while the vault is cryptographically locked
+   * — the in-memory LAK + key-lease are evicted and the workspace is curtained,
+   * but the SESSION + refresh token + revocation heartbeat are PRESERVED (unlike
+   * forceLogout). A correct PIN clears it via unlockWithPin.
+   */
+  private isVaultLocked = false;
+
+  /**
+   * Phase 12: device PIN-lock manager (PBKDF2 + safeStorage pepper → AES-GCM
+   * wrap of the LAK). Constructed in onload before initAtRestCipher so the
+   * adapter's PIN-lock pre-check can see whether a PIN owns the LAK. null until
+   * wired.
+   */
+  private pinLockManager: PinLockManager | null = null;
+
+  /** Phase 12: the opaque lock-curtain overlay; lazily constructed on first lock. */
+  private lockCurtain: LockCurtainController | null = null;
+
+  /** Phase 12 (L-4): active file path captured at lock time, re-opened on unlock. */
+  private preLockActiveFilePath: string | null = null;
+
+  /** Phase 12: whether the one-time "set a PIN" nudge (lock policy, no PIN) has been shown. */
+  private pinNudgeShown = false;
 
   /** Debounces the "Limited access" Notice so it isn't shown more than once per minute. */
   private lastLimitedAccessNoticeAt = 0;
@@ -638,15 +736,16 @@ export default class VaultGuardPlugin extends Plugin {
   private warmupRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Queue of operations made while offline */
-  private offlineQueue: Array<{
-    operation: "write" | "delete";
-    path: string;
-    data?: string;
-    timestamp: string;
-  }> = [];
+  private offlineQueue: OfflineQueueOperation[] = [];
 
   /** SY5: debounce handle for persisting the offline queue envelope. */
   private offlineQueuePersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Per-file server version state used for optimistic write guards. */
+  private remoteFileState = new RemoteFileStateStore();
+
+  /** Debounce handle for the encrypted remote-file-state envelope. */
+  private remoteFileStatePersistTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Per-file permission header injected into markdown views */
   private filePermissionHeader: FilePermissionHeader | null = null;
@@ -670,7 +769,90 @@ export default class VaultGuardPlugin extends Plugin {
    * filesystem access.
    */
   private agentBridgeRuntime: AgentBridgeRuntime | null = null;
+  private vaultOrientationService: VaultOrientationService | null = null;
   private permissionsGraphRuntime: PermissionsGraphRuntime | null = null;
+  private readonly longOperations = new LongOperationManager();
+  private longOperationUi: LongOperationUiController | null = null;
+  private longOperationStatusUnsubscribe: (() => void) | null = null;
+
+  private getLongOperationConflictKey(): string {
+    const serverVaultId = this.settings.serverVaultId?.trim();
+    if (serverVaultId) return `server-vault:${serverVaultId}`;
+    const vaultName =
+      typeof this.app?.vault?.getName === "function"
+        ? this.app.vault.getName()
+        : this.manifest?.id ?? "vaultguard";
+    return `local-vault:${vaultName}`;
+  }
+
+  private beginLongOperation(options: LongOperationStartOptions): LongOperationHandle {
+    const fallbackVaultName =
+      this.settings.serverVaultName ||
+      this.settings.serverVaultSlug ||
+      (typeof this.app?.vault?.getName === "function" ? this.app.vault.getName() : undefined);
+    return this.longOperations.begin({
+      ...options,
+      vaultId: options.vaultId ?? (this.settings.serverVaultId || undefined),
+      vaultName: options.vaultName ?? fallbackVaultName,
+      conflictKey: options.conflictKey ?? this.getLongOperationConflictKey(),
+    });
+  }
+
+  getVaultOrientationService(): VaultOrientationService {
+    if (!this.vaultOrientationService) {
+      this.vaultOrientationService = new VaultOrientationService({
+        app: this.app,
+        getSettings: () => this.settings,
+        getAtRestEncrypted: () => {
+          if (this.isLocalProjectMemoryModeEnabled()) return false;
+          const status = this.getAtRestStatus();
+          return status.kind === "unlocked" || status.kind === "locked" || status.kind === "needs-recovery";
+        },
+        getConnectorStatus: () => this.getVaultOrientationConnectorStatus(),
+        listServerVaults: () => this.listServerVaults(),
+        logError: (message, error) => this.logError(message, error),
+      });
+    }
+    return this.vaultOrientationService;
+  }
+
+  async getVaultOrientationSnapshotForDiagnostics(
+    options: { includeKnownVaults?: boolean; includeGit?: boolean; forceRefresh?: boolean } = {},
+  ): Promise<VaultOrientationSnapshot> {
+    const service = this.getVaultOrientationService();
+    const snapshot = await service.getSnapshot(diagnosticsConnectorContext(), {
+      includeKnownVaults: options.includeKnownVaults ?? true,
+      includeGit: options.includeGit ?? true,
+      includeConnectorStatus: true,
+      forceRefresh: options.forceRefresh === true,
+    });
+    return service.redactForClipboard(snapshot);
+  }
+
+  private getVaultOrientationConnectorStatus(): ConnectorStatusMatrix {
+    const localMode = this.isLocalProjectMemoryModeEnabled();
+    const claudeStatus = this.getAgentBridgeSkillStatus();
+    const codexStatus = this.getAgentBridgeCodexSkillStatus();
+    const openaiChat = this.settings.encryptedOpenAiKey ? "available" : "not-configured";
+    return {
+      claude: localMode
+        ? "disabled"
+        : claudeStatus.available && claudeStatus.installed
+          ? "available"
+          : "not-configured",
+      codex: localMode
+        ? "disabled"
+        : codexStatus.available && codexStatus.installed
+          ? "available"
+          : "not-configured",
+      openaiChat,
+      chatgptRemote: localMode
+        ? "disabled"
+        : this.session && this.settings.serverVaultId
+          ? "developer-only"
+          : "not-configured",
+    };
+  }
 
   private createAtRestAdapterRuntimeContext(): AtRestAdapterRuntimeContext {
     const thisPlugin = this;
@@ -680,6 +862,9 @@ export default class VaultGuardPlugin extends Plugin {
       get settings() {
         return thisPlugin.settings;
       },
+      // Phase 12: the adapter's PIN-lock pre-check keys off this to skip
+      // provisioning and land LOCKED on a PIN-enrolled cold start (edge #6).
+      isPinLockEnrolled: () => this.pinLockManager?.isEnrolled() ?? false,
       getSession: () => this.session,
       getKeyLease: () => this.keyLease,
       isVaultLeaseDenied: () => this.vaultLeaseDenied,
@@ -708,29 +893,53 @@ export default class VaultGuardPlugin extends Plugin {
         this.writePlainBinaryToDisk(path, data),
       notifyCloudDecryptFallback: (path) => this.notifyCloudDecryptFallback(path),
       notifyCorruptedWrite: (path) => this.notifyCorruptedWrite(path),
+      beginLongOperation: (options) => this.beginLongOperation(options),
+      getLongOperationConflictKey: () => this.getLongOperationConflictKey(),
       isOnline: () => this.isOnline(),
       isNetworkError: (error) => this.isNetworkError(error),
       setConnectionStatus: (status, options) =>
         this.setConnectionStatus(status, options),
       shouldUploadChangesImmediately: () => this.shouldUploadChangesImmediately(),
-      queueOfflineOperation: (operation, path, data) =>
-        this.queueOfflineOperation(operation, path, data),
+      queueOfflineOperation: (operation, path, data, options) =>
+        this.queueOfflineOperation(operation, path, data, options),
+      getRemoteFileState: (path) => this.getRemoteFileState(path),
+      getExpectedVersionId: (path) => this.getExpectedVersionId(path),
+      recordRemoteFilePresent: (path, update) =>
+        this.recordRemoteFilePresent(path, update),
+      recordRemoteFileAbsent: (path) => this.recordRemoteFileAbsent(path),
+      handleRemoteWriteConflict: (path, localContent, baseVersionId) =>
+        this.handleRemoteWriteConflict(path, localContent, baseVersionId),
       recordDeletionTombstone: (path) => this.recordDeletionTombstone(path),
       clearDeletionTombstone: (path) => this.clearDeletionTombstone(path),
       updateStatusBar: () => this.updateStatusBar(),
       encryptContent: (content) => this.encryptContent(content),
       computeHash: (content) => this.computeHash(content),
+      // BIN-A / D-02: byte-crypto pass-throughs beside their string siblings so
+      // the at-rest adapter runtime can (later waves) encrypt/decrypt/hash raw
+      // binary bytes with the same lease/vault guards.
+      encryptContentBytes: (content) => this.encryptContentBytes(content),
+      decryptContentBytes: (content) => this.decryptContentBytes(content),
+      computeHashBytes: (content) => this.computeHashBytes(content),
       apiRequest: <T>(
         method: string,
         endpoint: string,
         body?: Record<string, unknown>,
-        idTokenOverride?: string
-      ) =>
-        idTokenOverride !== undefined
+        idTokenOverride?: string,
+        options?: { timeoutMs?: number }
+      ) => {
+        // L2 (BIN-A): preserve the exact argument arity when no timeout override
+        // is passed. Existing callers (and their toHaveBeenCalledWith assertions)
+        // must keep seeing the same 2/3/4-arg shapes — trailing `undefined`s
+        // change the call signature. Only a real { timeoutMs } widens to 5 args.
+        if (options !== undefined) {
+          return this.apiRequest<T>(method, endpoint, body, idTokenOverride, options);
+        }
+        return idTokenOverride !== undefined
           ? this.apiRequest<T>(method, endpoint, body, idTokenOverride)
           : body !== undefined
             ? this.apiRequest<T>(method, endpoint, body)
-            : this.apiRequest<T>(method, endpoint),
+            : this.apiRequest<T>(method, endpoint);
+      },
       vaultPath: (suffix = "") => this.vaultPath(suffix),
       readFileDecrypted: (path) => this.readFileDecrypted(path),
       fetchRemoteFileContent: (path) => this.fetchRemoteFileContent(path),
@@ -769,6 +978,9 @@ export default class VaultGuardPlugin extends Plugin {
         this.keyLease = lease;
       },
       isVaultLeaseDenied: () => this.vaultLeaseDenied,
+      // Phase 12 (NN-2 / key-renewal guard): the heartbeat survives the lock,
+      // but checkKeyLeaseRenewal consults this to no-op while locked.
+      isVaultLocked: () => this.isVaultLocked,
       isLeaseRetryNeeded: () => this.leaseRetryNeeded,
       getEffectiveSyncMode: () => this.getEffectiveSyncMode(),
       getEffectiveSyncIntervalSeconds: () => this.getEffectiveSyncIntervalSeconds(),
@@ -827,6 +1039,11 @@ export default class VaultGuardPlugin extends Plugin {
       isOnline: () => this.isOnline(),
       setConnectionStatus: (status, options) =>
         this.setConnectionStatus(status, options),
+      getRemoteFileState: (path) => this.getRemoteFileState(path),
+      getExpectedVersionId: (path) => this.getExpectedVersionId(path),
+      recordRemoteFilePresent: (path, update) =>
+        this.recordRemoteFilePresent(path, update),
+      recordRemoteFileAbsent: (path) => this.recordRemoteFileAbsent(path),
       performInitialReconciliation: () => this.performInitialReconciliation(),
       registerFolderLifecycleListeners: () => this.registerFolderLifecycleListeners(),
       performSync: (options) => this.performSync(options),
@@ -874,6 +1091,10 @@ export default class VaultGuardPlugin extends Plugin {
         this.resolveReconciliationConflict(path, strategy, localManifest),
       hasOriginalAdapterRead: () => !!this.originalAdapterMethods.read,
       hasOriginalAdapterReadBinary: () => !!this.originalAdapterMethods.readBinary,
+      // BIN-A / L13: wave-4 pull gate needs write-binary capability so a legacy
+      // adapter without writeBinary can never silently drop a downloaded binary.
+      hasOriginalAdapterWriteBinary: () =>
+        !!this.originalAdapterMethods.writeBinary,
       hasOriginalAdapterWrite: () => !!this.originalAdapterMethods.write,
       hasOriginalAdapterRemove: () => !!this.originalAdapterMethods.remove,
       removeLocalPath: async (path) => {
@@ -883,6 +1104,9 @@ export default class VaultGuardPlugin extends Plugin {
       readPlainFromDisk: (path) => this.readPlainFromDisk(path),
       readPlainBinaryFromDisk: (path) => this.readPlainBinaryFromDisk(path),
       writePlainToDisk: (path, data) => this.writePlainToDisk(path, data),
+      // BIN-A / L13: byte sibling for writeLocalBinaryFileFromRemote's fallback.
+      writePlainBinaryToDisk: (path, data) =>
+        this.writePlainBinaryToDisk(path, data),
       decryptContent: (content) => this.decryptContent(content),
       bytesToBase64: (bytes) => this.bytesToBase64(bytes),
       notifyCloudDecryptFallback: (path) => this.notifyCloudDecryptFallback(path),
@@ -891,20 +1115,36 @@ export default class VaultGuardPlugin extends Plugin {
         this.emitAuditEvent(action as AuditAction, resourcePath, metadata),
       encryptContent: (content) => this.encryptContent(content),
       computeHash: (content) => this.computeHash(content),
+      // BIN-A / D-02: byte-crypto pass-throughs beside their string siblings for
+      // the sync runtime's push (encrypt/hash) and pull (decrypt) byte paths.
+      encryptContentBytes: (content) => this.encryptContentBytes(content),
+      decryptContentBytes: (content) => this.decryptContentBytes(content),
+      computeHashBytes: (content) => this.computeHashBytes(content),
       apiRequest: <T>(
         method: string,
         endpoint: string,
         body?: Record<string, unknown>,
-        idTokenOverride?: string
-      ) =>
-        idTokenOverride !== undefined
+        idTokenOverride?: string,
+        options?: { timeoutMs?: number }
+      ) => {
+        // L2 (BIN-A): preserve the exact argument arity when no timeout override
+        // is passed. Existing callers (and their toHaveBeenCalledWith assertions)
+        // must keep seeing the same 2/3/4-arg shapes — trailing `undefined`s
+        // change the call signature. Only a real { timeoutMs } widens to 5 args.
+        if (options !== undefined) {
+          return this.apiRequest<T>(method, endpoint, body, idTokenOverride, options);
+        }
+        return idTokenOverride !== undefined
           ? this.apiRequest<T>(method, endpoint, body, idTokenOverride)
           : body !== undefined
             ? this.apiRequest<T>(method, endpoint, body)
-            : this.apiRequest<T>(method, endpoint),
+            : this.apiRequest<T>(method, endpoint);
+      },
       vaultPath: (suffix = "") => this.vaultPath(suffix),
       isNetworkError: (error) => this.isNetworkError(error),
       recordSyncDiagnostic: (event, detail) => this.syncDiagnostics.record(event, detail),
+      beginLongOperation: (options) => this.beginLongOperation(options),
+      getLongOperationConflictKey: () => this.getLongOperationConflictKey(),
       showNotice: (message, timeout) => {
         if (timeout === undefined) {
           new Notice(message);
@@ -944,6 +1184,7 @@ export default class VaultGuardPlugin extends Plugin {
       getServerVaultId: () => this.settings.serverVaultId,
       getApiClient: () => this.apiClient,
       getAtRestCipher: () => this.getAtRestCipher(),
+      getVaultOrientationService: () => this.getVaultOrientationService(),
       getAdapterReadBinary: () =>
         this.ensureAtRestAdapterRuntimeObject().getAdapterReadBinary(),
       getAdapterWriteBinary: () =>
@@ -1120,6 +1361,10 @@ export default class VaultGuardPlugin extends Plugin {
           path: op.path,
           timestamp: op.timestamp,
           dataBytes: op.data?.length ?? 0,
+          // BIN-A / D-11: carry the byte-vs-string discriminant (not the payload)
+          // so the attachment debug report can separate legitimate byte-path
+          // binary writes from AR1 string-pipeline regressions.
+          encoding: op.encoding,
         }));
       },
       get deletionTombstonesCount() {
@@ -1127,6 +1372,9 @@ export default class VaultGuardPlugin extends Plugin {
       },
       get pluginId() {
         return thisPlugin.manifest.id;
+      },
+      get localProjectMemoryMode() {
+        return thisPlugin.isLocalProjectMemoryModeEnabled();
       },
       get vaultMemberRole() {
         return thisPlugin.vaultMemberRole;
@@ -1160,6 +1408,10 @@ export default class VaultGuardPlugin extends Plugin {
       stopAgentBridgeServer: () => this.stopAgentBridgeServer(),
       encryptVaultAtRest: () => this.encryptVaultAtRest(),
       decryptVaultAtRest: () => this.decryptVaultAtRest(),
+      decryptVaultAndDisableAtRestEncryption: async () => {
+        await this.decryptVaultAndDisableAtRestEncryption();
+      },
+      enableLocalProjectMemoryMode: () => this.enableLocalProjectMemoryMode(),
       switchServerVault: () => this.switchServerVault(),
       showAdminPanel: () => this.showAdminPanel(),
       showPathPermissionsModal: (path, isFolder, initialExplain) =>
@@ -1179,6 +1431,44 @@ export default class VaultGuardPlugin extends Plugin {
         process.env.NODE_ENV !== "production"
           ? () => registerChatDebugCommand(this)
           : () => {},
+      // Ternary (not a guarded call) so the production define folds this to a
+      // no-op and esbuild tree-shakes the standalone diagnostic out of the
+      // release bundle — mirrors registerChatDebugCommand above.
+      collectAttachmentPreviewData:
+        process.env.NODE_ENV !== "production"
+          ? (limit) => {
+              const adapter = this.app.vault.adapter as unknown as {
+                getResourcePath?: ((p: string) => string) & { __vaultguard?: boolean };
+              };
+              return collectAttachmentPreviewData(
+                {
+                  files: this.app.vault
+                    .getFiles()
+                    .map((f) => ({ path: f.path, extension: f.extension })),
+                  getResourcePath: (p) =>
+                    adapter.getResourcePath
+                      ? adapter.getResourcePath(p)
+                      : "(getResourcePath unavailable)",
+                  rawReadBinary: this.originalAdapterMethods.readBinary ?? undefined,
+                  readDecrypted: (p) => this.readPlainBinaryFromDisk(p),
+                  // The plugin overrides read/write/readBinary/... but NOT
+                  // getResourcePath; a future preview fix tags its override with
+                  // __vaultguard, flipping this true.
+                  getResourcePathIntercepted: !!adapter.getResourcePath?.__vaultguard,
+                  readBinaryIntercepted: !!this.originalAdapterMethods.readBinary,
+                  atRestActive: !!this.atRestCipher?.isReady(),
+                },
+                limit
+              );
+            }
+          : (): Promise<AttachmentPreviewReport> =>
+              Promise.resolve({
+                getResourcePathIntercepted: false,
+                readBinaryIntercepted: false,
+                atRestActive: false,
+                totalAttachments: 0,
+                analyzed: [],
+              }),
       logError: (message, error) => this.logError(message, error),
     };
   }
@@ -1385,6 +1675,12 @@ export default class VaultGuardPlugin extends Plugin {
     // Load persisted settings
     await this.loadSettings();
 
+    this.longOperationUi = new LongOperationUiController(this.app, this.longOperations);
+    this.longOperationUi.start();
+    this.longOperationStatusUnsubscribe = this.longOperations.subscribe(() => {
+      this.updateStatusBar();
+    });
+
     // Check for Obsidian Sync — VaultGuard is the sole sync/backup provider
     this.checkForObsidianSync();
 
@@ -1424,6 +1720,16 @@ export default class VaultGuardPlugin extends Plugin {
     // `cipherInitPromise` until init settles.
     this.interceptVaultAdapter();
 
+    // BIN-A preview: pre-decrypt an opened media file into the resource-preview
+    // blob cache so standalone image/PDF views get a synchronous getResourcePath
+    // cache hit instead of a broken-then-repaint flash. Guarded inside the
+    // runtime (no-ops unless at-rest is active and the file is renderable media).
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        if (file) void this.prewarmAttachmentPreview(file.path);
+      })
+    );
+
     // Bring up the local at-rest cipher BEFORE restoring the session. On
     // mobile (no Electron `safeStorage`), session blobs are sealed with the
     // LAK rather than the OS keystore, so we need the cipher ready to
@@ -1432,6 +1738,11 @@ export default class VaultGuardPlugin extends Plugin {
     // If init fails (no keychain on this device, broken wrap) we surface
     // the reason in a Notice and continue in degraded plaintext mode so
     // the plugin remains usable while the user investigates.
+    //
+    // Phase 12: construct the PIN-lock manager FIRST so initAtRestCipher's
+    // PIN-lock pre-check (isPinLockEnrolled) can land the vault LOCKED instead of
+    // provisioning/needs-recovery when a PIN owns the LAK (edge #6).
+    this.initPinLockManager();
     await this.initAtRestCipher();
 
     // SY5: restore queued offline operations (LAK-encrypted envelope) so
@@ -1439,11 +1750,23 @@ export default class VaultGuardPlugin extends Plugin {
     // with the in-memory queue. Fire-and-forget — it waits for cipher init
     // internally and merges under any ops queued while it loads.
     void this.loadPersistedOfflineQueue();
+    void this.loadPersistedRemoteFileState();
 
     // Restore session — synchronous safeStorage path first, async at-rest
     // path second. On desktop this is effectively zero-cost; on mobile it
     // adds a single AES-GCM decrypt (a few ms).
     await this.restoreSession();
+
+    // Phase 12 (H-1 / edge #6): if a session was just restored AND a PIN is
+    // enrolled, land LOCKED eagerly — keyed on isEnrolled() ALONE, never on
+    // idleAction. idleAction is unknown here (applyOrgSettings runs inside the
+    // BACKGROUNDED resumeStoredSession below, which we deliberately do NOT
+    // await), and the adapter already hard-locked in initAtRestCipher whenever a
+    // PIN owns the LAK — so gating the curtain on anything but isEnrolled() would
+    // leave an enrolled user in a logout-policy org with locked reads and NO
+    // curtain (a dead vault). idleAction governs ONLY the live-session idle→lock
+    // transition, not this restart/login unlock.
+    this.maybeEnterLockOnAuth();
 
     // Wire the folder-lifecycle vault listeners NOW, unconditionally, decoupled
     // from sync-engine init. This is the fix for folder deletes never reaching
@@ -1503,7 +1826,9 @@ export default class VaultGuardPlugin extends Plugin {
     // for the current session. Fire-and-forget so any persistence error
     // doesn't block the rest of plugin startup. Only persistent leases that
     // match this session's userId+vaultId are restored; orphans are dropped.
-    void this.restorePersistentAgentBridgeLeases();
+    if (!this.isLocalProjectMemoryModeEnabled()) {
+      void this.restorePersistentAgentBridgeLeases();
+    }
 
     // Register plugin commands
     this.registerCommands();
@@ -1575,6 +1900,11 @@ export default class VaultGuardPlugin extends Plugin {
       this.offlineQueuePersistTimer = null;
       await this.persistOfflineQueue().catch(() => {});
     }
+    if (this.remoteFileStatePersistTimer) {
+      clearTimeout(this.remoteFileStatePersistTimer);
+      this.remoteFileStatePersistTimer = null;
+      await this.persistRemoteFileState().catch(() => {});
+    }
 
     // Stop all timers
     this.stopSyncTimer();
@@ -1587,6 +1917,11 @@ export default class VaultGuardPlugin extends Plugin {
       this.updateChecker.stop();
       this.updateChecker = null;
     }
+    this.longOperationStatusUnsubscribe?.();
+    this.longOperationStatusUnsubscribe = null;
+    this.longOperationUi?.destroy();
+    this.longOperationUi = null;
+    this.longOperations.destroy();
 
     // Restore original vault adapter methods
     this.restoreVaultAdapter();
@@ -1672,6 +2007,10 @@ export default class VaultGuardPlugin extends Plugin {
    * the URL" before this handler is ever invoked.
    */
   async handleShareLink(params: { token?: string; vaultId?: string; [k: string]: string | undefined }): Promise<void> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: share links are disabled in Local Project Memory Mode.");
+      return;
+    }
     const token = (params.token ?? "").trim();
     const linkVaultId = (params.vaultId ?? "").trim();
 
@@ -1770,7 +2109,36 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   async createAgentBridgeLease(input: AgentBridgeLeaseInput = {}): Promise<AgentBridgeLeaseSecret> {
-    return this.ensureAgentBridgeRuntime().createLease(input);
+    const lease = this.ensureAgentBridgeRuntime().createLease(input);
+    this.vaultOrientationService?.invalidate("agent-bridge-lease-created");
+    return lease;
+  }
+
+  describeChatGptConnector(): ChatGptConnectorDescription {
+    return this.ensureAgentBridgeRuntime().describeChatGptConnector();
+  }
+
+  async createChatGptConnectorSession(
+    input: ChatGptConnectorSessionInput = {},
+  ): Promise<ChatGptConnectorSessionSecret> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      throw new Error("ChatGPT connector sessions are disabled in Local Project Memory Mode.");
+    }
+    const session = await this.ensureAgentBridgeRuntime().createChatGptConnectorSession(input);
+    this.vaultOrientationService?.invalidate("chatgpt-connector-session-created");
+    return session;
+  }
+
+  revokeChatGptConnectorSession(sessionId: string): boolean {
+    const revoked = this.ensureAgentBridgeRuntime().revokeChatGptConnectorSession(sessionId);
+    if (revoked) this.vaultOrientationService?.invalidate("chatgpt-connector-session-revoked");
+    return revoked;
+  }
+
+  revokeAllChatGptConnectorSessions(): number {
+    const count = this.ensureAgentBridgeRuntime().revokeAllChatGptConnectorSessions();
+    if (count > 0) this.vaultOrientationService?.invalidate("chatgpt-connector-sessions-revoked");
+    return count;
   }
 
   /**
@@ -1834,6 +2202,7 @@ export default class VaultGuardPlugin extends Plugin {
    * to an external agent right after Obsidian starts.
    */
   private async restorePersistentAgentBridgeLeases(): Promise<void> {
+    if (this.isLocalProjectMemoryModeEnabled()) return;
     await this.ensureAgentBridgeRuntime().restorePersistentLeases();
   }
 
@@ -1856,8 +2225,20 @@ export default class VaultGuardPlugin extends Plugin {
     return this.ensureAgentBridgeRuntimeObject().getSkillStatus();
   }
 
-  async installAgentBridgeSkill(options: { overwriteUnmanaged?: boolean } = {}): Promise<InstallResult> {
+  getAgentBridgeCodexSkillStatus(): (CodexSkillInstallStatus & { available: true }) | { available: false } {
+    return this.ensureAgentBridgeRuntimeObject().getCodexSkillStatus();
+  }
+
+  async installAgentBridgeSkill(
+    options: { overwriteUnmanaged?: boolean; force?: boolean } = {}
+  ): Promise<InstallResult> {
     return this.ensureAgentBridgeRuntimeObject().installSkill(options);
+  }
+
+  async installAgentBridgeCodexSkill(
+    options: { overwriteUnmanaged?: boolean; force?: boolean } = {}
+  ): Promise<CodexInstallResult> {
+    return this.ensureAgentBridgeRuntimeObject().installCodexSkill(options);
   }
 
   async uninstallAgentBridgeSkill(options: { force?: boolean } = {}): Promise<{
@@ -1867,15 +2248,28 @@ export default class VaultGuardPlugin extends Plugin {
     return this.ensureAgentBridgeRuntimeObject().uninstallSkill(options);
   }
 
+  async uninstallAgentBridgeCodexSkill(options: { force?: boolean } = {}): Promise<{
+    filePath: string;
+    removed: boolean;
+  }> {
+    return this.ensureAgentBridgeRuntimeObject().uninstallCodexSkill(options);
+  }
+
   revokeAgentBridgeLease(leaseId: string): boolean {
-    return this.ensureAgentBridgeRuntime().revokeLease(leaseId);
+    const revoked = this.ensureAgentBridgeRuntime().revokeLease(leaseId);
+    if (revoked) this.vaultOrientationService?.invalidate("agent-bridge-lease-revoked");
+    return revoked;
   }
 
   revokeAllAgentBridgeLeases(): void {
     this.ensureAgentBridgeRuntime().revokeAllLeases();
+    this.vaultOrientationService?.invalidate("agent-bridge-leases-revoked");
   }
 
   async startAgentBridgeServer(): Promise<AgentBridgeServerInfo> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      throw new Error("Agent bridge server leases are disabled in Local Project Memory Mode.");
+    }
     return this.ensureAgentBridgeRuntime().startServer();
   }
 
@@ -1951,6 +2345,10 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private openAgentBridgeLeaseModal(): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: server bridge leases are disabled in Local Project Memory Mode.", 6000);
+      return;
+    }
     this.ensureAgentBridgeRuntimeObject().openLeaseModal();
   }
 
@@ -1987,6 +2385,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   async saveSettings(): Promise<void> {
     await this.getSettingsRuntime().saveSettings();
+    this.vaultOrientationService?.invalidate("settings-saved");
   }
 
   async resetCloudConnectionDefaults(): Promise<void> {
@@ -2039,8 +2438,12 @@ export default class VaultGuardPlugin extends Plugin {
     this.getSettingsRuntime().rebuildApiClient();
   }
 
-  private async getResolvedApiEndpoint(idToken?: string, probePath?: string): Promise<string> {
-    return this.getSettingsRuntime().getResolvedApiEndpoint(idToken, probePath);
+  private async getResolvedApiEndpoint(
+    idToken?: string,
+    probePath?: string,
+    forceRefresh = false
+  ): Promise<string> {
+    return this.getSettingsRuntime().getResolvedApiEndpoint(idToken, probePath, forceRefresh);
   }
   // Command Registration
   // ─────────────────────────────────────────────────────────────────────────
@@ -2050,6 +2453,46 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private registerCommands(): void {
     registerVaultGuardCommands(this.createCommandContext());
+
+    // User-facing lock-on-demand command (quick 260708-g9m). Locks the vault at
+    // will instead of waiting for the idle timer. Runtime-gated ONLY by PIN
+    // enrollment inside lockVaultViaCommand() — intentionally registered OUTSIDE
+    // the dev-only build guard below, because this ships to users. Obsidian
+    // prefixes the palette label with the plugin name automatically.
+    this.addCommand({
+      id: "vaultguard-lock-vault",
+      name: "Lock vault",
+      callback: () => this.lockVaultViaCommand(),
+    });
+
+    // Dev-only testing aid (quick 260708-el6): force-open the PIN onboarding
+    // prompt on demand so it can be exercised without an idle-logout, without a
+    // lock-policy server (12-02 idleAction deploy), and without disabling an
+    // existing PIN. In production the esbuild `define` replaces
+    // `process.env.NODE_ENV` with "production", folding this guard to `if (false)`
+    // so esbuild DCE strips the whole block — and its command strings — from the
+    // released bundle. It therefore exists ONLY in dev builds
+    // (`npm run install:plugin:dev`), never in users' bundles. Mirrors the
+    // NODE_ENV gating used by registerChatDebugCommand.
+    if (process.env.NODE_ENV !== "production") {
+      this.addCommand({
+        id: "vaultguard-dev-test-pin-onboarding",
+        name: "Dev: test PIN onboarding prompt",
+        callback: () => {
+          // Log the natural-gate state (so a tester can see whether the real
+          // trigger WOULD have fired), then force-open regardless for the visual
+          // click-through. The persisted once-only flag is intentionally not
+          // reset here — force-open ignores it, so this command always works.
+          this.log(
+            `[dev] PIN onboarding gate: session=${!!this.session} ` +
+              `idleAction=${this.effectiveIdleAction()} ` +
+              `pinEnrolled=${this.pinLockEnrolled()} ` +
+              `promptShown=${!!this.settings.pinOnboardingPromptShown} — force-opening prompt`,
+          );
+          this.openPinOnboardingPrompt();
+        },
+      });
+    }
   }
 
   private getPermissionsGraphRuntime(): PermissionsGraphRuntime {
@@ -2166,11 +2609,19 @@ export default class VaultGuardPlugin extends Plugin {
    */
   /** Opens the share-management modal — listed in the command palette. */
   private openShareManagementModal(): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: sharing is disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.apiClient || !this.session) return;
     new ShareManagementModal(this.app, this.apiClient).open();
   }
 
   private async copyShareLinkForPath(path: string): Promise<void> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: share links are disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.session || !this.apiClient || !this.settings.serverVaultId) {
       new Notice("VaultGuard Sync: Log in and bind this vault before sharing.");
       return;
@@ -2309,6 +2760,10 @@ export default class VaultGuardPlugin extends Plugin {
     firstTimeSetup?: boolean;
     requireOrgSlug?: boolean;
   }): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: organization login is disabled in Local Project Memory Mode.", 6000);
+      return;
+    }
     const manualMode = this.settings.manualConfig === true;
     const hasBundledCloudAuth =
       Boolean(SAAS_DEFAULTS.cognitoUserPoolId) &&
@@ -2419,6 +2874,10 @@ export default class VaultGuardPlugin extends Plugin {
     exp?: string;
     [key: string]: string | undefined;
   }): Promise<void> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: invite redemption is disabled in Local Project Memory Mode.");
+      return;
+    }
     const slug = (params.org ?? params.slug ?? "").trim().toLowerCase();
     if (!slug) {
       new Notice("VaultGuard Sync invite link is missing the org slug.");
@@ -2839,6 +3298,16 @@ export default class VaultGuardPlugin extends Plugin {
     this.initializeApiClientFromSession(session);
 
     await this.persistSession(session);
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      this.keyLease = null;
+      this.vaultLeaseDenied = false;
+      this.stopSyncTimer();
+      this.stopKeyRenewalMonitor();
+      this.stopHeartbeatMonitor();
+      this.setConnectionStatus("offline", { scheduleRetry: false, notify: false });
+      new Notice(`VaultGuard Sync: Logged in as ${session.displayName}; ${LOCAL_PROJECT_MEMORY_MODE_NOTICE}`, 8000);
+      return;
+    }
     this.startKeyRenewalMonitor();
     this.startHeartbeatMonitor();
     new Notice(`VaultGuard Sync: Logged in as ${session.displayName}`);
@@ -2903,6 +3372,18 @@ export default class VaultGuardPlugin extends Plugin {
     } else {
       this.log("Vault binding skipped — sync engine deferred until a vault is picked.");
     }
+
+    // Phase 12 (H-1): a fresh login on a device that already has a PIN enrolled
+    // lands LOCKED too — the LAK is PIN-wrapped so the adapter is locked, and the
+    // curtain must appear regardless of idleAction. enterLockState stops the sync
+    // + key-renewal this login may have just started; the heartbeat stays alive.
+    this.maybeEnterLockOnAuth();
+
+    // Quick 260708-el6: a fresh login for a NEW user in a lock-policy org with no
+    // PIN yet — offer the skippable, once-ever "Set a PIN" prompt so idle-lock is
+    // discoverable. Gated + idempotent behind the persisted flag, so it shows at
+    // most once across both auth-entry points and across reloads.
+    this.maybeOfferPinOnboarding();
   }
 
   /**
@@ -3652,6 +4133,16 @@ export default class VaultGuardPlugin extends Plugin {
       await this.persistSession(this.session);
     }
 
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      this.keyLease = null;
+      this.vaultLeaseDenied = false;
+      this.stopSyncTimer();
+      this.stopKeyRenewalMonitor();
+      this.stopHeartbeatMonitor();
+      this.syncDiagnostics.record("restoreServerSession.skipped.localProjectMemoryMode");
+      return;
+    }
+
     this.startKeyRenewalMonitor();
     this.startHeartbeatMonitor();
 
@@ -3705,6 +4196,11 @@ export default class VaultGuardPlugin extends Plugin {
         this.logError("Sync engine init failed (non-blocking)", err);
       });
     }
+
+    // Quick 260708-el6: first lock-policy session for a returning/existing user
+    // (the endorsed once-ever migration nudge, reusing the same persisted flag).
+    // The flag guarantees at most one prompt across both entry points + reloads.
+    this.maybeOfferPinOnboarding();
   }
 
   /**
@@ -3890,6 +4386,10 @@ export default class VaultGuardPlugin extends Plugin {
     return this.ensureAtRestAdapterRuntimeObject().revertVaultFromAtRest();
   }
 
+  async decryptVaultAndDisableAtRestEncryption(): Promise<AtRestDecryptAndDisableResult> {
+    return this.ensureAtRestAdapterRuntimeObject().decryptVaultAtRestAndDisableEncryption();
+  }
+
   /**
    * Generate the user-readable recovery code. Throws if the cipher is
    * locked / disabled — the caller (settings tab) should gate the button
@@ -4008,14 +4508,17 @@ export default class VaultGuardPlugin extends Plugin {
 
   private showVaultGuardMenu(evt?: MouseEvent): void {
     const menu = new Menu();
+    const localProjectMemoryMode = this.isLocalProjectMemoryModeEnabled();
     const isLoggedIn = !!this.session;
     const isAdmin =
       this.session?.role === "admin" || this.session?.role === "owner";
     const currentVaultName =
-      this.settings.serverVaultName ||
-      this.settings.serverVaultSlug ||
-      this.settings.serverVaultId ||
-      "No server vault bound";
+      localProjectMemoryMode
+        ? "Local Project Memory"
+        : this.settings.serverVaultName ||
+          this.settings.serverVaultSlug ||
+          this.settings.serverVaultId ||
+          "No server vault bound";
 
     menu.addItem((item) =>
       item
@@ -4043,6 +4546,38 @@ export default class VaultGuardPlugin extends Plugin {
           .setTitle("Login")
           .setIcon("log-in")
           .onClick(() => this.handleLogin())
+      );
+      this.showMenu(menu, evt);
+      return;
+    }
+
+    if (localProjectMemoryMode) {
+      menu.addItem((item) =>
+        item
+          .setTitle("Open files panel")
+          .setIcon("panel-right")
+          .onClick(() => {
+            void this.activateVaultGuardSidebar();
+          })
+      );
+
+      menu.addItem((item) =>
+        item
+          .setTitle("Open AI chat")
+          .setIcon(VAULTGUARD_CHAT_ICON_ID)
+          .onClick(() => {
+            void this.activateVaultGuardChat();
+          })
+      );
+
+      menu.addSeparator();
+      menu.addItem((item) =>
+        item
+          .setTitle("Logout")
+          .setIcon("log-out")
+          .onClick(() => {
+            void this.forceLogout();
+          })
       );
       this.showMenu(menu, evt);
       return;
@@ -4270,6 +4805,10 @@ export default class VaultGuardPlugin extends Plugin {
    * selected server vault before regular sync resumes.
    */
   async switchServerVault(): Promise<boolean> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: server vault binding is disabled in Local Project Memory Mode.");
+      return false;
+    }
     const changed = await this.promptVaultBinding();
     if (changed && this.settings.serverVaultId && this.session) {
       this.syncDiagnostics.record("initializeSyncEngine.invoke", { caller: "switchServerVault" });
@@ -4284,6 +4823,10 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   async bindServerVault(result: { vaultId: string; name: string; slug: string }): Promise<boolean> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: server vault binding is disabled in Local Project Memory Mode.");
+      return false;
+    }
     const changed = await this.applyVaultBinding(result);
     if (changed && this.settings.serverVaultId && this.session) {
       this.syncDiagnostics.record("initializeSyncEngine.invoke", { caller: "bindServerVault" });
@@ -4650,6 +5193,12 @@ export default class VaultGuardPlugin extends Plugin {
    * SaaS API base URL or the currently configured apiEndpoint to discover it.
    */
   async resolveOrgConfig(slug: string, options: { silent?: boolean } = {}): Promise<void> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      if (!options.silent) {
+        new Notice("VaultGuard Sync: organization connection is disabled in Local Project Memory Mode.");
+      }
+      return;
+    }
     await this.getSettingsRuntime().resolveOrgConfig(slug, options);
   }
 
@@ -4684,10 +5233,12 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private getEffectiveSyncMode(): OrgSettingsResponse["syncMode"] {
+    if (this.isLocalProjectMemoryModeEnabled()) return "manual";
     return this.orgSettings?.syncMode ?? "periodic";
   }
 
   private getEffectiveSyncIntervalSeconds(): number {
+    if (this.isLocalProjectMemoryModeEnabled()) return 0;
     if (!this.orgSettings) {
       return this.settings.syncInterval;
     }
@@ -4704,6 +5255,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private shouldUploadChangesImmediately(): boolean {
+    if (this.isLocalProjectMemoryModeEnabled()) return false;
     return this.getEffectiveSyncMode() !== "manual";
   }
 
@@ -4712,7 +5264,9 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private noteSessionActivity(): void {
-    if (!this.session) {
+    // Phase 12: while locked, user activity must NOT reschedule an auto-lock —
+    // the vault is already locked and only a PIN (or a hard fallback) leaves it.
+    if (!this.session || this.isVaultLocked) {
       return;
     }
 
@@ -4744,6 +5298,31 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
+    // Phase 12 idle-behavior matrix (D3): the org's idleAction chooses lock vs
+    // logout; a cryptographic lock additionally requires an enrolled PIN (there
+    // is no secret to unlock with otherwise). Read the optional server field as
+    // `?? "logout"` so un-upgraded servers / existing orgs keep today's behavior.
+    const action = this.orgSettings?.idleAction ?? "logout";
+    const enrolled = this.pinLockManager?.isEnrolled() ?? false;
+
+    if (action === "lock" && enrolled) {
+      this.log(`Auto-lock: locking vault after ${autoLockMinutes} minutes of inactivity.`);
+      await this.enterLockState();
+      return;
+    }
+
+    if (action === "lock" && !enrolled) {
+      // Policy wants a lock but there's no PIN to unlock with — fall back to
+      // logout and nudge (once) toward enrolling a PIN so lock-not-logout works.
+      if (!this.pinNudgeShown) {
+        this.pinNudgeShown = true;
+        new Notice(
+          "VaultGuard Sync: set a PIN in VaultGuard settings to lock instead of logging out.",
+          8000
+        );
+      }
+    }
+
     this.log(`Auto-lock triggered after ${autoLockMinutes} minutes of inactivity.`);
     await this.forceLogout(
       `VaultGuard Sync: Session locked after ${autoLockMinutes} minutes of inactivity.`
@@ -4751,10 +5330,409 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Phase 12 (H-1 / edge #6): fire the lock curtain on ANY auth entry — cold-
+   * start session-restore OR a fresh login — whenever a PIN is enrolled, keyed on
+   * `isEnrolled()` ALONE and NEVER on idleAction. The adapter already hard-locks
+   * whenever a PIN owns the LAK (initAtRestCipher skips provisioning), so the
+   * curtain gate MUST mirror that exact condition or an enrolled user in a
+   * logout-policy org — or after an admin lock→logout flip — gets locked adapter
+   * reads with no way to unlock (the dead-vault H-1 case). Synchronous + eager:
+   * callers MUST NOT await sessionResumePromise first (idleAction is unknown until
+   * the backgrounded resume settles). idleAction governs ONLY the live-session
+   * idle→lock transition (lockSessionForInactivity), not restart/login unlock.
+   */
+  private maybeEnterLockOnAuth(): void {
+    if (this.session && this.pinLockManager?.isEnrolled() && !this.isVaultLocked) {
+      void this.enterLockState();
+    }
+  }
+
+  /**
+   * User-facing "Lock vault" command (quick 260708-g9m). Locks the vault on
+   * demand — but ONLY when a PIN is enrolled, so a user can never strand
+   * themselves behind an unlockable curtain (D-01). The four guard branches are
+   * independent, in order:
+   *   1. no session      → nudge to log in first; do NOT lock.
+   *   2. already locked   → silent no-op (the curtain is already up).
+   *   3. no PIN enrolled  → nudge (Notice + SetPinModal) INSTEAD of locking; the
+   *                         nudge does NOT chain into a lock afterward.
+   *   4. otherwise        → enter the cryptographic lock.
+   * Independent of idleAction by design: locking is invokable at will regardless
+   * of the org's idle policy; PIN enrollment is the only gate.
+   */
+  private lockVaultViaCommand(): void {
+    if (!this.session) {
+      new Notice("VaultGuard Sync: Log in before locking the vault.");
+      return;
+    }
+    if (this.isVaultLocked) {
+      return; // the curtain is already up — nothing to do
+    }
+    if (!this.pinLockEnrolled()) {
+      new Notice(
+        "VaultGuard Sync: Set a PIN first so you can unlock the vault after it locks."
+      );
+      new SetPinModal(this.app, async (secret) => {
+        await this.enrollPinLock(secret);
+      }).open();
+      return;
+    }
+    void this.enterLockState();
+  }
+
+  /**
+   * Enter the cryptographic lock (D2): evict the in-memory LAK + cloud key-lease,
+   * revoke the decrypted-media blob cache, stop the sync + key-renewal timers,
+   * and curtain the workspace — while PRESERVING the session, the apiClient
+   * tokens, and (crucially) the revocation heartbeat.
+   *
+   * NON-NEGOTIABLE #2: the heartbeat MUST keep running so server revocation
+   * (60s heartbeat / terminal token-refresh) and the 24h maxSessionDurationHours
+   * cap still force a REAL forceLogout even while locked — a locked session can
+   * never resurrect a revoked/expired one. Only sync + key-renewal stop here.
+   */
+  private async enterLockState(): Promise<void> {
+    if (!this.session || this.isVaultLocked) {
+      return;
+    }
+    this.atRestCipher?.lock(); // evict the in-memory LAK → managed reads fail closed
+    this.keyLease = null; // evict the cloud DEK
+    this.ensureAtRestAdapterRuntimeObject().setLocked(true); // fail-closed gate + revoke previews
+    this.stopSyncTimer();
+    this.stopKeyRenewalMonitor();
+    // NN-2: deliberately NOT stopHeartbeatMonitor() — see the method doc above.
+    this.isVaultLocked = true;
+    this.captureAndDetachContentLeaves(); // Pitfall 1 + L-4: no plaintext behind the curtain
+    this.showLockCurtain();
+    this.log("Vault locked (session + refresh token + heartbeat preserved).");
+  }
+
+  /** Lazily construct + render the opaque lock curtain wired to unlock/forgot. */
+  private showLockCurtain(): void {
+    if (!this.lockCurtain) {
+      this.lockCurtain = new LockCurtain(document);
+    }
+    this.lockCurtain.show({
+      onSubmit: (secret) => void this.unlockWithPin(secret),
+      onForgot: () => this.confirmForgotPin(),
+    });
+  }
+
+  /**
+   * Leave the lock: re-acquire the vault-scoped key lease, then tear the curtain
+   * down and resume sync + key-renewal. edge #2: a 401 (revoked / 24h
+   * maxSessionDurationHours cap) on the lease makes ensureVaultScopedKeyLease run
+   * a REAL forceLogout and return "logged-out" — a stale lock never silently
+   * resumes past the server cap. Plan 05 extends this to re-open the pre-lock file.
+   */
+  private async exitLockState(): Promise<void> {
+    if (!this.isVaultLocked) {
+      return;
+    }
+    let leaseResult: "ok" | "limited" | "logged-out";
+    try {
+      leaseResult = await this.ensureVaultScopedKeyLease();
+    } catch (err) {
+      // Transient lease failure (5xx / network): the LAK is already back in
+      // memory, so local content is readable. Tear the curtain down and let the
+      // key-renewal monitor retry (leaseRetryNeeded is set). This is NOT edge #2.
+      this.logError("Key lease re-acquire after unlock failed transiently (will retry)", err);
+      leaseResult = "limited";
+    }
+    if (leaseResult === "logged-out" || !this.session) {
+      // ensureVaultScopedKeyLease already ran forceLogout (edge #2), which tore
+      // the curtain down and reset isVaultLocked. Nothing more to do.
+      return;
+    }
+    this.isVaultLocked = false;
+    this.lockCurtain?.hide();
+    this.lockCurtain = null;
+    this.restartSyncTimer();
+    this.startKeyRenewalMonitor();
+    void this.reopenPreLockFile(); // L-4: unlock does not land on a blank workspace
+    this.log("Vault unlocked.");
+  }
+
+  /**
+   * Unlock with the user's PIN / passphrase. A wrong PIN shows a curtain error
+   * and stays locked; reason "locked-out" (the attempt cap) forces a REAL
+   * forceLogout. On success: adopt the PIN-unwrapped LAK, re-acquire the lease,
+   * and tear the curtain down — with NO email/password/MFA re-login.
+   */
+  private async unlockWithPin(secret: string): Promise<void> {
+    if (!this.pinLockManager || !this.isVaultLocked) {
+      return;
+    }
+    this.lockCurtain?.setBusy(true);
+
+    let res: Awaited<ReturnType<PinLockManager["unlock"]>>;
+    try {
+      res = await this.pinLockManager.unlock(secret);
+    } catch (err) {
+      this.logError("PIN unlock threw", err);
+      this.lockCurtain?.showError("Unlock failed. Please try again.");
+      return;
+    }
+
+    if (!res.ok) {
+      if (res.reason === "locked-out") {
+        await this.forceLogout(
+          "VaultGuard Sync: Too many attempts — please log in again."
+        );
+      } else {
+        this.lockCurtain?.showError("Incorrect PIN. Try again.");
+      }
+      return;
+    }
+
+    try {
+      await this.ensureAtRestAdapterRuntimeObject().unlockCipherWithLak(res.lak);
+    } catch (err) {
+      this.logError("Adopting the PIN-unwrapped LAK failed", err);
+      this.lockCurtain?.showError("Unlock failed. Please try again.");
+      return;
+    } finally {
+      res.lak.fill(0); // defensive: the cipher took its own copy
+    }
+
+    await this.exitLockState();
+  }
+
+  /** True if a PIN is enrolled on this device (public accessor for the settings UI). */
+  pinLockEnrolled(): boolean {
+    return this.pinLockManager?.isEnrolled() ?? false;
+  }
+
+  /** The effective org idle action ("lock" | "logout") for the settings UI. */
+  effectiveIdleAction(): "lock" | "logout" {
+    return this.orgSettings?.idleAction ?? "logout";
+  }
+
+  /**
+   * Lazy, once-ever discoverability prompt for lock-instead-of-logout (quick
+   * 260708-el6). A new user in a lock-policy org who never sets a PIN silently
+   * degrades to idle-LOGOUT (lockSessionForInactivity → action "lock" && !enrolled
+   * → forceLogout). Offer a skippable "Set a PIN" nudge exactly once. Safe to call
+   * from BOTH the fresh-login and session-restore entry points because it is
+   * idempotent behind the persisted `pinOnboardingPromptShown` flag.
+   */
+  private maybeOfferPinOnboarding(): void {
+    if (
+      this.session &&
+      this.effectiveIdleAction() === "lock" &&
+      !this.pinLockEnrolled() &&
+      !this.settings.pinOnboardingPromptShown
+    ) {
+      this.openPinOnboardingPrompt();
+    }
+  }
+
+  /**
+   * Show the soft two-button prompt. [Set PIN] reuses the canonical SetPinModal →
+   * enrollPinLock wiring (mirrors the settings.ts Set-a-PIN button — AC2); [Not
+   * now] (or any close) just persists the flag. Both choices funnel through
+   * markPinOnboardingPromptShown so the prompt never reappears (AC3).
+   */
+  private openPinOnboardingPrompt(): void {
+    new PinOnboardingPromptModal(this.app, {
+      onSetPin: () => {
+        void this.markPinOnboardingPromptShown().catch((err) =>
+          this.logError("Persisting PIN onboarding flag failed", err)
+        );
+        new SetPinModal(this.app, async (secret) => {
+          await this.enrollPinLock(secret);
+        }).open();
+      },
+      onDismiss: () => {
+        void this.markPinOnboardingPromptShown().catch((err) =>
+          this.logError("Persisting PIN onboarding flag failed", err)
+        );
+      },
+    }).open();
+  }
+
+  /**
+   * Persist the once-ever onboarding-prompt guard. Idempotent: a no-op (no
+   * redundant save) once the flag is already set, so a stray double-call from the
+   * modal's onClose dismissal fallback is harmless.
+   */
+  private async markPinOnboardingPromptShown(): Promise<void> {
+    if (this.settings.pinOnboardingPromptShown) {
+      return;
+    }
+    this.settings.pinOnboardingPromptShown = true;
+    await this.saveSettings();
+  }
+
+  /**
+   * Enroll a PIN so the vault locks-instead-of-logs-out (D2/D3). Requires the
+   * cipher UNLOCKED (the LAK must be in memory to hand to the PIN wrap).
+   *
+   * NON-NEGOTIABLE #1 + failure-safe order: write `lak-pin.envelope` FIRST
+   * (pinLockManager.enroll), THEN remove the transparent `lak.envelope`
+   * (clearPersistedWrap). Without clearPersistedWrap a same-OS user auto-unwraps
+   * the LAK PIN-free on the next cold start and D2 ("undecryptable without the
+   * PIN") is FALSE. Doing enroll before clear guarantees a failed enroll never
+   * leaves the device with NO way to load the LAK.
+   */
+  async enrollPinLock(secret: string): Promise<void> {
+    const cipher = this.getAtRestCipher();
+    if (!cipher?.isReady()) {
+      throw new Error("Unlock the vault before setting a PIN.");
+    }
+    if (!this.pinLockManager) {
+      throw new Error("PIN lock is unavailable on this device.");
+    }
+    const lak = cipher.exportLakBytes();
+    try {
+      await this.pinLockManager.enroll(secret, lak); // writes lak-pin.envelope
+      await cipher.clearPersistedWrap(); // NN-1: remove the transparent lak.envelope
+    } finally {
+      lak.fill(0);
+    }
+    new Notice(
+      "VaultGuard Sync: PIN set. Your vault now locks (not logs out) when idle."
+    );
+  }
+
+  /**
+   * Disable the PIN, restoring transparent at-rest unlock on this device.
+   * Requires the current secret (authorization). NN-1 reverse + failure-safe:
+   * restore `lak.envelope` (persistWrappedLak) BEFORE removing the PIN material
+   * (pinLockManager.disable), so the device always retains a way to load the LAK.
+   */
+  async disablePinLock(secret: string): Promise<void> {
+    if (!this.pinLockManager?.isEnrolled()) {
+      throw new Error("No PIN is set.");
+    }
+    const res = await this.pinLockManager.unlock(secret);
+    if (!res.ok) {
+      throw new Error(
+        res.reason === "locked-out"
+          ? "Too many attempts. Please try again later."
+          : "Incorrect PIN."
+      );
+    }
+    try {
+      const cipher = this.getAtRestCipher();
+      if (!cipher) {
+        throw new Error("At-rest encryption is not initialized.");
+      }
+      // Ensure the LAK is live so persistWrappedLak can re-create lak.envelope
+      // (normally the cipher is already unlocked when disabling from settings).
+      if (!cipher.isReady()) {
+        await this.ensureAtRestAdapterRuntimeObject().unlockCipherWithLak(res.lak);
+      }
+      await cipher.persistWrappedLak(); // NN-1 reverse: restore lak.envelope FIRST
+      await this.pinLockManager.disable(); // then remove lak-pin.envelope + pepper
+    } finally {
+      res.lak.fill(0);
+    }
+    new Notice(
+      "VaultGuard Sync: PIN removed. This device unlocks the vault transparently again."
+    );
+  }
+
+  /**
+   * Forgotten-PIN escape (Pitfall 2 / residual #2): disable the local pin-lock
+   * FIRST (enrolled→false so the next cold start does NOT re-enter the lock
+   * loop) THEN force a real logout. On re-login the cipher sees `lak.envelope`
+   * absent + ciphertext present and routes to the EXISTING at-rest recovery
+   * (recovery-code restore, or the "Reset at-rest encryption & re-sync" settings
+   * action) — never a needs-recovery dead-end. The user is never stranded.
+   */
+  async forgotPin(): Promise<void> {
+    await this.pinLockManager?.disable();
+    await this.forceLogout(
+      "VaultGuard Sync: PIN reset — please log in again. Your notes re-sync from the cloud."
+    );
+  }
+
+  /** Confirm the forgotten-PIN reset (wired to the lock curtain's onForgot). */
+  private confirmForgotPin(): void {
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("Reset PIN?");
+    modal.contentEl.createEl("p", {
+      text: "You'll be logged out and your notes will re-sync from the cloud. Continue?",
+    });
+    const row = modal.contentEl.createDiv({ cls: "modal-button-container" });
+    row
+      .createEl("button", { text: "Cancel" })
+      .addEventListener("click", () => modal.close());
+    const go = row.createEl("button", {
+      text: "Reset PIN & log out",
+      cls: "mod-warning",
+    });
+    go.addEventListener("click", () => {
+      modal.close();
+      void this.forgotPin();
+    });
+    modal.open();
+  }
+
+  /**
+   * Pitfall 1 + L-4: on lock, capture the active file path and detach open
+   * content leaves so already-rendered plaintext is gone even if the opaque
+   * curtain had a gap. Reversed by reopenPreLockFile() on unlock. Best-effort
+   * and workspace-shape-guarded (mobile-safe / test-safe).
+   */
+  private captureAndDetachContentLeaves(): void {
+    try {
+      this.preLockActiveFilePath = this.app.workspace.getActiveFile()?.path ?? null;
+      const ws = this.app.workspace as unknown as {
+        detachLeavesOfType?: (type: string) => void;
+      };
+      if (typeof ws.detachLeavesOfType === "function") {
+        for (const type of ["markdown", "image", "pdf"]) {
+          ws.detachLeavesOfType(type);
+        }
+      }
+    } catch (err) {
+      this.logError("Detaching content leaves on lock failed", err);
+    }
+  }
+
+  /** L-4: re-open the file that was active at lock time, so unlock is not blank. */
+  private async reopenPreLockFile(): Promise<void> {
+    const path = this.preLockActiveFilePath;
+    this.preLockActiveFilePath = null;
+    if (!path) return;
+    try {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (file instanceof TFile) {
+        await this.app.workspace.getLeaf().openFile(file);
+      }
+    } catch (err) {
+      this.logError("Re-opening the pre-lock file after unlock failed", err);
+    }
+  }
+
+  /**
+   * Biometric enrollment is a DEFERRED seam (D1/O-2). WebAuthn platform auth is
+   * unreachable from a community plugin on current Obsidian (Electron 39 < the 43
+   * that exposes app.configureWebAuthn, plus a native module + signing
+   * entitlements the plugin can't ship), so biometricAvailable() self-disables
+   * everywhere and this never actually runs. It exists so the (hidden) settings
+   * toggle compiles; biometric drops in additively later behind lak-prf.envelope.
+   */
+  async enrollBiometric(): Promise<void> {
+    new Notice("VaultGuard Sync: biometric unlock is coming in a later version.");
+  }
+
+  /**
    * Forces logout: invalidates the session, clears credentials,
    * and optionally wipes local cache.
    */
   async forceLogout(noticeMessage = "VaultGuard Sync: Logged out successfully."): Promise<void> {
+    // Phase 12: any hard-fallback logout while locked (forgotten PIN, attempt
+    // cap, server revocation via the still-alive heartbeat, or the 24h cap on
+    // unlock) must tear the curtain down FIRST so the workspace is reachable
+    // again after the normal logout clears state.
+    if (this.isVaultLocked) {
+      this.lockCurtain?.hide();
+      this.lockCurtain = null;
+      this.isVaultLocked = false;
+    }
     this.rememberLogoutAuthState(noticeMessage);
 
     try {
@@ -4919,8 +5897,17 @@ export default class VaultGuardPlugin extends Plugin {
     return this.ensureAtRestAdapterRuntimeObject().decryptVaultAtRest();
   }
 
+  private async decryptVaultAtRestAndDisableEncryption(): Promise<AtRestDecryptAndDisableResult> {
+    return this.ensureAtRestAdapterRuntimeObject().decryptVaultAtRestAndDisableEncryption();
+  }
+
   private interceptVaultAdapter(): void {
     return this.ensureAtRestAdapterRuntimeObject().interceptVaultAdapter();
+  }
+
+  /** BIN-A preview: pre-decrypt an opened media file into the blob cache. */
+  private prewarmAttachmentPreview(path: string): Promise<void> {
+    return this.ensureAtRestAdapterRuntimeObject().prewarmResourcePreview(path);
   }
 
   private restoreVaultAdapter(): void {
@@ -5584,7 +6571,7 @@ export default class VaultGuardPlugin extends Plugin {
   private async resolveReconciliationConflict(
     path: string,
     strategy: ConflictResolutionStrategy,
-    localManifest: Map<string, { content: string; hash: string }>
+    localManifest: Map<string, LocalManifestEntry>
   ): Promise<void> {
     return this.ensureSyncRuntime().resolveReconciliationConflict(path, strategy, localManifest);
   }
@@ -5838,6 +6825,9 @@ export default class VaultGuardPlugin extends Plugin {
     deleted: number;
     failed: number;
   }> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      throw new Error("Server purge is disabled in Local Project Memory Mode.");
+    }
     if (!this.session || !this.settings.serverVaultId) {
       throw new Error("Not connected to a server vault.");
     }
@@ -5937,6 +6927,39 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async handleConflict(conflict: SyncConflict): Promise<void> {
     return this.ensureSyncRuntime().handleConflict(conflict);
+  }
+
+  private getRemoteFileState(path: string): RemoteFileStateEntry | null {
+    return this.remoteFileState.get(this.normalizeVaultPath(path));
+  }
+
+  private getExpectedVersionId(path: string): string | undefined {
+    return this.remoteFileState.getExpectedVersionId(this.normalizeVaultPath(path));
+  }
+
+  private recordRemoteFilePresent(
+    path: string,
+    update: RemoteFileStateUpdate = {}
+  ): void {
+    this.remoteFileState.recordPresent(this.normalizeVaultPath(path), update);
+    this.scheduleRemoteFileStatePersist();
+  }
+
+  private recordRemoteFileAbsent(path: string): void {
+    this.remoteFileState.recordAbsent(this.normalizeVaultPath(path));
+    this.scheduleRemoteFileStatePersist();
+  }
+
+  private async handleRemoteWriteConflict(
+    path: string,
+    localContent: string,
+    baseVersionId?: string | null
+  ): Promise<RemoteWriteConflictResolutionResult> {
+    return this.ensureSyncRuntime().handleRemoteWriteConflict(
+      path,
+      localContent,
+      baseVersionId
+    );
   }
 
   /**
@@ -6183,6 +7206,7 @@ export default class VaultGuardPlugin extends Plugin {
    * or DEK lease expiry.
    */
   private startHeartbeatMonitor(): void {
+    if (this.isLocalProjectMemoryModeEnabled()) return;
     this.ensureSyncRuntime().startHeartbeatMonitor();
   }
 
@@ -6203,6 +7227,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Checks every minute if the lease needs renewal.
    */
   private startKeyRenewalMonitor(): void {
+    if (this.isLocalProjectMemoryModeEnabled()) return;
     this.ensureSyncRuntime().startKeyRenewalMonitor();
   }
 
@@ -6394,6 +7419,55 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Byte variant of {@link encryptContent} (BIN-A / D-02). Encrypts raw bytes
+   * with the SAME AES-256-GCM envelope (12-byte nonce ‖ ciphertext+tag, base64)
+   * so the server sees an identical ciphertext shape — `decryptContent` can
+   * decrypt this output and vice versa. Keeps the lease-expiry throw and the
+   * `assertLeaseMatchesBoundVault` guard verbatim (T-11-01: no crypto op without
+   * a valid vault-bound lease).
+   * @param content - Plaintext bytes to encrypt
+   * @returns Base64-encoded encrypted content (nonce + ciphertext + tag)
+   * @throws Error if no valid key lease is available
+   */
+  private async encryptContentBytes(content: ArrayBuffer): Promise<string> {
+    if (!this.keyLease || this.isKeyLeaseExpired()) {
+      throw new Error(
+        "VaultGuard Sync: Cannot encrypt - no valid key lease. Please reconnect."
+      );
+    }
+    this.assertLeaseMatchesBoundVault("encrypt");
+
+    const data = new Uint8Array(content);
+
+    // Generate random 12-byte nonce
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+
+    // Import the key
+    const keyBytes = this.base64ToBytes(this.keyLease.key);
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keyBytes.buffer as ArrayBuffer,
+      { name: "AES-GCM" },
+      false,
+      ["encrypt"]
+    );
+
+    // Encrypt
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce },
+      cryptoKey,
+      data
+    );
+
+    // Combine nonce + ciphertext and encode as base64
+    const combined = new Uint8Array(nonce.length + ciphertext.byteLength);
+    combined.set(nonce);
+    combined.set(new Uint8Array(ciphertext), nonce.length);
+
+    return this.bytesToBase64(combined);
+  }
+
+  /**
    * Decrypts file content using the current key lease.
    * Expects base64-encoded data in format: nonce (12 bytes) + ciphertext + tag.
    * @param encryptedBase64 - Base64-encoded encrypted content
@@ -6430,6 +7504,47 @@ export default class VaultGuardPlugin extends Plugin {
     );
 
     return new TextDecoder().decode(decrypted);
+  }
+
+  /**
+   * Byte variant of {@link decryptContent} (BIN-A / D-02). Same envelope split
+   * (`slice(0,12)` nonce / `slice(12)` ciphertext+tag) and the same lease/vault
+   * guards, but returns the decrypted `ArrayBuffer` instead of UTF-8-decoding it
+   * — the lossy `TextDecoder` step is exactly the AR1 failure class for binaries.
+   * @param encryptedContent - Base64-encoded encrypted content
+   * @returns Decrypted plaintext bytes
+   * @throws Error if decryption fails or no valid key lease
+   */
+  private async decryptContentBytes(encryptedContent: string): Promise<ArrayBuffer> {
+    if (!this.keyLease || this.isKeyLeaseExpired()) {
+      throw new Error(
+        "VaultGuard Sync: Cannot decrypt - no valid key lease. Please reconnect."
+      );
+    }
+    this.assertLeaseMatchesBoundVault("decrypt");
+
+    const combined = this.base64ToBytes(encryptedContent);
+
+    // Nonce (first 12 bytes) + ciphertext (remainder, includes auth tag).
+    const nonce = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+
+    const keyBytes = this.base64ToBytes(this.keyLease.key);
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keyBytes.buffer as ArrayBuffer,
+      { name: "AES-GCM" },
+      false,
+      ["decrypt"]
+    );
+
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: nonce },
+      cryptoKey,
+      ciphertext
+    );
+
+    return decrypted;
   }
 
   /**
@@ -6780,9 +7895,17 @@ export default class VaultGuardPlugin extends Plugin {
   private queueOfflineOperation(
     operation: "write" | "delete",
     path: string,
-    data?: string
+    data?: string,
+    // BIN-A / D-09 + version-guard: forward the optional binary-payload marker
+    // and/or version-guard fields to the sync runtime.
+    options?: {
+      encoding?: "base64";
+      contentType?: string;
+      baseVersionId?: string;
+      baseHash?: string;
+    }
   ): void {
-    return this.ensureSyncRuntime().queueOfflineOperation(operation, path, data);
+    return this.ensureSyncRuntime().queueOfflineOperation(operation, path, data, options);
   }
 
   /**
@@ -6836,7 +7959,11 @@ export default class VaultGuardPlugin extends Plugin {
     method: string,
     endpoint: string,
     body?: Record<string, unknown>,
-    idTokenOverride?: string
+    idTokenOverride?: string,
+    // L2 (BIN-A): optional per-request timeout override. Large binary PUTs pass a
+    // longer timeout (BINARY_PUT_TIMEOUT_MS) so a slow uplink is not misread as a
+    // network failure; omitted → the 30 s default in requestWithTimeout is unchanged.
+    options?: { timeoutMs?: number }
   ): Promise<ApiResponse<T>> {
     if (!idTokenOverride && this.session) {
       if (this.isSessionTokenExpiring(this.session)) {
@@ -6886,8 +8013,8 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     const idToken = idTokenOverride ?? this.session?.idToken;
-    const baseUrl = await this.getResolvedApiEndpoint(idToken);
-    const url = `${baseUrl}${endpoint}`;
+    let baseUrl = await this.getResolvedApiEndpoint(idToken);
+    let url = `${baseUrl}${endpoint}`;
     const headers: Record<string, string> = {};
 
     if (idToken) {
@@ -6904,9 +8031,14 @@ export default class VaultGuardPlugin extends Plugin {
     // AC-API1: the latest REAL HTTP failure (429/5xx that exhausted retries).
     // Returned with its true status instead of collapsing to statusCode 0.
     let lastHttpFailure: ApiResponse<T> | null = null;
+    let endpointRefreshAttempted = false;
 
     for (let attempt = 0; attempt < this.settings.maxRetryAttempts; attempt++) {
       try {
+        // L2 (BIN-A): thread the optional per-request timeout override. NOTE:
+        // Promise.race does NOT abort the underlying requestUrl — a timed-out PUT
+        // may still land server-side. Binary PUTs are idempotent so a retry is
+        // harmless, but nothing may assume at-most-once delivery.
         const response = await this.requestWithTimeout(
           requestUrl({
             url,
@@ -6915,7 +8047,8 @@ export default class VaultGuardPlugin extends Plugin {
             body: body ? JSON.stringify(body) : undefined,
             contentType: body ? "application/json" : undefined,
             throw: false,
-          })
+          }),
+          options?.timeoutMs
         );
 
         if (response.status === 0) {
@@ -6942,6 +8075,23 @@ export default class VaultGuardPlugin extends Plugin {
             error: null,
             requestId: this.getHeaderValue(response.headers, "x-request-id") ?? "",
           };
+        }
+
+        if (idToken && this.isGatewayMisrouteResponse(response)) {
+          if (!endpointRefreshAttempted) {
+            endpointRefreshAttempted = true;
+            const refreshedBaseUrl = await this.getResolvedApiEndpoint(
+              idToken,
+              undefined,
+              true
+            );
+            if (refreshedBaseUrl && refreshedBaseUrl !== baseUrl) {
+              baseUrl = refreshedBaseUrl;
+              url = `${baseUrl}${endpoint}`;
+              continue;
+            }
+          }
+          return this.buildMisroutedApiResponse<T>(response);
         }
 
         // AC-API1: every HTTP failure carries its REAL status to the caller.
@@ -7024,6 +8174,42 @@ export default class VaultGuardPlugin extends Plugin {
     };
   }
 
+  private isGatewayMisrouteResponse(response: RequestUrlResponse): boolean {
+    const contentType =
+      this.getHeaderValue(response.headers, "content-type")?.toLowerCase() ?? "";
+    const jsonBody =
+      response.json && typeof response.json === "object"
+        ? response.json as Record<string, unknown>
+        : null;
+    const message =
+      typeof jsonBody?.message === "string"
+        ? jsonBody.message
+        : typeof jsonBody?.Message === "string"
+          ? jsonBody.Message
+          : "";
+    const bodyText = response.text ?? "";
+
+    return looksLikeAwsSignatureError(message, bodyText, contentType);
+  }
+
+  private buildMisroutedApiResponse<T>(response: RequestUrlResponse): ApiResponse<T> {
+    return {
+      success: false,
+      data: null,
+      error: {
+        code: "MISROUTED_API_REQUEST",
+        message:
+          "The VaultGuard API endpoint rejected the request before it reached VaultGuard. " +
+          "Check the API endpoint in plugin settings; it should point to the VaultGuard REST API " +
+          "(for example https://api.example.com, your API Gateway URL, or your API CloudFront base URL). " +
+          "If the endpoint is correct, the deployed API authorizer may need to be refreshed.",
+        details: null,
+        statusCode: response.status,
+      },
+      requestId: this.getHeaderValue(response.headers, "x-request-id") ?? "",
+    };
+  }
+
   private describeNetworkFailureResponse(response: RequestUrlResponse): string {
     const text = (response.text ?? "").trim();
     if (text.length > 0) {
@@ -7033,7 +8219,10 @@ export default class VaultGuardPlugin extends Plugin {
     return "Network request failed with status 0.";
   }
 
-  private async requestWithTimeout<T>(promise: Promise<T>): Promise<T> {
+  private async requestWithTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number = 30_000
+  ): Promise<T> {
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
     try {
@@ -7042,7 +8231,7 @@ export default class VaultGuardPlugin extends Plugin {
         new Promise<T>((_, reject) => {
           timeoutId = setTimeout(() => {
             reject(new Error("Request timeout"));
-          }, 30_000);
+          }, timeoutMs);
         }),
       ]);
     } finally {
@@ -7299,6 +8488,13 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
+    const longOperation = this.longOperations.getPrimarySnapshot();
+    if (longOperation) {
+      renderLongOperationStatusBar(this.statusBarEl, longOperation);
+      return;
+    }
+    this.statusBarEl.classList?.remove("vaultguard-long-op-statusbar");
+
     if (!this.session) {
       if (this.lastLogoutAuthState) {
         this.statusBarEl.setText("VaultGuard Sync: Logged out");
@@ -7395,6 +8591,10 @@ export default class VaultGuardPlugin extends Plugin {
    * priority, and expiry). Distinct from the per-file controls in the header.
    */
   showPermissionRulesModal(initialSearch?: string): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: organization permission rules are disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.session) {
       this.showLoginRequiredNotice("view permissions");
       return;
@@ -7460,6 +8660,10 @@ export default class VaultGuardPlugin extends Plugin {
    * Only accessible to users with admin or owner roles.
    */
   private showAdminPanel(): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: organization management is disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.session) {
       return;
     }
@@ -7484,6 +8688,10 @@ export default class VaultGuardPlugin extends Plugin {
    * caller (command checkCallback or ribbon-menu item) gates on role.
    */
   private openAuditLog(): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: audit log is disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.session) return;
     if (!this.apiClient) {
       new Notice("VaultGuard Sync: not connected to a server.");
@@ -7509,6 +8717,10 @@ export default class VaultGuardPlugin extends Plugin {
    * VaultGuard ribbon menu beside "Audit log".
    */
   private openAuditConfig(): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: audit settings are disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.session) return;
     if (!this.apiClient) {
       new Notice("VaultGuard Sync: not connected to a server.");
@@ -7523,6 +8735,10 @@ export default class VaultGuardPlugin extends Plugin {
    * instead of navigating.
    */
   private openWebAdminPanel(): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: web admin is disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.session) return;
     if (!this.featureEnabled("webAdmin")) {
       new ProUpsellModal(this.app, "webAdmin").open();
@@ -7540,6 +8756,10 @@ export default class VaultGuardPlugin extends Plugin {
    * Displays who has access, current user's level, and admin controls.
    */
   private showPathPermissionsModal(path: string, isFolder: boolean, initialExplain = false): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: sharing and permission views are disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.session || !this.apiClient) {
       if (!this.session) {
         this.showLoginRequiredNotice("view permissions");
@@ -7583,6 +8803,10 @@ export default class VaultGuardPlugin extends Plugin {
    * Appends a trailing slash for folders so the rule applies recursively.
    */
   private showAddPermissionForPath(path: string, isFolder: boolean): void {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      new Notice("VaultGuard Sync: permission editing is disabled in Local Project Memory Mode.");
+      return;
+    }
     if (!this.apiClient) {
       new Notice("VaultGuard Sync: Please configure the API endpoint in settings first.");
       return;
@@ -7610,6 +8834,8 @@ export default class VaultGuardPlugin extends Plugin {
     this.permissionStore.invalidate();
     this.readOnlyGuard?.refreshAll();
     this.offlineQueue = [];
+    this.remoteFileState.clear();
+    this.scheduleRemoteFileStatePersist();
     this.syncState = {
       lastSync: null,
       pendingChanges: 0,
@@ -7642,9 +8868,11 @@ export default class VaultGuardPlugin extends Plugin {
     // Phase 9: SILENT — teardown path; no subscribers to notify.
     this.permissionStore.invalidate();
     this.offlineQueue = [];
+    this.remoteFileState.clear();
     // SY5: an empty queue removes the persisted envelope, so a logout/lock
     // never leaves another user's queued edits on disk for the next session.
     this.scheduleOfflineQueuePersist();
+    this.scheduleRemoteFileStatePersist();
     this.log("Sensitive data cleared from memory.");
   }
 
@@ -7662,6 +8890,106 @@ export default class VaultGuardPlugin extends Plugin {
   private offlineQueueEnvelopePath(): string {
     const pluginId = this.manifest?.id ?? "vaultguard-sync";
     return `${this.app.vault.configDir}/plugins/${pluginId}/offline-queue.envelope`;
+  }
+
+  // ── Phase 12: PIN-lock storage wiring ───────────────────────────────────────
+
+  /**
+   * Path of the PIN-wrapped LAK envelope. Unlike offline-queue.envelope this is
+   * a RAW file (NOT LAK-encrypted): it WRAPS the LAK and must be readable while
+   * the vault is locked. It lives under the excluded plugin folder
+   * (`.obsidian/plugins/<id>/…`), so the Local At-Rest Rule's exclusion applies —
+   * the sanctioned raw adapter.read/write/remove exception (mirrors lak.envelope).
+   */
+  private lakPinEnvelopePath(): string {
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    return `${this.app.vault.configDir}/plugins/${pluginId}/lak-pin.envelope`;
+  }
+
+  /** Non-secret PIN-lock slice from data.json, defaulted when absent (not enrolled). */
+  private pinLockSettingsSlice(): {
+    pepperWrapped?: string;
+    enrolled: boolean;
+    failedAttempts: number;
+    lockedUntil: number | null;
+  } {
+    const cur = this.settings.pinLock;
+    return {
+      pepperWrapped: cur?.pepperWrapped,
+      enrolled: cur?.enrolled ?? false,
+      failedAttempts: cur?.failedAttempts ?? 0,
+      lockedUntil: cur?.lockedUntil ?? null,
+    };
+  }
+
+  /**
+   * Construct the PinLockManager, wiring its storage seam to:
+   *  - `lak-pin.envelope` (raw file under the excluded plugin folder) for the
+   *    PIN-wrapped LAK envelope,
+   *  - the safeStorage-wrapped device pepper + the persisted rate-limit counter
+   *    in data.json (`this.settings.pinLock`),
+   *  - `probeSafeStorage()` for the OS-keychain pepper wrap (degraded tier when
+   *    unavailable, per PinLockManager).
+   *
+   * Called in onload BEFORE initAtRestCipher so the adapter's PIN-lock pre-check
+   * (`isPinLockEnrolled`) sees a live manager. Enroll/disable UI is Plan 05; this
+   * plan only reads the manager (unlock + isEnrolled).
+   */
+  private initPinLockManager(): void {
+    const adapter = this.app.vault.adapter;
+    const storage: PinLockStorage = {
+      readEnvelope: async () => {
+        const path = this.lakPinEnvelopePath();
+        try {
+          if (!(await adapter.exists(path))) return null;
+          const raw = await adapter.read(path);
+          return raw && raw.trim().length > 0 ? raw : null;
+        } catch (err) {
+          this.logError("Reading lak-pin.envelope failed", err);
+          return null;
+        }
+      },
+      writeEnvelope: async (blob) => {
+        const path = this.lakPinEnvelopePath();
+        await this.ensureParentFoldersForPath(path);
+        await adapter.write(path, blob);
+      },
+      clearEnvelope: async () => {
+        const path = this.lakPinEnvelopePath();
+        try {
+          if (await adapter.exists(path)) await adapter.remove(path);
+        } catch (err) {
+          this.logError("Removing lak-pin.envelope failed", err);
+        }
+      },
+      readPepper: async () => this.settings.pinLock?.pepperWrapped ?? null,
+      writePepper: async (blob) => {
+        this.settings.pinLock = { ...this.pinLockSettingsSlice(), pepperWrapped: blob };
+        await this.savePluginData();
+      },
+      clearPepper: async () => {
+        this.settings.pinLock = { ...this.pinLockSettingsSlice(), pepperWrapped: undefined };
+        await this.savePluginData();
+      },
+      loadPinState: () => {
+        const slice = this.pinLockSettingsSlice();
+        return {
+          enrolled: slice.enrolled,
+          failedAttempts: slice.failedAttempts,
+          lockedUntil: slice.lockedUntil,
+        };
+      },
+      savePinState: async (state) => {
+        this.settings.pinLock = {
+          ...this.pinLockSettingsSlice(),
+          enrolled: state.enrolled,
+          failedAttempts: state.failedAttempts,
+          lockedUntil: state.lockedUntil,
+        };
+        await this.savePluginData();
+      },
+    };
+    this.pinLockManager = new PinLockManager(storage, probeSafeStorage());
   }
 
   private scheduleOfflineQueuePersist(): void {
@@ -7688,8 +9016,13 @@ export default class VaultGuardPlugin extends Plugin {
         return;
       }
       await this.ensureParentFoldersForPath(path);
+      // BIN-A / D-09: always write envelope v2 from now on. v2 entries may carry
+      // `encoding: "base64"` + `contentType` for binary payloads; text entries
+      // are shape-identical to v1, so a v2 envelope holding only text ops is a
+      // strict superset a v1 reader would still find well-formed apart from the
+      // version tag (see the load gate / L11 downgrade note).
       const envelope = await this.atRestCipher.encryptString(
-        JSON.stringify({ v: 1, ops: this.offlineQueue })
+        JSON.stringify({ v: 2, ops: this.offlineQueue })
       );
       await this.originalAdapterMethods.writeBinary(path, envelope);
     } catch (error) {
@@ -7712,17 +9045,59 @@ export default class VaultGuardPlugin extends Plugin {
       const plaintext = await this.atRestCipher.decryptString(await readBinary(path));
       const parsed = JSON.parse(plaintext) as {
         v?: number;
-        ops?: Array<{ operation?: string; path?: string; data?: string; timestamp?: string }>;
+        ops?: Array<{
+          operation?: string;
+          path?: string;
+          data?: string;
+          timestamp?: string;
+          encoding?: string;
+          contentType?: string;
+          baseVersionId?: string;
+          baseHash?: string;
+        }>;
       };
-      if (parsed?.v !== 1 || !Array.isArray(parsed.ops)) return;
-      const restored = parsed.ops.filter(
-        (op): op is { operation: "write" | "delete"; path: string; data?: string; timestamp: string } =>
-          !!op &&
-          (op.operation === "write" || op.operation === "delete") &&
-          typeof op.path === "string" &&
-          op.path.length > 0 &&
-          typeof op.timestamp === "string"
-      );
+      // BIN-A / D-09 / L11: accept BOTH v1 (all-text, older builds) and v2
+      // (may carry binary base64 entries). Write is always v2 (see persist).
+      // NOTE (accepted downgrade, do not "fix"): a v1-only OLDER plugin reading a
+      // v2 envelope hits its strict `v !== 1` gate, silently skips restore, and
+      // leaves the envelope on disk for a newer build to pick up next launch.
+      if ((parsed?.v !== 1 && parsed?.v !== 2) || !Array.isArray(parsed.ops)) return;
+      const restored: OfflineQueueOperation[] = [];
+      for (const op of parsed.ops) {
+        if (
+          !op ||
+          (op.operation !== "write" && op.operation !== "delete") ||
+          typeof op.path !== "string" ||
+          op.path.length === 0 ||
+          typeof op.timestamp !== "string"
+        ) {
+          continue;
+        }
+        // Fail closed against unknown/future encodings: only an undefined ("text")
+        // or "base64" encoding can be replayed safely by this build. Anything else
+        // drops THAT entry (never flush a mis-encoded op as text) while valid
+        // siblings survive.
+        if (op.encoding !== undefined && op.encoding !== "base64") {
+          this.logError(
+            `Dropping restored offline op ${op.operation} "${op.path}" — unknown queue encoding "${op.encoding}"`,
+            new Error("unknown offline-queue entry encoding")
+          );
+          continue;
+        }
+        const entry: OfflineQueueOperation = {
+          operation: op.operation,
+          path: op.path,
+          timestamp: op.timestamp,
+        };
+        if (typeof op.data === "string") entry.data = op.data;
+        if (op.encoding === "base64") entry.encoding = "base64";
+        if (typeof op.contentType === "string") entry.contentType = op.contentType;
+        // Version-guard fields (theirs) travel with the entry so a replay after a
+        // restart still carries its optimistic-concurrency baseline.
+        if (typeof op.baseVersionId === "string") entry.baseVersionId = op.baseVersionId;
+        if (typeof op.baseHash === "string") entry.baseHash = op.baseHash;
+        restored.push(entry);
+      }
       if (restored.length === 0) return;
       // Ops queued during this launch (while the load ran) are NEWER — they
       // win per-path; restored ops go first so the flush stays chronological.
@@ -7734,6 +9109,65 @@ export default class VaultGuardPlugin extends Plugin {
       this.log(`Restored ${restored.length} queued offline operation(s) from the envelope.`);
     } catch (error) {
       this.logError("Failed to restore the offline queue envelope", error);
+    }
+  }
+
+  private remoteFileStateEnvelopePath(): string {
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    return `${this.app.vault.configDir}/plugins/${pluginId}/remote-file-state.envelope`;
+  }
+
+  private scheduleRemoteFileStatePersist(): void {
+    if (this.remoteFileStatePersistTimer) clearTimeout(this.remoteFileStatePersistTimer);
+    this.remoteFileStatePersistTimer = setTimeout(() => {
+      this.remoteFileStatePersistTimer = null;
+      void this.persistRemoteFileState();
+    }, 1_000);
+  }
+
+  private async persistRemoteFileState(): Promise<void> {
+    const path = this.remoteFileStateEnvelopePath();
+    try {
+      if (this.remoteFileState.isEmpty()) {
+        if (await this.app.vault.adapter.exists(path)) {
+          await this.app.vault.adapter.remove(path);
+        }
+        return;
+      }
+      if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.writeBinary) {
+        return;
+      }
+      await this.ensureParentFoldersForPath(path);
+      const envelope = await this.atRestCipher.encryptString(
+        JSON.stringify(this.remoteFileState.snapshot())
+      );
+      await this.originalAdapterMethods.writeBinary(path, envelope);
+    } catch (error) {
+      this.logError("Failed to persist the remote file state envelope", error);
+    }
+  }
+
+  private async loadPersistedRemoteFileState(): Promise<void> {
+    const readBinary = this.originalAdapterMethods.readBinary;
+    if (!readBinary) return;
+    const path = this.remoteFileStateEnvelopePath();
+    try {
+      if (!(await this.app.vault.adapter.exists(path))) return;
+      await this.waitForCipherInit(10_000);
+      if (!this.atRestCipher?.isReady()) {
+        this.log("Remote file state envelope present but the at-rest cipher is not ready; leaving it for the next launch.");
+        return;
+      }
+      const plaintext = await this.atRestCipher.decryptString(await readBinary(path));
+      const parsed = JSON.parse(plaintext) as {
+        v?: number;
+        entries?: RemoteFileStateEntry[];
+      };
+      if (parsed?.v !== 1 || !Array.isArray(parsed.entries)) return;
+      this.remoteFileState.load(parsed.entries);
+      this.log(`Restored remote version state for ${parsed.entries.length} path(s).`);
+    } catch (error) {
+      this.logError("Failed to restore the remote file state envelope", error);
     }
   }
 
@@ -7803,6 +9237,19 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Byte variant of {@link computeHash} (BIN-A / D-02). SHA-256 over the raw
+   * bytes with the identical lowercase-hex mapping, so
+   * `computeHashBytes(new TextEncoder().encode(s).buffer)` === `computeHash(s)`.
+   * @param content - The bytes to hash
+   * @returns Hex-encoded hash string
+   */
+  private async computeHashBytes(content: ArrayBuffer): Promise<string> {
+    const hashBuffer = await crypto.subtle.digest("SHA-256", content);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  /**
    * Converts a base64 string to a Uint8Array.
    * @param base64 - Base64-encoded string
    * @returns Decoded byte array
@@ -7822,9 +9269,16 @@ export default class VaultGuardPlugin extends Plugin {
    * @returns Base64-encoded string
    */
   private bytesToBase64(bytes: Uint8Array): string {
+    // L3 (BIN-A): chunked conversion. The old per-byte `+=` loop is O(n) with a
+    // ~3-4x peak-memory spike at 7 MB (UTF-16 doubling). Build the binary string
+    // in 0x8000-byte slices via String.fromCharCode.apply, then a single btoa.
+    // Browser-native only — NO Node Buffer (mobile constraint, see client.ts:384).
+    // Output is byte-identical to the old implementation.
+    const CHUNK_SIZE = 0x8000;
     let binary = "";
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+      const chunk = bytes.subarray(i, i + CHUNK_SIZE);
+      binary += String.fromCharCode.apply(null, chunk as unknown as number[]);
     }
     return btoa(binary);
   }

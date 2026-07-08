@@ -44,6 +44,14 @@ describe("settings-support", () => {
       allowedDomains: [],
       retentionDays: 365,
       autoLockMinutes: 30,
+      idleAction: "logout",
     });
+  });
+
+  it("defaults idleAction to the safe logout value in the fallback", () => {
+    // Offline / unknown-org fallback must never engage a cryptographic lock
+    // the user cannot unlock offline — it mirrors the server normalizer's
+    // absent -> "logout" so behavior is unsurprising when settings are missing.
+    expect(buildFallbackOrgSettings("org-123").idleAction).toBe("logout");
   });
 });

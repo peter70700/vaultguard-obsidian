@@ -19,12 +19,20 @@ import {
   UserSession,
 } from "../types";
 import type { AnthropicEffort } from "../types";
-import { AnthropicKeyStore } from "../ui/chat/api-key-store";
-import { AI_CHAT_MODELS, AI_CHAT_EFFORTS, AI_CHAT_PERMISSION_MODES } from "../ui/chat/models";
+import { AnthropicKeyStore, OpenAiKeyStore } from "../ui/chat/api-key-store";
+import {
+  AI_CHAT_MODELS,
+  AI_CHAT_EFFORTS,
+  AI_CHAT_PERMISSION_MODES,
+  OPENAI_CHAT_MODELS,
+  OPENAI_REASONING_EFFORTS,
+  OPENAI_VERBOSITIES,
+} from "../ui/chat/models";
 import {
   getClaudeAuthStatus,
   type ClaudeAuthStatus,
 } from "../ui/chat/claude-cli/claude-detector";
+import { LOCAL_PROJECT_MEMORY_MODE_NOTICE } from "./local-project-memory-mode";
 import type {
   UserListEntry,
   VaultKind,
@@ -36,9 +44,21 @@ import type {
   AgentBridgeLeaseSecret,
   AgentBridgeLeaseSummary,
   AgentBridgeServerInfo,
+  ChatGptConnectorSessionSecret,
+  ChatGptConnectorSessionSummary,
 } from "./agent-bridge";
+import type { VaultOrientationSnapshot } from "./vault-orientation";
+import {
+  buildCodexAgentsGuidance,
+  buildCodexConfigToml,
+  buildCodexTempWorkspaceLaunchCommand,
+  buildCodexTokenEnvCommand,
+} from "./agent-bridge-codex";
 import type { SkillInstallStatus } from "./agent-bridge-skill/installer";
+import type { CodexSkillInstallStatus } from "./agent-bridge-codex-skill/installer";
 import { SAAS_DEFAULTS } from "../config/saas-defaults";
+import { SetPinModal, ChangePinModal, DisablePinModal } from "../ui/lock/pin-modals";
+import { biometricAvailable } from "../crypto/biometric-probe";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default Settings
@@ -74,9 +94,14 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   debugLogging: false,
   maxRetryAttempts: 3,
   showStatusBar: true,
+  localProjectMemoryMode: false,
   excludedPaths: [...DEFAULT_EXCLUDED_PATHS],
   aiChatModel: "claude-opus-4-8",
   aiChatEffort: "high",
+  openAiModel: "gpt-5.5",
+  openAiReasoningEffort: "medium",
+  openAiVerbosity: "medium",
+  openAiMaxOutputTokens: 8192,
   // On by default for live token-by-token feedback. Desktop-only; mobile always
   // falls back to the Tier-1 requestUrl path (see chat-view streamingEnabled()).
   aiChatStreaming: true,
@@ -85,7 +110,24 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   aiChatKeySyncEnabled: true,
   aiChatPermissionMode: "confirm",
   aiChatProvider: "apiKey",
+  permissionsGraphDefaults: {
+    schemaVersion: 1,
+    renderMode: "auto",
+    layoutMode: "auto",
+    labelsMode: "auto",
+    searchScope: "all",
+    accessLevels: { read: true, write: true, admin: true },
+    nodeTypes: { users: true, files: true, folders: true },
+    maxFiles: 1000,
+    maxEdges: 1600,
+    depth: 2,
+  },
+  permissionsGraphVaultStates: {},
   deletionTombstones: {},
+  // Persisted once-ever guard for the onboarding "Set a PIN" prompt (quick
+  // 260708-el6). A persisted `true` overrides this default via the reload merge
+  // (Object.assign({}, DEFAULT_SETTINGS, data)), so the prompt shows at most once.
+  pinOnboardingPromptShown: false,
 };
 
 
@@ -115,6 +157,16 @@ interface AgentBridgeConnectionReveal {
   agentName: string;
   connectionJson: string;
   mcpConfig: string;
+  codexConfig: string;
+  codexTokenCommand: string;
+  codexLaunchCommand: string;
+  codexAgentsGuidance: string;
+  copiedToClipboard: boolean;
+}
+
+interface ChatGptConnectorReveal {
+  sessionId: string;
+  setupInstructions: string;
   copiedToClipboard: boolean;
 }
 
@@ -130,12 +182,15 @@ interface AgentBridgeConnectionReveal {
 export class VaultGuardSettingTab extends PluginSettingTab {
   private plugin: VaultGuardPlugin;
   private latestAgentBridgeReveal: AgentBridgeConnectionReveal | null = null;
+  private latestChatGptConnectorReveal: ChatGptConnectorReveal | null = null;
   private aiChatKeyStore: AnthropicKeyStore;
+  private openAiKeyStore: OpenAiKeyStore;
 
   constructor(app: App, plugin: VaultGuardPlugin) {
     super(app, plugin);
     this.plugin = plugin;
     this.aiChatKeyStore = new AnthropicKeyStore(plugin);
+    this.openAiKeyStore = new OpenAiKeyStore(plugin);
   }
 
   /**
@@ -226,6 +281,44 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     window.setTimeout(() => el.remove(), 6000);
   }
 
+  private renderLocalProjectMemoryModeSection(containerEl: HTMLElement): void {
+    const enabled = this.plugin.isLocalProjectMemoryModeEnabled();
+
+    new Setting(containerEl)
+      .setName("Local Project Memory Mode")
+      .setDesc(LOCAL_PROJECT_MEMORY_MODE_NOTICE)
+      .addToggle((toggle) =>
+        toggle
+          .setValue(enabled)
+          .onChange(async (value) => {
+            try {
+              if (value) {
+                await this.plugin.enableLocalProjectMemoryMode();
+              } else {
+                this.plugin.settings.localProjectMemoryMode = false;
+                await this.plugin.saveSettings();
+                this.plugin.restartSyncTimer();
+              }
+              this.display();
+            } catch (err) {
+              this.showStatus(
+                containerEl,
+                err instanceof Error ? err.message : "Local Project Memory Mode update failed.",
+                true,
+              );
+            }
+          }),
+      );
+
+    if (enabled) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text:
+          "Use this mode for repo-root vaults. AGENTS.md, 00_Index.md, docs, reports, handoffs, source, package, config, test, script, Terraform, and infrastructure files stay plaintext for coding agents and normal Git tools.",
+      });
+    }
+  }
+
   /**
    * Renders the "Local at-rest encryption" panel. Surfaces the cipher's
    * current state (unlocked / needs-recovery / disabled), an on-disk file
@@ -253,6 +346,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     this.renderAiProviderBlock(containerEl);
 
+    if (this.plugin.settings.aiChatProvider === "openai") {
+      this.renderOpenAiChatProviderSettings(containerEl);
+    } else {
     const hasKey = this.aiChatKeyStore.hasKey();
 
     // ── API key (masked, write-only) ────────────────────────────────────────
@@ -407,6 +503,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             });
         });
     }
+    }
 
     // ── Permissions ────────────────────────────────────────────────────────
     new Setting(containerEl)
@@ -448,6 +545,129 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       });
 
     this.renderPromptTemplates(containerEl);
+  }
+
+  private renderOpenAiChatProviderSettings(containerEl: HTMLElement): void {
+    const hasKey = this.openAiKeyStore.hasKey();
+
+    new Setting(containerEl)
+      .setName("OpenAI API key")
+      .setDesc(
+        hasKey
+          ? "A key is stored and encrypted on this device. Enter a new key to replace it, or clear it. The stored key is never displayed."
+          : "Stored encrypted on this device (OS keychain, or the local at-rest key as a fallback). Used only when you run AI Chat with OpenAI / GPT.",
+      )
+      .addText((text) => {
+        text.setPlaceholder(hasKey ? "•••• key stored — enter to replace" : "sk-...");
+        text.inputEl.type = "password";
+        text.inputEl.autocomplete = "off";
+        text.inputEl.setAttribute("autocapitalize", "off");
+        text.inputEl.setAttribute("spellcheck", "false");
+
+        const inputEl = text.inputEl;
+        const settingEl = inputEl.closest(".setting-item");
+        const controlEl = settingEl?.querySelector(".setting-item-control");
+        if (!controlEl) return;
+
+        const saveBtn = controlEl.createEl("button", {
+          text: "Save",
+          cls: "mod-cta vaultguard-inline-save-btn",
+        });
+        saveBtn.addEventListener("click", async () => {
+          const newKey = inputEl.value.trim();
+          if (!newKey) {
+            this.showStatus(containerEl, "Enter an OpenAI API key first.", true);
+            return;
+          }
+          saveBtn.disabled = true;
+          saveBtn.textContent = "Saving...";
+          try {
+            await this.openAiKeyStore.setKey(newKey);
+            inputEl.value = "";
+            this.showStatus(containerEl, "OpenAI API key saved.", false);
+            this.display();
+          } catch (error) {
+            this.showStatus(
+              containerEl,
+              `Failed to save key: ${(error as Error).message}`,
+              true,
+            );
+          } finally {
+            saveBtn.disabled = false;
+            saveBtn.textContent = "Save";
+          }
+        });
+
+        if (hasKey) {
+          const clearBtn = controlEl.createEl("button", {
+            text: "Clear",
+            cls: "vaultguard-inline-save-btn",
+          });
+          clearBtn.addEventListener("click", async () => {
+            clearBtn.disabled = true;
+            try {
+              await this.openAiKeyStore.clearKey();
+              this.showStatus(containerEl, "OpenAI API key removed.", false);
+              this.display();
+            } catch (error) {
+              this.showStatus(
+                containerEl,
+                `Failed to clear key: ${(error as Error).message}`,
+                true,
+              );
+            } finally {
+              clearBtn.disabled = false;
+            }
+          });
+        }
+      });
+
+    new Setting(containerEl)
+      .setName("Model")
+      .setDesc("OpenAI model used for AI chat turns.")
+      .addDropdown((dropdown) => {
+        for (const m of OPENAI_CHAT_MODELS) dropdown.addOption(m.id, m.label);
+        dropdown
+          .setValue(this.plugin.settings.openAiModel)
+          .onChange(async (value) => {
+            this.plugin.settings.openAiModel = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Reasoning effort")
+      .setDesc("How much reasoning budget the OpenAI model spends per turn.")
+      .addDropdown((dropdown) => {
+        for (const e of OPENAI_REASONING_EFFORTS) dropdown.addOption(e.id, e.label);
+        dropdown
+          .setValue(this.plugin.settings.openAiReasoningEffort)
+          .onChange(async (value) => {
+            this.plugin.settings.openAiReasoningEffort =
+              value === "low" || value === "high" ? value : "medium";
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Verbosity")
+      .setDesc("How detailed GPT responses should be by default.")
+      .addDropdown((dropdown) => {
+        for (const v of OPENAI_VERBOSITIES) dropdown.addOption(v.id, v.label);
+        dropdown
+          .setValue(this.plugin.settings.openAiVerbosity)
+          .onChange(async (value) => {
+            this.plugin.settings.openAiVerbosity =
+              value === "low" || value === "high" ? value : "medium";
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("OpenAI streaming")
+      .setDesc(
+        "OpenAI / GPT uses the non-streaming Responses API path in this phase. Anthropic streaming remains unchanged.",
+      );
   }
 
   /**
@@ -534,23 +754,32 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("AI provider")
       .setDesc(
-        "Choose how AI Chat talks to Claude. Subscription mode uses your own Claude Code login " +
-          "(no API key, no per-token charge) and is desktop only; the plugin never handles your " +
-          "subscription token.",
+        "Choose how AI Chat talks to an AI provider. Vault access still goes through VaultGuard-controlled tools.",
       )
       .addDropdown((dropdown) => {
-        dropdown.addOption("subscription", "Claude subscription (Claude Code CLI)");
+        if (!onMobile) {
+          dropdown.addOption("subscription", "Claude subscription (Claude Code CLI)");
+        }
         dropdown.addOption("apiKey", "Anthropic API key");
+        dropdown.addOption("openai", "OpenAI / GPT");
         dropdown
-          .setValue(this.plugin.settings.aiChatProvider)
+          .setValue(
+            onMobile && this.plugin.settings.aiChatProvider === "subscription"
+              ? "apiKey"
+              : this.plugin.settings.aiChatProvider,
+          )
           .onChange(async (value) => {
-            this.plugin.settings.aiChatProvider = value === "subscription" ? "subscription" : "apiKey";
+            this.plugin.settings.aiChatProvider =
+              value === "subscription" && !onMobile
+                ? "subscription"
+                : value === "openai"
+                  ? "openai"
+                  : "apiKey";
             this.plugin.settings.aiChatProviderExplicit = true;
             await this.plugin.saveSettings();
             // Re-render so the status line / API-key field reflect the choice.
             this.display();
           });
-        if (onMobile) dropdown.setDisabled(true);
       });
 
     if (this.plugin.settings.aiChatProvider !== "subscription") return;
@@ -685,11 +914,87 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     builder(bodyEl);
   }
 
+  /**
+   * Phase 12 (D3): the user-owned PIN lifecycle. Set a PIN to lock-instead-of-
+   * logout on idle; change/disable it here. The biometric toggle is a hidden
+   * D1/O-2 seam (never shown on current Obsidian; mobile is PIN-only).
+   */
+  private renderVaultLockSection(containerEl: HTMLElement): void {
+    const plugin = this.plugin;
+    const enrolled = plugin.pinLockEnrolled();
+    const idleAction = plugin.effectiveIdleAction();
+
+    new Setting(containerEl).setName("Vault lock / PIN").setHeading();
+
+    if (!enrolled) {
+      new Setting(containerEl)
+        .setName("Set a PIN")
+        .setDesc(
+          `A PIN lets VaultGuard lock (instead of log you out) when the vault goes idle — you unlock with the PIN, no full re-login. Your organization's current idle action is "${idleAction}".`
+        )
+        .addButton((b) =>
+          b
+            .setButtonText("Set PIN")
+            .setCta()
+            .onClick(() => {
+              new SetPinModal(this.app, async (secret) => {
+                await plugin.enrollPinLock(secret);
+                this.display();
+              }).open();
+            })
+        );
+    } else {
+      new Setting(containerEl)
+        .setName("Vault PIN")
+        .setDesc(
+          "Your vault locks instead of logging out when idle. Disabling the PIN restores transparent at-rest unlock on this device."
+        )
+        .addButton((b) =>
+          b.setButtonText("Change PIN").onClick(() => {
+            new ChangePinModal(this.app, async (current, next) => {
+              await plugin.disablePinLock(current);
+              await plugin.enrollPinLock(next);
+              this.display();
+            }).open();
+          })
+        )
+        .addButton((b) =>
+          b
+            .setButtonText("Disable PIN")
+            .setWarning()
+            .onClick(() => {
+              new DisablePinModal(this.app, async (secret) => {
+                await plugin.disablePinLock(secret);
+                this.display();
+              }).open();
+            })
+        );
+    }
+
+    // Biometric unlock (D1/O-2 seam): desktop-only AND only when the platform
+    // actually exposes a user-verifying authenticator — which is NEVER on
+    // current Obsidian, so this toggle stays hidden. Mobile is PIN-only.
+    if (!Platform.isMobileApp) {
+      void biometricAvailable().then((available) => {
+        if (!available) return;
+        new Setting(containerEl)
+          .setName("Use biometric unlock")
+          .setDesc("Unlock with your device biometrics instead of typing the PIN.")
+          .addToggle((t) =>
+            t.setValue(false).onChange(() => void plugin.enrollBiometric())
+          );
+      });
+    }
+  }
+
   private renderAtRestSection(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("Local at-rest encryption").setHeading();
-    const atRestDesc = Platform.isMobileApp
-      ? "Vault files on this device are encrypted on disk with a per-device key kept in this app's secure storage. Without VaultGuard Sync running, the files on disk are ciphertext — useful if your phone backs up app data to iCloud / Google Drive."
-      : "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard Sync running, opening files in Finder shows ciphertext.";
+    const localProjectMemoryMode = this.plugin.isLocalProjectMemoryModeEnabled();
+    const atRestDesc = localProjectMemoryMode
+      ? "Disabled by Local Project Memory Mode. Files are kept plaintext for repo-root project memory, Git tools, and coding agents."
+      : Platform.isMobileApp
+        ? "Vault files on this device are encrypted on disk with a per-device key kept in this app's secure storage. Without VaultGuard Sync running, the files on disk are ciphertext — useful if your phone backs up app data to iCloud / Google Drive."
+        : "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard Sync running, opening files in Finder shows ciphertext.";
     containerEl.createEl("p", {
       text: atRestDesc,
       cls: "setting-item-description",
@@ -712,7 +1017,12 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           (tally.failed > 0 ? `, ${tally.failed} unreadable` : "") +
           ` (${tally.total} files total).`;
         tallyEl.setText(summary);
-        if (tally.plaintext > 0 && status.kind === "unlocked") {
+        if (localProjectMemoryMode && tally.encrypted > 0) {
+          tallyEl.createDiv({
+            cls: "vaultguard-at-rest-tally-warning",
+            text: `${tally.encrypted} VG1 file(s) remain encrypted. Run "Decrypt vault and disable at-rest encryption" before using this repo-root vault for coding-agent memory.`,
+          });
+        } else if (tally.plaintext > 0 && status.kind === "unlocked") {
           tallyEl.createDiv({
             cls: "vaultguard-at-rest-tally-warning",
             text: `${tally.plaintext} file(s) are still plaintext. Click "Encrypt all files now" to migrate them.`,
@@ -732,13 +1042,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     const encryptSetting = new Setting(panel)
       .setName("Encrypt all files now")
       .setDesc(
-        "Walks the vault and rewrites any plaintext files as ciphertext. Idempotent — files already encrypted are skipped."
+        localProjectMemoryMode
+          ? "Disabled while Local Project Memory Mode is active. Repo-root project files must stay plaintext."
+          : "Walks the vault and rewrites any plaintext files as ciphertext. Idempotent — files already encrypted are skipped."
       )
       .addButton((button) => {
         button
           .setButtonText("Encrypt vault")
           .setCta()
-          .setDisabled(!isUnlocked)
+          .setDisabled(localProjectMemoryMode || !isUnlocked)
           .onClick(async () => {
             button.setButtonText("Encrypting…").setDisabled(true);
             try {
@@ -759,32 +1071,53 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     const session = this.plugin.getSession();
     const canReauth = isUnlocked && Boolean(session);
+    const canDecrypt = localProjectMemoryMode || canReauth;
     const reauthDisabledHint = !session
       ? " Log in to your VaultGuard account to enable this action — re-authentication is required so a brief unattended-laptop moment can't expose your at-rest key."
       : "";
 
     const decryptSetting = new Setting(panel)
-      .setName("Decrypt all files (revert to plaintext)")
+      .setName("Decrypt vault and disable at-rest encryption")
       .setDesc(
-        "Reverse the at-rest encryption. Use this before disabling the plugin if you want the vault folder to remain readable through normal tools. Requires re-entering your account password — a logged-in but unattended Obsidian shouldn't be able to silently drop your at-rest protection." +
-          reauthDisabledHint
+        localProjectMemoryMode
+          ? "Recover any existing VG1 files to plaintext and keep at-rest encryption disabled. Uses a non-encrypting write path."
+          : "Reverse the at-rest encryption, persist encryption disabled before plaintext writes, and keep files readable through normal tools. Requires re-entering your account password." +
+            reauthDisabledHint
       )
       .addButton((button) => {
         button
-          .setButtonText("Decrypt vault")
+          .setButtonText(localProjectMemoryMode ? "Decrypt and keep plaintext" : "Decrypt vault")
           .setWarning()
-          .setDisabled(!canReauth)
+          .setDisabled(!canDecrypt)
           .onClick(() => {
+            if (localProjectMemoryMode) {
+              void (async () => {
+                button.setButtonText("Decrypting…").setDisabled(true);
+                try {
+                  await this.plugin.decryptVaultAndDisableAtRestEncryption();
+                  this.showStatus(containerEl, "Vault decryption pass complete.", false);
+                } catch (err) {
+                  this.showStatus(
+                    containerEl,
+                    `Decryption failed: ${(err as Error).message}`,
+                    true
+                  );
+                } finally {
+                  this.display();
+                }
+              })();
+              return;
+            }
             new AtRestPasswordConfirmModal(this.app, {
               title: "Confirm: decrypt vault on this device",
               description:
-                "This will rewrite every encrypted file in your vault back to plaintext. Anyone with disk access (or another logged-in user on this Mac) will then be able to read your notes through Finder. Re-enter your account password to confirm you're the one doing this.",
+                "This will rewrite encrypted files back to plaintext and keep local at-rest encryption disabled. Anyone with disk access (or another logged-in user on this Mac) will then be able to read your notes through Finder. Re-enter your account password to confirm you're the one doing this.",
               onVerify: (pw) => this.plugin.verifyAccountPassword(pw),
               onConfirmed: () => {
                 void (async () => {
                   button.setButtonText("Decrypting…").setDisabled(true);
                   try {
-                    await this.plugin.revertVaultFromAtRest();
+                    await this.plugin.decryptVaultAndDisableAtRestEncryption();
                     this.showStatus(containerEl, "Vault decryption pass complete.", false);
                   } catch (err) {
                     this.showStatus(
@@ -1715,6 +2048,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       cls: "setting-item-description",
     });
 
+    this.renderLocalProjectMemoryModeSection(containerEl);
+
     // `session` / `isManualMode` are computed once and read by both the
     // Connection and Account blocks below.
     const session = this.plugin.getSession();
@@ -2101,7 +2436,13 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // ── Sync Settings ───────────────────────────────────────────────────────
     new Setting(containerEl).setName("Synchronization").setHeading();
     const orgPolicy = this.plugin.getOrgPolicySettings();
-    if (orgPolicy) {
+    if (this.plugin.isLocalProjectMemoryModeEnabled()) {
+      new Setting(containerEl)
+        .setName("Local-only")
+        .setDesc(
+          "Remote sync, share links, server vault binding, organization permissions, and team/admin features are disabled while Local Project Memory Mode is active.",
+        );
+    } else if (orgPolicy) {
       const policyDescription =
         orgPolicy.syncMode === "manual"
           ? "Manual sync only"
@@ -2133,108 +2474,111 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         );
     }
 
-    new Setting(containerEl)
-      .setName("Default conflict resolution")
-      .setDesc(
-        "How to handle sync conflicts when both local and remote versions have changed."
-      )
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption(ConflictResolutionStrategy.ASK_USER, "Ask me each time")
-          .addOption(ConflictResolutionStrategy.KEEP_LOCAL, "Always keep local")
-          .addOption(
-            ConflictResolutionStrategy.KEEP_REMOTE,
-            "Always keep remote"
-          )
-          .addOption(
-            ConflictResolutionStrategy.DUPLICATE,
-            "Create duplicate file"
-          )
-          .setValue(this.plugin.settings.defaultConflictResolution)
-          .onChange(async (value) => {
-            this.plugin.settings.defaultConflictResolution =
-              value as ConflictResolutionStrategy;
-            await this.plugin.saveSettings();
-          })
-      );
+    if (!this.plugin.isLocalProjectMemoryModeEnabled()) {
+      new Setting(containerEl)
+        .setName("Default conflict resolution")
+        .setDesc(
+          "How to handle sync conflicts when both local and remote versions have changed."
+        )
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption(ConflictResolutionStrategy.ASK_USER, "Ask me each time")
+            .addOption(ConflictResolutionStrategy.KEEP_LOCAL, "Always keep local")
+            .addOption(
+              ConflictResolutionStrategy.KEEP_REMOTE,
+              "Always keep remote"
+            )
+            .addOption(
+              ConflictResolutionStrategy.DUPLICATE,
+              "Create duplicate file"
+            )
+            .setValue(this.plugin.settings.defaultConflictResolution)
+            .onChange(async (value) => {
+              this.plugin.settings.defaultConflictResolution =
+                value as ConflictResolutionStrategy;
+              await this.plugin.saveSettings();
+            })
+        );
 
-    const configDir = this.app.vault.configDir;
-    const configWorkspacePath = `${configDir}/workspace.json`;
-    const configPluginsPath = `${configDir}/plugins`;
+      const configDir = this.app.vault.configDir;
+      const configWorkspacePath = `${configDir}/workspace.json`;
+      const configPluginsPath = `${configDir}/plugins`;
 
-    const excludedPathsSetting = new Setting(containerEl)
-      .setName("Excluded paths (local-only)")
-      .setDesc(
-        "One path per line. Files and folders matching these patterns are never uploaded, " +
-        "downloaded, or deleted on the server — they stay on this device only. Use exact " +
-        `paths (e.g. ${configWorkspacePath}) or folder prefixes (e.g. ${configPluginsPath}). ` +
-        "This setting applies to this device only; it does not change the server vault."
-      )
-      .addTextArea((textArea) => {
-        textArea.inputEl.rows = 6;
-        textArea.inputEl.addClass("vaultguard-mono-textarea");
-        textArea
-          .setPlaceholder(`${configWorkspacePath}\n${configPluginsPath}\n.trash`)
-          .setValue((this.plugin.settings.excludedPaths ?? []).join("\n"))
-          .onChange(async (value) => {
-            this.plugin.settings.excludedPaths = value
-              .split("\n")
-              .map((line) => line.trim())
-              .filter((line) => line.length > 0);
-            await this.plugin.saveSettings();
-          });
-        return textArea;
-      });
-    excludedPathsSetting.settingEl.addClass("vaultguard-excluded-paths-setting");
+      const excludedPathsSetting = new Setting(containerEl)
+        .setName("Excluded paths (local-only)")
+        .setDesc(
+          "One path per line. Files and folders matching these patterns are never uploaded, " +
+          "downloaded, or deleted on the server — they stay on this device only. Use exact " +
+          `paths (e.g. ${configWorkspacePath}) or folder prefixes (e.g. ${configPluginsPath}). ` +
+          "This setting applies to this device only; it does not change the server vault."
+        )
+        .addTextArea((textArea) => {
+          textArea.inputEl.rows = 6;
+          textArea.inputEl.addClass("vaultguard-mono-textarea");
+          textArea
+            .setPlaceholder(`${configWorkspacePath}\n${configPluginsPath}\n.trash`)
+            .setValue((this.plugin.settings.excludedPaths ?? []).join("\n"))
+            .onChange(async (value) => {
+              this.plugin.settings.excludedPaths = value
+                .split("\n")
+                .map((line) => line.trim())
+                .filter((line) => line.length > 0);
+              await this.plugin.saveSettings();
+            });
+          return textArea;
+        });
+      excludedPathsSetting.settingEl.addClass("vaultguard-excluded-paths-setting");
 
-    this.renderPluginAllowlistSection(containerEl);
+      this.renderPluginAllowlistSection(containerEl);
+      this.renderVaultLockSection(containerEl);
 
-    new Setting(containerEl)
-      .setName("Purge excluded paths from server")
-      .setDesc(
-        "Delete every server-side copy of files that match the excluded paths above. " +
-        "Useful after adding a new exclusion: without this, other members on other " +
-        "devices keep pulling the file down. This affects the shared server vault."
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Purge from server")
-          .setWarning()
-          .onClick(async () => {
-            const patterns = this.plugin.settings.excludedPaths ?? [];
-            if (patterns.length === 0) {
-              this.showStatus(containerEl, "No excluded paths configured.", true);
-              return;
-            }
-            const confirmed = await this.showDestructiveConfirmation(
-              containerEl,
-              "PURGE FROM SERVER",
-              "Delete every matching file from the shared server vault? " +
-                "Other members will lose these files on their next sync. " +
-                "Local copies on this device are kept.\n\n" +
-                `Patterns:\n${patterns.join("\n")}\n\n` +
-                "Type PURGE FROM SERVER to confirm."
-            );
-            if (!confirmed) return;
-            try {
-              button.setDisabled(true);
-              button.setButtonText("Purging…");
-              const result = await this.plugin.purgeExcludedFromServer();
-              const summary = `Matched ${result.matched}, deleted ${result.deleted}` +
-                (result.failed > 0 ? `, ${result.failed} failed` : "");
-              this.showStatus(containerEl, summary, result.failed > 0);
-            } catch (err) {
-              this.showStatus(
+      new Setting(containerEl)
+        .setName("Purge excluded paths from server")
+        .setDesc(
+          "Delete every server-side copy of files that match the excluded paths above. " +
+          "Useful after adding a new exclusion: without this, other members on other " +
+          "devices keep pulling the file down. This affects the shared server vault."
+        )
+        .addButton((button) =>
+          button
+            .setButtonText("Purge from server")
+            .setWarning()
+            .onClick(async () => {
+              const patterns = this.plugin.settings.excludedPaths ?? [];
+              if (patterns.length === 0) {
+                this.showStatus(containerEl, "No excluded paths configured.", true);
+                return;
+              }
+              const confirmed = await this.showDestructiveConfirmation(
                 containerEl,
-                err instanceof Error ? err.message : "Purge failed.",
-                true
+                "PURGE FROM SERVER",
+                "Delete every matching file from the shared server vault? " +
+                  "Other members will lose these files on their next sync. " +
+                  "Local copies on this device are kept.\n\n" +
+                  `Patterns:\n${patterns.join("\n")}\n\n` +
+                  "Type PURGE FROM SERVER to confirm."
               );
-            } finally {
-              button.setDisabled(false);
-              button.setButtonText("Purge from server");
-            }
-          })
-      );
+              if (!confirmed) return;
+              try {
+                button.setDisabled(true);
+                button.setButtonText("Purging…");
+                const result = await this.plugin.purgeExcludedFromServer();
+                const summary = `Matched ${result.matched}, deleted ${result.deleted}` +
+                  (result.failed > 0 ? `, ${result.failed} failed` : "");
+                this.showStatus(containerEl, summary, result.failed > 0);
+              } catch (err) {
+                this.showStatus(
+                  containerEl,
+                  err instanceof Error ? err.message : "Purge failed.",
+                  true
+                );
+              } finally {
+                button.setDisabled(false);
+                button.setButtonText("Purge from server");
+              }
+            })
+        );
+    }
 
     // ── Display Settings ────────────────────────────────────────────────────
     new Setting(containerEl).setName("Display").setHeading();
@@ -2411,7 +2755,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // Agent bridge + AI chat live behind one disclosure. Both helpers keep
     // their own desktop gating and setHeading() labels.
     this.renderCollapsibleSection(containerEl, "AI & automation", (body) => {
+      this.renderVaultOrientationSection(body);
       this.renderAgentBridgeSection(body);
+      this.renderChatGptConnectorSection(body);
       this.renderAiChatSection(body);
     });
 
@@ -2503,8 +2849,183 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * bridge operations in Settings: create a lease, revoke all leases, inspect
    * every active lease, rotate one token, or revoke one lease.
    */
+  private renderVaultOrientationSection(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Vault orientation").setHeading();
+    const summaryEl = containerEl.createDiv({ cls: "vaultguard-orientation-summary" });
+
+    const renderSnapshot = async (forceRefresh = false): Promise<VaultOrientationSnapshot | null> => {
+      summaryEl.empty();
+      summaryEl.createDiv({ cls: "setting-item-description", text: "Loading orientation metadata..." });
+      try {
+        const snapshot = await this.plugin.getVaultOrientationSnapshotForDiagnostics({
+          includeKnownVaults: true,
+          includeGit: true,
+          forceRefresh,
+        });
+        summaryEl.empty();
+        this.renderVaultOrientationSummary(summaryEl, snapshot);
+        return snapshot;
+      } catch (error) {
+        summaryEl.empty();
+        summaryEl.createDiv({
+          cls: "setting-item-description mod-warning",
+          text: `Could not load vault orientation: ${this.errorMessage(error)}`,
+        });
+        return null;
+      }
+    };
+
+    void renderSnapshot(false);
+
+    new Setting(containerEl)
+      .setName("Orientation diagnostics")
+      .setDesc(
+        "Metadata only. Does not grant access and omits absolute paths, raw Git remotes, tokens, keys, and note contents.",
+      )
+      .addButton((button) =>
+        button.setButtonText("Refresh").onClick(async () => {
+          button.setDisabled(true).setButtonText("Refreshing...");
+          await renderSnapshot(true);
+          button.setDisabled(false).setButtonText("Refresh");
+        }),
+      )
+      .addButton((button) =>
+        button.setButtonText("Copy diagnostics").onClick(async () => {
+          button.setDisabled(true).setButtonText("Copying...");
+          const snapshot = await renderSnapshot(true);
+          const copied = snapshot
+            ? await this.writeClipboard(JSON.stringify(snapshot, null, 2))
+            : false;
+          new Notice(copied ? "Vault orientation diagnostics copied." : "Could not copy diagnostics.");
+          button.setDisabled(false).setButtonText("Copy diagnostics");
+        }),
+      );
+  }
+
+  private renderVaultOrientationSummary(parent: HTMLElement, snapshot: VaultOrientationSnapshot): void {
+    const active = snapshot.activeVault;
+    const git = active.git.detected
+      ? `Git: detected${active.git.dirty === true ? ", dirty" : active.git.dirty === false ? ", clean" : ""}`
+      : "Git: not detected";
+    const rows = [
+      `Active vault: ${active.displayName}`,
+      `Vault kind: ${active.locationKind} / ${active.storageKind}`,
+      `Protection: ${active.protection.localProjectMemoryMode ? "Local Project Memory Mode" : active.protection.encrypted ? "protected/encrypted" : "not encrypted"}`,
+      git,
+      `Connectors: Claude ${active.connectors.claude}, Codex ${active.connectors.codex}, GPT ${active.connectors.openaiChat}, ChatGPT ${active.connectors.chatgptRemote}`,
+      `Write safety: ${active.safety.writeMode} - ${active.safety.reason}`,
+    ];
+    for (const row of rows) {
+      parent.createDiv({ cls: "setting-item-description", text: row });
+    }
+    if (snapshot.knownVaults.length > 0) {
+      parent.createDiv({
+        cls: "setting-item-description",
+        text: `Known vaults shown: ${snapshot.knownVaults.length} (bounded metadata only).`,
+      });
+    }
+  }
+
+  private renderChatGptConnectorSection(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("ChatGPT connector / remote MCP (developer preview)").setHeading();
+
+    if (this.plugin.isLocalProjectMemoryModeEnabled()) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text:
+          "ChatGPT connector sessions are disabled in Local Project Memory Mode. Repo-root project-memory vaults must stay local and plaintext for coding workflows.",
+      });
+      return;
+    }
+
+    if (Platform.isMobileApp) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text:
+          "ChatGPT connector is desktop-only. It needs the local VaultGuard MCP server and an HTTPS/Secure MCP Tunnel path that mobile Obsidian cannot host.",
+      });
+      return;
+    }
+
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Developer preview only. This exposes selected read-only VaultGuard tools to ChatGPT through an HTTPS or Secure MCP Tunnel endpoint. Anything returned by a tool can leave this device and be processed by OpenAI. Use narrow scopes, short sessions, and revoke sessions when finished. Never paste Agent Bridge lease tokens, recovery keys, local access keys, OpenAI API keys, or vault secrets into ChatGPT.",
+    });
+
+    const description = this.plugin.describeChatGptConnector();
+    const sessions = description.sessions;
+    const canCreate = Boolean(this.plugin.getSession() && this.plugin.settings.serverVaultId);
+
+    new Setting(containerEl)
+      .setName("Connector actions")
+      .setDesc(
+        canCreate
+          ? "Create a short-lived read-only connector session for Secure MCP Tunnel testing, or revoke current connector sessions."
+          : "Log in and bind this Obsidian folder to a server vault before creating connector sessions.",
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Create read-only session")
+          .setCta()
+          .setDisabled(!canCreate)
+          .onClick(async () => this.createChatGptConnectorSession(button)),
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Revoke all connector sessions")
+          .setWarning()
+          .setDisabled(sessions.length === 0)
+          .onClick(async () => {
+            button.setDisabled(true).setButtonText("Revoking...");
+            try {
+              const revoked = this.plugin.revokeAllChatGptConnectorSessions();
+              this.latestChatGptConnectorReveal = null;
+              new Notice(`VaultGuard Sync: revoked ${revoked} ChatGPT connector session${revoked === 1 ? "" : "s"}.`);
+              this.display();
+            } catch (error) {
+              new Notice(
+                `VaultGuard Sync: could not revoke ChatGPT connector sessions - ${this.errorMessage(error)}`,
+                8000,
+              );
+              button.setDisabled(false).setButtonText("Revoke all connector sessions");
+            }
+          }),
+      );
+
+    if (description.server) {
+      const serverInfo = containerEl.createDiv({ cls: "vaultguard-agent-bridge-server" });
+      serverInfo.createEl("strong", { text: "Connector server: " });
+      serverInfo.appendText(`${description.server.mcpEndpoint} (metadata at ${description.server.metadataEndpoint})`);
+    }
+
+    this.renderLatestChatGptConnectorReveal(containerEl);
+
+    new Setting(containerEl).setName("Active ChatGPT connector sessions").setHeading();
+    if (sessions.length === 0) {
+      containerEl.createDiv({
+        cls: "setting-item-description",
+        text: "No active ChatGPT connector sessions.",
+      });
+      return;
+    }
+
+    for (const session of sessions) {
+      this.renderChatGptConnectorSessionRow(containerEl, session);
+    }
+  }
+
   private renderAgentBridgeSection(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("Agent bridge connections (desktop only.)").setHeading();
+
+    if (this.plugin.isLocalProjectMemoryModeEnabled()) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text:
+          "Agent bridge leases are disabled in Local Project Memory Mode. Use the local files panel and AI chat for repo-root project-memory workflows without exposing remote VaultGuard tools.",
+      });
+      return;
+    }
 
     // Agent bridge needs a local HTTP server (Node `http` module). That's
     // only reachable in desktop Obsidian's renderer. On mobile we surface
@@ -2514,7 +3035,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       containerEl.createEl("p", {
         cls: "setting-item-description",
         text:
-          "Agent bridge is desktop-only. It exposes VaultGuard Sync's tools to local MCP clients (Claudian, Claude Code, Cursor) via a localhost HTTP server, which Obsidian mobile renderers can't host. Manage agent leases from a desktop install of this same vault.",
+          "Agent bridge is desktop-only. It exposes VaultGuard Sync's tools to local MCP clients (Codex, Claudian, Claude Code, Cursor) via a localhost HTTP server, which Obsidian mobile renderers can't host. Manage agent leases from a desktop install of this same vault.",
       });
       return;
     }
@@ -2522,7 +3043,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text:
-        "Agent bridge leases let an external agent (Claudian, Claude Code, Cursor, custom MCP client) talk to this vault through VaultGuard Sync tools. Each lease has its own bearer token; revoking or rotating one does not disturb the others. Hidden paths (.obsidian, .trash, .git, ...) are always blocked.",
+        "Agent bridge leases let an external agent (Codex, Claudian, Claude Code, Cursor, custom MCP client) talk to this vault through VaultGuard Sync tools. Each lease has its own bearer token; revoking or rotating one does not disturb the others. Hidden paths (.obsidian, .trash, .git, ...) are always blocked.",
     });
 
     const surface = this.plugin.getAgentBridge();
@@ -2573,6 +3094,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     this.renderAgentBridgeServerState(containerEl, server, activeLeases.length);
     this.renderLatestAgentBridgeReveal(containerEl);
     this.renderAgentBridgeSkillRow(containerEl);
+    this.renderAgentBridgeCodexSkillRow(containerEl);
 
     new Setting(containerEl).setName("Current leases").setHeading();
 
@@ -2587,6 +3109,97 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     for (const lease of activeLeases) {
       this.renderAgentBridgeLeaseRow(containerEl, lease);
     }
+  }
+
+  private async createChatGptConnectorSession(button: ButtonComponent): Promise<void> {
+    button.setDisabled(true).setButtonText("Creating...");
+    try {
+      const session: ChatGptConnectorSessionSecret = await this.plugin.createChatGptConnectorSession({
+        agentName: "ChatGPT connector",
+        scope: "/**",
+        ttlMinutes: 30,
+        tunnelMode: "secure-mcp-tunnel",
+      });
+      this.latestChatGptConnectorReveal = {
+        sessionId: session.sessionId,
+        setupInstructions: session.setupInstructions,
+        copiedToClipboard: false,
+      };
+      new Notice("VaultGuard Sync: ChatGPT connector read-only session created.");
+      this.display();
+    } catch (error) {
+      new Notice(
+        `VaultGuard Sync: could not create ChatGPT connector session - ${this.errorMessage(error)}`,
+        8000,
+      );
+      button.setDisabled(false).setButtonText("Create read-only session");
+    }
+  }
+
+  private renderLatestChatGptConnectorReveal(containerEl: HTMLElement): void {
+    const reveal = this.latestChatGptConnectorReveal;
+    if (!reveal) return;
+    const block = containerEl.createDiv({ cls: "vaultguard-agent-bridge-reveal" });
+    block.createEl("strong", { text: "ChatGPT connector setup copied from the latest session" });
+    block.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "This setup block includes the short-lived connector access token. Copy it only into trusted developer tooling or the Secure MCP Tunnel setup flow. It is not an Agent Bridge lease token.",
+    });
+    this.renderAgentBridgeCopyBlock(block, {
+      title: "ChatGPT connector setup",
+      body: reveal.setupInstructions,
+      copyLabel: "Copy connector setup",
+    });
+  }
+
+  private renderChatGptConnectorSessionRow(
+    containerEl: HTMLElement,
+    session: ChatGptConnectorSessionSummary,
+  ): void {
+    const block = containerEl.createDiv({ cls: "vaultguard-agent-bridge-lease" });
+    block.addClass("is-ephemeral");
+    block.createEl("strong", { text: session.agentName });
+    const details = block.createDiv({ cls: "vaultguard-agent-bridge-lease-details" });
+    this.addAgentBridgeLeaseDetail(details, "Session ID", session.sessionId);
+    this.addAgentBridgeLeaseDetail(details, "Profile", session.profile);
+    this.addAgentBridgeLeaseDetail(details, "Scope", session.pathScopes.join(", "));
+    this.addAgentBridgeLeaseDetail(details, "OAuth scopes", session.oauthScopes.join(", "));
+    this.addAgentBridgeLeaseDetail(details, "Token ID", session.tokenId);
+    this.addAgentBridgeLeaseDetail(details, "Created", this.formatDateTime(session.createdAt));
+    this.addAgentBridgeLeaseDetail(details, "Expires", this.formatDateTime(session.expiresAt));
+    this.addAgentBridgeLeaseDetail(
+      details,
+      "Limits",
+      `${session.limits.maxListFiles} files, ${session.limits.maxSearchResults} search hits, ${this.formatBytes(session.limits.maxReadBytes)} reads`,
+    );
+
+    const actions = block.createDiv({ cls: "vaultguard-agent-bridge-inline-actions" });
+    const revokeBtn = new ButtonComponent(actions);
+    revokeBtn
+      .setButtonText("Revoke session")
+      .setWarning()
+      .onClick(async () => {
+        revokeBtn.setDisabled(true).setButtonText("Revoking...");
+        try {
+          const revoked = this.plugin.revokeChatGptConnectorSession(session.sessionId);
+          if (this.latestChatGptConnectorReveal?.sessionId === session.sessionId) {
+            this.latestChatGptConnectorReveal = null;
+          }
+          new Notice(
+            revoked
+              ? "VaultGuard Sync: ChatGPT connector session revoked."
+              : "VaultGuard Sync: ChatGPT connector session was already gone.",
+          );
+          this.display();
+        } catch (error) {
+          new Notice(
+            `VaultGuard Sync: could not revoke ChatGPT connector session - ${this.errorMessage(error)}`,
+            8000,
+          );
+          revokeBtn.setDisabled(false).setButtonText("Revoke session");
+        }
+      });
   }
 
   private renderAgentBridgeServerState(
@@ -2715,6 +3328,66 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
   }
 
+  private renderAgentBridgeCodexSkillRow(containerEl: HTMLElement): void {
+    const status = this.plugin.getAgentBridgeCodexSkillStatus();
+
+    if (!status.available) {
+      new Setting(containerEl)
+        .setName("Codex skill")
+        .setDesc(
+          "Not available on this device - installing the skill needs Node filesystem access (desktop Obsidian only)."
+        );
+      return;
+    }
+
+    const setting = new Setting(containerEl)
+      .setName("Codex skill")
+      .setDesc(this.codexSkillStatusDescription(status));
+
+    if (!status.codexSkillsAvailable) {
+      setting.addButton((button) =>
+        button
+          .setButtonText("Install anyway")
+          .setWarning()
+          .onClick(async () => this.runCodexSkillInstall(button, { force: true }))
+      );
+      return;
+    }
+
+    if (status.managedConflict) {
+      setting.addButton((button) =>
+        button
+          .setButtonText("Overwrite existing SKILL.md")
+          .setWarning()
+          .onClick(async () => this.runCodexSkillInstall(button, { overwriteUnmanaged: true }))
+      );
+      return;
+    }
+
+    if (!status.installed) {
+      setting.addButton((button) =>
+        button
+          .setButtonText("Install skill")
+          .setCta()
+          .onClick(async () => this.runCodexSkillInstall(button))
+      );
+      return;
+    }
+
+    setting
+      .addButton((button) =>
+        button
+          .setButtonText("Update / re-install")
+          .onClick(async () => this.runCodexSkillInstall(button))
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Uninstall")
+          .setWarning()
+          .onClick(async () => this.runCodexSkillUninstall(button))
+      );
+  }
+
   private skillStatusDescription(status: SkillInstallStatus & { available: true }): string {
     if (!status.claudeCodeAvailable) {
       return `Claude Code does not appear to be installed (no ~/.claude/skills/ directory). The skill would land at ${status.skillFilePath} if you install it anyway.`;
@@ -2726,6 +3399,21 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       return `Installed at ${status.skillFilePath}. The skill teaches Claude Code (and any agent that loads ~/.claude/skills/) to use VaultGuard Sync's MCP tools instead of Read/Glob/Grep against encrypted vault files. Re-install to pull the latest skill body.`;
     }
     return `Writes a SKILL.md to ${status.skillFilePath}. Tells Claude Code to reach for VaultGuard Sync's MCP tools when it sees an encrypted vault, rather than reading ciphertext directly. Contains no tokens or per-user state.`;
+  }
+
+  private codexSkillStatusDescription(
+    status: CodexSkillInstallStatus & { available: true }
+  ): string {
+    if (!status.codexSkillsAvailable) {
+      return `Codex skills directory was not found (no ~/.agents/skills/ directory). The skill would land at ${status.skillFilePath} if you install it anyway.`;
+    }
+    if (status.managedConflict) {
+      return `A SKILL.md exists at ${status.skillFilePath} but was not installed by VaultGuard Sync. Overwriting will replace it. Cancel and inspect the file if you did not expect this.`;
+    }
+    if (status.installed) {
+      return `Installed at ${status.skillFilePath}. The skill teaches Codex to use VaultGuard Sync's MCP tools instead of raw filesystem reads against protected vault content. Re-install to pull the latest skill body.`;
+    }
+    return `Writes a SKILL.md to ${status.skillFilePath}. Tells Codex to use the VaultGuard MCP bridge for protected Obsidian vault content and avoid raw filesystem access. Contains no tokens or per-user state.`;
   }
 
   private async runSkillInstall(
@@ -2774,6 +3462,52 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
   }
 
+  private async runCodexSkillInstall(
+    button: ButtonComponent,
+    options: { overwriteUnmanaged?: boolean; force?: boolean } = {}
+  ): Promise<void> {
+    const original = button.buttonEl.textContent ?? "Install skill";
+    button.setDisabled(true).setButtonText("Installing...");
+    try {
+      const result = await this.plugin.installAgentBridgeCodexSkill(options);
+      const verb =
+        result.action === "noop"
+          ? "already current"
+          : result.action === "created"
+            ? "installed"
+            : result.action === "overwrote-conflict"
+              ? "overwrote existing file"
+              : "updated";
+      new Notice(`VaultGuard Sync: Codex skill ${verb} at ${result.filePath}.`, 6000);
+      this.display();
+    } catch (error) {
+      new Notice(
+        `VaultGuard Sync: could not install Codex skill - ${this.errorMessage(error)}`,
+        8000
+      );
+      button.setDisabled(false).setButtonText(original);
+    }
+  }
+
+  private async runCodexSkillUninstall(button: ButtonComponent): Promise<void> {
+    button.setDisabled(true).setButtonText("Removing...");
+    try {
+      const result = await this.plugin.uninstallAgentBridgeCodexSkill();
+      if (result.removed) {
+        new Notice(`VaultGuard Sync: Codex skill removed from ${result.filePath}.`, 6000);
+      } else {
+        new Notice("VaultGuard Sync: no managed Codex skill file to remove.", 4000);
+      }
+      this.display();
+    } catch (error) {
+      new Notice(
+        `VaultGuard Sync: could not uninstall Codex skill - ${this.errorMessage(error)}`,
+        8000
+      );
+      button.setDisabled(false).setButtonText("Uninstall");
+    }
+  }
+
   private renderLatestAgentBridgeReveal(containerEl: HTMLElement): void {
     const reveal = this.latestAgentBridgeReveal;
     if (!reveal) return;
@@ -2783,8 +3517,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     block.createEl("p", {
       cls: "setting-item-description",
       text: reveal.copiedToClipboard
-        ? "The rotated MCP config was copied. It is also shown here until this settings panel refreshes again."
-        : "The token was rotated, but clipboard copy was unavailable. Copy one of the snippets below before leaving this settings panel.",
+        ? "The rotated MCP config was copied. Codex snippets are also shown here until this settings panel refreshes again."
+        : "The token was rotated, but clipboard copy was unavailable. Copy the needed snippets below before leaving this settings panel.",
     });
 
     this.renderAgentBridgeCopyBlock(block, {
@@ -2796,6 +3530,26 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       title: "Generic HTTP-RPC connection",
       body: reveal.connectionJson,
       copyLabel: "Copy connection JSON",
+    });
+    this.renderAgentBridgeCopyBlock(block, {
+      title: "Codex config.toml",
+      body: reveal.codexConfig,
+      copyLabel: "Copy Codex config",
+    });
+    this.renderAgentBridgeCopyBlock(block, {
+      title: "Codex token environment command",
+      body: reveal.codexTokenCommand,
+      copyLabel: "Copy token command",
+    });
+    this.renderAgentBridgeCopyBlock(block, {
+      title: "Codex empty workspace launch",
+      body: reveal.codexLaunchCommand,
+      copyLabel: "Copy launch command",
+    });
+    this.renderAgentBridgeCopyBlock(block, {
+      title: "Codex AGENTS.md guidance",
+      body: reveal.codexAgentsGuidance,
+      copyLabel: "Copy AGENTS guidance",
     });
   }
 
@@ -2873,6 +3627,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       const refreshed = this.plugin.rotateAgentBridgeLeaseToken(lease.leaseId);
       const mcpConfig = this.buildAgentBridgeMcpConfig(refreshed, server);
       const connectionJson = this.buildAgentBridgeConnectionJson(refreshed, server);
+      const codexConfig = buildCodexConfigToml({ mcpEndpoint: server.mcpEndpoint });
+      const codexTokenCommand = buildCodexTokenEnvCommand(refreshed.token);
+      const codexLaunchCommand = buildCodexTempWorkspaceLaunchCommand(refreshed.token);
+      const codexAgentsGuidance = buildCodexAgentsGuidance();
       const copiedToClipboard = await this.writeClipboard(mcpConfig);
 
       this.latestAgentBridgeReveal = {
@@ -2880,6 +3638,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         agentName: refreshed.agentName,
         connectionJson,
         mcpConfig,
+        codexConfig,
+        codexTokenCommand,
+        codexLaunchCommand,
+        codexAgentsGuidance,
         copiedToClipboard,
       };
 

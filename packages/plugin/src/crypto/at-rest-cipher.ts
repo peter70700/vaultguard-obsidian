@@ -263,6 +263,94 @@ export class AtRestCipher {
     this.status = { kind: "uninitialized" };
   }
 
+  // ─── PIN-lock seam (Phase 12) ──────────────────────────────────────────────
+  //
+  // These four methods let a PIN own the LAK without standing up a parallel
+  // crypto path. They are DORMANT until the lock loop + enrollment UI wire them
+  // (Plans 04/05); nothing here changes runtime behaviour on its own.
+
+  /**
+   * Export a defensive COPY of the raw 32-byte LAK.
+   *
+   * Used by the PIN-enroll flow (Plan 05) to hand the LAK to
+   * `PinLockManager.enroll`, which wraps it under a PIN-derived key. Returns a
+   * copy so callers can zero their buffer without corrupting the cipher's live
+   * key. Throws when locked — there is no LAK to export.
+   */
+  exportLakBytes(): Uint8Array {
+    if (!this.lak) {
+      throw new Error("AtRestCipher: cannot export LAK while locked. Unlock first.");
+    }
+    return this.lak.slice();
+  }
+
+  /**
+   * Adopt a raw LAK (e.g. one a PIN just unwrapped) and become `unlocked`
+   * WITHOUT persisting a safeStorage wrap.
+   *
+   * This is the PIN-unlock entry point. It deliberately does NOT mirror
+   * `restoreFromRecoveryCode`, which re-wraps the LAK via safeStorage and
+   * recreates `lak.envelope`. Recreating that transparent wrap would restore a
+   * PIN-free auto-unwrap path on the next cold start and silently defeat D2
+   * ("undecryptable without the PIN"). While a PIN is enrolled the authoritative
+   * wrap is `lak-pin.envelope` (owned by PinLockManager); the transparent
+   * `lak.envelope` must stay gone. NON-NEGOTIABLE #1.
+   */
+  async unlockWithLak(bytes: Uint8Array): Promise<void> {
+    if (bytes.length !== KEY_LEN) {
+      throw new Error(
+        `AtRestCipher: unlockWithLak expects a ${KEY_LEN}-byte LAK, got ${bytes.length}.`
+      );
+    }
+    // The cipher may be unlocking straight from a locked / failed-init state, so
+    // ensure safeStorage has been probed (mirrors restoreFromRecoveryCode :518).
+    if (!this.safeStorage) this.safeStorage = probeSafeStorage();
+
+    if (this.lak) this.lak.fill(0);
+    this.lak = bytes.slice();
+
+    this.cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      this.lak as BufferSource,
+      { name: "AES-GCM" },
+      false,
+      ["encrypt", "decrypt"]
+    );
+
+    // Record which tier we would wrap under IF a transparent wrap existed — but
+    // do NOT create one here (no wrapLakBytes / saveWrappedLak call).
+    const method = this.safeStorage?.isEncryptionAvailable()
+      ? "safe-storage"
+      : "localstorage-fallback";
+    this.method = method;
+    this.status = { kind: "unlocked", method };
+  }
+
+  /**
+   * Remove `lak.envelope` while staying unlocked — used when a PIN takes
+   * ownership of the LAK; the PIN envelope (`lak-pin.envelope`) is written
+   * separately by PinLockManager. Contrast `reset()`, which locks first: here
+   * the in-memory LAK stays live so the user keeps working. Enroll half of
+   * NON-NEGOTIABLE #1.
+   */
+  async clearPersistedWrap(): Promise<void> {
+    await this.storage.clearWrappedLak();
+  }
+
+  /**
+   * Re-create `lak.envelope` from the live in-memory LAK. Reverses
+   * `clearPersistedWrap()` when a PIN is disabled, restoring the transparent
+   * safeStorage auto-unwrap. Disable half of NON-NEGOTIABLE #1. Throws when
+   * locked — there is no LAK to wrap.
+   */
+  async persistWrappedLak(): Promise<void> {
+    if (!this.lak) {
+      throw new Error("AtRestCipher: cannot persist wrapped LAK while locked. Unlock first.");
+    }
+    const blob = await this.wrapLakBytes(this.lak);
+    await this.storage.saveWrappedLak(blob);
+  }
+
   /**
    * Returns true if `bytes` looks like a VaultGuard at-rest-encrypted file.
    * Cheap (4-byte magic check). Used to gate decryption — anything that

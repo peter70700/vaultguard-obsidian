@@ -624,13 +624,45 @@ paths:
     get:
       tags: [Files]
       summary: List soft-deleted files
+      description: Omit `operation` to list soft-deleted files. Set `operation=read` to read a root file literally named `deleted`.
+      parameters:
+        - in: query
+          name: operation
+          required: false
+          schema:
+            type: string
+            enum: [read]
       responses:
         '200':
-          description: Deleted files.
+          description: Deleted files by default, or file content when `operation=read`.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DeletedFilesResponse'
+                oneOf:
+                  - $ref: '#/components/schemas/DeletedFilesResponse'
+                  - $ref: '#/components/schemas/FileContentResponse'
+    put:
+      tags: [Files]
+      summary: Write a root file literally named deleted
+      requestBody:
+        $ref: '#/components/requestBodies/FileWriteRequest'
+      responses:
+        '200':
+          description: Written file metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileWriteResponse'
+    delete:
+      tags: [Files]
+      summary: Soft-delete a root file literally named deleted
+      responses:
+        '200':
+          description: Soft-delete result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileDeleteResponse'
 
   /vaults/{vaultId}/files/{path}/restore-delete:
     parameters:

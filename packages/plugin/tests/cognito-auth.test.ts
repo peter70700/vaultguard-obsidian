@@ -440,6 +440,29 @@ describe("vaultguardForgotPassword", () => {
       vaultguardForgotPassword("http://localhost:3000", "client-123", "user@example.com")
     ).rejects.toThrow("Server down");
   });
+
+  it("retries against the stage-stripped origin when a stage suffix yields a gateway 403", async () => {
+    // Regression: `/orgs/{slug}/config` returns a base with a `/dev` stage
+    // suffix; the custom domain maps its root onto the stage, so `/dev/auth/...`
+    // 403s with "Missing Authentication Token". The call must transparently
+    // fall back to the origin root, where the route actually exists.
+    mockRequestUrl
+      .mockResolvedValueOnce(jsonResponse(403, { message: "Missing Authentication Token" }))
+      .mockResolvedValueOnce(jsonResponse(200, {}));
+
+    await expect(
+      vaultguardForgotPassword("https://api.example.com/dev", "client-123", "user@example.com")
+    ).resolves.toBeUndefined();
+
+    expect(mockRequestUrl).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ url: "https://api.example.com/dev/auth/forgot-password" })
+    );
+    expect(mockRequestUrl).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ url: "https://api.example.com/auth/forgot-password" })
+    );
+  });
 });
 
 describe("vaultguardConfirmReset", () => {

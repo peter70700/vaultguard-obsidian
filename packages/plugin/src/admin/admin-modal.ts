@@ -1338,6 +1338,7 @@ export class AdminModal extends Modal {
     let syncIntervalValue = String(settings.syncIntervalMinutes);
     let maxSessionValue = String(settings.maxSessionDurationHours);
     let autoLockValue = String(settings.autoLockMinutes);
+    let idleActionValue: "lock" | "logout" = settings.idleAction ?? "logout";
     let allowedDomainsValue = (settings.allowedDomains ?? []).join("\n");
     let retentionValue = String(settings.retentionDays);
 
@@ -1383,6 +1384,7 @@ export class AdminModal extends Modal {
         allowedDomains: normalizeDomains(allowedDomainsValue),
         retentionDays: parsePositiveInteger("Audit log retention", retentionValue),
         autoLockMinutes: parseNonNegativeInteger("Auto-lock", autoLockValue),
+        idleAction: idleActionValue,
       };
     };
 
@@ -1505,6 +1507,22 @@ export class AdminModal extends Modal {
           });
       });
     autoLockSetting.settingEl.addClass("vaultguard-number-setting");
+
+    new Setting(container)
+      .setName("On idle timeout")
+      .setDesc(
+        "Lock keeps you signed in and requires your PIN to return; Log out ends the session (re-login required). Each user sets their own PIN in VaultGuard settings."
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("logout", "Log out")
+          .addOption("lock", "Lock (require PIN)")
+          .setValue(idleActionValue)
+          .setDisabled(readOnly)
+          .onChange((value) => {
+            idleActionValue = value as "lock" | "logout";
+          })
+      );
 
     const allowedDomainsSetting = new Setting(container)
       .setName("Allowed email domains")

@@ -40,6 +40,17 @@ export class VaultToolRuntime {
           );
         case "vaultguard_read":
           return ok(await this.surface.read(this.leaseId, input as { path: string; maxBytes?: number }));
+        case "vaultguard_get_vault_orientation":
+          return ok(
+            await this.surface.getVaultOrientation(
+              this.leaseId,
+              input as {
+                includeKnownVaults?: boolean;
+                includeGit?: boolean;
+                includeConnectorStatus?: boolean;
+              },
+            ),
+          );
         case "vaultguard_apply_patch":
           // confirmWrite() fires INSIDE applyPatch when lease.writeMode==="confirm".
           return ok(await this.surface.applyPatch(this.leaseId, input as { path: string; diff: string }));

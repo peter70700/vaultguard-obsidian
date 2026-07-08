@@ -74,15 +74,15 @@ variable "max_file_size_bytes" {
 }
 
 variable "sender_email" {
-  description = "From address for transactional emails"
+  description = "From address for transactional emails (email Lambda + Cognito). On the dedicated transactional sending subdomain so its reputation is isolated from the apex (Google Workspace + website) and from the marketing lane (news.*)."
   type        = string
-  default     = "noreply@example.com"
+  default     = "noreply@mail.example.com"
 }
 
 variable "sender_domain" {
-  description = "Verified SES domain identity"
+  description = "Verified SES sending identity for transactional mail. Kept in sync with the mail.<domain> subdomain the dns module provisions. The apex identity stays verified for rollback: flip this + sender_email back to the apex to revert."
   type        = string
-  default     = "example.com"
+  default     = "mail.example.com"
 }
 
 variable "domain_name" {

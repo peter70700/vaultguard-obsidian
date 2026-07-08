@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { Menu, Notice, requestUrl } from "obsidian";
+import { Menu, Notice, TFile, requestUrl } from "obsidian";
 
 import VaultGuardPlugin from "../src/plugin/main";
 import { DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "../src/plugin/settings";
-import { PermissionLevel } from "../src/types";
+import { ConflictResolutionStrategy, PermissionLevel } from "../src/types";
+import { BINARY_SYNC_MAX_BYTES } from "../src/plugin/binary-content";
 
 const mockNotice = vi.mocked(Notice);
 const mockRequestUrl = vi.mocked(requestUrl);
@@ -83,6 +84,8 @@ function makePlugin() {
       configDir: ".obsidian",
       adapter: {
         getBasePath: () => "/Users/test/VaultGuard Test Vault",
+        exists: vi.fn().mockResolvedValue(false),
+        remove: vi.fn().mockResolvedValue(undefined),
       },
       getName: () => "VaultGuard Test Vault",
     },
@@ -153,6 +156,31 @@ function makeSession() {
     roles: ["admin"],
     createdAt: new Date().toISOString(),
   };
+}
+
+function jsonResponse(
+  status: number,
+  json: unknown,
+  headers: Record<string, string> = {
+    "content-type": "application/json",
+    "x-request-id": "req-test",
+  }
+) {
+  return {
+    status,
+    json,
+    text: JSON.stringify(json),
+    headers,
+  } as any;
+}
+
+function awsSigV4GatewayResponse(message = "Authorization header requires 'Credential' parameter.") {
+  return {
+    status: 403,
+    json: { message },
+    text: JSON.stringify({ message }),
+    headers: { "content-type": "application/json" },
+  } as any;
 }
 
 function makeMemoryStorage(): Storage {
@@ -251,6 +279,768 @@ function makeKeyLease() {
     vaultId: "vault-abc",
   };
 }
+
+describe("VaultGuardPlugin byte crypto (BIN-A)", () => {
+  // PNG magic bytes + 0x80/0xff/0xfe invalid-UTF-8 continuation bytes: a payload
+  // a lossy TextDecoder would mangle (U+FFFD) — exactly the AR1 failure class the
+  // byte variants avoid by never UTF-8-decoding.
+  const BINARY_FIXTURE = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x80, 0xff, 0xfe, 0x00,
+  ]);
+
+  beforeEach(() => {
+    mockNotice.mockReset();
+    mockRequestUrl.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  it("round-trips raw binary bytes through encrypt/decrypt without loss", async () => {
+    const plugin = makePlugin();
+    plugin.keyLease = makeKeyLease();
+
+    const encrypted = await plugin.encryptContentBytes(BINARY_FIXTURE.buffer);
+    expect(typeof encrypted).toBe("string");
+
+    const decrypted = await plugin.decryptContentBytes(encrypted);
+    expect(new Uint8Array(decrypted)).toEqual(BINARY_FIXTURE);
+  });
+
+  it("produces an envelope identical to the string crypto (server sees no difference)", async () => {
+    const plugin = makePlugin();
+    plugin.keyLease = makeKeyLease();
+
+    // Byte-encrypt of UTF-8 "hello" is decryptable by the STRING decryptContent.
+    const byteEncrypted = await plugin.encryptContentBytes(
+      new TextEncoder().encode("hello").buffer
+    );
+    await expect(plugin.decryptContent(byteEncrypted)).resolves.toBe("hello");
+
+    // String-encrypt of "hello" is decryptable by the BYTE decryptContentBytes.
+    const stringEncrypted = await plugin.encryptContent("hello");
+    const decryptedBytes = await plugin.decryptContentBytes(stringEncrypted);
+    expect(new TextDecoder().decode(decryptedBytes)).toBe("hello");
+  });
+
+  it("computeHashBytes matches computeHash for the same UTF-8 content", async () => {
+    const plugin = makePlugin();
+
+    // Include a multi-byte-UTF-8 string so the parity is not an ASCII accident.
+    for (const s of ["hello", "žlutý kůň", ""]) {
+      const bytesHash = await plugin.computeHashBytes(
+        new TextEncoder().encode(s).buffer
+      );
+      const stringHash = await plugin.computeHash(s);
+      expect(bytesHash).toBe(stringHash);
+    }
+  });
+
+  it("both byte variants reject when the key lease is missing", async () => {
+    const plugin = makePlugin();
+    plugin.keyLease = null;
+
+    await expect(
+      plugin.encryptContentBytes(BINARY_FIXTURE.buffer)
+    ).rejects.toThrow(/no valid key lease/);
+    await expect(plugin.decryptContentBytes("AAAA")).rejects.toThrow(
+      /no valid key lease/
+    );
+  });
+
+  it("both byte variants reject when the key lease is expired", async () => {
+    const plugin = makePlugin();
+    plugin.keyLease = makeKeyLease();
+    plugin.isKeyLeaseExpired = vi.fn(() => true);
+
+    await expect(
+      plugin.encryptContentBytes(BINARY_FIXTURE.buffer)
+    ).rejects.toThrow(/no valid key lease/);
+    await expect(plugin.decryptContentBytes("AAAA")).rejects.toThrow(
+      /no valid key lease/
+    );
+  });
+
+  it("bytesToBase64 chunking is byte-identical to a per-byte reference", () => {
+    const plugin = makePlugin();
+    // 70_000 bytes crosses two 0x8000 (32_768) chunks plus an odd remainder.
+    // Deterministic fill covering the full 0-255 byte range (crypto.getRandomValues
+    // caps at 65_536 bytes/call, and a reproducible pattern is a better parity fixture).
+    const bytes = new Uint8Array(70_000);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = (i * 31 + 7) & 0xff;
+    }
+
+    let reference = "";
+    for (let i = 0; i < bytes.length; i++) {
+      reference += String.fromCharCode(bytes[i]);
+    }
+    const expected = btoa(reference);
+
+    expect(plugin.bytesToBase64(bytes)).toBe(expected);
+  });
+});
+
+describe("VaultGuardPlugin requestWithTimeout override (BIN-A / L2)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("rejects with the default 30 s timeout when the request is slow", async () => {
+    const plugin = makePlugin();
+    // A request that would resolve only after 60 s — longer than the 30 s default.
+    const slow = new Promise((resolve) =>
+      setTimeout(() => resolve("late"), 60_000)
+    );
+
+    const raced = (plugin as any).requestWithTimeout(slow);
+    const expectation = expect(raced).rejects.toThrow("Request timeout");
+
+    // Advance past the 30 s default; the internal timeout fires before the request.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expectation;
+  });
+
+  it("resolves when a longer per-request timeoutMs override is supplied", async () => {
+    const plugin = makePlugin();
+    const slow = new Promise((resolve) =>
+      setTimeout(() => resolve("late"), 60_000)
+    );
+
+    const raced = (plugin as any).requestWithTimeout(slow, 120_000);
+
+    // Advance past the request's 60 s but before the 120 s override → it resolves.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(raced).resolves.toBe("late");
+  });
+});
+
+describe("VaultGuardPlugin readForSync classifier (BIN-A / D-10)", () => {
+  // PNG magic + 0x80/0xff/0xfe invalid-UTF-8 bytes: never survives a strict
+  // UTF-8 probe, so it must classify as binary.
+  const BINARY_BYTES = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x80, 0xff, 0xfe, 0x00,
+  ]);
+
+  beforeEach(() => {
+    mockNotice.mockReset();
+  });
+
+  it("classifies UTF-8 content as text from a single binary read (capable adapter)", async () => {
+    const plugin = makePlugin();
+    const readBinary = vi
+      .fn()
+      .mockResolvedValue(new TextEncoder().encode("# hello world").buffer);
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary,
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+
+    const runtime = plugin.ensureSyncRuntime();
+    const result = await runtime.readForSync("notes/a.md");
+
+    expect(result).toEqual({ kind: "text", text: "# hello world" });
+    // One disk read, no double-read (no readPlainFromDisk fallback path).
+    expect(readBinary).toHaveBeenCalledTimes(1);
+  });
+
+  it("strips a leading UTF-8 BOM to match readPlainFromDisk text semantics", async () => {
+    const plugin = makePlugin();
+    // EF BB BF is the UTF-8 BOM; TextDecoder('utf-8') consumes it, matching
+    // readPlainFromDisk's own TextDecoder.
+    const withBom = new Uint8Array([0xef, 0xbb, 0xbf, 0x68, 0x69]); // BOM + "hi"
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(withBom.buffer),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+
+    const runtime = plugin.ensureSyncRuntime();
+    const result = await runtime.readForSync("notes/bom.md");
+
+    expect(result).toEqual({ kind: "text", text: "hi" });
+  });
+
+  it("classifies invalid-UTF-8 bytes as binary, returning the exact bytes read once", async () => {
+    const plugin = makePlugin();
+    const readBinary = vi.fn().mockResolvedValue(BINARY_BYTES.buffer);
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary,
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+
+    const runtime = plugin.ensureSyncRuntime();
+    const result = await runtime.readForSync("attachments/photo.png");
+
+    expect(result.kind).toBe("binary");
+    if (result.kind === "binary") {
+      expect(new Uint8Array(result.bytes)).toEqual(BINARY_BYTES);
+    }
+    expect(readBinary).toHaveBeenCalledTimes(1);
+  });
+
+  it("always classifies as text via readPlainFromDisk on a legacy adapter, never touching readBinary (AR2/D-10)", async () => {
+    const plugin = makePlugin();
+    // Legacy adapter: no readBinary capability.
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: null,
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.readPlainFromDisk = vi.fn().mockResolvedValue("legacy string content");
+    plugin.readPlainBinaryFromDisk = vi.fn(); // must NOT be called
+
+    const runtime = plugin.ensureSyncRuntime();
+    const result = await runtime.readForSync("attachments/photo.png");
+
+    expect(result).toEqual({ kind: "text", text: "legacy string content" });
+    expect(plugin.readPlainBinaryFromDisk).not.toHaveBeenCalled();
+    expect(plugin.readPlainFromDisk).toHaveBeenCalledWith("attachments/photo.png");
+  });
+});
+
+describe("VaultGuardPlugin uploadReconciledBinaryFile (BIN-A / D-07)", () => {
+  const BINARY_BYTES = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x80, 0xff, 0xfe, 0x00,
+  ]);
+
+  function makeBinaryUploadPlugin() {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    plugin.emitAuditEvent = vi.fn().mockResolvedValue(undefined);
+    return plugin;
+  }
+
+  beforeEach(() => {
+    mockNotice.mockReset();
+  });
+
+  it("uploads bytes via encryptContentBytes with a byte hash, real contentType, and 120 s timeout", async () => {
+    const plugin = makeBinaryUploadPlugin();
+    let put: any = null;
+    plugin.apiRequest = vi.fn(
+      async (method: string, path: string, body: any, _idT: unknown, options: unknown) => {
+        if (method === "PUT") {
+          put = { path, body, options };
+          return { success: true, data: {}, error: null, requestId: "req-put" };
+        }
+        throw new Error(`Unexpected API call: ${method} ${path}`);
+      }
+    );
+
+    const runtime = plugin.ensureSyncRuntime();
+    const outcome = await runtime.uploadReconciledBinaryFile(
+      "attachments/photo.png",
+      BINARY_BYTES.buffer
+    );
+
+    expect(outcome).toBe("uploaded");
+    // Vault-scoped path, body extended with contentType only.
+    expect(put.path).toContain("/files/");
+    expect(Object.keys(put.body).sort()).toEqual(["content", "contentType", "hash"]);
+    expect(put.body.contentType).toBe("image/png");
+    expect(put.options).toEqual({ timeoutMs: 120000 });
+    // The ciphertext round-trips to the original bytes; hash matches computeHashBytes.
+    const decrypted = await plugin.decryptContentBytes(put.body.content);
+    expect(new Uint8Array(decrypted)).toEqual(BINARY_BYTES);
+    expect(put.body.hash).toBe(await plugin.computeHashBytes(BINARY_BYTES.buffer));
+    expect(plugin.emitAuditEvent).toHaveBeenCalledWith(
+      "file.write",
+      "attachments/photo.png",
+      { reconciliation: true }
+    );
+  });
+
+  it("records an upload.binary-push diagnostics breadcrumb on a successful byte upload (D-11 coverage, dev-only)", async () => {
+    const plugin = makeBinaryUploadPlugin();
+    plugin.apiRequest = vi.fn(async () => ({
+      success: true,
+      data: {},
+      error: null,
+      requestId: "req-put",
+    }));
+
+    const runtime = plugin.ensureSyncRuntime();
+    await runtime.uploadReconciledBinaryFile("attachments/photo.png", BINARY_BYTES.buffer);
+
+    // Completes the binary breadcrumb family (pull / oversize-skip / size-gate
+    // already covered by 11-04/05) with the push-success event.
+    const pushCrumb = plugin.syncDiagnostics
+      .snapshot()
+      .find((entry: any) => entry.event === "upload.binary-push");
+    expect(pushCrumb).toBeDefined();
+    expect(pushCrumb.detail).toEqual({
+      path: "attachments/photo.png",
+      bytes: BINARY_BYTES.byteLength,
+    });
+  });
+
+  it("returns skipped-too-large with NO network call and a limit+BIN-B Notice for oversize bytes", async () => {
+    const plugin = makeBinaryUploadPlugin();
+    plugin.apiRequest = vi.fn();
+    const oversize = new Uint8Array(BINARY_SYNC_MAX_BYTES + 1);
+    oversize[8] = 0xff;
+
+    const runtime = plugin.ensureSyncRuntime();
+    const outcome = await runtime.uploadReconciledBinaryFile("attachments/huge.png", oversize.buffer);
+
+    expect(outcome).toBe("skipped-too-large");
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+    // Notice names the file, the 7 MiB limit, and BIN-B.
+    const noticed = mockNotice.mock.calls.some(
+      ([message]) =>
+        typeof message === "string" &&
+        message.includes("attachments/huge.png") &&
+        message.includes("7 MiB") &&
+        message.includes("BIN-B")
+    );
+    expect(noticed).toBe(true);
+  });
+
+  it("returns skipped-no-lease without a PUT when no key lease is available", async () => {
+    const plugin = makeBinaryUploadPlugin();
+    plugin.keyLease = null;
+    plugin.apiRequest = vi.fn();
+
+    const runtime = plugin.ensureSyncRuntime();
+    const outcome = await runtime.uploadReconciledBinaryFile("a.png", BINARY_BYTES.buffer);
+
+    expect(outcome).toBe("skipped-no-lease");
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+  });
+
+  it("returns skipped-no-permission without a PUT when the user lacks WRITE", async () => {
+    const plugin = makeBinaryUploadPlugin();
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.NONE);
+    plugin.apiRequest = vi.fn();
+
+    const runtime = plugin.ensureSyncRuntime();
+    const outcome = await runtime.uploadReconciledBinaryFile("a.png", BINARY_BYTES.buffer);
+
+    expect(outcome).toBe("skipped-no-permission");
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+  });
+
+  it("throws when the PUT fails (caller requeue discipline unchanged)", async () => {
+    const plugin = makeBinaryUploadPlugin();
+    plugin.apiRequest = vi.fn(async () => ({
+      success: false,
+      data: null,
+      error: { statusCode: 500, message: "server boom" },
+      requestId: "req-put",
+    }));
+
+    const runtime = plugin.ensureSyncRuntime();
+    await expect(
+      runtime.uploadReconciledBinaryFile("a.png", BINARY_BYTES.buffer)
+    ).rejects.toThrow("server boom");
+  });
+});
+
+describe("VaultGuardPlugin handleShareLink (BIN-A / D-11 — local-open-only, no download; T-11-25)", () => {
+  // A share token is a POINTER, never a capability token. The handler resolves
+  // the token to a (vaultId, relPath) and OPENS the local file via Obsidian's own
+  // pipeline (interceptedReadBinary decrypts a synced binary at rest). It NEVER
+  // downloads content. Verify-only: no production change — these lock the two
+  // branches (synced-open, not-yet-synced Notice) so BIN-A can't regress them.
+  function makeShareLinkPlugin(resolvedRelPath: string) {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.apiClient = {
+      resolveShare: vi.fn(async () => ({ vaultId: "vault-abc", relPath: resolvedRelPath })),
+    };
+    // Tripwire: the handler must never issue a content download. Any apiRequest
+    // call (e.g. a /files/ GET) would mean the pointer became a capability.
+    plugin.apiRequest = vi.fn(async () => ({ success: true, data: {}, error: null, requestId: "x" }));
+    return plugin;
+  }
+
+  beforeEach(() => {
+    mockNotice.mockReset();
+  });
+
+  it("opens a locally-present synced binary via workspace.openFile (Obsidian's own pipeline) without downloading", async () => {
+    const plugin = makeShareLinkPlugin("attachments/photo.png");
+    const file = Object.assign(new TFile(), { path: "attachments/photo.png" });
+    plugin.app.vault.getAbstractFileByPath = vi.fn(() => file);
+    const openFile = vi.fn().mockResolvedValue(undefined);
+    plugin.app.workspace.getLeaf = vi.fn(() => ({ openFile }));
+
+    await plugin.handleShareLink({ token: "tok-1", vaultId: "vault-abc" });
+
+    expect(plugin.apiClient.resolveShare).toHaveBeenCalledWith("vault-abc", "tok-1");
+    // Opened via Obsidian's binary pipeline (→ interceptedReadBinary decrypts);
+    // the plugin itself fetches no bytes.
+    expect(openFile).toHaveBeenCalledWith(file);
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+  });
+
+  it("shows the existing \"isn't available in this vault\" Notice for a not-yet-synced binary and downloads nothing", async () => {
+    const plugin = makeShareLinkPlugin("attachments/not-synced.png");
+    plugin.app.vault.getAbstractFileByPath = vi.fn(() => null);
+    const openFile = vi.fn();
+    plugin.app.workspace.getLeaf = vi.fn(() => ({ openFile }));
+
+    await plugin.handleShareLink({ token: "tok-2", vaultId: "vault-abc" });
+
+    expect(openFile).not.toHaveBeenCalled();
+    const noticed = mockNotice.mock.calls.some(
+      ([message]) =>
+        typeof message === "string" &&
+        message.includes("attachments/not-synced.png") &&
+        message.includes("isn't available in this vault")
+    );
+    expect(noticed).toBe(true);
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe("VaultGuardPlugin writeLocalBinaryFileFromRemote (BIN-A / D-06 pull)", () => {
+  function makeBinaryPullPlugin() {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.applyingRemoteWrite = false;
+    // Capable adapter: writeBinary present → L13 gate passes.
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn(),
+      write: vi.fn(),
+      writeBinary: vi.fn(),
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+    plugin.writePlainBinaryToDisk = vi.fn().mockResolvedValue(undefined);
+    return plugin;
+  }
+
+  beforeEach(() => {
+    mockNotice.mockReset();
+  });
+
+  it("writes a new binary via vault.createBinary inside the applyingRemoteWrite bracket, ensuring parent folders", async () => {
+    const plugin = makeBinaryPullPlugin();
+    let appliedDuringWrite: boolean | null = null;
+    const createBinary = vi.fn(async () => {
+      appliedDuringWrite = plugin.applyingRemoteWrite;
+    });
+    plugin.app.vault.getAbstractFileByPath = vi.fn(() => null);
+    plugin.app.vault.createBinary = createBinary;
+    plugin.app.vault.modifyBinary = vi.fn();
+
+    const runtime = plugin.ensureSyncRuntime();
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]).buffer;
+    await runtime.writeLocalBinaryFileFromRemote("attachments/nested/photo.png", bytes);
+
+    // Parent folders ensured for the nested path.
+    expect(plugin.ensureParentFoldersForPath).toHaveBeenCalledWith(
+      "attachments/nested/photo.png"
+    );
+    expect(createBinary).toHaveBeenCalledWith("attachments/nested/photo.png", bytes);
+    expect(plugin.app.vault.modifyBinary).not.toHaveBeenCalled();
+    // The string writers are never used for binary content.
+    expect(plugin.writePlainBinaryToDisk).not.toHaveBeenCalled();
+    // Bracket: applyingRemoteWrite is TRUE during the write, reset to false after.
+    expect(appliedDuringWrite).toBe(true);
+    expect(plugin.applyingRemoteWrite).toBe(false);
+  });
+
+  it("modifies an existing binary via vault.modifyBinary when a TFile already exists", async () => {
+    const plugin = makeBinaryPullPlugin();
+    const existing = Object.assign(new TFile(), { path: "attachments/photo.png" });
+    plugin.app.vault.getAbstractFileByPath = vi.fn(() => existing);
+    plugin.app.vault.createBinary = vi.fn();
+    plugin.app.vault.modifyBinary = vi.fn().mockResolvedValue(undefined);
+
+    const runtime = plugin.ensureSyncRuntime();
+    const bytes = new Uint8Array([0x89, 0x50, 0x80, 0xff]).buffer;
+    await runtime.writeLocalBinaryFileFromRemote("attachments/photo.png", bytes);
+
+    expect(plugin.app.vault.modifyBinary).toHaveBeenCalledWith(existing, bytes);
+    expect(plugin.app.vault.createBinary).not.toHaveBeenCalled();
+    expect(plugin.applyingRemoteWrite).toBe(false);
+  });
+
+  it("falls back to writePlainBinaryToDisk when vault.createBinary throws", async () => {
+    const plugin = makeBinaryPullPlugin();
+    plugin.app.vault.getAbstractFileByPath = vi.fn(() => null);
+    plugin.app.vault.createBinary = vi.fn(async () => {
+      throw new Error("vault index stale");
+    });
+    plugin.app.vault.modifyBinary = vi.fn();
+
+    const runtime = plugin.ensureSyncRuntime();
+    const bytes = new Uint8Array([0x89, 0x50, 0x80, 0xff]).buffer;
+    await runtime.writeLocalBinaryFileFromRemote("a.png", bytes);
+
+    expect(plugin.writePlainBinaryToDisk).toHaveBeenCalledWith("a.png", bytes);
+    expect(plugin.applyingRemoteWrite).toBe(false);
+  });
+
+  it("skips with a log and no write on a legacy adapter without writeBinary (L13 — never silently drops content)", async () => {
+    const plugin = makeBinaryPullPlugin();
+    plugin.originalAdapterMethods.writeBinary = null; // legacy adapter
+    plugin.app.vault.getAbstractFileByPath = vi.fn();
+    plugin.app.vault.createBinary = vi.fn();
+    plugin.app.vault.modifyBinary = vi.fn();
+
+    const runtime = plugin.ensureSyncRuntime();
+    const bytes = new Uint8Array([0x89, 0x50]).buffer;
+    await expect(
+      runtime.writeLocalBinaryFileFromRemote("a.png", bytes)
+    ).resolves.toBeUndefined();
+
+    expect(plugin.app.vault.createBinary).not.toHaveBeenCalled();
+    expect(plugin.app.vault.modifyBinary).not.toHaveBeenCalled();
+    expect(plugin.writePlainBinaryToDisk).not.toHaveBeenCalled();
+    expect(plugin.ensureParentFoldersForPath).not.toHaveBeenCalled();
+    expect(plugin.log).toHaveBeenCalled();
+  });
+
+  it("resets applyingRemoteWrite even when the write fails entirely (finally-block discipline)", async () => {
+    const plugin = makeBinaryPullPlugin();
+    plugin.app.vault.getAbstractFileByPath = vi.fn(() => null);
+    plugin.app.vault.createBinary = vi.fn(async () => {
+      throw new Error("disk full");
+    });
+    plugin.app.vault.modifyBinary = vi.fn();
+    plugin.writePlainBinaryToDisk = vi.fn(async () => {
+      throw new Error("cipher not ready");
+    });
+
+    const runtime = plugin.ensureSyncRuntime();
+    const bytes = new Uint8Array([0x89, 0x50]).buffer;
+    await expect(
+      runtime.writeLocalBinaryFileFromRemote("a.png", bytes)
+    ).rejects.toThrow("cipher not ready");
+
+    expect(plugin.applyingRemoteWrite).toBe(false);
+  });
+});
+
+describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => {
+  function makeApplyRemotePlugin() {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.settings.deletionTombstones = {};
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn(),
+      write: vi.fn(),
+      writeBinary: vi.fn(),
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    return plugin;
+  }
+
+  beforeEach(() => {
+    mockNotice.mockReset();
+  });
+
+  it("routes a binary GET response (contentType image/png) to the byte writer, never the string writer", async () => {
+    const plugin = makeApplyRemotePlugin();
+    const fixture = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff, 0xfe, 0x00]);
+    const encrypted = await plugin.encryptContentBytes(fixture.buffer);
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: encrypted, encoding: "base64", contentType: "image/png" },
+      error: null,
+      requestId: "req-get",
+    });
+    plugin.writeLocalFileFromRemote = vi.fn(); // string writer — must NOT be called
+
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.writeLocalBinaryFileFromRemote = vi.fn().mockResolvedValue(undefined);
+
+    await runtime.applyRemoteChange({ path: "attachments/photo.png", size: 8 });
+
+    expect(runtime.writeLocalBinaryFileFromRemote).toHaveBeenCalledTimes(1);
+    const [calledPath, calledBytes] =
+      runtime.writeLocalBinaryFileFromRemote.mock.calls[0];
+    expect(calledPath).toBe("attachments/photo.png");
+    expect(new Uint8Array(calledBytes)).toEqual(fixture);
+    expect(plugin.writeLocalFileFromRemote).not.toHaveBeenCalled();
+  });
+
+  it("routes a text GET response (contentType text/markdown) through the string path unchanged", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: "ignored-ciphertext", contentType: "text/markdown" },
+      error: null,
+      requestId: "req-get",
+    });
+    plugin.decodeRemoteFileContent = vi.fn().mockResolvedValue("# hello");
+    plugin.writeLocalFileFromRemote = vi.fn().mockResolvedValue(undefined);
+
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.writeLocalBinaryFileFromRemote = vi.fn();
+
+    await runtime.applyRemoteChange({ path: "notes/a.md", size: 7 });
+
+    expect(plugin.writeLocalFileFromRemote).toHaveBeenCalledWith("notes/a.md", "# hello");
+    expect(runtime.writeLocalBinaryFileFromRemote).not.toHaveBeenCalled();
+  });
+
+  it("treats an undefined contentType as text (fail-safe = today's behavior)", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: "ignored-ciphertext" }, // no contentType field
+      error: null,
+      requestId: "req-get",
+    });
+    plugin.decodeRemoteFileContent = vi.fn().mockResolvedValue("body");
+    plugin.writeLocalFileFromRemote = vi.fn().mockResolvedValue(undefined);
+
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.writeLocalBinaryFileFromRemote = vi.fn();
+
+    await runtime.applyRemoteChange({ path: "notes/a.md", size: 4 });
+
+    expect(plugin.writeLocalFileFromRemote).toHaveBeenCalledWith("notes/a.md", "body");
+    expect(runtime.writeLocalBinaryFileFromRemote).not.toHaveBeenCalled();
+  });
+
+  it("base64-decodes a decrypted:true binary response DIRECTLY, never through a UTF-8 decode (L5)", async () => {
+    const plugin = makeApplyRemotePlugin();
+    // Bytes that are NOT valid UTF-8: a TextDecoder round-trip would corrupt them.
+    const rawBytes = new Uint8Array([0x89, 0x50, 0x80, 0xff, 0xfe, 0x00, 0xc0, 0xc1]);
+    const b64 = Buffer.from(rawBytes).toString("base64");
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        content: b64,
+        encoding: "base64",
+        decrypted: true,
+        contentType: "image/png",
+      },
+      error: null,
+      requestId: "req-dec",
+    });
+    // The string decode path must NOT be used for the binary branch.
+    plugin.decodeRemoteFileContent = vi.fn();
+
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.writeLocalBinaryFileFromRemote = vi.fn().mockResolvedValue(undefined);
+
+    await runtime.applyRemoteChange({ path: "attachments/photo.png", size: 8 });
+
+    const [, calledBytes] = runtime.writeLocalBinaryFileFromRemote.mock.calls[0];
+    expect(new Uint8Array(calledBytes)).toEqual(rawBytes);
+    expect(plugin.decodeRemoteFileContent).not.toHaveBeenCalled();
+  });
+
+  it("skips with a notice and no write when a binary decrypt fails (OD-2 fail-open, never wipes)", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: "not-decryptable", contentType: "image/png" },
+      error: null,
+      requestId: "req-get",
+    });
+    plugin.decryptContentBytes = vi.fn().mockRejectedValue(new Error("bad tag"));
+    plugin.notifyCloudDecryptFallback = vi.fn();
+
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.writeLocalBinaryFileFromRemote = vi.fn();
+
+    await expect(
+      runtime.applyRemoteChange({ path: "attachments/photo.png", size: 8 })
+    ).resolves.toBeUndefined();
+
+    expect(plugin.notifyCloudDecryptFallback).toHaveBeenCalledWith("attachments/photo.png");
+    expect(runtime.writeLocalBinaryFileFromRemote).not.toHaveBeenCalled();
+  });
+
+  it("materializes a serverOnly binary through the SAME applyRemoteChange fork during reconciliation", async () => {
+    // Proves the chokepoint covers the reconciliation download surface (and, by
+    // construction, the delta-loop and repair surfaces that call the identical
+    // this.ctx.applyRemoteChange). Real applyRemoteChange runs (not stubbed).
+    const plugin = makeApplyRemotePlugin();
+    plugin.connectionState.status = "online";
+    plugin.isOnline = vi.fn(() => true);
+    plugin.vaultLeaseDenied = false;
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.app.vault.getFiles = vi.fn(() => []);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
+    plugin.askReconciliationPlan = vi
+      .fn()
+      .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+
+    const fixture = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
+    const encrypted = await plugin.encryptContentBytes(fixture.buffer);
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: encrypted, encoding: "base64", contentType: "image/png" },
+      error: null,
+      requestId: "req-get",
+    });
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            deltas: [
+              {
+                path: "/attachments/photo.png",
+                action: "created",
+                lastModified: "x",
+                checksum: "c",
+                size: 6,
+              },
+            ],
+            syncTimestamp: "2026-07-03T00:00:00.000Z",
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.writeLocalBinaryFileFromRemote = vi.fn().mockResolvedValue(undefined);
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    expect(runtime.writeLocalBinaryFileFromRemote).toHaveBeenCalledTimes(1);
+    const [p, b] = runtime.writeLocalBinaryFileFromRemote.mock.calls[0];
+    expect(p).toBe("attachments/photo.png");
+    expect(new Uint8Array(b)).toEqual(fixture);
+  });
+});
 
 describe("VaultGuardPlugin connection and crypto helpers", () => {
   beforeEach(() => {
@@ -679,6 +1469,74 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.connectionState.status).toBe("online");
   });
 
+  it("re-resolves a stale cached API endpoint when server-session login hits an AWS SigV4 gateway error", async () => {
+    const plugin = makePlugin();
+    plugin.settings.apiEndpoint = "https://api.vaultguard.test";
+    plugin.resolvedApiEndpoint = "https://stale.vaultguard.test";
+    plugin.settings.maxRetryAttempts = 2;
+    const sessionEnvelope = {
+      sessionId: "server-session-1",
+      userId: "user-1",
+      email: "user@example.com",
+      roles: ["admin"],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+
+    mockRequestUrl
+      .mockResolvedValueOnce(awsSigV4GatewayResponse())
+      .mockResolvedValueOnce(jsonResponse(200, { vaults: [] }))
+      .mockResolvedValueOnce(jsonResponse(200, sessionEnvelope));
+
+    await expect(plugin.openServerSession("provider-id-token")).resolves.toEqual(
+      sessionEnvelope
+    );
+
+    expect(mockRequestUrl.mock.calls.map((call) => call[0].url)).toEqual([
+      "https://stale.vaultguard.test/auth/session",
+      "https://api.vaultguard.test/vaults",
+      "https://api.vaultguard.test/auth/session",
+    ]);
+    expect(mockRequestUrl.mock.calls[0][0].headers).toMatchObject({
+      Authorization: "provider-id-token",
+    });
+    expect(mockRequestUrl.mock.calls[2][0].headers).toMatchObject({
+      Authorization: "provider-id-token",
+    });
+  });
+
+  it("sanitizes unrecoverable AWS SigV4 gateway errors during server-session login", async () => {
+    const plugin = makePlugin();
+    plugin.settings.apiEndpoint = "https://api.vaultguard.test";
+    plugin.resolvedApiEndpoint = "https://api.vaultguard.test";
+    plugin.settings.maxRetryAttempts = 2;
+    const rawAwsMessage =
+      "Authorization header requires 'Credential' parameter. " +
+      "Authorization header requires 'Signature' parameter. " +
+      "Authorization header requires 'SignedHeaders' parameter. " +
+      "Authorization=W1OMEyBH/FmQL+YPOaLvOX/mWkhUnVBCMQ7";
+
+    mockRequestUrl
+      .mockResolvedValueOnce(awsSigV4GatewayResponse(rawAwsMessage))
+      .mockResolvedValueOnce(awsSigV4GatewayResponse(rawAwsMessage));
+
+    let thrown: unknown;
+    try {
+      await plugin.openServerSession("provider-id-token");
+    } catch (error) {
+      thrown = error;
+    }
+    const message = thrown instanceof Error ? thrown.message : String(thrown);
+    expect(message).toContain("VaultGuard API endpoint rejected the request");
+    expect(message).not.toMatch(/Credential|Signature|SignedHeaders|Authorization=/i);
+    expect(message).not.toContain("<Error");
+    expect(mockRequestUrl.mock.calls[0][0].url).toBe(
+      "https://api.vaultguard.test/auth/session"
+    );
+    expect(mockRequestUrl.mock.calls.slice(1).map((call) => call[0].url)).toContain(
+      "https://api.vaultguard.test/vaults"
+    );
+  });
+
   it("does not schedule retry timers while the browser reports offline", () => {
     const plugin = makePlugin();
     plugin.session = makeSession();
@@ -717,6 +1575,333 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     expect(plugin.offlineQueue.map((op: any) => op.path)).toEqual(["a.md", "b.md"]);
     expect(plugin.connectionState.status).toBe("offline");
+  });
+
+  describe("offline-queue v2 flush — binary fork (BIN-A / L8)", () => {
+    const ok = { success: true, data: {}, error: null, requestId: "r" };
+    const failWith = (statusCode: number, message: string) => ({
+      success: false,
+      data: null,
+      error: { code: "ERR", message, details: null, statusCode },
+      requestId: "r",
+    });
+
+    it("flushes a queued binary op through the byte path with contentType + 120 s timeout", async () => {
+      const plugin = makePlugin();
+      plugin.session = makeSession();
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = "online";
+
+      // PNG magic + invalid-UTF-8 bytes: a lossy string flush would corrupt this.
+      const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff, 0xfe, 0x00]);
+      plugin.offlineQueue = [
+        {
+          operation: "write",
+          path: "img/pic.png",
+          data: Buffer.from(PNG).toString("base64"),
+          timestamp: "2026-07-03T00:00:00.000Z",
+          encoding: "base64",
+          contentType: "image/png",
+        },
+      ];
+      plugin.apiRequest = vi.fn().mockResolvedValue(ok);
+
+      await plugin.flushOfflineQueue();
+
+      expect(plugin.apiRequest).toHaveBeenCalledTimes(1);
+      const [method, endpoint, body, idToken, options] = plugin.apiRequest.mock.calls[0];
+      expect(method).toBe("PUT");
+      expect(endpoint).toContain("img%2Fpic.png");
+      expect(body.contentType).toBe("image/png");
+      expect(idToken).toBeUndefined();
+      expect(options).toEqual({ timeoutMs: 120_000 });
+      // hash is the BYTE hash of the plain bytes…
+      expect(body.hash).toBe(await plugin.computeHashBytes(PNG.buffer));
+      // …and content decrypts back to the exact original bytes (no lossy decode).
+      const decrypted = await plugin.decryptContentBytes(body.content);
+      expect(new Uint8Array(decrypted)).toEqual(PNG);
+      expect(plugin.offlineQueue).toHaveLength(0);
+    });
+
+    it("leaves the text flush body byte-identical ({ content, hash }, no contentType, no timeout)", async () => {
+      const plugin = makePlugin();
+      plugin.session = makeSession();
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = "online";
+      plugin.offlineQueue = [
+        {
+          operation: "write",
+          path: "notes/a.md",
+          data: "hello",
+          timestamp: "2026-07-03T00:00:00.000Z",
+        },
+      ];
+      plugin.apiRequest = vi.fn().mockResolvedValue(ok);
+
+      await plugin.flushOfflineQueue();
+
+      const [method, , body, , options] = plugin.apiRequest.mock.calls[0];
+      expect(method).toBe("PUT");
+      expect(body).toEqual({ content: expect.any(String), hash: expect.any(String) });
+      expect(body).not.toHaveProperty("contentType");
+      expect(options).toBeUndefined();
+    });
+
+    it("drops a binary op on a permanent 413 with a Notice naming the path; text stays console-only", async () => {
+      // Binary + 413 → dropped (not requeued) + Notice.
+      const plugin = makePlugin();
+      plugin.session = makeSession();
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = "online";
+      plugin.offlineQueue = [
+        {
+          operation: "write",
+          path: "img/big.png",
+          data: Buffer.from(new Uint8Array([0x89, 0x50, 0xff])).toString("base64"),
+          timestamp: "2026-07-03T00:00:00.000Z",
+          encoding: "base64",
+          contentType: "image/png",
+        },
+      ];
+      plugin.apiRequest = vi.fn().mockResolvedValue(failWith(413, "Payload too large"));
+      mockNotice.mockClear();
+
+      await plugin.flushOfflineQueue();
+
+      expect(plugin.offlineQueue).toHaveLength(0);
+      expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining("img/big.png"), 10_000);
+
+      // Text + 413 → dropped, NO Notice (today's semantics preserved).
+      const plugin2 = makePlugin();
+      plugin2.session = makeSession();
+      plugin2.keyLease = makeKeyLease();
+      plugin2.connectionState.status = "online";
+      plugin2.offlineQueue = [
+        {
+          operation: "write",
+          path: "notes/big.md",
+          data: "x",
+          timestamp: "2026-07-03T00:00:00.000Z",
+        },
+      ];
+      plugin2.apiRequest = vi.fn().mockResolvedValue(failWith(413, "Payload too large"));
+      mockNotice.mockClear();
+
+      await plugin2.flushOfflineQueue();
+
+      expect(plugin2.offlineQueue).toHaveLength(0);
+      expect(mockNotice).not.toHaveBeenCalled();
+    });
+
+    it("requeues a binary op on a transient statusCode 0 (AC-API1 discipline intact)", async () => {
+      const plugin = makePlugin();
+      plugin.session = makeSession();
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = "online";
+      plugin.offlineQueue = [
+        {
+          operation: "write",
+          path: "img/x.png",
+          data: Buffer.from(new Uint8Array([0x89, 0xff])).toString("base64"),
+          timestamp: "2026-07-03T00:00:00.000Z",
+          encoding: "base64",
+          contentType: "image/png",
+        },
+      ];
+      plugin.apiRequest = vi.fn().mockResolvedValue(failWith(0, "Network request failed"));
+      mockNotice.mockClear();
+
+      await plugin.flushOfflineQueue();
+
+      // Transient → requeued (never dropped), offline flip, and NO drop Notice.
+      expect(plugin.offlineQueue.map((op: any) => op.path)).toEqual(["img/x.png"]);
+      expect(plugin.connectionState.status).toBe("offline");
+      expect(mockNotice).not.toHaveBeenCalled();
+    });
+  });
+
+  it("flushes queued writes with the captured expectedVersionId and stores the returned version", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.offlineQueue = [
+      {
+        operation: "write",
+        path: "a.md",
+        data: "A",
+        baseVersionId: "v1",
+        timestamp: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        path: "/a.md",
+        versionId: "v2",
+        checksum: '"etag-2"',
+        size: 1,
+        lastModified: "2026-07-03T00:00:00.000Z",
+      },
+      error: null,
+      requestId: "req-write",
+    });
+
+    await plugin.flushOfflineQueue();
+
+    expect(plugin.offlineQueue).toHaveLength(0);
+    expect(plugin.apiRequest).toHaveBeenCalledWith(
+      "PUT",
+      "/vaults/vault-abc/files/a.md",
+      expect.objectContaining({ expectedVersionId: "v1" })
+    );
+    expect(plugin.remoteFileState.getExpectedVersionId("a.md")).toBe("v2");
+  });
+
+  it("keeps an offline queued write pending when replay hits a version conflict requiring user resolution", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.settings.defaultConflictResolution = "ask_user";
+    plugin.offlineQueue = [
+      {
+        operation: "write",
+        path: "a.md",
+        data: "local edit",
+        baseVersionId: "v1",
+        timestamp: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+    plugin.emitAuditEvent = vi.fn().mockResolvedValue(undefined);
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        content: Buffer.from("remote edit").toString("base64"),
+        decrypted: true,
+        versionId: "v2",
+        lastModified: "2026-07-03T00:00:00.000Z",
+      },
+      error: null,
+      requestId: "req-read",
+    });
+    plugin.decodeRemoteFileContent = vi.fn().mockResolvedValue("remote edit");
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: false,
+      data: null,
+      error: {
+        code: "CONFLICT",
+        message: "stale version",
+        details: null,
+        statusCode: 409,
+      },
+      requestId: "req-conflict",
+    });
+
+    await plugin.flushOfflineQueue();
+
+    expect(plugin.offlineQueue).toHaveLength(1);
+    expect(plugin.offlineQueue[0]).toMatchObject({
+      operation: "write",
+      path: "a.md",
+      data: "local edit",
+      baseVersionId: "v1",
+    });
+    expect(plugin.syncState.conflicts).toHaveLength(1);
+    expect(plugin.syncState.conflicts[0]).toMatchObject({
+      path: "a.md",
+      localHash: expect.any(String),
+      remoteHash: expect.any(String),
+      resolution: null,
+    });
+  });
+
+  it("keeps an offline queued write pending when replay discovers the remote file was deleted", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.settings.defaultConflictResolution = "ask_user";
+    plugin.remoteFileState.recordPresent("a.md", {
+      versionId: "v1",
+      baseHash: "base-hash",
+    });
+    plugin.offlineQueue = [
+      {
+        operation: "write",
+        path: "a.md",
+        data: "local edit after remote delete",
+        baseVersionId: "v1",
+        timestamp: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+    plugin.emitAuditEvent = vi.fn().mockResolvedValue(undefined);
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: false,
+      data: null,
+      error: {
+        code: "NOT_FOUND",
+        message: "File not found",
+        details: null,
+        statusCode: 404,
+      },
+      requestId: "req-read-missing",
+    });
+    plugin.decodeRemoteFileContent = vi.fn();
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: false,
+      data: null,
+      error: {
+        code: "CONFLICT",
+        message: "current version is missing",
+        details: null,
+        statusCode: 409,
+      },
+      requestId: "req-conflict",
+    });
+
+    await plugin.flushOfflineQueue();
+
+    expect(plugin.fetchRemoteFileContent).toHaveBeenCalledWith("a.md");
+    expect(plugin.decodeRemoteFileContent).not.toHaveBeenCalled();
+    expect(plugin.offlineQueue).toHaveLength(1);
+    expect(plugin.remoteFileState.get("a.md")).toMatchObject({ state: "absent" });
+    expect(plugin.syncState.conflicts[0]).toMatchObject({
+      path: "a.md",
+      localHash: expect.any(String),
+      remoteHash: "remote-deleted",
+      baseHash: "base-hash",
+      remoteDeleted: true,
+      resolution: null,
+    });
+  });
+
+  it("resolves a pending remote-deleted conflict by keeping the remote deletion", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.settings.defaultConflictResolution = "keep_remote";
+    plugin.originalAdapterMethods = {
+      ...(plugin.originalAdapterMethods ?? {}),
+      remove: vi.fn().mockResolvedValue(undefined),
+    };
+    plugin.emitAuditEvent = vi.fn().mockResolvedValue(undefined);
+    const conflict = {
+      path: "a.md",
+      localHash: "local-hash",
+      remoteHash: "remote-deleted",
+      baseHash: "base-hash",
+      detectedAt: "2026-01-01T00:00:00.000Z",
+      resolution: null,
+      localModified: "2026-01-01T00:00:00.000Z",
+      remoteModified: "2026-01-01T00:00:01.000Z",
+      remoteDeleted: true,
+    };
+
+    await plugin.handleConflict(conflict);
+
+    expect(plugin.originalAdapterMethods.remove).toHaveBeenCalledWith("a.md");
+    expect(plugin.remoteFileState.get("a.md")).toMatchObject({ state: "absent" });
+    expect(conflict.resolution).toBe("keep_remote");
   });
 
   it("does not fail startup when Obsidian protocol handlers are unavailable", () => {
@@ -2543,19 +3728,21 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
   });
 
   // AR1: 0x80–0xFF bytes are invalid as a UTF-8 lead sequence, so a real
-  // attachment (PNG header + high bytes) can never survive the string sync
-  // pipeline. Every string-upload path must SKIP such files, mirroring
-  // interceptedWriteBinary's "binary sync unsupported" fail-closed policy.
+  // attachment (PNG header + high bytes) can never survive the *string* sync
+  // pipeline losslessly. Post-BIN-A these bytes ride the dedicated BYTE path
+  // (encryptContentBytes / computeHashBytes); this fixture proves the byte
+  // path is taken and the lossy string decode never happens.
   const AR1_BINARY_BYTES = new Uint8Array([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x80, 0xff, 0xfe, 0x00,
   ]);
 
-  it("uploadLocalOnlyFiles skips binary local-only files instead of uploading a lossy decode (AR1)", async () => {
+  it("uploadLocalOnlyFiles uploads an in-size binary via the byte path and counts it as an upload (BIN-A / D-07)", async () => {
     const plugin = makePlugin();
     plugin.settings.serverVaultId = "vault-abc";
     plugin.session = makeSession();
     plugin.keyLease = makeKeyLease();
     plugin.connectionState.status = "online";
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
     plugin.originalAdapterMethods = {
       read: vi.fn(),
       readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
@@ -2566,8 +3753,100 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     };
     plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/photo.png" }]);
     plugin.collectLocalFolderPaths = vi.fn(() => []);
-    plugin.uploadReconciledFile = vi.fn();
-    plugin.removeUnsyncedLocalFile = vi.fn();
+    plugin.ensureAtRestEncryptedInPlace = vi.fn(async () => true);
+    let put: any = null;
+    plugin.apiRequest = vi.fn(
+      async (method: string, path: string, body: any, _idT: unknown, options: unknown) => {
+        if (method === "POST" && path.endsWith("/files/sync")) {
+          return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
+        }
+        if (method === "PUT") {
+          put = { path, body, options };
+          return { success: true, data: {}, error: null, requestId: "req-put" };
+        }
+        throw new Error(`Unexpected API call: ${method} ${path}`);
+      }
+    );
+
+    const result = await plugin.uploadLocalOnlyFiles();
+
+    // Counted as an UPLOAD, not skipped (D-11 truthfulness).
+    expect(result?.uploadedFiles).toBe(1);
+    expect(result?.skippedFiles).toBe(0);
+    expect(result?.removedLocalFiles).toBe(0);
+    // The byte PUT fired with a real contentType + the large-body timeout, and
+    // the ciphertext round-trips to the original bytes.
+    expect(put).not.toBeNull();
+    expect(put.body.contentType).toBe("image/png");
+    expect(put.options).toEqual({ timeoutMs: 120000 });
+    const decrypted = await plugin.decryptContentBytes(put.body.content);
+    expect(new Uint8Array(decrypted)).toEqual(AR1_BINARY_BYTES);
+    // Post-upload at-rest hygiene fires ONLY after "uploaded" (CR-1/D-01).
+    expect(plugin.ensureAtRestEncryptedInPlace).toHaveBeenCalledWith("attachments/photo.png");
+  });
+
+  it("uploadLocalOnlyFiles on a legacy adapter (no readBinary) keeps a binary-extension file on the text path, never the byte path (AR2/D-10)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: null, // legacy: capability gate closed
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    // Legacy classification reads via readPlainFromDisk (string).
+    plugin.readPlainFromDisk = vi.fn().mockResolvedValue("legacy text");
+    plugin.readPlainBinaryFromDisk = vi.fn(); // must NOT be called
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/photo.png" }]);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.uploadReconciledFile = vi.fn(async () => "uploaded");
+    plugin.ensureAtRestEncryptedInPlace = vi.fn(async () => true);
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
+      }
+      // A byte PUT would be a regression — legacy adapters must not reach it.
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    const result = await plugin.uploadLocalOnlyFiles();
+
+    expect(result?.uploadedFiles).toBe(1);
+    // The STRING sibling handled it (byte-identical to pre-BIN-A behavior); the
+    // byte path (direct PUT) was never taken.
+    expect(plugin.uploadReconciledFile).toHaveBeenCalledWith(
+      "attachments/photo.png",
+      "legacy text",
+      expect.anything()
+    );
+    expect(plugin.readPlainBinaryFromDisk).not.toHaveBeenCalled();
+  });
+
+  it("uploadLocalOnlyFiles skips an oversize binary (no PUT, no hygiene) and counts it skipped (L10)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    const oversize = new Uint8Array(BINARY_SYNC_MAX_BYTES + 1);
+    oversize[8] = 0xff; // ensure the content probe classifies it binary
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(oversize.buffer),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/huge.png" }]);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.ensureAtRestEncryptedInPlace = vi.fn(async () => true);
     plugin.apiRequest = vi.fn(async (method: string, path: string) => {
       if (method === "POST" && path.endsWith("/files/sync")) {
         return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
@@ -2579,9 +3858,15 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     expect(result?.skippedFiles).toBe(1);
     expect(result?.uploadedFiles).toBe(0);
-    expect(result?.removedLocalFiles).toBe(0);
-    expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
-    expect(plugin.removeUnsyncedLocalFile).not.toHaveBeenCalled();
+    // CR-1/L10: no PUT and no LAK-encrypt path for an unsendable file.
+    expect(plugin.apiRequest).not.toHaveBeenCalledWith(
+      "PUT",
+      expect.any(String),
+      expect.anything(),
+      undefined,
+      expect.anything()
+    );
+    expect(plugin.ensureAtRestEncryptedInPlace).not.toHaveBeenCalled();
   });
 
   it("uploadLocalOnlyFiles re-encrypts an uploaded local-only text file in place (external-add hygiene)", async () => {
@@ -2615,7 +3900,10 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.ensureAtRestEncryptedInPlace).toHaveBeenCalledWith("dropped/note.md");
   });
 
-  it("performInitialReconciliation neither uploads binary files nor overwrites them from a lossy server copy (AR1)", async () => {
+  // BIN-A / wave 5: the former AR1 "binaries are invisible to reconciliation"
+  // test is replaced by these — binaries now participate as first-class,
+  // byte-hashed manifest entries, with the L7 lossy-artifact healing rule.
+  function makeBinaryReconcilePlugin() {
     const plugin = makePlugin();
     plugin.settings.serverVaultId = "vault-abc";
     plugin.settings.bindingReconciledVaultId = undefined;
@@ -2623,43 +3911,39 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     plugin.keyLease = makeKeyLease();
     plugin.connectionState.status = "online";
     plugin.vaultLeaseDenied = false;
-    const textBytes = new TextEncoder().encode("plain note");
     plugin.originalAdapterMethods = {
       read: vi.fn(),
-      readBinary: vi.fn(async (path: string) =>
-        path === "attachments/photo.png" ? AR1_BINARY_BYTES.buffer : textBytes.buffer
-      ),
+      readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
       write: null,
+      writeBinary: vi.fn(),
       list: null,
       remove: null,
       rename: null,
     };
-    plugin.app.vault.getFiles = vi.fn(() => [
-      { path: "attachments/photo.png" },
-      { path: "notes/local.md" },
-    ]);
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/photo.png" }]);
     plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
     plugin.collectLocalFolderPaths = vi.fn(() => []);
     plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
-    plugin.computeHash = vi.fn(async (content: string) => `hash:${content}`);
     plugin.applyRemoteChange = vi.fn();
     plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
     plugin.askReconciliationPlan = vi
       .fn()
-      .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+      .mockResolvedValue({ proceed: true, conflictStrategy: "keep_local" });
+    return plugin;
+  }
+
+  function stubSyncInventory(plugin: any) {
     plugin.apiRequest = vi.fn(async (method: string, path: string) => {
       if (method === "POST" && path.endsWith("/files/sync")) {
         return {
           success: true,
           data: {
             deltas: [
-              // A lossy pre-fix server copy of the SAME binary path: it must
-              // not be classified serverOnly and written over the local bytes.
               {
                 path: "/attachments/photo.png",
                 action: "created",
                 lastModified: "2026-07-01T00:00:00.000Z",
-                checksum: "lossy",
+                checksum: "c",
                 size: 12,
               },
             ],
@@ -2671,23 +3955,492 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       }
       throw new Error(`Unexpected API call: ${method} ${path}`);
     });
+  }
+
+  it("heals a pre-BIN-A lossy server copy (text/markdown) of a local binary by uploading local bytes, never downloading (AR1/L7)", async () => {
+    const plugin = makeBinaryReconcilePlugin();
+    stubSyncInventory(plugin);
+    // The server copy is a lossy text/markdown artifact of the pre-fix pipeline.
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: "lossy-artifact", contentType: "text/markdown" },
+      error: null,
+      requestId: "req-get",
+    });
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn().mockResolvedValue("uploaded");
 
     await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
 
-    // The binary file is invisible to the plan: not localOnly (no upload),
-    // not serverOnly (no overwrite), not a conflict.
+    // Healed: intact local bytes uploaded via the byte path.
+    expect(runtime.uploadReconciledBinaryFile).toHaveBeenCalledTimes(1);
+    const [healedPath, healedBytes] =
+      runtime.uploadReconciledBinaryFile.mock.calls[0];
+    expect(healedPath).toBe("attachments/photo.png");
+    expect(new Uint8Array(healedBytes)).toEqual(AR1_BINARY_BYTES);
+    // The lossy artifact was NEVER downloaded over local content (T-11-16).
+    expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+    expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
+    // A silent integrity heal — invisible to the plan buckets.
     expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
       serverOnly: [],
-      localOnly: ["/notes/local.md"],
+      localOnly: [],
       conflicts: [],
     });
-    expect(plugin.uploadReconciledFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a byte-identical server binary as already in sync — no upload, no download (BIN-A)", async () => {
+    const plugin = makeBinaryReconcilePlugin();
+    stubSyncInventory(plugin);
+    // A genuine server BINARY whose bytes match the local file exactly.
+    const encrypted = await plugin.encryptContentBytes(AR1_BINARY_BYTES.buffer);
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: encrypted, encoding: "base64", contentType: "image/png" },
+      error: null,
+      requestId: "req-get",
+    });
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn();
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
+      serverOnly: [],
+      localOnly: [],
+      conflicts: [],
+    });
+    expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
+    expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+  });
+
+  it("CR-1 closure: an interceptedWriteBinary push is in-sync on the next catch-up — no echo re-upload (BIN-A / D-08)", async () => {
+    const plugin = makeBinaryReconcilePlugin();
+    // Isolate the push from permission-warmup + at-rest-cipher internals so the
+    // test asserts only the hash-stability loop.
+    plugin.awaitPermissionReadiness = vi.fn().mockResolvedValue(undefined);
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    plugin.writePlainBinaryToDisk = vi.fn().mockResolvedValue(undefined);
+
+    // ── Device-A drag-drop: interceptedWriteBinary pushes the in-size binary.
+    let pushedContent: string | null = null;
+    let pushedHash: string | null = null;
+    plugin.apiRequest = vi.fn(async (method: string, endpoint: string, body: any) => {
+      if (method === "PUT" && endpoint.includes("/files/")) {
+        pushedContent = body.content;
+        pushedHash = body.hash;
+      }
+      return { success: true, data: {}, error: null, requestId: "r" };
+    });
+
+    await plugin.interceptedWriteBinary("attachments/photo.png", AR1_BINARY_BYTES.buffer);
+
+    // The push hashed the PLAINTEXT bytes — the exact hash reconciliation's
+    // byte-hashed manifest entry computes for the identical local plaintext.
+    expect(pushedHash).toBe(await plugin.computeHashBytes(AR1_BINARY_BYTES.buffer));
+    // A local VG1 copy landed (never a server-only push with no local trace).
+    expect(plugin.writePlainBinaryToDisk).toHaveBeenCalledWith(
+      "attachments/photo.png",
+      AR1_BINARY_BYTES.buffer
+    );
+
+    // ── Device-A catch-up: the server now holds exactly what we pushed. The
+    // both-exist byte compare decrypts the server copy, hashes its bytes, and
+    // finds them equal to the local manifest hash → in-sync. No re-upload
+    // (echo storm), no download.
+    stubSyncInventory(plugin);
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: pushedContent, encoding: "base64", contentType: "image/png" },
+      error: null,
+      requestId: "req-get",
+    });
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn();
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
+      serverOnly: [],
+      localOnly: [],
+      conflicts: [],
+    });
+    expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
+    expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+  });
+
+  it("routes a differing server binary to a conflict resolved via the byte path (BIN-A / L4)", async () => {
+    const plugin = makeBinaryReconcilePlugin();
+    stubSyncInventory(plugin);
+    // A genuine server BINARY whose bytes DIFFER from the local file.
+    const differentBytes = new Uint8Array([0x89, 0x50, 0x00, 0x01, 0x80, 0xfe]);
+    const encrypted = await plugin.encryptContentBytes(differentBytes.buffer);
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: encrypted, encoding: "base64", contentType: "image/png" },
+      error: null,
+      requestId: "req-get",
+    });
+    const runtime = plugin.ensureSyncRuntime();
+    // keep_local (the plan default) → the binary conflict resolves via byte upload.
+    runtime.uploadReconciledBinaryFile = vi.fn().mockResolvedValue("uploaded");
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    // Differing hash → routed to the conflict bucket...
+    expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
+      serverOnly: [],
+      localOnly: [],
+      conflicts: ["/attachments/photo.png"],
+    });
+    // ...and resolved losslessly via the byte uploader (KEEP_LOCAL).
+    expect(runtime.uploadReconciledBinaryFile).toHaveBeenCalledTimes(1);
+    expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
+  });
+
+  it("skips a binary whose server copy cannot be fetched — never a conflict, never a wipe (OD-2)", async () => {
+    const plugin = makeBinaryReconcilePlugin();
+    stubSyncInventory(plugin);
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: false,
+      data: null,
+      error: { message: "server unreachable" },
+      requestId: "req-get",
+    });
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn();
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    // Neither same, conflict, nor heal — just skipped. Local bytes untouched.
+    expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
+      serverOnly: [],
+      localOnly: [],
+      conflicts: [],
+    });
+    expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
+    expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+  });
+
+  it("on a legacy adapter (no readBinary) keeps a binary-extension file on the string path, never the byte path (AR2/D-10)", async () => {
+    const plugin = makeBinaryReconcilePlugin();
+    // Legacy: capability gate closed → readForSync string-reads everything.
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: null,
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.readPlainFromDisk = vi.fn().mockResolvedValue("legacy text");
+    plugin.readPlainBinaryFromDisk = vi.fn(); // must NOT be called
+    plugin.fetchRemoteFileContent = vi.fn(); // no byte fetch on legacy
+    // photo.png is local-only here (empty server inventory).
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: { deltas: [], syncTimestamp: "2026-07-02T00:00:00.000Z" },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn(); // byte path must NOT be taken
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    // The STRING sibling handled it (byte-identical to pre-BIN-A legacy behavior).
     expect(plugin.uploadReconciledFile).toHaveBeenCalledWith(
-      "notes/local.md",
-      "plain note",
+      "attachments/photo.png",
+      "legacy text",
       undefined
     );
+    expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
+    expect(plugin.readPlainBinaryFromDisk).not.toHaveBeenCalled();
+  });
+
+  it("performInitialReconciliation uploads a local-only in-size binary as a first-class byte upload (BIN-A / D-05, D-11)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.vaultLeaseDenied = false;
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
+      write: null,
+      writeBinary: vi.fn(),
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/photo.png" }]);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.applyRemoteChange = vi.fn();
+    // The STRING uploader must NOT be used for a binary.
+    plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
+    plugin.askReconciliationPlan = vi
+      .fn()
+      .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: { deltas: [], syncTimestamp: "2026-07-03T00:00:00.000Z" },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn().mockResolvedValue("uploaded");
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    // The binary is a first-class localOnly entry, uploaded via the BYTE path.
+    expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
+      serverOnly: [],
+      localOnly: ["/attachments/photo.png"],
+      conflicts: [],
+    });
+    expect(runtime.uploadReconciledBinaryFile).toHaveBeenCalledTimes(1);
+    const [uploadedPath, uploadedBytes] =
+      runtime.uploadReconciledBinaryFile.mock.calls[0];
+    expect(uploadedPath).toBe("attachments/photo.png");
+    expect(new Uint8Array(uploadedBytes)).toEqual(AR1_BINARY_BYTES);
+    expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
+  });
+
+  it("performInitialReconciliation excludes an oversize local binary — never uploaded, serverOnly, or overwritten (L10)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.vaultLeaseDenied = false;
+    const oversize = new Uint8Array(BINARY_SYNC_MAX_BYTES + 1);
+    oversize[8] = 0xff; // ensure the content probe classifies it binary
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(oversize.buffer),
+      write: null,
+      writeBinary: vi.fn(),
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/huge.png" }]);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.applyRemoteChange = vi.fn();
+    plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
+    plugin.askReconciliationPlan = vi
+      .fn()
+      .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            // A server copy of the SAME oversize path: it must NOT be classified
+            // serverOnly and written over the intact local (only) copy.
+            deltas: [
+              {
+                path: "/attachments/huge.png",
+                action: "created",
+                lastModified: "x",
+                checksum: "c",
+                size: 99,
+              },
+            ],
+            syncTimestamp: "2026-07-03T00:00:00.000Z",
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn().mockResolvedValue("uploaded");
+    mockNotice.mockClear();
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    // Invisible to the plan: not serverOnly (no overwrite), not localOnly (no
+    // upload), not a conflict.
+    expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
+      serverOnly: [],
+      localOnly: [],
+      conflicts: [],
+    });
+    expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
     expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+    // A throttled size Notice named the ~7 MiB limit + BIN-B.
+    const sizedNotice = mockNotice.mock.calls.some(
+      ([message]) =>
+        typeof message === "string" &&
+        message.includes("7 MiB") &&
+        message.includes("BIN-B")
+    );
+    expect(sizedNotice).toBe(true);
+  });
+
+  it("resolveReconciliationConflict KEEP_LOCAL byte-uploads a binary entry, never the string uploader (BIN-A / L4)", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.uploadReconciledFile = vi.fn(); // string uploader must NOT be used
+    plugin.applyRemoteChange = vi.fn();
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn().mockResolvedValue("uploaded");
+    const manifest = new Map([
+      [
+        "/attachments/photo.png",
+        { kind: "binary", bytes: AR1_BINARY_BYTES.buffer, hash: "h" },
+      ],
+    ]);
+
+    await runtime.resolveReconciliationConflict(
+      "/attachments/photo.png",
+      ConflictResolutionStrategy.KEEP_LOCAL,
+      manifest
+    );
+
+    expect(runtime.uploadReconciledBinaryFile).toHaveBeenCalledTimes(1);
+    const [p, b] = runtime.uploadReconciledBinaryFile.mock.calls[0];
+    expect(p).toBe("attachments/photo.png");
+    expect(new Uint8Array(b)).toEqual(AR1_BINARY_BYTES);
+    expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
+    expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+  });
+
+  it("resolveReconciliationConflict KEEP_REMOTE byte-pulls a binary via the applyRemoteChange chokepoint (BIN-A / L4)", async () => {
+    const plugin = makePlugin();
+    plugin.applyRemoteChange = vi.fn().mockResolvedValue(undefined);
+    plugin.uploadReconciledFile = vi.fn();
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn();
+    runtime.writeLocalBinaryFileFromRemote = vi.fn();
+    const manifest = new Map([
+      [
+        "/attachments/photo.png",
+        { kind: "binary", bytes: AR1_BINARY_BYTES.buffer, hash: "h" },
+      ],
+    ]);
+
+    await runtime.resolveReconciliationConflict(
+      "/attachments/photo.png",
+      ConflictResolutionStrategy.KEEP_REMOTE,
+      manifest
+    );
+
+    // The single chokepoint pulls the remote; byte-vs-string is decided INSIDE
+    // applyRemoteChange on the GET-response contentType (D-06). No local upload.
+    expect(plugin.applyRemoteChange).toHaveBeenCalledWith({
+      path: "attachments/photo.png",
+      size: 0,
+    });
+    expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
+    expect(runtime.writeLocalBinaryFileFromRemote).not.toHaveBeenCalled();
+  });
+
+  it("resolveReconciliationConflict DUPLICATE byte-writes local to the conflict path then byte-pulls the remote (BIN-A / L4)", async () => {
+    const plugin = makePlugin();
+    plugin.writeLocalFileFromRemote = vi.fn(); // string writer must NOT be used
+    plugin.applyRemoteChange = vi.fn().mockResolvedValue(undefined);
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.writeLocalBinaryFileFromRemote = vi.fn().mockResolvedValue(undefined);
+    const manifest = new Map([
+      [
+        "/attachments/photo.png",
+        { kind: "binary", bytes: AR1_BINARY_BYTES.buffer, hash: "h" },
+      ],
+    ]);
+
+    await runtime.resolveReconciliationConflict(
+      "/attachments/photo.png",
+      ConflictResolutionStrategy.DUPLICATE,
+      manifest
+    );
+
+    // Local bytes written to a conflict-named path via the reused byte writer...
+    expect(runtime.writeLocalBinaryFileFromRemote).toHaveBeenCalledTimes(1);
+    const [conflictPath, bytes] =
+      runtime.writeLocalBinaryFileFromRemote.mock.calls[0];
+    expect(conflictPath).toMatch(/^attachments\/photo \(conflict .*\)\.png$/);
+    expect(new Uint8Array(bytes)).toEqual(AR1_BINARY_BYTES);
+    // ...and the remote byte-pulled into the ORIGINAL path.
+    expect(plugin.applyRemoteChange).toHaveBeenCalledWith({
+      path: "attachments/photo.png",
+      size: 0,
+    });
+    expect(plugin.writeLocalFileFromRemote).not.toHaveBeenCalled();
+  });
+
+  it("counts a reconciled binary upload as an upload (not a skip) in the summary (BIN-A / D-11)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.vaultLeaseDenied = false;
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
+      write: null,
+      writeBinary: vi.fn(),
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/photo.png" }]);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.applyRemoteChange = vi.fn();
+    plugin.askReconciliationPlan = vi
+      .fn()
+      .mockResolvedValue({ proceed: true, conflictStrategy: "keep_local" });
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: { deltas: [], syncTimestamp: "2026-07-03T00:00:00.000Z" },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+    const runtime = plugin.ensureSyncRuntime();
+    runtime.uploadReconciledBinaryFile = vi.fn().mockResolvedValue("uploaded");
+    mockNotice.mockClear();
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    // The completion summary counts the binary in the UPLOAD bucket (D-11), not
+    // as a skip.
+    const completeNotice = mockNotice.mock.calls.find(
+      ([message]) =>
+        typeof message === "string" && message.includes("Reconciliation complete")
+    );
+    expect(completeNotice?.[0]).toContain("1 uploaded");
+    expect(completeNotice?.[0]).not.toContain("skipped");
   });
 
   it("queues both rename halves and tombstones the old path when offline/lease-less (SY4)", async () => {
@@ -2726,12 +4479,14 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(typeof plugin.settings.deletionTombstones["folder-a/note.md"]).toBe("string");
   });
 
-  it("syncFileRenameToServer leaves binary files alone instead of PUTting a lossy decode (AR1)", async () => {
+  it("syncFileRenameToServer renames an online binary via a byte PUT + old-path DELETE (BIN-A / L1)", async () => {
     const plugin = makePlugin();
     plugin.settings.serverVaultId = "vault-abc";
     plugin.session = makeSession();
     plugin.keyLease = makeKeyLease();
     plugin.connectionState.status = "online";
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    plugin.emitPermissionChanged = vi.fn();
     plugin.originalAdapterMethods = {
       read: vi.fn(),
       readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
@@ -2740,13 +4495,138 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       remove: null,
       rename: null,
     };
+    const calls: any[] = [];
+    plugin.apiRequest = vi.fn(
+      async (method: string, path: string, body: any, _idT: unknown, options: unknown) => {
+        calls.push({ method, path, body, options });
+        return { success: true, data: {}, error: null, requestId: "r" };
+      }
+    );
+
+    await plugin.syncFileRenameToServer("attachments/old.png", "attachments/new.png");
+
+    const put = calls.find((c) => c.method === "PUT");
+    const del = calls.find((c) => c.method === "DELETE");
+    // Byte PUT of the NEW path: contentType + large-body timeout, ciphertext
+    // round-trips to the original bytes.
+    expect(put).toBeDefined();
+    expect(put.path).toContain("new.png");
+    expect(put.body.contentType).toBe("image/png");
+    expect(put.options).toEqual({ timeoutMs: 120000 });
+    const decrypted = await plugin.decryptContentBytes(put.body.content);
+    expect(new Uint8Array(decrypted)).toEqual(AR1_BINARY_BYTES);
+    // OLD path still DELETEd (the rename completes on the server).
+    expect(del).toBeDefined();
+    expect(del.path).toContain("old.png");
+  });
+
+  it("syncFileRenameToServer queues an offline binary rename as a base64 write + delete (BIN-A / L1)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = null; // lease-less → offline branch
+    plugin.connectionState.status = "offline";
+    plugin.settings.deletionTombstones = {};
+    plugin.offlineQueue = [];
     plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
     plugin.apiRequest = vi.fn();
 
     await plugin.syncFileRenameToServer("attachments/old.png", "attachments/new.png");
 
-    // Neither the PUT of decoded-as-text content nor the old-path DELETE ran.
     expect(plugin.apiRequest).not.toHaveBeenCalled();
+    const writeOp = plugin.offlineQueue.find((o: any) => o.operation === "write");
+    const deleteOp = plugin.offlineQueue.find((o: any) => o.operation === "delete");
+    // Queued write carries encoding "base64" + contentType; data is base64 of
+    // the PLAIN bytes so the flush replays it through the byte crypto path.
+    expect(writeOp).toMatchObject({
+      operation: "write",
+      path: "attachments/new.png",
+      encoding: "base64",
+      contentType: "image/png",
+    });
+    expect(writeOp.data).toBe(Buffer.from(AR1_BINARY_BYTES).toString("base64"));
+    expect(deleteOp).toMatchObject({ operation: "delete", path: "attachments/old.png" });
+    expect(typeof plugin.settings.deletionTombstones["attachments/old.png"]).toBe("string");
+  });
+
+  it("syncFileRenameToServer skips ALL server ops for an oversize binary rename (no PUT/queue/delete + Notice, L10)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.offlineQueue = [];
+    plugin.settings.deletionTombstones = {};
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    const oversize = new Uint8Array(BINARY_SYNC_MAX_BYTES + 1);
+    oversize[8] = 0xff; // ensure the content probe classifies it binary
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(oversize.buffer),
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.apiRequest = vi.fn();
+    mockNotice.mockClear();
+
+    await plugin.syncFileRenameToServer("attachments/huge-old.png", "attachments/huge-new.png");
+
+    // Same conservative rule as interceptedRename (11-02): never a PUT, never a
+    // queued write, never a delete of the old server copy we can't replace.
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+    expect(plugin.offlineQueue).toHaveLength(0);
+    expect(plugin.settings.deletionTombstones).toEqual({});
+    const noticed = mockNotice.mock.calls.some(
+      ([message]) =>
+        typeof message === "string" &&
+        message.includes("7 MiB") &&
+        message.includes("BIN-B")
+    );
+    expect(noticed).toBe(true);
+  });
+
+  it("syncFileRenameToServer on a legacy adapter (no readBinary) keeps the string PUT path (AR2/D-10)", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.WRITE);
+    plugin.emitPermissionChanged = vi.fn();
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: null, // legacy: capability gate closed
+      write: null,
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.readPlainFromDisk = vi.fn().mockResolvedValue("legacy note text");
+    plugin.readPlainBinaryFromDisk = vi.fn(); // must NOT be called
+    const calls: any[] = [];
+    plugin.apiRequest = vi.fn(async (method: string, path: string, body: any) => {
+      calls.push({ method, path, body });
+      return { success: true, data: {}, error: null, requestId: "r" };
+    });
+
+    await plugin.syncFileRenameToServer("attachments/old.png", "attachments/new.png");
+
+    const put = calls.find((c) => c.method === "PUT");
+    // String PUT body (no contentType) — byte-identical to pre-BIN-A behavior.
+    expect(put).toBeDefined();
+    expect(Object.keys(put.body).sort()).toEqual(["content", "hash"]);
+    expect(put.body.contentType).toBeUndefined();
+    expect(plugin.readPlainBinaryFromDisk).not.toHaveBeenCalled();
   });
 
   // Regression: cold-path (full-scan) deletions are INFERRED from manifest-vs-S3
@@ -2920,6 +4800,178 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(envelopeFiles.has(envelopePath)).toBe(false);
   });
 
+  describe("offline-queue v2 envelope (BIN-A / D-09)", () => {
+    const envelopePath = ".obsidian/plugins/vaultguard-sync/offline-queue.envelope";
+    let envelopeFiles: Map<string, ArrayBuffer>;
+
+    beforeEach(() => {
+      envelopeFiles = new Map<string, ArrayBuffer>();
+      vi.stubGlobal("localStorage", makeMemoryStorage());
+    });
+
+    function wireEnvelopePlugin() {
+      const plugin = makePlugin();
+      plugin.manifest = { id: "vaultguard-sync" };
+      plugin.app.vault.configDir = ".obsidian";
+      plugin.app.vault.adapter = {
+        exists: vi.fn(async (p: string) => envelopeFiles.has(p)),
+        remove: vi.fn(async (p: string) => {
+          envelopeFiles.delete(p);
+        }),
+      };
+      plugin.originalAdapterMethods = {
+        read: null,
+        write: null,
+        list: null,
+        remove: null,
+        rename: null,
+        readBinary: vi.fn(async (p: string) => envelopeFiles.get(p)!),
+        writeBinary: vi.fn(async (p: string, bytes: ArrayBuffer) => {
+          envelopeFiles.set(p, bytes);
+        }),
+      };
+      // Identity cipher: the persisted "ciphertext" is the UTF-8 bytes of the
+      // JSON plaintext, so a test can decode the stored envelope to assert its
+      // shape (and the version tag).
+      plugin.atRestCipher = {
+        isReady: () => true,
+        encryptString: vi.fn(async (s: string) => new TextEncoder().encode(s).buffer),
+        decryptString: vi.fn(async (b: ArrayBuffer) => new TextDecoder().decode(b)),
+      };
+      plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+      plugin.waitForCipherInit = vi.fn().mockResolvedValue(true);
+      return plugin;
+    }
+
+    it("round-trips a v2 envelope with a text op and a binary op across restart", async () => {
+      const plugin1 = wireEnvelopePlugin();
+      plugin1.offlineQueue = [
+        {
+          operation: "write",
+          path: "notes/a.md",
+          data: "hello",
+          timestamp: "2026-07-03T00:00:00.000Z",
+        },
+        {
+          operation: "write",
+          path: "img/pic.png",
+          data: "iVBORw0KGgo=",
+          timestamp: "2026-07-03T00:00:01.000Z",
+          encoding: "base64",
+          contentType: "image/png",
+        },
+      ];
+      await plugin1.persistOfflineQueue();
+
+      // The on-disk envelope is v2 (identity cipher ⇒ plaintext is the UTF-8 JSON).
+      const stored = envelopeFiles.get(envelopePath)!;
+      expect(JSON.parse(new TextDecoder().decode(stored)).v).toBe(2);
+
+      // Restart: a fresh instance restores both ops with their fields intact.
+      const plugin2 = wireEnvelopePlugin();
+      plugin2.offlineQueue = [];
+      await plugin2.loadPersistedOfflineQueue();
+
+      expect(plugin2.offlineQueue).toEqual([
+        expect.objectContaining({ operation: "write", path: "notes/a.md", data: "hello" }),
+        expect.objectContaining({
+          operation: "write",
+          path: "img/pic.png",
+          data: "iVBORw0KGgo=",
+          encoding: "base64",
+          contentType: "image/png",
+        }),
+      ]);
+      // The text op restored WITHOUT a spurious binary marker.
+      expect(plugin2.offlineQueue[0].encoding).toBeUndefined();
+      expect(plugin2.offlineQueue[0].contentType).toBeUndefined();
+    });
+
+    it("still restores a legacy v1 envelope written by an older build", async () => {
+      const plugin = wireEnvelopePlugin();
+      // Hand-write a v1 envelope through the same identity cipher (persist now
+      // always writes v2, so v1 can only arrive from an older build on disk).
+      const v1Json = JSON.stringify({
+        v: 1,
+        ops: [
+          {
+            operation: "write",
+            path: "notes/old.md",
+            data: "legacy",
+            timestamp: "2026-07-01T00:00:00.000Z",
+          },
+        ],
+      });
+      envelopeFiles.set(envelopePath, new TextEncoder().encode(v1Json).buffer);
+
+      plugin.offlineQueue = [];
+      await plugin.loadPersistedOfflineQueue();
+
+      expect(plugin.offlineQueue).toEqual([
+        expect.objectContaining({ operation: "write", path: "notes/old.md", data: "legacy" }),
+      ]);
+    });
+
+    it("drops a v2 entry with an unknown encoding but keeps valid siblings", async () => {
+      const plugin = wireEnvelopePlugin();
+      const v2Json = JSON.stringify({
+        v: 2,
+        ops: [
+          {
+            operation: "write",
+            path: "img/ok.png",
+            data: "AAAA",
+            timestamp: "2026-07-03T00:00:00.000Z",
+            encoding: "base64",
+            contentType: "image/png",
+          },
+          {
+            operation: "write",
+            path: "img/bad.bin",
+            data: "ffff",
+            timestamp: "2026-07-03T00:00:01.000Z",
+            encoding: "hex",
+          },
+          {
+            operation: "write",
+            path: "notes/ok.md",
+            data: "text",
+            timestamp: "2026-07-03T00:00:02.000Z",
+          },
+        ],
+      });
+      envelopeFiles.set(envelopePath, new TextEncoder().encode(v2Json).buffer);
+
+      plugin.offlineQueue = [];
+      await plugin.loadPersistedOfflineQueue();
+
+      const paths = plugin.offlineQueue.map((op: any) => op.path);
+      expect(paths).toEqual(["img/ok.png", "notes/ok.md"]);
+      expect(paths).not.toContain("img/bad.bin");
+      expect(plugin.logError).toHaveBeenCalledWith(
+        expect.stringContaining("unknown queue encoding"),
+        expect.any(Error)
+      );
+    });
+
+    it("persists the envelope as v2 (plaintext handed to the cipher)", async () => {
+      const plugin = wireEnvelopePlugin();
+      const encryptSpy = plugin.atRestCipher.encryptString;
+      plugin.offlineQueue = [
+        {
+          operation: "write",
+          path: "notes/a.md",
+          data: "hi",
+          timestamp: "2026-07-03T00:00:00.000Z",
+        },
+      ];
+      await plugin.persistOfflineQueue();
+      expect(encryptSpy).toHaveBeenCalledTimes(1);
+      const plaintext = encryptSpy.mock.calls[0][0] as string;
+      expect(JSON.parse(plaintext).v).toBe(2);
+    });
+  });
+
   it("preserves the local permission cache when the sync response does not signal permissionsChanged", async () => {
     const plugin = makePlugin();
     plugin.settings.serverVaultId = "vault-abc";
@@ -2992,6 +5044,9 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     const files = [
       { path: "Welcome.md" },
       { path: "notes/idea.md" },
+      // BIN-A: binaries flow in presence-only via vault.getFiles() — no byte
+      // hash goes on the wire here (the manifest is deletion-detection only).
+      { path: "attachments/photo.png" },
       { path: ".obsidian/plugins/vaultguard-sync/data.json" },
       { path: "secret/private.md" },
     ];
@@ -3011,6 +5066,8 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     expect(manifest["/Welcome.md"]).toBe("");
     expect(manifest["/notes/idea.md"]).toBe("");
+    // BIN-A: a binary path appears presence-only (empty value), exactly like text.
+    expect(manifest["/attachments/photo.png"]).toBe("");
     expect(manifest).not.toHaveProperty("/.obsidian/plugins/vaultguard-sync/data.json");
     expect(manifest).not.toHaveProperty("/secret/private.md");
     expect(manifest["/notes/.vaultguard-folder"]).toBe("");
@@ -3152,6 +5209,92 @@ describe("VaultGuardPlugin limited-access placeholder flow", () => {
     expect(plugin.writePlainToDisk).toHaveBeenCalledWith("permitted/b.md", "");
     expect(plugin.placeholderPaths.has("permitted/a.md")).toBe(true);
     expect(plugin.placeholderPaths.has("permitted/b.md")).toBe(true);
+  });
+
+  it("skips empty placeholders for known-binary-extension serverOnly paths (BIN-A/L6 option b), keeping text + extensionless placeholders", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.connectionState.status = "online";
+    plugin.isOnline = vi.fn(() => true);
+    plugin.computeHash = vi.fn(async (s: string) => "h-" + s);
+    plugin.app.vault.getFiles = vi.fn(() => []);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+    plugin.ensureLocalFolderPath = vi.fn().mockResolvedValue(true);
+    plugin.isFolderMarkerPath = vi.fn((p: string) => p.endsWith(".vaultguard-folder"));
+    plugin.askReconciliationPlan = vi.fn(); // must NOT be called in limited mode
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        deltas: [
+          { path: "/notes/note.md", action: "created", lastModified: "x", checksum: "c1", size: 1 },
+          { path: "/attachments/photo.png", action: "created", lastModified: "x", checksum: "c2", size: 2 },
+          { path: "/data/export", action: "created", lastModified: "x", checksum: "c3", size: 3 },
+        ],
+        syncTimestamp: "2026-07-03T00:00:00.000Z",
+      },
+      error: null,
+      requestId: "req-recon",
+    });
+
+    const ok = await plugin.performInitialReconciliation();
+
+    expect(ok).toBe(true);
+    // Text note + extension-less path get placeholders...
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith("notes/note.md", "");
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith("data/export", "");
+    expect(plugin.placeholderPaths.has("notes/note.md")).toBe(true);
+    expect(plugin.placeholderPaths.has("data/export")).toBe(true);
+    // ...but the binary attachment is never placeholdered (would be a broken image).
+    expect(plugin.writePlainToDisk).not.toHaveBeenCalledWith("attachments/photo.png", "");
+    expect(plugin.placeholderPaths.has("attachments/photo.png")).toBe(false);
+  });
+
+  it("never overwrites a locally-existing binary via the lease-denied placeholder branch (OD-2 regression guard)", async () => {
+    const plugin = makeLimitedPlugin();
+    plugin.connectionState.status = "online";
+    plugin.isOnline = vi.fn(() => true);
+    plugin.computeHash = vi.fn(async (s: string) => "h-" + s);
+    // A local binary that ALSO exists on the server (same path).
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn(),
+      write: null,
+      writeBinary: vi.fn(),
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.readPlainBinaryFromDisk = vi
+      .fn()
+      .mockResolvedValue(new Uint8Array([0x89, 0x50, 0x80, 0xff]).buffer);
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/photo.png" }]);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+    plugin.ensureLocalFolderPath = vi.fn().mockResolvedValue(true);
+    plugin.isFolderMarkerPath = vi.fn((p: string) => p.endsWith(".vaultguard-folder"));
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        deltas: [
+          { path: "/attachments/photo.png", action: "created", lastModified: "x", checksum: "c", size: 2 },
+        ],
+        syncTimestamp: "2026-07-03T00:00:00.000Z",
+      },
+      error: null,
+      requestId: "req-recon",
+    });
+
+    const ok = await plugin.performInitialReconciliation();
+
+    expect(ok).toBe(true);
+    // The on-disk binary is never overwritten with an empty placeholder (it is a
+    // local file, excluded from serverOnly; the placeholder branch never sees it).
+    expect(plugin.writePlainToDisk).not.toHaveBeenCalledWith("attachments/photo.png", "");
+    expect(plugin.placeholderPaths.has("attachments/photo.png")).toBe(false);
   });
 
   it("placeholderPaths is cleared when checkKeyLeaseRenewal recovers from limited -> ok", async () => {

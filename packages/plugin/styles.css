@@ -12,6 +12,7 @@
 .modal.vaultguard-dialog-modal,
 .modal.vaultguard-login-modal,
 .modal.vaultguard-mfa-setup-modal,
+.modal.vaultguard-long-operation-modal,
 .modal.vaultguard-permission-rule-modal,
 .modal.vaultguard-reconciliation-modal,
 .modal.vaultguard-vault-picker-modal,
@@ -26,6 +27,7 @@
 .modal.vaultguard-dialog-modal .modal-content,
 .modal.vaultguard-login-modal .modal-content,
 .modal.vaultguard-mfa-setup-modal .modal-content,
+.modal.vaultguard-long-operation-modal .modal-content,
 .modal.vaultguard-permission-rule-modal .modal-content,
 .modal.vaultguard-reconciliation-modal .modal-content,
 .modal.vaultguard-vault-picker-modal .modal-content,
@@ -147,6 +149,236 @@
 
 .vaultguard-status-text {
   color: var(--text-muted);
+}
+
+/* Long Operation Progress */
+
+.vaultguard-long-op-statusbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-normal);
+}
+
+.vaultguard-long-op-statusbar-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--vaultguard-progress-accent, #14b8a6);
+}
+
+.vaultguard-long-op-statusbar-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.vaultguard-long-op-statusbar-label {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.86em;
+}
+
+.modal.vaultguard-long-operation-modal {
+  width: 620px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 48px);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+.modal.vaultguard-long-operation-modal .modal-content {
+  padding: 0;
+  overflow: hidden;
+}
+
+.vaultguard-long-op-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 22px 24px 20px;
+  color: var(--text-normal);
+  background:
+    linear-gradient(180deg, rgba(20, 184, 166, 0.1), transparent 160px),
+    var(--background-primary);
+}
+
+.vaultguard-long-op-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.vaultguard-long-op-icon {
+  display: flex;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 36px;
+  border-radius: 8px;
+  color: var(--vaultguard-progress-accent, #14b8a6);
+  background: rgba(20, 184, 166, 0.12);
+  border: 1px solid rgba(20, 184, 166, 0.35);
+}
+
+.vaultguard-long-op-title-wrap {
+  min-width: 0;
+}
+
+.vaultguard-long-op-title {
+  margin: 0;
+  color: var(--text-normal);
+  font-size: 1.14em;
+  line-height: 1.25;
+}
+
+.vaultguard-long-op-subtitle {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 0.86em;
+}
+
+.vaultguard-long-op-phase {
+  display: grid;
+  grid-template-columns: minmax(74px, max-content) 1fr;
+  gap: 12px;
+  align-items: baseline;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-long-op-phase-label,
+.vaultguard-long-op-metric-label {
+  color: var(--text-muted);
+  font-size: 0.78em;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.vaultguard-long-op-phase-value {
+  min-width: 0;
+  color: var(--text-normal);
+  overflow-wrap: anywhere;
+}
+
+.vaultguard-long-op-progress-track {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  height: 12px;
+  border-radius: 6px;
+  background: var(--background-modifier-border);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+}
+
+.vaultguard-long-op-progress-fill {
+  height: 100%;
+  min-width: 2px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #14b8a6, #38bdf8);
+}
+
+.vaultguard-long-op-progress-fill.is-indeterminate {
+  opacity: 0.72;
+  background:
+    repeating-linear-gradient(
+      45deg,
+      rgba(20, 184, 166, 0.9) 0,
+      rgba(20, 184, 166, 0.9) 8px,
+      rgba(56, 189, 248, 0.9) 8px,
+      rgba(56, 189, 248, 0.9) 16px
+    );
+}
+
+.vaultguard-long-op-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.vaultguard-long-op-metric {
+  min-width: 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+
+.vaultguard-long-op-metric-value {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-normal);
+  font-size: 0.94em;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.vaultguard-long-op-warning,
+.vaultguard-long-op-stall,
+.vaultguard-long-op-protected,
+.vaultguard-long-op-failure {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  line-height: 1.4;
+}
+
+.vaultguard-long-op-warning {
+  color: var(--text-normal);
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.vaultguard-long-op-stall {
+  color: var(--text-normal);
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.32);
+}
+
+.vaultguard-long-op-protected {
+  color: var(--text-normal);
+  background: rgba(20, 184, 166, 0.1);
+  border: 1px solid rgba(20, 184, 166, 0.32);
+}
+
+.vaultguard-long-op-failure {
+  color: var(--text-normal);
+  background: rgba(239, 68, 68, 0.11);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.vaultguard-long-op-message {
+  color: var(--text-muted);
+  font-size: 0.9em;
+  line-height: 1.4;
+}
+
+.vaultguard-long-op-controls {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.vaultguard-long-op-control {
+  min-width: 120px;
+}
+
+@media (max-width: 560px) {
+  .vaultguard-long-op-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .vaultguard-long-op-statusbar-label {
+    max-width: 160px;
+  }
 }
 
 /* ─── Ribbon Auth Indicator ──────────────────────────────────────────────── */
@@ -6340,6 +6572,22 @@ button .vaultguard-btn-spinner:only-child {
   padding: 0;
 }
 
+.vaultguard-pg-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+}
+
+.vaultguard-pg-title {
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+}
+
 /* --- Toolbar: legend (filter) + depth control ----------------------------- */
 .vaultguard-pg-toolbar {
   display: flex;
@@ -6352,6 +6600,61 @@ button .vaultguard-btn-spinner:only-child {
   padding: 8px 10px;
   border-bottom: 1px solid var(--background-modifier-border);
   background-color: var(--background-secondary);
+}
+
+.vaultguard-pg-options-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.vaultguard-pg-options-summary:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.vaultguard-pg-options-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(120px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+}
+
+.vaultguard-pg-option-field,
+.vaultguard-pg-option-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.vaultguard-pg-option-field {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.vaultguard-pg-option-field input,
+.vaultguard-pg-option-field select {
+  width: 100%;
+  min-width: 0;
+  font-size: var(--font-ui-smaller);
+}
+
+.vaultguard-pg-option-toggle {
+  justify-content: flex-start;
 }
 
 .vaultguard-pg-legend {
@@ -6430,6 +6733,19 @@ button .vaultguard-btn-spinner:only-child {
   background-color: var(--color-purple, #a371e0); /* admin */
   height: 4px;
   border-radius: 2px;
+}
+
+.vaultguard-pg-large-notice {
+  margin: 8px 10px 0;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--color-yellow, #e0a526);
+  border-radius: var(--radius-s);
+  background-color: var(--background-secondary);
+}
+
+.vaultguard-pg-large-notice.is-hidden {
+  display: none;
 }
 
 .vaultguard-pg-depth {
@@ -6657,6 +6973,22 @@ button .vaultguard-btn-spinner:only-child {
   background-color: var(--background-modifier-hover);
 }
 
+.vaultguard-pg-show-more {
+  margin-top: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+
+.vaultguard-pg-show-more:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
 .vaultguard-pg-explain-row-dot {
   flex: 0 0 auto;
   width: 11px;
@@ -6728,6 +7060,44 @@ button .vaultguard-btn-spinner:only-child {
   display: none;
 }
 
+/* --- Performance debug readout ------------------------------------------- */
+.vaultguard-pg-debug {
+  margin: 0 10px 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.vaultguard-pg-debug details {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--background-secondary);
+}
+
+.vaultguard-pg-debug-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.vaultguard-pg-debug-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 10px;
+  padding: 0 8px 8px;
+}
+
+.vaultguard-pg-debug-grid > div:nth-child(odd) {
+  color: var(--text-faint);
+}
+
+.vaultguard-pg-debug-grid > div:nth-child(even) {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
 /* --- Empty / connect state ------------------------------------------------ */
 .vaultguard-pg-empty {
   display: flex;
@@ -6777,4 +7147,224 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-pg-empty-action-icon .svg-icon {
   width: 16px;
   height: 16px;
+}
+
+/* ── Phase 12: vault idle-lock curtain (restyled to the login modal, 260708-g9m) ── */
+.vaultguard-lock-curtain {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  /* Opaque by construction (Pitfall 1 / T-g9m-03): no transparency, so
+     already-rendered plaintext behind the curtain can never show through. */
+  background: var(--background-primary);
+}
+.vaultguard-lock-curtain__card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: min(420px, calc(100vw - 32px));
+  padding: 32px 28px 24px;
+  border-radius: 12px;
+  background: var(--background-secondary);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.35);
+  box-sizing: border-box;
+}
+.vaultguard-lock-curtain__icon {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 4px;
+  color: var(--interactive-accent);
+  line-height: 1;
+}
+.vaultguard-lock-curtain__icon svg {
+  display: block;
+  width: 48px;
+  height: 48px;
+}
+.vaultguard-lock-curtain__title {
+  text-align: center;
+  margin: 0 0 4px;
+  font-size: 1.35em;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.vaultguard-lock-curtain__subtitle {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.88em;
+  margin: 0 0 8px;
+  line-height: 1.4;
+}
+.vaultguard-lock-curtain__input {
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 0.95em;
+  line-height: 1.3;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  box-sizing: border-box;
+  box-shadow: none;
+}
+.vaultguard-lock-curtain__input:focus {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px rgba(var(--interactive-accent-rgb, 124, 58, 237), 0.18);
+}
+.vaultguard-lock-curtain__input::placeholder {
+  color: var(--text-faint);
+}
+.vaultguard-lock-curtain__error {
+  min-height: 1.2em;
+  color: var(--text-error);
+  font-size: 0.85em;
+  text-align: center;
+  line-height: 1.4;
+}
+.vaultguard-lock-curtain__unlock {
+  width: 100%;
+  min-height: 36px;
+  padding: 9px 16px;
+  border-radius: 6px;
+  font-size: 0.92em;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--text-on-accent);
+  background-color: var(--interactive-accent);
+  border: none;
+  transition: background-color 0.15s, opacity 0.15s;
+}
+.vaultguard-lock-curtain__unlock:hover {
+  background-color: var(--interactive-accent-hover);
+}
+.vaultguard-lock-curtain__unlock:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.vaultguard-lock-curtain__biometric {
+  width: 100%;
+  min-height: 36px;
+  padding: 9px 16px;
+  border-radius: 6px;
+  font-size: 0.92em;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--text-normal);
+  background-color: var(--interactive-normal);
+  border: none;
+  transition: background-color 0.15s, opacity 0.15s;
+}
+.vaultguard-lock-curtain__biometric:hover {
+  background-color: var(--interactive-hover);
+}
+.vaultguard-lock-curtain__forgot {
+  margin-top: 2px;
+  text-align: center;
+  color: var(--interactive-accent);
+  font-size: 0.82em;
+  text-decoration: none;
+  cursor: pointer;
+}
+.vaultguard-lock-curtain__forgot:hover {
+  text-decoration: underline;
+}
+
+/* ── Phase 12: PIN modals restyled to match the login modal (260708-g9m) ─────── */
+.modal.vaultguard-pin-modal {
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  display: flex;
+  flex-direction: column;
+}
+.vaultguard-pin-modal-content {
+  padding: 32px 28px 24px;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+.vaultguard-pin-modal-icon {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 12px;
+  color: var(--interactive-accent);
+  line-height: 1;
+}
+.vaultguard-pin-modal-icon svg {
+  display: block;
+  width: 48px;
+  height: 48px;
+}
+.vaultguard-pin-modal-title {
+  text-align: center;
+  margin: 0 0 4px;
+  font-size: 1.35em;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.vaultguard-pin-modal-subtitle {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.88em;
+  margin: 0 0 20px;
+  line-height: 1.4;
+}
+/* Field groups sit directly in the modal content (no login-form wrapper), so
+   give them the same vertical rhythm the login form's `gap` provides. */
+.vaultguard-pin-modal-content .vaultguard-field-group {
+  margin-bottom: 16px;
+}
+.vaultguard-pin-modal-error {
+  min-height: 1.2em;
+  color: var(--text-error);
+  font-size: 0.85em;
+  text-align: left;
+  line-height: 1.4;
+}
+.vaultguard-pin-modal-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid var(--background-modifier-border);
+  flex-shrink: 0;
+}
+.vaultguard-pin-modal-actions button {
+  flex: 1;
+  min-width: 0;
+  min-height: 36px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 0.92em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s, opacity 0.15s;
+  white-space: nowrap;
+}
+.vaultguard-pin-modal-actions button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+@media (max-width: 720px) {
+  .vaultguard-pg-options-grid {
+    grid-template-columns: repeat(2, minmax(110px, 1fr));
+  }
+
+  .vaultguard-pg-body {
+    flex-direction: column;
+  }
+
+  .vaultguard-pg-explain {
+    width: auto;
+    flex-basis: 190px;
+    border-left: none;
+    border-top: 1px solid var(--background-modifier-border);
+  }
 }

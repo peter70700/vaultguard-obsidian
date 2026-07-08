@@ -26,6 +26,11 @@ const SYSTEM_BLOCKS: ReadonlyArray<string> = [
     "which files matter before you start reading whole files — it is cheaper than " +
     "listing and reading everything. Then read only the files you need.",
 
+  "Use vaultguard_get_vault_orientation before tasks that may involve multiple " +
+    "vaults, protected or encrypted content, Git state, connector readiness, or " +
+    "write safety. Treat the active vault as the default target unless the user " +
+    "names another vault, and confirm the target vault before cross-vault writes.",
+
   "When editing, prefer vaultguard_apply_patch with a minimal unified diff over " +
     "rewriting a whole file. Use vaultguard_create only for genuinely new files. " +
     "Writes may require the user to confirm each change before it touches disk.",

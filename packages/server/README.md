@@ -80,7 +80,7 @@ later via `vaultguard_allow_public_signup = true`.
 | Re-encryption on user offboarding | ✅ |
 | Multi-vault support per organization | ✅ |
 | Plugin allowlist enforcement | ✅ |
-| Time-bound key leases (4h default, configurable) | ✅ |
+| Time-bound key leases (1h default, configurable) | ✅ |
 | Cognito-based auth (federate to your IdP if desired) | ✅ |
 | Basic audit trail (`GET /vaults/{vaultId}/audit/logs` — last 30 days on CE) | ✅ |
 | In-Obsidian admin UI (users / permissions / settings) | ✅ |
@@ -98,9 +98,9 @@ These features stay in the managed Pro plan ([upgrade](https://vaultguard.cloud)
 | **Advanced audit** (dashboards, alerts, CSV export, per-user/per-file reports) | Anomaly detection, scheduled reports, full retention window (CE caps audit queries at 30 days) |
 | **Stripe-backed billing** | Managed subscription lifecycle |
 | **Managed AWS infrastructure** | We run it, patch it, back it up |
-| **Daily backups, 99.9% uptime SLA** | Operational guarantees |
-| **Email support, 24h SLA** | Human help when you need it |
-| **SOC 2 / HIPAA attestations** | Compliance evidence (Enterprise) |
+| **Managed backup and uptime targets** | Hosted operational program; contractual terms only by agreement |
+| **Email support targets** | Human help when you need it; response commitments depend on plan terms |
+| **SOC 2 / HIPAA evidence packages** | Enterprise evidence when available by agreement |
 | **SAML / OIDC SSO integration** | Federate to your IdP cleanly (Enterprise) |
 
 Share-link, billing, and web-admin endpoints exist in the CE terraform graph
@@ -214,7 +214,7 @@ managed migration if you want to move a large team.
 - **Bugs / feature requests:** open an issue on this repo.
 - **General questions:** [GitHub Discussions](https://github.com/peter70700/vaultguard-obsidian/discussions).
 - **Security disclosures:** email support@vaultguard.cloud.
-- **Commercial support, SLA, SSO, compliance:** [vaultguard.cloud](https://vaultguard.cloud).
+- **Commercial support, service-level terms, SSO, compliance evidence:** [vaultguard.cloud](https://vaultguard.cloud).
 
 ## License
 

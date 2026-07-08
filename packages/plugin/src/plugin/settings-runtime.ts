@@ -290,13 +290,22 @@ export class PluginSettingsRuntime {
     }
   }
 
-  async getResolvedApiEndpoint(idToken?: string, probePath?: string): Promise<string> {
+  async getResolvedApiEndpoint(
+    idToken?: string,
+    probePath?: string,
+    forceRefresh = false,
+  ): Promise<string> {
     const configuredApiEndpoint = normalizeVaultGuardApiBaseUrl(this.getEffectiveConfig().apiEndpoint);
     if (!configuredApiEndpoint) {
       return "";
     }
 
-    if (this.ctx.resolvedApiEndpoint) {
+    if (forceRefresh) {
+      this.ctx.setResolvedApiEndpoint(null);
+      this.ctx.setApiEndpointResolutionPromise(null);
+    }
+
+    if (!forceRefresh && this.ctx.resolvedApiEndpoint) {
       return this.ctx.resolvedApiEndpoint;
     }
 
@@ -304,7 +313,7 @@ export class PluginSettingsRuntime {
       return configuredApiEndpoint;
     }
 
-    if (this.ctx.apiEndpointResolutionPromise) {
+    if (!forceRefresh && this.ctx.apiEndpointResolutionPromise) {
       return await this.ctx.apiEndpointResolutionPromise;
     }
 

@@ -64,6 +64,10 @@ export interface GraphBuilderInput {
   rules?: ExplainRule[];
   /** Injectable "now" (ISO) for deterministic expiry detection. */
   now?: string;
+  /** Optional pre-render node-type controls; defaults preserve existing output. */
+  includeUsers?: boolean;
+  includeFiles?: boolean;
+  includeFolders?: boolean;
 }
 
 /**
@@ -180,6 +184,9 @@ export function buildGraphElements(input: GraphBuilderInput): GraphElement[] {
   const elements: GraphElement[] = [];
   const seen = new Set<string>();
   const roleByUser = new Map<string, ExplainVaultRole>();
+  const includeUsers = input.includeUsers !== false;
+  const includeFiles = input.includeFiles !== false;
+  const includeFolders = input.includeFolders !== false;
 
   const push = (el: GraphElement): void => {
     if (seen.has(el.data.id)) return;
@@ -188,6 +195,7 @@ export function buildGraphElements(input: GraphBuilderInput): GraphElement[] {
   };
 
   const ensureUserNode = (uid: string, member?: GraphMember, principal?: GraphPrincipal): void => {
+    if (!includeUsers) return;
     const label =
       member?.displayName?.trim() ||
       member?.email?.trim() ||
@@ -205,7 +213,7 @@ export function buildGraphElements(input: GraphBuilderInput): GraphElement[] {
   //    still feeds the expiry calc and the click→explain narration.)
   for (const member of input.members) {
     roleByUser.set(member.userId, member.role);
-    ensureUserNode(member.userId, member);
+    if (includeUsers) ensureUserNode(member.userId, member);
   }
 
   // Emit a faint containment edge parent→child. Deduplicated by id, so a folder
@@ -222,28 +230,39 @@ export function buildGraphElements(input: GraphBuilderInput): GraphElement[] {
     });
   };
 
-  // Ensure ancestor folder nodes exist and are chained by containment edges
+  // Ensure a folder node exists and is chained to its ancestors by containment edges
   // (FLAT model — no compound `parent` nesting). Top-level folders/files are
   // roots (no vault parent), so each folder subtree floats freely and the graph
   // stays connected through the users that span files.
-  const ensureFolderChain = (filePath: string): string | null => {
-    const folders = ancestorFolders(filePath);
+  const ensureFolderPath = (folderPath: string): string | null => {
+    if (!includeFolders) return null;
+    const folders = Array.from(new Set([...ancestorFolders(`${folderPath}/__folder`), normalizePath(folderPath)]));
     let parentId: string | null = null;
-    for (const folderPath of folders) {
-      const id = folderId(folderPath);
-      const segments = folderPath.split("/").filter(Boolean);
+    for (const currentFolderPath of folders) {
+      const id = folderId(currentFolderPath);
+      const segments = currentFolderPath.split("/").filter(Boolean);
       // Trailing "/" makes a folder unmistakable from a same-named file.
       push({
         data: {
           id,
           kind: "folder",
-          label: `${segments[segments.length - 1] ?? folderPath}/`,
-          path: folderPath,
+          label: `${segments[segments.length - 1] ?? currentFolderPath}/`,
+          path: currentFolderPath,
         },
         classes: "folder",
       });
       if (parentId) linkContainment(parentId, id);
       parentId = id;
+    }
+    return parentId;
+  };
+
+  const ensureFolderChain = (filePath: string): string | null => {
+    if (!includeFolders) return null;
+    const folders = ancestorFolders(filePath);
+    let parentId: string | null = null;
+    for (const folderPath of folders) {
+      parentId = ensureFolderPath(folderPath);
     }
     return parentId; // immediate parent node for the file, or null at vault root
   };
@@ -257,20 +276,22 @@ export function buildGraphElements(input: GraphBuilderInput): GraphElement[] {
     }
 
     const path = normalizePath(rawSummary.path);
-    const parentId = ensureFolderChain(path);
-    const segments = path.split("/").filter(Boolean);
-    push({
-      data: {
-        id: fileId(path),
-        kind: "file",
-        label: segments[segments.length - 1] ?? path,
-        path,
-      },
-      classes: "file",
-    });
-    if (parentId) linkContainment(parentId, fileId(path));
+    const parentId = includeFolders ? ensureFolderChain(path) : null;
+    if (includeFiles) {
+      const segments = path.split("/").filter(Boolean);
+      push({
+        data: {
+          id: fileId(path),
+          kind: "file",
+          label: segments[segments.length - 1] ?? path,
+          path,
+        },
+        classes: "file",
+      });
+      if (parentId) linkContainment(parentId, fileId(path));
 
-    addPermissionEdges(fileId(path), path, rawSummary.principals);
+      addPermissionEdges(fileId(path), path, rawSummary.principals);
+    }
   }
 
   // 4. Folder-level permission edges. Folders are evaluated at their own path
@@ -282,6 +303,7 @@ export function buildGraphElements(input: GraphBuilderInput): GraphElement[] {
     if (!folderSummary.principals || folderSummary.principals.length === 0) continue;
     const path = normalizePath(folderSummary.path);
     const fid = folderId(path);
+    if (!seen.has(fid) && !includeFiles && includeFolders) ensureFolderPath(path);
     if (!seen.has(fid)) continue;
     addPermissionEdges(fid, path, folderSummary.principals);
   }
@@ -290,6 +312,7 @@ export function buildGraphElements(input: GraphBuilderInput): GraphElement[] {
 
   // ── helper (closure over push/roleByUser/input) ──────────────────────────
   function addPermissionEdges(targetId: string, targetPath: string, principals: GraphPrincipal[]): void {
+    if (!includeUsers) return;
     for (const principal of principals) {
       // level "none" ⇒ no edge.
       if (!principal.level || principal.level === "none") continue;

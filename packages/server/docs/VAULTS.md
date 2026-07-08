@@ -155,7 +155,15 @@ PUT    /vaults/{vaultId}/files/{path+}         → write content
 DELETE /vaults/{vaultId}/files/{path+}         → soft-delete (S3 delete marker)
 GET    /vaults/{vaultId}/files/{path+}/history → version history
 POST   /vaults/{vaultId}/files/sync            → delta sync (server returns changed files)
+GET    /vaults/{vaultId}/files/deleted         → list soft-deleted files
 ```
+
+`GET /vaults/{vaultId}/files/deleted` remains the deleted-files listing route
+for backward compatibility. To read a root file literally named `deleted`, use
+`GET /vaults/{vaultId}/files/deleted?operation=read`; static `PUT` and
+`DELETE` on `/vaults/{vaultId}/files/deleted` are wired to normal file
+write/delete handling for that same root filename. Nested files named
+`deleted` use the normal percent-encoded `{path+}` route.
 
 `GET /vaults/{vaultId}/overview` is intentionally separate from content routes.
 It is restricted to vault admins/org admins and returns only metadata needed for

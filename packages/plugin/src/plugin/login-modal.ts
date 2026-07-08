@@ -95,6 +95,18 @@ export class LoginModal extends Modal {
   }
 
   onOpen(): void {
+    // Reset transient credential/challenge state on every (re-)render of the
+    // login form. onOpen() is re-invoked after a password reset succeeds and by
+    // "Back to login", and it rebuilds the DOM from scratch — but the string
+    // fields persist on the instance. Without this, `this.password` keeps the
+    // OLD password the user typed before opening the reset form: the password
+    // input renders visually empty, yet a Sign In submits the stale old
+    // password, which Cognito rejects with "Invalid email or password" BEFORE
+    // any MFA challenge is issued — so the user is never asked for their 2FA
+    // code and reasonably concludes the reset "didn't work". Email and org slug
+    // are intentionally preserved (they're prefilled), so they're not cleared.
+    this.resetTransientCredentialState();
+
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-login-modal");
@@ -329,6 +341,25 @@ export class LoginModal extends Modal {
     this.modalEl.removeClass("vaultguard-login-modal");
     this.contentEl.removeClass("vaultguard-login-modal-content");
     this.contentEl.empty();
+  }
+
+  /**
+   * Clears password / MFA / new-password / passphrase entry state and the
+   * challenge-flow flags so a freshly rendered login form never submits input
+   * left over from a previous form (most importantly the old password typed
+   * before a password reset). Email and org slug are deliberately preserved —
+   * they're prefilled for convenience and carry no security risk.
+   */
+  private resetTransientCredentialState(): void {
+    this.password = "";
+    this.mfaCode = "";
+    this.passphrase = "";
+    this.passphraseConfirm = "";
+    this.newPasswordValue = "";
+    this.newPasswordConfirm = "";
+    this.showMfa = false;
+    this.showNewPassword = false;
+    this.recoveryMode = false;
   }
 
   showMfaPrompt(): void {

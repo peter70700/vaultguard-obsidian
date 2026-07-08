@@ -36,8 +36,8 @@ the Obsidian client.
   access level (read / write / admin) and dashed for time-bound grants. Click any
   node or edge to see exactly which rule grants that access and why. The graph
   only ever shows files you yourself can read. Desktop-only.
-- **Audit logging** — every access and permission change is recorded to an
-  append-only audit log (advanced dashboards, alerts, and CSV export are a Pro
+- **Audit logging** — every access and permission change is recorded to a
+  server-side audit log (advanced dashboards, alerts, and CSV export are a Pro
   feature).
 - **Re-encryption on offboarding** — revoking a user rotates the keys for the
   files they could reach, so their cached copies become permanently unreadable.
@@ -88,7 +88,7 @@ Identical in every tier — security primitives are never paywalled.
 | End-to-end encryption (AES-256-GCM + AWS KMS) | ✓ | ✓ | ✓ |
 | Per-file permissions with role inheritance | ✓ | ✓ | ✓ |
 | Re-encryption on user offboarding | ✓ | ✓ | ✓ |
-| Time-bound key leases (4h default, configurable) | ✓ | ✓ | ✓ |
+| Time-bound key leases (1h default, configurable) | ✓ | ✓ | ✓ |
 | Multi-vault support per organization | ✓ | ✓ | ✓ |
 | Plugin allowlist enforcement | ✓ | ✓ | ✓ |
 | Cognito auth (password + BYO IdP via Cognito) | ✓ | ✓ | ✓ |
@@ -111,17 +111,17 @@ Where Pro starts to earn its keep.
 | Transactional email (invites, password reset) | Your SES | Managed | Managed |
 | Org signup | Single-tenant lockdown | Multi-tenant | Custom |
 | Managed AWS infrastructure | ✗ | ✓ | ✓ |
-| Automatic security updates + patches | ✗ | ✓ | ✓ |
-| Daily backups | ✗ | ✓ | ✓ |
-| Uptime SLA | None | 99.9% | 99.99% |
-| Support | Community (GitHub) | Email, 24h SLA | Priority, 4h SLA |
+| Managed security update process | ✗ | ✓ | ✓ |
+| Managed backup operations | ✗ | ✓ | ✓ |
+| Uptime target | None | 99.9% target | Custom by agreement |
+| Support target | Community (GitHub) | Email, 1-business-day target | Priority by agreement |
 
 ### Enterprise-only
 
 | Capability | CE | Pro | Enterprise |
 | --- | :---: | :---: | :---: |
 | SAML / OIDC SSO integration | ✗ | ✗ | ✓ |
-| SOC 2 / HIPAA attestations | ✗ | ✗ | ✓ |
+| SOC 2 / HIPAA evidence packages | ✗ | ✗ | Available by agreement |
 | Dedicated infrastructure | ✗ | ✗ | ✓ |
 | Custom data residency | ✗ | ✗ | ✓ |
 | Custom key rotation & retention policies | ✗ | ✗ | ✓ |
@@ -153,7 +153,7 @@ What you do vs. what we do.
 - No web admin panel — managing 50 users from inside Obsidian is painful for non-technical leads
 - No share links — every external collaboration needs the recipient to be a full vault member
 - No audit dashboards, alerts, or CSV exports for compliance teams
-- No SLA, no managed backups, no patch pipeline — AWS deprecations are your problem
+- No managed uptime commitment, backup operations, or patch pipeline — AWS deprecations are your responsibility
 - No SSO, no compliance attestations — Enterprise is the only path for regulated environments
 
 ### The one-sentence pitch

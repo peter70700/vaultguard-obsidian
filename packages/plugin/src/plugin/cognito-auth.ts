@@ -3,7 +3,105 @@
  * Uses Obsidian's requestUrl to bypass Electron/CORS restrictions.
  */
 
-import { requestUrl } from "obsidian";
+import { RequestUrlResponse, requestUrl } from "obsidian";
+
+/**
+ * Build the ordered list of base URLs to try for an *unauthenticated*
+ * VaultGuard backend call (forgot-password, confirm-reset, recovery-code
+ * verify). These flows run before the user has a token, so they can't go
+ * through the authenticated endpoint resolver (which probes `/vaults` with a
+ * bearer token and caches the working base). Without that resolution, a stored
+ * endpoint that carries a stage suffix — e.g. `https://api.example.com/dev`,
+ * which is what `/orgs/{slug}/config` returns — points at a path the custom
+ * domain doesn't expose (`/dev/auth/...`), so API Gateway answers the generic
+ * 403 `{"message":"Missing Authentication Token"}` and the reset silently fails.
+ *
+ * We mirror what the resolver would eventually discover: try the configured
+ * base first, then progressively strip trailing path segments down to the
+ * origin root. The custom domain maps its root directly onto the deployed
+ * stage, so the origin candidate is the one that actually carries the routes.
+ */
+function candidateAuthBases(apiBaseUrl: string): string[] {
+  const trimmed = apiBaseUrl.replace(/\/+$/, "");
+  const candidates: string[] = [];
+  const push = (value: string) => {
+    const normalized = value.replace(/\/+$/, "");
+    if (normalized && !candidates.includes(normalized)) {
+      candidates.push(normalized);
+    }
+  };
+
+  push(trimmed);
+
+  try {
+    const parsed = new URL(trimmed);
+    const segments = parsed.pathname.split("/").filter((segment) => segment.length > 0);
+    // Progressively drop trailing segments: `/a/b` → `/a` → origin root.
+    for (let end = segments.length - 1; end >= 0; end--) {
+      const nextPath = segments.slice(0, end).join("/");
+      parsed.pathname = nextPath ? `/${nextPath}` : "";
+      parsed.search = "";
+      parsed.hash = "";
+      push(parsed.toString());
+    }
+  } catch {
+    // Non-URL base (shouldn't happen after config validation) — the single
+    // trimmed candidate above is the best we can do.
+  }
+
+  return candidates;
+}
+
+/**
+ * True when a response is API Gateway's generic "this resource/method doesn't
+ * exist here" rejection — the request never reached a VaultGuard Lambda, so
+ * the base URL is wrong (typically a spurious stage suffix). Safe to retry
+ * against another base: no email was sent and no reset code was consumed.
+ */
+function isGatewayResourceMiss(response: RequestUrlResponse): boolean {
+  if (response.status !== 403) {
+    return false;
+  }
+  const message =
+    (response.json as { message?: string } | undefined)?.message ??
+    response.text ??
+    "";
+  return message.includes("Missing Authentication Token");
+}
+
+/**
+ * POST JSON to an unauthenticated VaultGuard `/auth/*` endpoint, transparently
+ * retrying against stage-stripped base URLs when the gateway reports the
+ * resource is missing. Returns the first response that actually reached a
+ * Lambda (any status that isn't a gateway resource miss), so callers keep their
+ * existing per-endpoint status handling.
+ */
+async function postToVaultGuardAuth(
+  apiBaseUrl: string,
+  path: string,
+  body: unknown
+): Promise<RequestUrlResponse> {
+  const bases = candidateAuthBases(apiBaseUrl);
+  let lastResponse: RequestUrlResponse | null = null;
+
+  for (const base of bases) {
+    const response = await requestUrl({
+      url: `${base}${path}`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      throw: false,
+    });
+    lastResponse = response;
+    if (!isGatewayResourceMiss(response)) {
+      return response;
+    }
+  }
+
+  // Every candidate was a gateway miss — return the last one so the caller's
+  // error handling produces a message rather than throwing on a null.
+  return lastResponse as RequestUrlResponse;
+}
 
 export interface CognitoTokens {
   accessToken: string;
@@ -521,12 +619,9 @@ export async function vaultguardForgotPassword(
     throw new Error("API endpoint must be configured to reset your password.");
   }
 
-  const response = await requestUrl({
-    url: `${base}/auth/forgot-password`,
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, clientId }),
-    throw: false,
+  const response = await postToVaultGuardAuth(base, "/auth/forgot-password", {
+    email,
+    clientId,
   });
 
   if (response.status >= 200 && response.status < 300) {
@@ -556,12 +651,11 @@ export async function vaultguardConfirmReset(
     throw new Error("API endpoint must be configured to reset your password.");
   }
 
-  const response = await requestUrl({
-    url: `${base}/auth/confirm-reset`,
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, code, newPassword, clientId }),
-    throw: false,
+  const response = await postToVaultGuardAuth(base, "/auth/confirm-reset", {
+    email,
+    code,
+    newPassword,
+    clientId,
   });
 
   if (response.status >= 200 && response.status < 300) {
@@ -594,14 +688,9 @@ export async function vaultguardVerifyRecoveryCode(
   code: string
 ): Promise<void> {
   const base = apiBaseUrl.replace(/\/+$/, "");
-  const response = await requestUrl({
-    url: `${base}/auth/recovery-codes/verify`,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ email, code }),
-    throw: false,
+  const response = await postToVaultGuardAuth(base, "/auth/recovery-codes/verify", {
+    email,
+    code,
   });
 
   if (response.status >= 200 && response.status < 300) {
