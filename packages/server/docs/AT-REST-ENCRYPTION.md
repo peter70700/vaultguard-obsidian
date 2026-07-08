@@ -301,6 +301,56 @@ dismiss it permanently (`atRestFirstRunDismissed` setting).
 
 ---
 
+## Vault idle-lock & PIN (Phase 12)
+
+A device PIN adds a **fast idle-lock**: after the org's `autoLockMinutes` of
+inactivity the vault **locks** (the in-memory LAK is evicted, managed reads fail
+closed, an opaque curtain covers the workspace) instead of logging the user out.
+Entering the PIN re-derives the LAK and unlocks — no full email+password+MFA
+re-login. The revocation heartbeat keeps running while locked (NN-2), so a
+server-side revoke or the session-duration cap still forces a real logout.
+
+### Passkey model (default) — what setting a PIN does
+
+Enrolling a PIN wraps the LAK a **second** way — PBKDF2(PIN)+pepper → AES-GCM →
+`lak-pin.envelope` — **alongside** the transparent `safeStorage` wrap
+(`lak.envelope`), which is **kept**. Consequences:
+
+- A full login or an app restart unlocks the vault **transparently** via
+  `lak.envelope` — **no PIN prompt**. `initAtRestCipher` lands UNLOCKED whenever a
+  valid transparent wrap is present. The PIN is only the fast re-lock after idle.
+- **Threat model (honest):** this is the **same** posture a device with **no** PIN
+  already has — the LAK is recoverable from the OS keychain, so a full-OS-access
+  attacker on the **unlocked, logged-in** machine can decrypt. What a PIN still
+  buys: the idle-lock UX, plus — because the second wrap is PBKDF2+pepper — it does
+  **not** weaken cold-disk theft (the keychain-held KEK/pepper are still required).
+  This **relaxes decision D2** ("undecryptable without the PIN even with full OS
+  access"), by the product owner's explicit choice, to remove the
+  double-authentication of "log in, then also enter a PIN."
+
+### Max-security path — "Require PIN on startup"
+
+Turning on **Settings → Vault lock / PIN → Require PIN on startup** removes the
+transparent `lak.envelope`, so `lak-pin.envelope` becomes the **only** wrap:
+
+- The vault is genuinely **undecryptable without the PIN**, even with full OS
+  access — this is the original **D2** guarantee.
+- Cost: a PIN prompt on **every** startup / login (`initAtRestCipher` lands LOCKED;
+  the curtain appears). `enrollPinLock` removes the transparent wrap when this is
+  on; toggling it back off restores it (`persistWrappedLak`).
+
+### Legacy-device migration
+
+A device that enrolled a PIN under the pre-12-07 model has **no** `lak.envelope`
+(enroll used to delete it), so it lands LOCKED on startup. The first successful PIN
+unlock regenerates the transparent wrap (`unlockWithPin` → `persistWrappedLak`),
+auto-migrating it into the passkey model — the next startup unlocks transparently.
+
+**Seams:** `enrollPinLock`, `unlockWithPin`, `initAtRestCipher` (the `landLocked`
+decision), `setRequirePinOnStartup`, and the `requirePinOnStartup` setting.
+
+---
+
 ## Migration
 
 Two command-palette entries plus equivalents in the settings panel:

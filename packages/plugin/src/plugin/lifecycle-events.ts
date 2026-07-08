@@ -62,14 +62,53 @@ export function registerSidebarLayoutLifecycle(ctx: LifecycleEventsContext): voi
   });
 }
 
+/**
+ * Leading-edge throttle: invoke `fn` immediately on the first call, then suppress
+ * further calls until `intervalMs` has elapsed. Uses Date.now() only (no timers), so
+ * it is deterministic and trivially unit-testable, and it can never itself schedule
+ * work while the vault is locked. Phase 12-07.
+ */
+export function leadingThrottle(fn: () => void, intervalMs: number): () => void {
+  // -Infinity (not 0) so the FIRST call always fires the leading edge, independent
+  // of the absolute clock value (now - (-Infinity) === Infinity >= intervalMs).
+  let last = -Infinity;
+  return () => {
+    const now = Date.now();
+    if (now - last >= intervalMs) {
+      last = now;
+      fn();
+    }
+  };
+}
+
+/**
+ * Throttle window for high-frequency "reading" gestures (mousemove/wheel/scroll).
+ * One noteSessionActivity() per window keeps the idle timer fresh while reading,
+ * without calling it on every pixel of movement.
+ */
+export const ACTIVITY_THROTTLE_MS = 10_000;
+
 export function registerSessionActivityTracking(ctx: LifecycleEventsContext): void {
   const recordActivity = () => ctx.noteSessionActivity();
   const doc = getActiveObsidianDocument();
+
+  // Phase 12-07: reading counts as activity. Reading gestures (scroll/wheel/mouse-
+  // move) fire in bursts, so route them through a single leading-edge throttle —
+  // reading a long note keeps the session alive without hammering noteSessionActivity.
+  // Discrete intent gestures (mousedown/keydown/touchstart/focus) stay UNthrottled so
+  // the very first interaction always counts.
+  const recordReading = leadingThrottle(recordActivity, ACTIVITY_THROTTLE_MS);
 
   if (doc) {
     ctx.registerDomEvent(doc, "mousedown", recordActivity);
     ctx.registerDomEvent(doc, "keydown", recordActivity);
     ctx.registerDomEvent(doc, "touchstart", recordActivity);
+    // scroll does not bubble, so listen in the CAPTURE phase to catch scrolls inside
+    // any scroller (the editor / preview panes), not just the document root.
+    ctx.registerDomEvent(doc, "wheel", recordReading);
+    ctx.registerDomEvent(doc, "scroll", recordReading, true);
+    ctx.registerDomEvent(doc, "mousemove", recordReading);
+    ctx.registerDomEvent(doc, "pointermove", recordReading);
   }
   ctx.registerDomEvent(window, "focus", recordActivity);
 }
@@ -83,6 +122,12 @@ export function registerFocusSyncHandlers(ctx: LifecycleEventsContext): void {
   if (!doc) return;
   ctx.registerDomEvent(doc, "visibilitychange", () => {
     if (doc.visibilityState === "visible") {
+      // While the vault is locked the LAK is evicted, so resuming/pulling would
+      // fail-closed in writePlainToDisk (mobile "refusing to write … local
+      // at-rest encryption is unavailable"). Stay paused; exitLockState resumes
+      // the loop and re-pulls once the user unlocks. (handleFocusSyncTrigger has
+      // its own lock guard, but skip resumeSyncLoop entirely here.)
+      if (ctx.isVaultLocked()) return;
       ctx.resumeSyncLoop("window visible");
       ctx.handleFocusSyncTrigger();
     } else {

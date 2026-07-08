@@ -417,7 +417,9 @@ async function handleSignup(
       syncMode: 'periodic',
       syncIntervalMinutes: 1,
       enforceEncryption: true,
-      maxSessionDurationHours: 24,
+      // 720h = 30 days — persistent trusted device (Phase 12 change #5). The cap is
+      // still enforced by assertSessionAgePolicy; this only raises the new-org default.
+      maxSessionDurationHours: 720,
       requireMfa: false,
       allowedDomains: [],
       retentionDays: 365,

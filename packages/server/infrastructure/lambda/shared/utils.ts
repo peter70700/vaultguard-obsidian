@@ -1839,7 +1839,12 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
   syncMode: 'periodic',
   syncIntervalMinutes: 1,
   enforceEncryption: true,
-  maxSessionDurationHours: 24,
+  // 720h = 30 days: the "persistent trusted device" default (Phase 12 change #5).
+  // The cap is NOT removed — assertSessionAgePolicy still enforces whatever the org
+  // stores; existing orgs keep their stored value because normalizeStoredOrgSettings
+  // only supplies this default when the field is absent. Tracks the 30-day
+  // refresh-token window so active users are not force-relogin'd ~daily.
+  maxSessionDurationHours: 720,
   requireMfa: false,
   allowedDomains: [],
   retentionDays: 365,

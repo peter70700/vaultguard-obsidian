@@ -2427,9 +2427,21 @@ async function handleSync(
       const objModified = obj.LastModified || new Date(0);
       const objChecksum = obj.ETag || '';
       const clientChecksum = clientChecksums[relativePath];
+      // A file the client has NO manifest entry for is absent locally and must
+      // be delivered even when its S3 LastModified predates the client's cursor.
+      // Without this, a file that was on the server before the cursor but was
+      // never landed locally (e.g. a binary a pre-BIN-A client received, skipped
+      // writing, yet still advanced its cursor past) is stranded forever: the
+      // `objModified > lastSyncDate` gate below never fires and the checksum
+      // `else if` requires a client entry. STRICT `=== undefined` is mandatory:
+      // buildLocalSyncManifest stores every locally-present file as "" (a
+      // presence-only marker), so a falsy `!clientChecksum` would re-download
+      // every present file on every cold sync. Mirrors the folder-marker branch
+      // above, which already uses the same absent-locally rule.
+      const absentLocally = clientChecksum === undefined;
 
-      if (objModified > lastSyncDate) {
-        // File was modified since last sync
+      if (absentLocally || objModified > lastSyncDate) {
+        // Absent locally → created; present-but-stale-cursor → modified.
         const action: SyncDelta['action'] = clientChecksum ? 'modified' : 'created';
 
         // BIN-A / D-04 + L9: cold-path deltas deliberately DO NOT carry contentType.

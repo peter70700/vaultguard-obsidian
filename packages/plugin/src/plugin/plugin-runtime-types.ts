@@ -270,6 +270,7 @@ export interface LifecycleEventsContext {
     target: Window | Document,
     type: string,
     callback: EventListenerOrEventListenerObject,
+    options?: boolean | AddEventListenerOptions,
   ): void;
   registerInterval(id: number): void;
 
@@ -291,6 +292,7 @@ export interface LifecycleEventsContext {
   handleFocusSyncTrigger(): void;
   resumeSyncLoop(reason: string): void;
   pauseSyncLoop(reason: string): void;
+  isVaultLocked(): boolean;
   handleBrowserOnline(): void;
   handleBrowserOffline(): void;
   handleFolderCreated(path: string): void;

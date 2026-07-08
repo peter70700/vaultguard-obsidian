@@ -409,6 +409,20 @@ export class SyncRuntime {
       this.ctx.recordSyncDiagnostic("performSync.skipped", { reason: "notLoggedIn" });
       return;
     }
+    // Authoritative lock backstop: while the vault is locked the LAK is evicted
+    // (atRestCipher.lock() in enterLockState), so isReady() is false and any
+    // pulled server change would hit writePlainToDisk's fail-closed guard and
+    // throw "refusing to write … local at-rest encryption is unavailable". The
+    // periodic timer is already stopped on lock, but the focus/visibility
+    // triggers reach performSync directly — this guard covers every caller.
+    // exitLockState restarts the timer and pulls on unlock, so nothing is lost.
+    if (this.ctx.isVaultLocked?.()) {
+      const message = "VaultGuard Sync: Sync skipped — vault is locked.";
+      this.ctx.log(message);
+      if (userInitiated) this.ctx.showNotice(message);
+      this.ctx.recordSyncDiagnostic("performSync.skipped", { reason: "vaultLocked" });
+      return;
+    }
     if (!this.ctx.isOnline()) {
       const message = "VaultGuard Sync: Sync skipped — offline.";
       this.ctx.log(message);

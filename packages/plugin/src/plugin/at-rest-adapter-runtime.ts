@@ -786,14 +786,46 @@ export class AtRestAdapterRuntime {
 
     this.atRestCipher = new AtRestCipher(storage);
 
-    // Edge #6 / NN-1: a PIN owns the LAK. Do NOT call cipher.init() (no
-    // provisioning, no needs-recovery routing). Land LOCKED and await the PIN —
-    // the plugin's unlockWithPin path calls unlockCipherWithLak(lak) once
-    // PinLockManager unwraps `lak-pin.envelope`. The cipher stays not-ready and
-    // every managed VG1 read fails closed (see readPlainFromDisk short-circuit).
+    // Phase 12-07 passkey model: a PIN-enrolled device lands LOCKED only when it
+    // CANNOT unlock transparently — i.e. the transparent `lak.envelope` is absent
+    // (legacy PIN-only device, or a corrupt/unreadable wrap) OR the user opted into
+    // "Require PIN on startup" (max-security / true D2). When the transparent wrap is
+    // present and the toggle is off, fall through to cipher.init() below so the LAK
+    // unwraps transparently and the vault lands UNLOCKED — no PIN prompt after a
+    // login / app start; the PIN is then only the fast idle re-lock.
+    //
+    // Probe via storage.probeWrappedLak() (not a bare exists): 'present' = a valid
+    // wrap → transparent unlock; 'absent' OR 'error' (corrupt/unreadable) → land
+    // LOCKED and let the PIN unlock, which self-heals the wrap via the unlockWithPin
+    // passkey migration. Landing LOCKED still skips cipher.init(), so the "absent
+    // envelope + VG1 ciphertext → needs-recovery" misroute never fires for a PIN
+    // device (edge #6 preserved).
+    let transparentWrapPresent = false;
     if (pinEnrolled) {
+      try {
+        // Prefer the careful probe (distinguishes a valid wrap from a corrupt/empty
+        // one → 'error' lands LOCKED so the PIN self-heals it); fall back to a bare
+        // existence check if the seam doesn't expose probeWrappedLak.
+        transparentWrapPresent = storage.probeWrappedLak
+          ? (await storage.probeWrappedLak()).kind === "present"
+          : await adapter.exists(envelopePath);
+      } catch (err) {
+        this.logError(
+          "Probing the transparent LAK wrap for the PIN landing decision failed",
+          err
+        );
+        transparentWrapPresent = false; // fall back to the PIN unlock (self-heals)
+      }
+    }
+    const requirePinOnStartup = this.settings.requirePinOnStartup === true;
+    const landLocked = pinEnrolled && (!transparentWrapPresent || requirePinOnStartup);
+    if (landLocked) {
       this.locked = true;
-      this.log("AtRestCipher: PIN enrolled — landing LOCKED, awaiting unlock.");
+      this.log(
+        `AtRestCipher: PIN enrolled — landing LOCKED, awaiting unlock (${
+          requirePinOnStartup ? "require-PIN-on-startup" : "no transparent wrap"
+        }).`
+      );
       return;
     }
 
@@ -2139,13 +2171,17 @@ export class AtRestAdapterRuntime {
    * `blob:` URL synchronously; on a miss we return the real (ciphertext) URL and
    * kick off an async decrypt that repopulates the cache and swaps the rendered
    * element's src. Non-media, excluded, or not-yet-encrypted paths pass straight
-   * through to the original method.
+   * through to the original method. Logged out (no cloud session) short-circuits
+   * to the ciphertext URL BEFORE the cache lookup — mirroring interceptedRead's
+   * `!this.session` guard — so sign-out hides encrypted media even though the
+   * local LAK stays ready, and no stale cached blob is served post-logout.
    */
   interceptedGetResourcePath(path: string): string {
     const original = this.originalAdapterMethods.getResourcePath;
     if (!original) return path;
     const originalUrl = original(path);
     if (
+      !this.session ||
       !this.atRestCipher?.isReady() ||
       this.isAtRestExcluded(path) ||
       !isKnownBinaryExtensionPath(path)
@@ -2170,6 +2206,7 @@ export class AtRestAdapterRuntime {
     const original = this.originalAdapterMethods.getResourcePath;
     if (
       !original ||
+      !this.session ||
       !this.atRestCipher?.isReady() ||
       this.isAtRestExcluded(path) ||
       !isKnownBinaryExtensionPath(path)
@@ -2202,6 +2239,9 @@ export class AtRestAdapterRuntime {
     if (this.resourcePreviewInFlight.has(path)) return;
     this.resourcePreviewInFlight.add(path);
     try {
+      // Authoritative post-logout decryption choke point: never decrypt media
+      // without a cloud session (the finally still clears the in-flight dedupe).
+      if (!this.session) return;
       const existing = this.resourcePreviewCache.get(path);
       if (existing?.mtime === mtime) return;
       const bytes = await this.readPlainBinaryFromDisk(path);
@@ -2284,6 +2324,18 @@ export class AtRestAdapterRuntime {
     }
     this.resourcePreviewCache.clear();
     this.resourcePreviewInFlight.clear();
+  }
+
+  /**
+   * Revoke all decrypted media-preview blob URLs. Called on logout/deauth so
+   * images/PDFs decrypted during an authenticated session can't linger in an
+   * open pane after sign-out. Distinct from the lock path: logout does NOT evict
+   * the LAK (files stay readable at rest), so the sync getResourcePath session
+   * guard — not cipher readiness — is what stops re-decryption; this call clears
+   * the already-decrypted blobs.
+   */
+  revokeResourcePreviews(): void {
+    this.revokeAllResourcePreviews();
   }
 
   /**

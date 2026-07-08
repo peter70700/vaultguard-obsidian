@@ -58,6 +58,7 @@ import {
   type AtRestDecryptAndDisableResult,
   type AtRestAdapterRuntime,
 } from "./at-rest-adapter-runtime";
+import { isKnownBinaryExtensionPath } from "./binary-content";
 import {
   LOCAL_PROJECT_MEMORY_MODE_NOTICE,
   isLocalProjectMemoryModeEnabled,
@@ -1479,6 +1480,7 @@ export default class VaultGuardPlugin extends Plugin {
       target: Window | Document,
       type: string,
       callback: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
     ) => void;
 
     return {
@@ -1488,8 +1490,8 @@ export default class VaultGuardPlugin extends Plugin {
       registerEvent: (eventRef) => {
         this.registerEvent(eventRef);
       },
-      registerDomEvent: (target, type, callback) => {
-        registerDomEvent(target, type, callback);
+      registerDomEvent: (target, type, callback, options) => {
+        registerDomEvent(target, type, callback, options);
       },
       registerInterval: (id) => {
         this.registerInterval(id);
@@ -1529,6 +1531,7 @@ export default class VaultGuardPlugin extends Plugin {
       handleFocusSyncTrigger: () => this.handleFocusSyncTrigger(),
       resumeSyncLoop: (reason) => this.resumeSyncLoop(reason),
       pauseSyncLoop: (reason) => this.pauseSyncLoop(reason),
+      isVaultLocked: () => this.isVaultLocked,
       handleBrowserOnline: () => this.handleBrowserOnline(),
       handleBrowserOffline: () => this.handleBrowserOffline(),
       handleFolderCreated: (path) => this.handleFolderCreated(path),
@@ -1726,7 +1729,9 @@ export default class VaultGuardPlugin extends Plugin {
     // runtime (no-ops unless at-rest is active and the file is renderable media).
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
-        if (file) void this.prewarmAttachmentPreview(file.path);
+        if (!file) return;
+        this.noticeIfMediaOpenWhileLoggedOut(file.path);
+        void this.prewarmAttachmentPreview(file.path);
       })
     );
 
@@ -1757,15 +1762,15 @@ export default class VaultGuardPlugin extends Plugin {
     // adds a single AES-GCM decrypt (a few ms).
     await this.restoreSession();
 
-    // Phase 12 (H-1 / edge #6): if a session was just restored AND a PIN is
-    // enrolled, land LOCKED eagerly — keyed on isEnrolled() ALONE, never on
-    // idleAction. idleAction is unknown here (applyOrgSettings runs inside the
-    // BACKGROUNDED resumeStoredSession below, which we deliberately do NOT
-    // await), and the adapter already hard-locked in initAtRestCipher whenever a
-    // PIN owns the LAK — so gating the curtain on anything but isEnrolled() would
-    // leave an enrolled user in a logout-policy org with locked reads and NO
-    // curtain (a dead vault). idleAction governs ONLY the live-session idle→lock
-    // transition, not this restart/login unlock.
+    // Phase 12-07 (passkey model): if a session was just restored, show the lock
+    // curtain ONLY when the vault could not unlock transparently — the cipher is not
+    // ready (legacy PIN device with no transparent wrap, or a corrupt wrap) OR the
+    // user opted into "Require PIN on startup". A passkey-model device (transparent
+    // lak.envelope present, toggle off) unlocked already in initAtRestCipher, so no
+    // curtain and no double-auth. maybeEnterLockOnAuth mirrors the adapter's
+    // landLocked decision, so an enrolled device that DID land locked still curtains
+    // (H-1 dead-vault protection). idleAction is irrelevant here — it governs only
+    // the live-session idle→lock transition, not this restart/login unlock.
     this.maybeEnterLockOnAuth();
 
     // Wire the folder-lifecycle vault listeners NOW, unconditionally, decoupled
@@ -3373,10 +3378,12 @@ export default class VaultGuardPlugin extends Plugin {
       this.log("Vault binding skipped — sync engine deferred until a vault is picked.");
     }
 
-    // Phase 12 (H-1): a fresh login on a device that already has a PIN enrolled
-    // lands LOCKED too — the LAK is PIN-wrapped so the adapter is locked, and the
-    // curtain must appear regardless of idleAction. enterLockState stops the sync
-    // + key-renewal this login may have just started; the heartbeat stays alive.
+    // Phase 12-07 (passkey model): a fresh login unlocks the vault transparently
+    // when the transparent lak.envelope is present and "Require PIN on startup" is
+    // off — no PIN prompt after the email+password+MFA login (the double-auth we
+    // removed). maybeEnterLockOnAuth curtains ONLY for a legacy/no-wrap device or the
+    // max-security toggle; when it does curtain, enterLockState stops sync +
+    // key-renewal but keeps the heartbeat alive (NN-2).
     this.maybeEnterLockOnAuth();
 
     // Quick 260708-el6: a fresh login for a NEW user in a lock-policy org with no
@@ -4715,6 +4722,24 @@ export default class VaultGuardPlugin extends Plugin {
     return message;
   }
 
+  /**
+   * When a signed-out user opens a renderable binary (image/PDF/…), surface the
+   * same "login required" notice text files get. Media renders via
+   * getResourcePath, which never calls interceptedRead/interceptedReadBinary, so
+   * without this an attachment opened while logged out is a silent broken
+   * preview. No-ops for text (interceptedRead already notices those), excluded
+   * paths, and authenticated sessions; showLoginRequiredNotice is throttled.
+   */
+  private noticeIfMediaOpenWhileLoggedOut(path: string): void {
+    if (
+      !this.session &&
+      isKnownBinaryExtensionPath(path) &&
+      !this.isPathExcluded(path)
+    ) {
+      this.showLoginRequiredNotice("open", path);
+    }
+  }
+
   private getSidebarAuthState(): VaultGuardSidebarAuthState | null {
     if (this.session) {
       return null;
@@ -5298,53 +5323,79 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
-    // Phase 12 idle-behavior matrix (D3): the org's idleAction chooses lock vs
-    // logout; a cryptographic lock additionally requires an enrolled PIN (there
-    // is no secret to unlock with otherwise). Read the optional server field as
-    // `?? "logout"` so un-upgraded servers / existing orgs keep today's behavior.
-    const action = this.orgSettings?.idleAction ?? "logout";
+    // Phase 12-07 idle matrix (persistent trusted device): idle must NEVER destroy
+    // the session on the UNDEPLOYED idleAction fallback — that was the "nonstop
+    // logout" bug (the old `?? "logout"` collapsed an absent field into a logout).
+    // Read the RAW server field — "lock" | "logout" | undefined — and only the
+    // EXPLICIT, deployed "logout" logs out.
+    const action = this.orgSettings?.idleAction; // may be undefined (field undeployed)
     const enrolled = this.pinLockManager?.isEnrolled() ?? false;
 
-    if (action === "lock" && enrolled) {
+    // (1) EXPLICIT, server-deployed "logout" policy → honor it (admin compliance).
+    // Fires only once 12-02's idleAction field is actually deployed by the org.
+    if (action === "logout") {
+      this.log(`Auto-logout (org policy) after ${autoLockMinutes} minutes of inactivity.`);
+      await this.forceLogout(
+        `VaultGuard Sync: Session ended after ${autoLockMinutes} minutes of inactivity (org policy).`
+      );
+      return;
+    }
+
+    // (2) A PIN is enrolled → cryptographic lock, session preserved — whether
+    // idleAction is "lock" OR still undeployed (undefined). A PIN device always
+    // locks (never logs out) on idle. enterLockState keeps the heartbeat alive (NN-2).
+    if (enrolled) {
       this.log(`Auto-lock: locking vault after ${autoLockMinutes} minutes of inactivity.`);
       await this.enterLockState();
       return;
     }
 
-    if (action === "lock" && !enrolled) {
-      // Policy wants a lock but there's no PIN to unlock with — fall back to
-      // logout and nudge (once) toward enrolling a PIN so lock-not-logout works.
-      if (!this.pinNudgeShown) {
-        this.pinNudgeShown = true;
-        new Notice(
-          "VaultGuard Sync: set a PIN in VaultGuard settings to lock instead of logging out.",
-          8000
-        );
-      }
+    // (3) No PIN and no explicit logout policy → do NOT log out (persistent trusted
+    // device). Keep the session alive and nudge (once per session) toward setting a
+    // PIN so the user gets real idle locking. This is the fix for the idle-logout UX.
+    if (!this.pinNudgeShown) {
+      this.pinNudgeShown = true;
+      new Notice(
+        "VaultGuard Sync: set a PIN in VaultGuard settings to lock the vault when it goes idle.",
+        8000
+      );
     }
-
-    this.log(`Auto-lock triggered after ${autoLockMinutes} minutes of inactivity.`);
-    await this.forceLogout(
-      `VaultGuard Sync: Session locked after ${autoLockMinutes} minutes of inactivity.`
+    this.log(
+      `Idle after ${autoLockMinutes} minutes — session kept (no PIN enrolled; set one to enable idle lock).`
     );
   }
 
   /**
-   * Phase 12 (H-1 / edge #6): fire the lock curtain on ANY auth entry — cold-
-   * start session-restore OR a fresh login — whenever a PIN is enrolled, keyed on
-   * `isEnrolled()` ALONE and NEVER on idleAction. The adapter already hard-locks
-   * whenever a PIN owns the LAK (initAtRestCipher skips provisioning), so the
-   * curtain gate MUST mirror that exact condition or an enrolled user in a
-   * logout-policy org — or after an admin lock→logout flip — gets locked adapter
-   * reads with no way to unlock (the dead-vault H-1 case). Synchronous + eager:
-   * callers MUST NOT await sessionResumePromise first (idleAction is unknown until
-   * the backgrounded resume settles). idleAction governs ONLY the live-session
-   * idle→lock transition (lockSessionForInactivity), not restart/login unlock.
+   * Phase 12-07 (passkey model, supersedes H-1's "curtain on ANY auth"): fire the
+   * lock curtain after an auth entry (cold-start restore OR fresh login) ONLY when
+   * the vault could not unlock transparently — i.e. the cipher is not ready (legacy
+   * PIN-only device with no transparent wrap, or a corrupt wrap) OR the user opted
+   * into "Require PIN on startup" (max-security). When the transparent wrap already
+   * unlocked the cipher and the toggle is off, we DON'T curtain — the full login
+   * already proved identity, so a PIN on top is the double-auth this redesign kills.
+   *
+   * This still MIRRORS the adapter's landing decision (initAtRestCipher →
+   * `landLocked`): the curtain shows exactly when the adapter landed LOCKED, so an
+   * enrolled device whose cipher is locked never has managed reads fail closed with
+   * no way to unlock (H-1 dead-vault protection preserved). Synchronous + eager:
+   * callers MUST NOT await sessionResumePromise first. idleAction governs ONLY the
+   * live-session idle→lock transition (lockSessionForInactivity), not this path.
    */
   private maybeEnterLockOnAuth(): void {
-    if (this.session && this.pinLockManager?.isEnrolled() && !this.isVaultLocked) {
-      void this.enterLockState();
+    if (!this.session || !this.pinLockManager?.isEnrolled() || this.isVaultLocked) {
+      return;
     }
+    // Passkey model: the cipher already unlocked transparently (login/startup found
+    // the transparent lak.envelope) and the user hasn't opted into max-security →
+    // don't curtain (no double-auth).
+    const cipherReady = this.getAtRestCipher()?.isReady() ?? false;
+    const requirePin = this.settings.requirePinOnStartup === true;
+    if (cipherReady && !requirePin) {
+      return;
+    }
+    // Otherwise the cipher could NOT unlock transparently (legacy/no-wrap device) or
+    // the user wants max-security — curtain so the PIN can unlock.
+    void this.enterLockState();
   }
 
   /**
@@ -5447,6 +5498,14 @@ export default class VaultGuardPlugin extends Plugin {
     this.isVaultLocked = false;
     this.lockCurtain?.hide();
     this.lockCurtain = null;
+    // resumeSyncLoop (not just restartSyncTimer) so we clear any paused flag set
+    // while the window was hidden: if the vault locked while backgrounded, the
+    // visibilitychange handler now skips resumeSyncLoop on a locked→visible
+    // transition, leaving paused=true — restartSyncTimer alone would then skip
+    // ("paused" reason) and leave sync dead after unlock. The user is looking at
+    // the app (they just entered the PIN), so resuming is correct. If it was not
+    // paused, resumeSyncLoop no-ops and restartSyncTimer starts the timer.
+    this.resumeSyncLoop("vault unlocked");
     this.restartSyncTimer();
     this.startKeyRenewalMonitor();
     void this.reopenPreLockFile(); // L-4: unlock does not land on a blank workspace
@@ -5493,6 +5552,21 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     } finally {
       res.lak.fill(0); // defensive: the cipher took its own copy
+    }
+
+    // Passkey migration (Phase 12-07): a device enrolled under the old model has NO
+    // transparent lak.envelope (enroll used to delete it), so it lands LOCKED on
+    // every startup. Now that this PIN unlock re-installed the LAK in the cipher,
+    // regenerate the transparent wrap so the NEXT startup / login unlocks without a
+    // PIN. Skipped in max-security mode (requirePinOnStartup) where the wrap must
+    // stay absent. Best-effort: a failure never blocks the unlock (idempotent
+    // re-write when the wrap is already present).
+    if (this.settings.requirePinOnStartup !== true) {
+      try {
+        await this.getAtRestCipher()?.persistWrappedLak();
+      } catch (err) {
+        this.logError("Passkey migration (persistWrappedLak after PIN unlock) failed", err);
+      }
     }
 
     await this.exitLockState();
@@ -5565,15 +5639,24 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Enroll a PIN so the vault locks-instead-of-logs-out (D2/D3). Requires the
-   * cipher UNLOCKED (the LAK must be in memory to hand to the PIN wrap).
+   * Enroll a PIN so the vault locks-instead-of-logs-out on idle (D3) and can be
+   * re-opened fast with the PIN. Requires the cipher UNLOCKED (the LAK must be in
+   * memory to hand to the PIN wrap).
    *
-   * NON-NEGOTIABLE #1 + failure-safe order: write `lak-pin.envelope` FIRST
-   * (pinLockManager.enroll), THEN remove the transparent `lak.envelope`
-   * (clearPersistedWrap). Without clearPersistedWrap a same-OS user auto-unwraps
-   * the LAK PIN-free on the next cold start and D2 ("undecryptable without the
-   * PIN") is FALSE. Doing enroll before clear guarantees a failed enroll never
-   * leaves the device with NO way to load the LAK.
+   * Passkey model (default, requirePinOnStartup off — Phase 12-07): KEEP the
+   * transparent `lak.envelope` alongside the new `lak-pin.envelope`, so a full login
+   * / app startup still unlock the vault transparently and the PIN only re-locks it
+   * on idle. This relaxes D2 to the OS-keychain posture (a full-OS-access attacker on
+   * the unlocked machine can decrypt — the SAME posture a no-PIN device already has),
+   * documented honestly in docs/AT-REST-ENCRYPTION.md.
+   *
+   * Max-security (requirePinOnStartup on): remove the transparent wrap so
+   * `lak-pin.envelope` is the ONLY wrap and the vault is undecryptable without the
+   * PIN even with full OS access (true D2), at the cost of a PIN on every startup.
+   *
+   * Failure-safe order: write `lak-pin.envelope` FIRST (pinLockManager.enroll), THEN
+   * — max-security only — remove `lak.envelope`, so a failed enroll never leaves the
+   * device with NO way to load the LAK.
    */
   async enrollPinLock(secret: string): Promise<void> {
     const cipher = this.getAtRestCipher();
@@ -5586,13 +5669,67 @@ export default class VaultGuardPlugin extends Plugin {
     const lak = cipher.exportLakBytes();
     try {
       await this.pinLockManager.enroll(secret, lak); // writes lak-pin.envelope
-      await cipher.clearPersistedWrap(); // NN-1: remove the transparent lak.envelope
+      if (this.settings.requirePinOnStartup === true) {
+        // Max-security only (true D2): remove the transparent wrap so the PIN is the
+        // sole key holder. Passkey mode (default) KEEPS lak.envelope so login /
+        // startup unlock transparently and the PIN only re-locks the vault on idle.
+        await cipher.clearPersistedWrap();
+      }
     } finally {
       lak.fill(0);
     }
     new Notice(
-      "VaultGuard Sync: PIN set. Your vault now locks (not logs out) when idle."
+      this.settings.requirePinOnStartup === true
+        ? "VaultGuard Sync: PIN set. Your vault now requires this PIN on every startup and locks (not logs out) when idle."
+        : "VaultGuard Sync: PIN set. Your vault now locks (not logs out) when idle — unlock with the PIN, no full re-login."
     );
+  }
+
+  /**
+   * Toggle "Require PIN on startup" (Phase 12-07) — the passkey ↔ max-security
+   * switch — and reconcile the on-disk wrap to match. Called only from the settings
+   * tab, so cipher access is encapsulated here (the tab never touches the cipher).
+   *
+   *   enabled=true  (max-security / true D2): remove the transparent `lak.envelope`
+   *                 so `lak-pin.envelope` is the ONLY wrap → PIN required on every
+   *                 startup; vault undecryptable without it even with full OS access.
+   *   enabled=false (passkey, default): restore `lak.envelope` (persistWrappedLak) so
+   *                 login / startup unlock transparently and the PIN only re-locks
+   *                 the vault on idle.
+   *
+   * The flag is ALWAYS persisted. The on-disk reconcile only runs when a PIN is
+   * enrolled AND the cipher is unlocked (it needs the live LAK); if the vault is
+   * locked we persist the flag and ask the user to unlock first — the OFF case is
+   * additionally self-healing via the unlockWithPin passkey migration.
+   */
+  async setRequirePinOnStartup(enabled: boolean): Promise<void> {
+    this.settings.requirePinOnStartup = enabled;
+    await this.saveSettings();
+
+    if (!this.pinLockEnrolled()) {
+      return; // no PIN → nothing on disk to reconcile; the flag applies at next enroll
+    }
+    const cipher = this.getAtRestCipher();
+    if (!cipher?.isReady()) {
+      // Vault locked: we can't re-provision the wrap without the live LAK. The flag
+      // is saved; unlocking with the PIN reconciles the OFF case (passkey migration).
+      new Notice(
+        "VaultGuard Sync: unlock the vault first to apply this change to your PIN."
+      );
+      return;
+    }
+    try {
+      if (enabled) {
+        await cipher.clearPersistedWrap(); // max-security: PIN becomes the sole wrap
+      } else {
+        await cipher.persistWrappedLak(); // passkey: restore transparent unlock
+      }
+    } catch (err) {
+      this.logError("Reconciling the at-rest wrap for requirePinOnStartup failed", err);
+      new Notice(
+        "VaultGuard Sync: couldn't update the PIN startup setting on disk. Try again."
+      );
+    }
   }
 
   /**
@@ -6770,6 +6907,11 @@ export default class VaultGuardPlugin extends Plugin {
 
   private handleFocusSyncTrigger(): void {
     if (!this.session || !this.settings.serverVaultId) return;
+    // Never sync while the vault is locked: the LAK is evicted, so a pulled
+    // change would fail-closed in writePlainToDisk (mobile "refusing to write …
+    // local at-rest encryption is unavailable"). exitLockState re-pulls on
+    // unlock. performSync has its own backstop, but bail before rewarm too.
+    if (this.isVaultLocked) return;
     if (this.syncState.status === "syncing") return;
     const now = Date.now();
     if (now - this.lastFocusSyncAt < 3000) return;
@@ -8860,6 +9002,12 @@ export default class VaultGuardPlugin extends Plugin {
     // admin/share modal, a queued call) can reuse the idToken after logout or
     // auto-lock. getAuthHeaders then fails closed until the user re-authenticates.
     this.apiClient?.clearTokens();
+    // Revoke media-preview blob URLs decrypted during the session so an already-
+    // open image/PDF pane can't keep showing decrypted content after logout/unload
+    // (the getResourcePath session gate stops re-decrypting; this clears what's
+    // already decrypted). Use the nullable field directly — teardown must never
+    // instantiate the runtime via ensureAtRestAdapterRuntimeObject().
+    this.atRestAdapterRuntime?.revokeResourcePreviews();
     this.orgSettings = null;
     this.vaultMemberRole = null;
     this.stopKeyRenewalMonitor();
@@ -9350,7 +9498,12 @@ export default class VaultGuardPlugin extends Plugin {
    * @param message - The message to log
    */
   private log(message: string): void {
-    if (this.settings.debugLogging) {
+    // Dev builds (`install:plugin:dev`, NODE_ENV="development") force logging ON so
+    // troubleshooting needs no manual toggle. The dev term is evaluated FIRST so it
+    // never touches this.settings (which can be undefined during very-early onload),
+    // and esbuild constant-folds it to `false` in the production bundle
+    // (NODE_ENV="production") — so prod logging stays gated ONLY on the user setting.
+    if (process.env.NODE_ENV !== "production" || this.settings.debugLogging) {
       console.log(`${LOG_PREFIX} ${message}`);
     }
   }

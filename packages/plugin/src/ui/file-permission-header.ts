@@ -65,6 +65,10 @@ interface HeaderContext {
   allowAdminPerFileRestrictions?: boolean;
   /** When provided and returns false, the banner is suppressed (settings toggle). */
   isEnabled?: () => boolean;
+  /** Returns false when signed out. The permission banner is meaningless
+   *  without a session (no permissions to show), so update() tears it down —
+   *  making image/PDF/audio FileViews match .md (no header when logged out). */
+  isLoggedIn?: () => boolean;
 }
 
 interface RuleCacheEntry {
@@ -157,6 +161,13 @@ export class FilePermissionHeader {
     // tear the banner down and make the file-open / active-leaf-change
     // listeners no-ops while disabled.
     if (this.ctx.isEnabled && !this.ctx.isEnabled()) {
+      this.remove();
+      return;
+    }
+
+    // Auth gate: no session ⇒ no permissions to show. Remove the banner and
+    // no-op so image/PDF/other FileViews match .md (no header when logged out).
+    if (this.ctx.isLoggedIn && !this.ctx.isLoggedIn()) {
       this.remove();
       return;
     }

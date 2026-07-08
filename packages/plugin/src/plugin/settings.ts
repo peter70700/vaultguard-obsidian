@@ -128,6 +128,10 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   // 260708-el6). A persisted `true` overrides this default via the reload merge
   // (Object.assign({}, DEFAULT_SETTINGS, data)), so the prompt shows at most once.
   pinOnboardingPromptShown: false,
+  // Passkey model by default (Phase 12-07): enrolling a PIN KEEPS the transparent
+  // at-rest wrap, so login/startup unlock without a PIN and the PIN only re-locks
+  // on idle. true = max-security (transparent wrap removed; PIN every startup).
+  requirePinOnStartup: false,
 };
 
 
@@ -968,6 +972,27 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                 this.display();
               }).open();
             })
+        );
+    }
+
+    // "Require PIN on startup" — the passkey (default) vs max-security switch. Only
+    // meaningful once a PIN is enrolled (it governs how that PIN behaves at startup /
+    // login). Off = transparent unlock after login, PIN only re-locks on idle; on =
+    // PIN required every startup (transparent wrap removed → true D2).
+    if (enrolled) {
+      const requireOnStartup = this.plugin.settings.requirePinOnStartup === true;
+      new Setting(containerEl)
+        .setName("Require PIN on startup")
+        .setDesc(
+          requireOnStartup
+            ? "On: enter your PIN every time Obsidian starts or you log in. Your notes stay encrypted on disk until you do (maximum security)."
+            : "Off: unlock transparently after login; the PIN only re-locks the vault when it goes idle."
+        )
+        .addToggle((t) =>
+          t.setValue(requireOnStartup).onChange(async (value) => {
+            await this.plugin.setRequirePinOnStartup(value);
+            this.display();
+          })
         );
     }
 

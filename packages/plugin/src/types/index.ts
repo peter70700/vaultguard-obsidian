@@ -659,6 +659,21 @@ export interface VaultGuardSettings {
    * falsy = "not yet prompted".
    */
   pinOnboardingPromptShown?: boolean;
+  /**
+   * "Require PIN on startup" — the passkey-vs-max-security switch (Phase 12-07).
+   *
+   * Default (absent / false = passkey model): enrolling a PIN KEEPS the transparent
+   * safeStorage LAK wrap (`lak.envelope`) alongside the PIN wrap, so a full login or
+   * app startup unlocks the vault transparently — the PIN only re-locks the vault
+   * when it goes idle. Accepted trade-off: a full-OS-access attacker on the unlocked
+   * machine can decrypt (the SAME posture a no-PIN device already has).
+   *
+   * `true` = max-security (true D2): the transparent wrap is removed, so
+   * `lak-pin.envelope` is the ONLY wrap and the vault is genuinely undecryptable
+   * without the PIN even with full OS access — at the cost of a PIN prompt on every
+   * startup / login. Read EVERYWHERE as `=== true` so an absent key means "off".
+   */
+  requirePinOnStartup?: boolean;
 }
 
 /** A user-defined slash-command prompt template for the AI Chat panel. */

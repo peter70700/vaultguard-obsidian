@@ -473,6 +473,29 @@ describe('File Protection: Vault Adapter Interception', () => {
     });
   });
 
+  // ── noticeIfMediaOpenWhileLoggedOut ──────────────────────────────────
+
+  describe('noticeIfMediaOpenWhileLoggedOut (media open bypasses the read notice)', () => {
+    it('warns login-required when a signed-out user opens a renderable binary', () => {
+      plugin.session = null;
+      plugin.noticeIfMediaOpenWhileLoggedOut('attachments/photo.png');
+      expect(mockNotice).toHaveBeenCalledWith(
+        expect.stringContaining('VaultGuard Sync: Login required to open "attachments/photo.png".'),
+        9000
+      );
+    });
+    it('stays silent for a signed-out text file (interceptedRead already notices those)', () => {
+      plugin.session = null;
+      plugin.noticeIfMediaOpenWhileLoggedOut('docs/readme.md');
+      expect(mockNotice).not.toHaveBeenCalled();
+    });
+    it('stays silent when authenticated', () => {
+      plugin.session = makeSession('member');
+      plugin.noticeIfMediaOpenWhileLoggedOut('attachments/photo.png');
+      expect(mockNotice).not.toHaveBeenCalled();
+    });
+  });
+
   // ── interceptedWrite ─────────────────────────────────────────────────
 
   describe('interceptedWrite', () => {
@@ -1505,6 +1528,10 @@ describe('File Protection: at-rest media preview (BIN-A / getResourcePath)', () 
     methods.readBinary = vi.fn(async () => PNG.buffer.slice(0));
     methods.getResourcePath = vi.fn((p: string) => `app://host/${p}?42`);
     runtime = plugin.ensureAtRestAdapterRuntimeObject();
+    // The preview path is now session-gated (mirrors interceptedRead's
+    // `if (!this.session)`): authenticate so the existing decrypt-and-serve tests
+    // exercise the authenticated behavior. Logged-out cases set session = null.
+    plugin.session = makeSession();
 
     createObjectURL = vi.fn(() => 'blob:vg/1');
     revokeObjectURL = vi.fn();
@@ -1557,6 +1584,32 @@ describe('File Protection: at-rest media preview (BIN-A / getResourcePath)', () 
     await runtime.prewarmResourcePreview('img/pic.png');
     runtime.evictResourcePreview('img/pic.png');
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:vg/1');
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('app://host/img/pic.png?42');
+  });
+
+  it('blocks getResourcePath when logged out (returns ciphertext URL, no decrypt)', () => {
+    plugin.session = null;
+    // The !this.session guard precedes cipher-readiness and the cache lookup, so a
+    // logged-out user gets the ciphertext app:// URL — a broken preview matching the
+    // "no access" header — even though the local LAK is still ready.
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('app://host/img/pic.png?42');
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it('prewarm is a no-op when logged out (never reads or decrypts)', async () => {
+    plugin.session = null;
+    await runtime.prewarmResourcePreview('img/pic.png');
+    expect(plugin.originalAdapterMethods.readBinary).not.toHaveBeenCalled();
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it('does not serve an authenticated-session blob after the session goes null', async () => {
+    // Warm the cache while authenticated (session set in beforeEach).
+    await runtime.prewarmResourcePreview('img/pic.png');
+    expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('blob:vg/1');
+    // Session drops (logout): the guard precedes the cache lookup, so the stale
+    // decrypted blob is never served — the ciphertext URL comes back instead.
+    plugin.session = null;
     expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('app://host/img/pic.png?42');
   });
 });
