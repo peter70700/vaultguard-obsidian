@@ -107,6 +107,13 @@ export class AtRestAdapterRuntime {
   private readOnlyFallbackNoticeAt: Map<string, number> = new Map();
   private cloudDecryptFallbackNoticeAt: Map<string, number> = new Map();
   private cipherInitPromise: Promise<boolean> | null = null;
+  /**
+   * W2: handle to the sticky init-time needs-recovery Notice so it can be
+   * cleared on recovery via ANY door — not just its own CTA click. Held here
+   * (instead of a local `const`) precisely so refreshAtRestRecoverySurfaces can
+   * hide it on the transition OUT of needs-recovery.
+   */
+  private atRestRecoveryNotice: Notice | null = null;
   private corruptedWriteNoticeAt: Map<string, number> = new Map();
   private binaryWriteNoticeAt: Map<string, number> = new Map();
   /** Paths currently being re-encrypted in place (dedupes concurrent triggers). */
@@ -272,7 +279,11 @@ export class AtRestAdapterRuntime {
       await this.initAtRestCipher();
     }
     if (!this.atRestCipher) return false;
-    return this.atRestCipher.restoreFromRecoveryCode(code);
+    const restored = await this.atRestCipher.restoreFromRecoveryCode(code);
+    // Recovery-code door: re-assert the #1 surfaces so a successful restore
+    // CLEARS the status bar + sidebar banner + sticky (W2).
+    this.ctx.refreshAtRestRecoverySurfaces?.();
+    return restored;
   }
 
   getAdapterReadBinary(): ((normalizedPath: string) => Promise<ArrayBuffer>) | null {
@@ -835,9 +846,11 @@ export class AtRestAdapterRuntime {
     // mode this migration block exists to prevent.
     if (envelopeMigrationFailureReason !== null) {
       const reason = envelopeMigrationFailureReason;
-      this.app.workspace.onLayoutReady(() =>
-        this.showAtRestRecoveryBanner(reason)
-      );
+      this.app.workspace.onLayoutReady(() => {
+        this.showAtRestRecoveryBanner(reason);
+        // Re-assert the persistent status bar + sidebar now that layout exists.
+        this.ctx.refreshAtRestRecoverySurfaces?.();
+      });
       this.logError(
         "AtRestCipher init aborted: envelope migration failed",
         new Error(reason)
@@ -858,9 +871,13 @@ export class AtRestAdapterRuntime {
           // Defer the banner until layout is ready — the recovery flow
           // routes through the settings tab, which doesn't exist yet at
           // this point in onload.
-          this.app.workspace.onLayoutReady(() =>
-            this.showAtRestRecoveryBanner(status.reason)
-          );
+          this.app.workspace.onLayoutReady(() => {
+            this.showAtRestRecoveryBanner(status.reason);
+            // Re-assert the persistent status bar + sidebar surfaces so init
+            // landing in needs-recovery no longer leaves them blind (the gap
+            // that let the failure stay silent until Settings → Advanced).
+            this.ctx.refreshAtRestRecoverySurfaces?.();
+          });
         } else {
           const reason = status.kind === "disabled" ? status.reason : "unknown";
           new Notice(
@@ -1018,7 +1035,12 @@ export class AtRestAdapterRuntime {
   showAtRestRecoveryBanner(reason: string): void {
     const doc = getActiveObsidianDocument();
     if (!doc) return;
+    // W2: keep the handle in a field (hide any prior one first so notices never
+    // stack) so recovery via a different door can clear it via
+    // clearAtRestRecoveryStickyNotice.
+    this.atRestRecoveryNotice?.hide();
     const notice = new Notice("", 0);
+    this.atRestRecoveryNotice = notice;
     const frag = doc.createDocumentFragment();
     const strong = frag.createEl("strong");
     strong.setText("VaultGuard Sync: cannot read encrypted files on this device. ");
@@ -1028,10 +1050,18 @@ export class AtRestAdapterRuntime {
       cls: "vaultguard-notice-link",
     });
     link.addEventListener("click", () => {
-      notice.hide();
-      this.openVaultGuardSettings();
+      // Route through the plugin's single recovery indirection (interim →
+      // Settings → Advanced; 13-03 swaps only that body). Hide on click too.
+      this.clearAtRestRecoveryStickyNotice();
+      this.ctx.startAtRestRecoveryFlow?.();
     });
     notice.setMessage(frag);
+  }
+
+  /** W2: hide + drop the init-time sticky recovery notice. */
+  clearAtRestRecoveryStickyNotice(): void {
+    this.atRestRecoveryNotice?.hide();
+    this.atRestRecoveryNotice = null;
   }
 
   /**
@@ -1172,6 +1202,140 @@ export class AtRestAdapterRuntime {
         10000,
       );
     }
+  }
+
+  /**
+   * Guarded local-cache reset — the wipe-then-provision half of the phase's
+   * escape hatch from `needs-recovery` (Phase 13-02, decision D1).
+   *
+   * Enumerate every on-disk VG1 ciphertext file and remove it via the RAW
+   * `originalAdapterMethods.remove`, clear the stale key material
+   * (wrapped LAK + fallback KEK), then re-run `initAtRestCipher()` so its
+   * fresh-provision path (envelope absent + no VG1 ciphertext + no PIN) mints a
+   * NEW LAK and lands `unlocked`. The caller (plugin) must have disabled the PIN
+   * BEFORE calling this — otherwise init lands LOCKED, not unlocked (D2).
+   *
+   * ── AT-REST RULE EXCEPTION (documented) ──────────────────────────────────────
+   * This method contains the SINGLE sanctioned direct use of
+   * `originalAdapterMethods.remove`. Everywhere else, vault content is touched
+   * ONLY through readPlainFromDisk / writePlainToDisk (the CLAUDE.md at-rest
+   * rule). The raw remove is REQUIRED here because the intercepted delete
+   * (`interceptedDelete`) tombstones the path AND issues a server
+   * `DELETE /files/…`, which would destroy the AUTHORITATIVE server copy — the
+   * exact opposite of recovery. The raw remove deletes ONLY the local disk file.
+   * The plugin sets `resettingLocalCache` + pauses the sync loop around this call
+   * so the `vault.on('delete')` listeners can't propagate a deletion either.
+   * DO NOT "fix" this back to interceptedDelete / readPlainFromDisk.
+   *
+   * Returns the wiped paths so the caller can settle Obsidian's TFile index
+   * before reconciliation — a lingering just-deleted path would be SY6
+   * unreadable-skipped and never re-pulled (threat T-13-06).
+   *
+   * Safety net (threat T-13-05): the fresh LAK is minted ONLY by
+   * initAtRestCipher's backstop, which refuses to provision while readable VG1
+   * ciphertext survives. So an INCOMPLETE wipe routes back to `needs-recovery`
+   * rather than orphaning readable data under a brand-new key.
+   */
+  async wipeAndReprovisionLocalAtRest(): Promise<{ wipedPaths: string[] }> {
+    // AT-REST RULE EXCEPTION (see method doc): the raw remove captured here is
+    // the ONE sanctioned direct originalAdapterMethods.remove — it bypasses
+    // interceptedDelete's server DELETE. DO NOT route this through the helpers.
+    const remove = this.originalAdapterMethods.remove;
+    if (!remove) {
+      // No raw remove capability → we cannot safely wipe. Refuse WITHOUT
+      // clearing key material or reprovisioning: minting a fresh LAK over the
+      // surviving ciphertext would orphan it (threat T-13-05).
+      throw new Error(
+        "VaultGuard Sync: cannot reset at-rest encryption — the vault adapter has no raw remove capability.",
+      );
+    }
+
+    const ciphertextPaths = await this.findAtRestCiphertextFiles();
+
+    let operation: LongOperationHandle;
+    try {
+      operation = this.ctx.beginLongOperation({
+        kind: "at-rest-reset",
+        operationName: "Reset local at-rest encryption",
+        phase: "Removing unreadable local ciphertext",
+        placement: "protected",
+        totalItems: ciphertextPaths.length,
+        capabilities: {
+          protectedPhase: true,
+          canCancel: false,
+          canPause: false,
+        },
+        // Never overlap a sync / reconcile / (de)encrypt pass — they read or
+        // rewrite the same files the wipe is removing.
+        conflictsWith: [
+          "vault-encrypt",
+          "vault-decrypt",
+          "sync",
+          "background-sync",
+          "initial-reconciliation",
+        ],
+        stalledAfterMs: DEFAULT_STALLED_OPERATION_MS,
+      });
+    } catch (error) {
+      if (isLongOperationConflict(error)) {
+        new Notice(`VaultGuard Sync: ${describeConflict(error.conflict)}`, 6000);
+      }
+      throw error;
+    }
+
+    const wipedPaths: string[] = [];
+    try {
+      let processed = 0;
+      let failed = 0;
+      await processInBatches(
+        ciphertextPaths,
+        async (path) => {
+          processed += 1;
+          // Excluded paths (plugin config, workspace.json, …) were never at-rest
+          // encrypted — never touch them.
+          if (this.isAtRestExcluded(path)) {
+            operation.update({ processedItems: processed });
+            return;
+          }
+          try {
+            // ⚠ AT-REST RULE EXCEPTION (see method doc): the ONE sanctioned direct
+            // raw remove. Bypasses interceptedDelete's server DELETE and deletes
+            // ONLY the local disk file. The plugin's resettingLocalCache flag +
+            // paused sync loop suppress the vault.on('delete') propagation path.
+            await remove(path);
+            wipedPaths.push(path);
+          } catch (err) {
+            failed += 1;
+            this.logError(`At-rest reset: failed to remove "${path}"`, err);
+          }
+          operation.update({
+            processedItems: processed,
+            message: `${wipedPaths.length} removed, ${failed} failed.`,
+          });
+        },
+        {
+          batchSize: DEFAULT_LONG_OPERATION_BATCH_SIZE,
+          token: operation.token,
+        },
+      );
+
+      // Clear the stale key material: locks the cipher, clears the wrapped LAK
+      // envelope AND the fallback KEK. The dead LAK is discarded — there is
+      // nothing recoverable to preserve.
+      await this.atRestCipher?.reset();
+
+      // Re-provision. With the envelope cleared, all VG1 gone, and the PIN
+      // disabled by the plugin BEFORE this call, init takes the fresh-provision
+      // path → `unlocked`. An incomplete wipe routes back to needs-recovery.
+      await this.initAtRestCipher();
+
+      operation.complete(`${wipedPaths.length} removed, ${failed} failed.`);
+    } catch (error) {
+      operation.fail(error);
+      throw error;
+    }
+
+    return { wipedPaths };
   }
 
   /**

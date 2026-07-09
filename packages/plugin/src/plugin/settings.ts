@@ -10,6 +10,10 @@ import {
   AtRestRecoveryCodeModal,
   AtRestRestoreModal,
 } from "./at-rest-modals";
+import {
+  AtRestRecoveryModal,
+  computeAtRestResetButtonState,
+} from "../ui/at-rest-recovery-modal";
 import { AgentBridgeLeaseModal } from "./agent-bridge-modal";
 import type VaultGuardPlugin from "./main";
 import {
@@ -1194,6 +1198,43 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           })
       );
     recoverySetting.settingEl.addClass("vaultguard-at-rest-action");
+
+    // Door #2 (D4): the guided-reset entry point. Enabled PRECISELY when the
+    // buttons above (Encrypt / Decrypt / View-code) are all disabled — i.e. in
+    // needs-recovery with a session + online — so the button that lights up is
+    // exactly the one a stuck user needs. Offline / logged-out → disabled +
+    // honest copy, with the non-destructive "Enter recovery code…" alternate
+    // sitting directly below (D5). It opens the SAME AtRestRecoveryModal as the
+    // indicator CTA (door #1) — one flow, two doors. The 13-02 engine guard is
+    // authoritative; this enablement is only UX (shared matrix, no second gate).
+    const resetState = computeAtRestResetButtonState({
+      needsRecovery,
+      hasSession: Boolean(session),
+      online: this.plugin.isConnectedOnline(),
+    });
+    if (resetState.visible) {
+      const resetSetting = new Setting(panel)
+        .setName("Reset local encryption & re-download from server")
+        .setDesc(resetState.description)
+        .addButton((button) => {
+          button.setButtonText("Reset & re-download");
+          if (resetState.cta) button.setCta();
+          // LO-02: also dead while a reset is already running (the engine's
+          // reentrancy guard is authoritative; this removes the trigger surface).
+          const inFlight = this.plugin.isAtRestResetInFlight();
+          button.setDisabled(!resetState.enabled || inFlight).onClick(() => {
+            if (this.plugin.isAtRestResetInFlight()) {
+              new Notice(
+                "VaultGuard Sync: a local at-rest reset is already running. Please wait for it to finish.",
+                6000,
+              );
+              return;
+            }
+            new AtRestRecoveryModal(this.app, this.plugin).open();
+          });
+        });
+      resetSetting.settingEl.addClass("vaultguard-at-rest-action");
+    }
 
     const restoreSetting = new Setting(panel)
       .setName("Restore from recovery code")

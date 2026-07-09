@@ -58,6 +58,8 @@ import {
   type AtRestDecryptAndDisableResult,
   type AtRestAdapterRuntime,
 } from "./at-rest-adapter-runtime";
+import { AtRestRecoveryCodeModal, AtRestRestoreModal } from "./at-rest-modals";
+import { AtRestRecoveryModal } from "../ui/at-rest-recovery-modal";
 import { isKnownBinaryExtensionPath } from "./binary-content";
 import {
   LOCAL_PROJECT_MEMORY_MODE_NOTICE,
@@ -648,6 +650,48 @@ export default class VaultGuardPlugin extends Plugin {
   private applyingRemoteWrite = false;
 
   /**
+   * Phase 13-02 (guarded local-cache reset): true only for the duration of
+   * `resetLocalAtRestAndResync()`. The reset wipes the dead local VG1 ciphertext
+   * via the RAW `originalAdapterMethods.remove` (bypassing `interceptedDelete`'s
+   * server DELETE), but Obsidian's file watcher still fires `vault.on('delete')`
+   * for each removed file. `handleFolderDeleted` / `handleVaultFileDeleted`
+   * early-return while this is set so NONE of those events can propagate a
+   * deletion to the authoritative server copy. `applyingRemoteWrite` deliberately
+   * does NOT cover deletes, so this is a separate, purpose-built suppression flag.
+   */
+  private resettingLocalCache = false;
+
+  /**
+   * Reentrancy latch for `resetLocalAtRestAndResync()` (CR-01). Distinct from
+   * `resettingLocalCache` (which the delete listeners read to suppress
+   * propagation) so the two concerns never overload: this one SERIALIZES the
+   * recovery doors, that one SUPPRESSES delete events.
+   *
+   * True from the instant a reset commits (past the guards) until its `finally`.
+   * A second concurrent reset must refuse at the very top — BEFORE any side
+   * effect — because if it ran the shared-flag `finally` it would clear
+   * `resettingLocalCache` + resume the sync loop WHILE the first reset is still
+   * raw-removing files, un-suppressing that wipe's `vault.on('delete')` events
+   * into server DELETEs (the exact zero-DELETE-invariant break the phase exists
+   * to prevent).
+   */
+  private atRestResetInFlight = false;
+
+  /**
+   * Path-scoped delete suppression that OUTLIVES the global `resettingLocalCache`
+   * window (HI-01). The global flag is only up across the reset's own window; a
+   * slow/debounced file watcher (network drives, some mobile/sync-folder hosts)
+   * can deliver a wiped file's `vault.on('delete')` event AFTER the reset's
+   * `finally` has dropped that flag — which would then propagate a server DELETE
+   * and strand the file. Every raw-removed path is recorded here for exactly as
+   * long as it is gone: an entry self-clears the moment the path exists again
+   * (reconcile re-pulls it, or the user re-creates it — see the create listener
+   * in `onload`), after which a genuine later delete of that path propagates
+   * normally. It is NOT a timer — the lifetime is "until the path is back".
+   */
+  private wipedPathsAwaitingRepull = new Set<string>();
+
+  /**
    * Whether we've already wired up the vault.on('create' | 'delete' | 'rename')
    * listeners that mirror folder lifecycle to the server. Registering twice
    * would double-fire every marker upload/delete; this flag stops that.
@@ -913,6 +957,17 @@ export default class VaultGuardPlugin extends Plugin {
       recordDeletionTombstone: (path) => this.recordDeletionTombstone(path),
       clearDeletionTombstone: (path) => this.clearDeletionTombstone(path),
       updateStatusBar: () => this.updateStatusBar(),
+      // Phase 13 #1: the runtime fires the refresh hub after init/migration-
+      // failure/restore transitions; the sticky's CTA + the recovery-code door
+      // route through these plugin indirections.
+      refreshAtRestRecoverySurfaces: () => this.refreshAtRestRecoverySurfaces(),
+      startAtRestRecoveryFlow: () => this.startAtRestRecoveryFlow(),
+      startAtRestRecoveryFromRecoveryCode: () =>
+        this.startAtRestRecoveryFromRecoveryCode(),
+      // Phase 13-02: the guarded local-cache reset flag, threaded so the runtime
+      // can consult it if needed. main.ts owns set/clear around the wipe.
+      isResettingLocalCache: () => this.isResettingLocalCache(),
+      setResettingLocalCache: (v) => this.setResettingLocalCache(v),
       encryptContent: (content) => this.encryptContent(content),
       computeHash: (content) => this.computeHash(content),
       // BIN-A / D-02: byte-crypto pass-throughs beside their string siblings so
@@ -1248,8 +1303,14 @@ export default class VaultGuardPlugin extends Plugin {
       },
       pluginForViews: this,
       getSidebarAuthState: () => this.getSidebarAuthState(),
+      // Backs the sidebar's W1 pull-getter with the single source of truth so a
+      // freshly-instantiated leaf reflects the cipher's CURRENT state on paint.
+      getAtRestRecoveryState: () => this.computeAtRestRecoveryState(),
       handleLogin: () => this.handleLogin(),
       openVaultGuardSettings: () => this.openVaultGuardSettings(),
+      startAtRestRecoveryFlow: () => this.startAtRestRecoveryFlow(),
+      startAtRestRecoveryFromRecoveryCode: () =>
+        this.startAtRestRecoveryFromRecoveryCode(),
     };
   }
 
@@ -1801,6 +1862,17 @@ export default class VaultGuardPlugin extends Plugin {
       this.app.vault.on("create", (file) => {
         if (!this.app.workspace.layoutReady) return;
         void this.encryptExternallyAddedFile(file.path);
+      })
+    );
+
+    // HI-01 self-clean: the instant a path re-appears (reconcile re-pulled it,
+    // or the user created a new file there), drop its wipe-delete suppression so
+    // a genuine later delete of that path propagates. Deliberately UNGATED (no
+    // layoutReady gate) and ordering-independent — it only ever mutates the tiny
+    // wipedPathsAwaitingRepull set and is a no-op unless a reset just ran.
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        this.clearWipeSuppressionForRecreatedPath(file.path);
       })
     );
 
@@ -3391,6 +3463,10 @@ export default class VaultGuardPlugin extends Plugin {
     // discoverable. Gated + idempotent behind the persisted flag, so it shows at
     // most once across both auth-entry points and across reloads.
     this.maybeOfferPinOnboarding();
+
+    // Login is an at-rest transition point: re-assert the #1 surfaces so a
+    // needs-recovery cipher stays alarmed (and clears if login unlocked it).
+    this.refreshAtRestRecoverySurfaces();
   }
 
   /**
@@ -4208,6 +4284,11 @@ export default class VaultGuardPlugin extends Plugin {
     // (the endorsed once-ever migration nudge, reusing the same persisted flag).
     // The flag guarantees at most one prompt across both entry points + reloads.
     this.maybeOfferPinOnboarding();
+
+    // Session restore is an at-rest transition point too — re-assert the #1
+    // surfaces from the cipher's real state (the init-time banner may have
+    // fired before layout was ready on a fresh restore).
+    this.refreshAtRestRecoverySurfaces();
   }
 
   /**
@@ -6349,6 +6430,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private handleFolderDeleted(path: string): void {
+    if (this.isWipeSuppressedDelete(path, true)) return; // 13-02/HI-01: never DELETE a wiped path on the server
     return this.ensureSyncRuntime().handleFolderDeleted(path);
   }
 
@@ -6361,7 +6443,78 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private handleVaultFileDeleted(path: string): void {
+    if (this.isWipeSuppressedDelete(path, false)) return; // 13-02/HI-01: never DELETE a wiped path on the server
     return this.ensureSyncRuntime().handleVaultFileDeleted(path);
+  }
+
+  /**
+   * True when a `vault.on('delete')` for `path` is a stale artifact of the local
+   * at-rest wipe (the file was raw-removed during a reset) rather than a genuine
+   * user delete — so it must NOT propagate a server DELETE. Two layers, so a
+   * wiped path is safe REGARDLESS of watcher timing:
+   *
+   *   1. `resettingLocalCache` — the global flag, up only across the reset's own
+   *      window. Covers the common fast-watcher case (events drain in-window).
+   *   2. `wipedPathsAwaitingRepull` — the path-scoped set that OUTLIVES that
+   *      window (HI-01). A wiped path stays here until it exists again, so a
+   *      slow/debounced delete event that fires AFTER the global flag is dropped
+   *      is still suppressed.
+   *
+   * For a folder delete we ALSO suppress when the folder still CONTAINS a
+   * wiped-awaiting-repull descendant: a folder emptied by the wipe and removed
+   * late by Obsidian would otherwise prefix-DELETE its (server-authoritative)
+   * children. Once reconcile re-pulls those children their entries self-clear,
+   * and a later user delete of the re-created folder propagates normally.
+   */
+  private isWipeSuppressedDelete(path: string, isFolder: boolean): boolean {
+    if (this.resettingLocalCache) return true;
+    if (this.wipedPathsAwaitingRepull.size === 0) return false;
+    const normalized = this.normalizeVaultPath(path);
+    if (this.wipedPathsAwaitingRepull.has(normalized)) return true;
+    if (isFolder) {
+      const prefix = normalized + "/";
+      for (const wiped of this.wipedPathsAwaitingRepull) {
+        if (wiped.startsWith(prefix)) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * A path re-appeared on disk (reconcile re-pulled it, or the user created a new
+   * file there) — so stop treating a future delete of it as a wipe artifact. Any
+   * later delete of this path is now a genuine user action and must propagate.
+   * This is the self-cleaning half of the HI-01 suppression: an entry lives
+   * exactly until its path is back, never on a fixed timer. Wired to every
+   * `vault.on('create')` (see `onload`); a no-op unless a reset just ran.
+   */
+  private clearWipeSuppressionForRecreatedPath(path: string): void {
+    if (this.wipedPathsAwaitingRepull.size === 0) return;
+    this.wipedPathsAwaitingRepull.delete(this.normalizeVaultPath(path));
+  }
+
+  /** True while `resetLocalAtRestAndResync()` is wiping the local VG1 cache. */
+  isResettingLocalCache(): boolean {
+    return this.resettingLocalCache;
+  }
+
+  /**
+   * True from the moment a local at-rest reset commits (past the guards) until
+   * its `finally` — the reentrancy latch (CR-01) that serializes the recovery
+   * doors. Read by the doors (LO-02) to refuse opening a second reset flow, and
+   * by the engine itself to refuse a second concurrent entry.
+   */
+  isAtRestResetInFlight(): boolean {
+    return this.atRestResetInFlight;
+  }
+
+  /**
+   * Flip the local-cache-reset suppression flag. Set true before the raw-remove
+   * wipe (so the vault delete listeners no-op) and false in the reset's `finally`
+   * so normal delete propagation resumes even if the re-pull throws.
+   */
+  setResettingLocalCache(v: boolean): void {
+    this.resettingLocalCache = v;
   }
 
   /**
@@ -8636,6 +8789,23 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
     this.statusBarEl.classList?.remove("vaultguard-long-op-statusbar");
+    this.statusBarEl.classList?.remove("vaultguard-status-at-rest-locked");
+
+    // A locked at-rest cipher outranks BOTH connection and login state: the bug
+    // is a keychain/KEK mismatch independent of auth, so surface it BEFORE the
+    // no-session branch — a logged-out needs-recovery must still alarm (mobile
+    // has no status bar, so this is the desktop half of that same signal).
+    // D3: fires ONLY on needs-recovery — never the normal Phase-12 `locked`
+    // idle-state (it has its own curtain) or the intentional `disabled` state.
+    if (this.getAtRestStatus().kind === "needs-recovery") {
+      this.statusBarEl.classList?.add("vaultguard-status-at-rest-locked");
+      this.statusBarEl.setText("VaultGuard Sync 🔒 Encryption locked");
+      this.statusBarEl.setAttr(
+        "title",
+        "Local at-rest encryption can't unlock on this device — sync is paused. Click to fix."
+      );
+      return;
+    }
 
     if (!this.session) {
       if (this.lastLogoutAuthState) {
@@ -8687,10 +8857,284 @@ export default class VaultGuardPlugin extends Plugin {
   toggleStatusBar(show: boolean): void {
     if (show && !this.statusBarEl) {
       this.statusBarEl = this.addStatusBarItem();
+      // Clickable recovery affordance — but ONLY act while needs-recovery, so a
+      // normal Connected status bar is never hijacked (no-op otherwise).
+      this.statusBarEl?.addEventListener("click", () => {
+        if (this.getAtRestStatus().kind === "needs-recovery") {
+          this.startAtRestRecoveryFlow();
+        }
+      });
       this.updateStatusBar();
     } else if (!show && this.statusBarEl) {
       this.statusBarEl.remove();
       this.statusBarEl = null;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // At-rest needs-recovery surfacing (Phase 13 #1)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * The SINGLE SOURCE OF TRUTH for the at-rest recovery triple. BOTH the
+   * pull-getter (view ctx) AND the push hub read this, so the two paths can
+   * never drift into a "surfaces say healthy while the cipher is locked" state.
+   */
+  private computeAtRestRecoveryState(): {
+    needsRecovery: boolean;
+    reason: string;
+    canReset: boolean;
+  } {
+    const status = this.getAtRestStatus();
+    const needsRecovery = status.kind === "needs-recovery";
+    return {
+      needsRecovery,
+      reason: needsRecovery ? status.reason : "",
+      // The indicator SHOWS regardless of auth/connectivity (needsRecovery), but
+      // the destructive reset needs an authenticated + online session — the
+      // server is authoritative for the re-pull. 13-03 consumes canReset to gate
+      // the reset CTA; offline/logged-out falls back to the recovery-code path.
+      canReset: needsRecovery && !!this.session && this.isOnline(),
+    };
+  }
+
+  /**
+   * The refresh hub: re-assert the persistent #1 surfaces (desktop status bar +
+   * every live sidebar leaf) from the cipher's REAL state at every at-rest
+   * transition — and, W2, hide the init-time sticky when we've LEFT
+   * needs-recovery so recovery via ANY door (a sidebar/status-bar CTA or the
+   * settings button) clears it, not only the sticky's own CTA click. It does NOT
+   * re-fire a sticky (that is owned by showAtRestRecoveryBanner at init).
+   */
+  refreshAtRestRecoverySurfaces(): void {
+    const state = this.computeAtRestRecoveryState();
+    this.updateStatusBar();
+    this.pushAtRestRecoveryStateToSidebar(state);
+    if (!state.needsRecovery) {
+      this.atRestAdapterRuntime?.clearAtRestRecoveryStickyNotice();
+    }
+  }
+
+  /** Push the current recovery triple into every open sidebar leaf. */
+  private pushAtRestRecoveryStateToSidebar(state: {
+    needsRecovery: boolean;
+    reason: string;
+    canReset: boolean;
+  }): void {
+    const leaves = this.app.workspace.getLeavesOfType(VAULTGUARD_VIEW_TYPE);
+    for (const leaf of leaves) {
+      const view = leaf.view as unknown as {
+        setAtRestRecoveryState?: (s: typeof state) => void;
+      };
+      view?.setAtRestRecoveryState?.(state);
+    }
+  }
+
+  /**
+   * The single CTA indirection every #1 surface (status bar, sidebar banner,
+   * sticky notice) routes through — 13-01 wired every CTA here precisely so this
+   * ONE body could be swapped without rewiring anything. It now opens the guided
+   * `AtRestRecoveryModal` (door #1), the same modal the Settings → Advanced reset
+   * button opens (door #2) — one flow, two doors (D4).
+   */
+  startAtRestRecoveryFlow(): void {
+    // LO-02: don't open a second reset flow while one is already running. The
+    // engine's reentrancy guard (CR-01) is the authoritative fix; this removes
+    // the concrete trigger surface (and the confusing "second modal opens, then
+    // errors with a conflict" UX). Covers every #1 door — the status-bar click,
+    // the sidebar "Fix now" button, and the sticky notice all route here.
+    if (this.isAtRestResetInFlight()) {
+      new Notice(
+        "VaultGuard Sync: a local at-rest reset is already running. Please wait for it to finish.",
+        6000,
+      );
+      return;
+    }
+    new AtRestRecoveryModal(this.app, this).open();
+  }
+
+  /**
+   * SC4 — after a successful reset, surface the NEW recovery code with a save
+   * prompt. The freshly-provisioned LAK has its own per-device code; showing it
+   * now is the user's one chance to save the non-destructive restore path for
+   * next time (#3 onboarding capture is deferred — this is the minimum bar).
+   *
+   * Guarded so a stray call can't throw or leak: `exportRecoveryCode()` only
+   * works when the cipher is `unlocked` (the state a successful reset lands in),
+   * so we no-op otherwise. The code is shown via the existing
+   * `AtRestRecoveryCodeModal` and is NEVER written to a log (T-13-10).
+   */
+  async surfaceNewRecoveryCodeAfterReset(): Promise<void> {
+    if (this.getAtRestStatus().kind !== "unlocked") {
+      // Reset didn't land unlocked (e.g. an incomplete wipe routed back to
+      // needs-recovery) — there is no fresh code to show. Stay silent.
+      return;
+    }
+    let code: string;
+    try {
+      code = await this.exportAtRestRecoveryCode();
+    } catch (err) {
+      // Never include the (absent) code in the log — only the error.
+      this.logError("Could not export the new recovery code after reset", err);
+      return;
+    }
+    new AtRestRecoveryCodeModal(this.app, {
+      code,
+      onSaved: () => {
+        new Notice(
+          "VaultGuard Sync: recovery code saved. You can view it again in Settings → Local at-rest encryption → “View recovery code”.",
+          7000,
+        );
+      },
+    }).open();
+    new Notice(
+      "VaultGuard Sync: local encryption was reset and your files are re-downloading. A NEW recovery code was generated — save it now (Settings → “View recovery code” if you dismiss it).",
+      10000,
+    );
+  }
+
+  /**
+   * The non-destructive alternate (D5): open the existing recovery-code restore
+   * flow directly. Works offline — the correct per-device code re-wraps the
+   * exact LAK. On success, re-assert the surfaces so they clear.
+   */
+  startAtRestRecoveryFromRecoveryCode(): void {
+    new AtRestRestoreModal(this.app, {
+      onSubmit: (code) => this.restoreAtRestFromRecoveryCode(code),
+      onRestored: () => {
+        new Notice(
+          "VaultGuard Sync: at-rest key restored. Reopening any notes will now load decrypted content.",
+          7000
+        );
+        this.refreshAtRestRecoverySurfaces();
+      },
+    }).open();
+  }
+
+  /**
+   * Guarded escape hatch from at-rest `needs-recovery` (Phase 13-02, Feature #2 —
+   * engine only; Plan 13-03 wires the confirm modal + settings button to this).
+   *
+   * From needs-recovery + authenticated + online + a bound serverVaultId: wipe
+   * the dead local VG1 ciphertext + stale key material, provision a FRESH LAK,
+   * and re-pull every file from the AUTHORITATIVE server under the new key —
+   * WITHOUT deleting anything on the server.
+   *
+   * SAFETY (D1): this GUARD is authoritative — the 13-03 modal/button enablement
+   * is only a UX pre-filter. A wrong-state call REFUSES here (no wipe, no key
+   * change, no network), so it can never destroy live server data (threat
+   * T-13-04). The wipe issues ZERO server DELETEs: files are removed via the raw
+   * `originalAdapterMethods.remove` (bypassing interceptedDelete) under the
+   * `resettingLocalCache` flag (no-ops the vault delete listeners) + a paused
+   * sync loop (threat T-13-03).
+   *
+   * Does NOT surface the new recovery code — that is 13-03 (UI). Resolves on
+   * success; the caller shows the code.
+   */
+  async resetLocalAtRestAndResync(): Promise<void> {
+    // REENTRANCY GUARD (CR-01) — the VERY FIRST thing, before ANY side effect.
+    // A second concurrent reset must refuse cleanly: if it fell through to the
+    // shared-flag `finally` below it would run `setResettingLocalCache(false)` +
+    // `resumeSyncLoop` WHILE the first reset is still raw-removing files,
+    // un-suppressing that wipe's `vault.on('delete')` events into server DELETEs
+    // (the zero-DELETE-invariant break). This throw touches NOTHING (no flag, no
+    // pause, no wipe, no network) — the first reset's state is left intact.
+    if (this.atRestResetInFlight) {
+      const err = new Error(
+        "VaultGuard Sync: a local at-rest reset is already in progress. Wait for it to finish before starting another."
+      );
+      err.name = "AtRestResetGuardError";
+      throw err;
+    }
+
+    // GUARD (authoritative, D1). All four conditions are required; any miss
+    // refuses with ZERO side effects (no flag flip, no pause, no wipe, no
+    // network) so a wrong-state call can never delete live server data.
+    if (
+      !this.session ||
+      !this.isOnline() ||
+      this.getAtRestStatus().kind !== "needs-recovery" ||
+      !this.settings.serverVaultId
+    ) {
+      const err = new Error(
+        "VaultGuard Sync: resetting local encryption needs a locked (needs-recovery) at-rest state, an authenticated session, an online connection, and a bound vault. Refusing — no files were changed."
+      );
+      err.name = "AtRestResetGuardError";
+      throw err;
+    }
+
+    // COMMIT: past the guards, latch the reentrancy flag so any concurrent door
+    // refuses above (CR-01), then raise the delete-suppression flag + pause sync.
+    this.atRestResetInFlight = true;
+    this.setResettingLocalCache(true);
+    // Drop any stragglers from a prior reset (HI-01). Safe: a still-gone path
+    // can't fire a delete, and a re-created one already self-cleared. The global
+    // flag covers the window until the wipe repopulates this set below.
+    this.wipedPathsAwaitingRepull.clear();
+    this.pauseSyncLoop("at-rest reset");
+    try {
+      // D2: clear PIN enrollment FIRST. The PIN wrapped the now-dead LAK, so it
+      // is stale; a still-enrolled PIN makes initAtRestCipher land LOCKED instead
+      // of fresh-provisioning to `unlocked`. disable() clears lak-pin.envelope +
+      // pepper with NO unlock precondition (the dead LAK is discarded — there is
+      // nothing recoverable to preserve).
+      await this.pinLockManager?.disable();
+
+      // Wipe dead VG1 ciphertext + clear key material + fresh-provision the LAK.
+      // The wipe uses the single sanctioned raw remove (documented at-rest-rule
+      // exception in wipeAndReprovisionLocalAtRest).
+      const { wipedPaths } =
+        await this.ensureAtRestAdapterRuntimeObject().wipeAndReprovisionLocalAtRest();
+
+      // HI-01: keep suppressing each wiped path's delete even AFTER this method's
+      // `finally` drops the global flag — a slow/debounced watcher can deliver
+      // the wipe's delete event late. Entries self-clear on re-create (the
+      // create listener), so a legitimate later user delete still propagates.
+      for (const p of wipedPaths) {
+        this.wipedPathsAwaitingRepull.add(this.normalizeVaultPath(p));
+      }
+
+      // Settle Obsidian's TFile index so the wiped paths are gone from
+      // app.vault.getFiles() before reconcile — else they are SY6 unreadable-
+      // skipped and never re-pulled (threat T-13-06).
+      await this.settleVaultIndexAfterWipe(wipedPaths);
+
+      // Re-pull every server file under the fresh LAK (set-based serverOnly
+      // pull; binaries included, contingent on the deployed cold-path fix).
+      await this.performInitialReconciliation();
+    } finally {
+      // Restore normal delete propagation + the sync loop even if the re-pull
+      // throws, and re-assert the #1 surfaces so they reflect the outcome
+      // (cleared on success; still-alarming if the wipe was incomplete and init
+      // routed back to needs-recovery).
+      this.setResettingLocalCache(false);
+      this.resumeSyncLoop("at-rest reset complete");
+      this.refreshAtRestRecoverySurfaces();
+      // Release the reentrancy latch LAST — after the shared flag is down — so a
+      // door that fires during this `finally` still refuses (CR-01).
+      this.atRestResetInFlight = false;
+    }
+  }
+
+  /**
+   * After the raw-remove wipe, poll until Obsidian's TFile index has dropped
+   * every removed path (or a short timeout). `performInitialReconciliation`
+   * reads `app.vault.getFiles()`; a lingering just-deleted path would fail its
+   * read and be SY6-skipped (unreadable), stranding the server copy instead of
+   * re-pulling it. The wipe suppresses only OUR server propagation — Obsidian
+   * still updates its own index, we just wait for it to drain.
+   */
+  private async settleVaultIndexAfterWipe(wipedPaths: string[]): Promise<void> {
+    if (wipedPaths.length === 0) return;
+    const wanted = new Set(wipedPaths.map((p) => this.normalizeVaultPath(p)));
+    const deadline = Date.now() + 3000;
+    for (;;) {
+      const stillListed = this.app.vault
+        .getFiles()
+        .some((f) => wanted.has(this.normalizeVaultPath(f.path)));
+      if (!stillListed) return;
+      if (Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
 

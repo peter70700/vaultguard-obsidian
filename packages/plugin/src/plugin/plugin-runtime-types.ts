@@ -212,8 +212,19 @@ export interface VaultGuardViewRegistrationContext {
   readonly sidebarViewConfig: VaultGuardSidebarViewConfig | null;
   readonly pluginForViews: unknown;
   getSidebarAuthState(): VaultGuardSidebarAuthState | null;
+  // Phase 13 #1 — optional so the build stays green before the plugin supplies
+  // the backing (createViewRegistrationContext, Task 2). getAtRestRecoveryState
+  // backs the sidebar's W1 pull-getter; the two start* hooks route the banner
+  // CTAs through the plugin's single recovery indirections.
+  getAtRestRecoveryState?(): {
+    needsRecovery: boolean;
+    reason: string;
+    canReset: boolean;
+  };
   handleLogin(): void;
   openVaultGuardSettings(): void;
+  startAtRestRecoveryFlow?(): void;
+  startAtRestRecoveryFromRecoveryCode?(): void;
 }
 
 export interface VaultGuardSidebarActivationContext {
@@ -481,6 +492,18 @@ export interface AtRestAdapterRuntimeContext {
   recordDeletionTombstone(path: string): void;
   clearDeletionTombstone(path: string): void;
   updateStatusBar(): void;
+  // Phase 13 #1 — optional so existing ctx-builder test mocks keep compiling.
+  // The runtime fires refreshAtRestRecoverySurfaces after init/migration-failure/
+  // restore transitions; the sticky CTA + recovery-code door route through the
+  // two start* indirections.
+  refreshAtRestRecoverySurfaces?(): void;
+  startAtRestRecoveryFlow?(): void;
+  startAtRestRecoveryFromRecoveryCode?(): void;
+  // Phase 13-02 (guarded local-cache reset) — optional so existing ctx-builder
+  // test mocks keep compiling. main.ts owns setting/clearing the flag around the
+  // raw-remove wipe; the vault delete listeners honor it to suppress server DELETEs.
+  isResettingLocalCache?(): boolean;
+  setResettingLocalCache?(v: boolean): void;
 
   encryptContent(content: string): Promise<string>;
   computeHash(content: string): Promise<string>;

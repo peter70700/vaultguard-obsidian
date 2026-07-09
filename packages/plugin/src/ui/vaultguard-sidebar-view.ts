@@ -71,10 +71,31 @@ export interface VaultGuardSidebarAuthState {
   actionLabel?: string;
 }
 
+export interface AtRestRecoverySurfaceState {
+  needsRecovery: boolean;
+  reason: string;
+  canReset: boolean;
+}
+
 export interface VaultGuardSidebarViewOptions {
   getAuthState?: () => VaultGuardSidebarAuthState | null;
+  /**
+   * W1 pull path: the plugin's CURRENT at-rest recovery state. Mirrors
+   * getAuthState — a freshly-instantiated leaf (a mid-session close/reopen)
+   * seeds from this so it reflects the cipher's real state on first paint,
+   * not only from a later push. The push-only default (false) is exactly why
+   * a reopened leaf silently showed no banner while the cipher stayed locked
+   * — which on mobile (no status bar) is the silent-failure class this closes.
+   */
+  getAtRestRecoveryState?: () => AtRestRecoverySurfaceState;
   onLogin?: () => void;
   onOpenSettings?: () => void;
+  /** Primary needs-recovery CTA ("Fix now") — routes through the plugin's single
+   * startAtRestRecoveryFlow() indirection (interim: Settings → Advanced). */
+  onStartAtRestRecovery?: () => void;
+  /** Secondary needs-recovery CTA ("Enter recovery code…") — the non-destructive
+   * D5 alternate; opens the recovery-code restore flow. */
+  onRestoreFromRecoveryCode?: () => void;
 }
 
 // ─── View Class ────────────────────────────────────────────────────────────
@@ -102,6 +123,14 @@ export class VaultGuardSidebarView extends ItemView {
   private revokeReason = "";
   private leaseExpiresAt: number | null = null;
   private batchAccessUnavailable = false;
+
+  // At-rest needs-recovery banner state (Phase 13 #1). Driven by BOTH a live
+  // push (setAtRestRecoveryState) and a fresh-view pull (getAtRestRecoveryState
+  // seeded in onOpen/reload) so a mid-session leaf reopen still shows it.
+  private atRestNeedsRecovery = false;
+  private atRestRecoveryReason = "";
+  private atRestCanReset = false;
+  private atRestBannerEl: HTMLElement | null = null;
 
   // References to filter/UI elements so we can update them in place
   private userSelectEl: HTMLSelectElement | null = null;
@@ -143,12 +172,20 @@ export class VaultGuardSidebarView extends ItemView {
 
     this.contentEl_ = container;
 
+    // W1 pull: seed from the cipher's CURRENT state BEFORE painting so a fresh
+    // leaf (a mid-session reopen) reflects reality, not the push-only default.
+    this.seedAtRestRecoveryFromPull();
+
     if (!this.config) {
       this.renderNotLoggedIn(container);
+      // The banner shows even logged out — needs-recovery is real regardless of
+      // auth, and mobile has no status bar, so this is the primary mobile surface.
+      this.refreshAtRestBanner();
       return;
     }
 
     this.renderShell(container);
+    this.refreshAtRestBanner();
     await this.loadEntries();
   }
 
@@ -169,6 +206,98 @@ export class VaultGuardSidebarView extends ItemView {
     this.sortSelectEl = null;
     this.sharedToggleEl = null;
     this.searchInputEl = null;
+    this.atRestBannerEl = null;
+  }
+
+  // ─── At-Rest Needs-Recovery Banner (Phase 13 #1) ──────────────────────
+
+  /**
+   * Push the current at-rest recovery state into the view — the live path
+   * from the plugin's refreshAtRestRecoverySurfaces hub. Mirrors
+   * updateLeaseExpiry: store the state + surgically refresh the single banner
+   * element, never a full re-render.
+   */
+  setAtRestRecoveryState(state: AtRestRecoverySurfaceState): void {
+    this.atRestNeedsRecovery = state.needsRecovery;
+    this.atRestRecoveryReason = state.reason;
+    this.atRestCanReset = state.canReset;
+    this.refreshAtRestBanner();
+  }
+
+  /**
+   * W1 pull path: seed the three at-rest fields from the plugin's CURRENT
+   * cipher state so a freshly-instantiated leaf renders from reality on first
+   * paint. A later setAtRestRecoveryState push still updates live.
+   */
+  private seedAtRestRecoveryFromPull(): void {
+    const s = this.options.getAtRestRecoveryState?.();
+    if (s) {
+      this.atRestNeedsRecovery = s.needsRecovery;
+      this.atRestRecoveryReason = s.reason;
+      this.atRestCanReset = s.canReset;
+    }
+  }
+
+  /**
+   * Surgically insert (or remove) the single needs-recovery banner as the
+   * FIRST child of the content container, independent of the shell/empty-state
+   * below it — modeled on updateLeaseExpiry's in-place update, NOT a full
+   * re-render, so it persists in both the renderShell and renderNotLoggedIn
+   * layouts.
+   */
+  private refreshAtRestBanner(): void {
+    const container = this.contentEl_;
+    if (!container) return;
+
+    // Drop any prior banner first (also clears a stale ref orphaned by a
+    // container empty()), so we never stack duplicates on repeated refreshes.
+    this.atRestBannerEl?.remove();
+    this.atRestBannerEl = null;
+
+    if (!this.atRestNeedsRecovery) return;
+
+    const banner = container.createDiv({
+      cls: "vaultguard-sb-at-rest-recovery mod-critical",
+      prepend: true,
+    });
+    this.atRestBannerEl = banner;
+    this.renderAtRestRecoveryBanner(banner);
+  }
+
+  private renderAtRestRecoveryBanner(container: HTMLElement): void {
+    container.empty();
+
+    const header = container.createDiv({ cls: "vaultguard-sb-at-rest-recovery-header" });
+    const icon = header.createSpan({ cls: "vaultguard-sb-at-rest-recovery-icon" });
+    setIcon(icon, "lock");
+    header.createSpan({
+      cls: "vaultguard-sb-at-rest-recovery-title",
+      text: "Encryption locked — sync paused",
+    });
+
+    container.createDiv({
+      cls: "vaultguard-sb-at-rest-recovery-reason",
+      text:
+        this.atRestRecoveryReason ||
+        "Local at-rest encryption can't unlock on this device, so sync is paused.",
+    });
+
+    const actions = container.createDiv({ cls: "vaultguard-sb-at-rest-recovery-actions" });
+
+    // Both CTAs always render — the banner always offers the route. The
+    // honesty/enablement copy for the destructive reset lives in 13-03's
+    // modal/settings, not here.
+    const fixBtn = actions.createEl("button", {
+      cls: "vaultguard-sb-at-rest-recovery-action vaultguard-sb-at-rest-recovery-fix mod-cta",
+      text: "Fix now",
+    });
+    fixBtn.addEventListener("click", () => this.options.onStartAtRestRecovery?.());
+
+    const restoreBtn = actions.createEl("button", {
+      cls: "vaultguard-sb-at-rest-recovery-action vaultguard-sb-at-rest-recovery-restore",
+      text: "Enter recovery code…",
+    });
+    restoreBtn.addEventListener("click", () => this.options.onRestoreFromRecoveryCode?.());
   }
 
   /**
@@ -187,9 +316,13 @@ export class VaultGuardSidebarView extends ItemView {
 
     if (!this.contentEl_) return;
 
+    // W1 pull: re-seed from CURRENT cipher state before repainting.
+    this.seedAtRestRecoveryFromPull();
+
     if (!this.config) {
       this.contentEl_.empty();
       this.renderNotLoggedIn(this.contentEl_);
+      this.refreshAtRestBanner();
       return;
     }
 
@@ -199,6 +332,7 @@ export class VaultGuardSidebarView extends ItemView {
       this.renderShell(this.contentEl_);
     }
 
+    this.refreshAtRestBanner();
     await this.loadEntries();
   }
 

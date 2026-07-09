@@ -2288,6 +2288,69 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   color: var(--color-red, #e03e3e);
 }
 
+/* ─── At-Rest Needs-Recovery Surfaces (Phase 13 #1) ───────────────────── */
+
+/* Sidebar banner — persistent, mod-critical danger tone. Rendered in BOTH
+   auth states; the primary mobile surface (mobile has no desktop status bar). */
+.vaultguard-sb-at-rest-recovery {
+  margin: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background-color: rgba(255, 50, 50, 0.08);
+  border: 1px solid rgba(255, 50, 50, 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vaultguard-sb-at-rest-recovery-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vaultguard-sb-at-rest-recovery-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-red, #e03e3e);
+}
+
+.vaultguard-sb-at-rest-recovery-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.vaultguard-sb-at-rest-recovery-title {
+  font-weight: 600;
+  color: var(--color-red, #e03e3e);
+}
+
+.vaultguard-sb-at-rest-recovery-reason {
+  font-size: 0.85em;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.vaultguard-sb-at-rest-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.vaultguard-sb-at-rest-recovery-action {
+  font-size: 0.85em;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+/* Desktop status-bar locked glyph — danger tone + click-to-fix affordance.
+   Applied ONLY on needs-recovery (D3); removed on every other status render. */
+.vaultguard-status-at-rest-locked {
+  color: var(--color-red, #e03e3e);
+  cursor: pointer;
+}
+
 /* ─── Confirmation Dialog ─────────────────────────────────────────────── */
 
 .vaultguard-confirm-input {
@@ -5111,6 +5174,65 @@ button .vaultguard-btn-spinner:only-child {
 .modal.vaultguard-at-rest-restore-modal .modal-content {
   padding: 24px;
   overflow-x: hidden;
+}
+
+/* ── Guided at-rest reset modal (Phase 13-03, door #1 + door #2) ───────────── */
+.modal.vaultguard-at-rest-recovery-reset-modal {
+  width: 560px;
+  max-width: calc(100vw - 32px);
+}
+
+.modal.vaultguard-at-rest-recovery-reset-modal .modal-content {
+  padding: 24px;
+  overflow-x: hidden;
+}
+
+.vaultguard-at-rest-recovery-reset-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.vaultguard-at-rest-recovery-reset-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-error);
+}
+
+.vaultguard-at-rest-recovery-reset-icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+.vaultguard-at-rest-recovery-reset-title {
+  margin: 0;
+  color: var(--text-error);
+}
+
+.vaultguard-at-rest-recovery-reset-body p {
+  margin: 6px 0;
+}
+
+.modal.vaultguard-at-rest-recovery-reset-modal .vaultguard-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
+.modal.vaultguard-at-rest-recovery-reset-modal .vaultguard-modal-status {
+  min-height: 18px;
+  margin: 8px 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.modal.vaultguard-at-rest-recovery-reset-modal
+  .vaultguard-modal-status.vaultguard-at-rest-recovery-reset-error {
+  color: var(--text-error);
 }
 
 @media (max-width: 640px) {

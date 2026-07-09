@@ -55,8 +55,19 @@ export function registerVaultGuardViews(ctx: VaultGuardViewRegistrationContext):
   ctx.registerView(VAULTGUARD_VIEW_TYPE, (leaf) => {
     const view = new VaultGuardSidebarView(leaf, {
       getAuthState: () => ctx.getSidebarAuthState(),
+      // W1 pull: back the fresh-view seed with the plugin's single source of
+      // truth. Optional on the ctx (Task 2 supplies the plugin backing) — until
+      // then it coalesces to a calm default so the build stays green.
+      getAtRestRecoveryState: () =>
+        ctx.getAtRestRecoveryState?.() ?? {
+          needsRecovery: false,
+          reason: "",
+          canReset: false,
+        },
       onLogin: () => ctx.handleLogin(),
       onOpenSettings: () => ctx.openVaultGuardSettings(),
+      onStartAtRestRecovery: () => ctx.startAtRestRecoveryFlow?.(),
+      onRestoreFromRecoveryCode: () => ctx.startAtRestRecoveryFromRecoveryCode?.(),
     });
     if (ctx.sidebarViewConfig) {
       view.configure(ctx.sidebarViewConfig);
