@@ -105,16 +105,18 @@ export class PermissionsGraphVirtualQaModal extends Modal {
 
     const statusEl = this.contentEl.createEl("p", { text: "Awaiting disposable-vault confirmation." });
     statusEl.setAttr("aria-live", "polite");
-    const graphContainer = this.contentEl.createDiv();
+    const graphContainer = this.contentEl.createDiv({
+      cls: "vaultguard-permissions-graph-qa-canvas",
+    });
     graphContainer.setAttr("role", "img");
     graphContainer.setAttr(
       "aria-label",
       "Synthetic virtual permissions graph preview. Evidence details follow below.",
     );
-    graphContainer.style.cssText =
-      "height:420px;min-height:280px;margin-top:12px;border:1px solid var(--background-modifier-border);background:var(--background-primary);";
-    const evidenceEl = this.contentEl.createEl("pre", { text: "No synthetic QA evidence yet." });
-    evidenceEl.style.cssText = "max-height:260px;overflow:auto;white-space:pre-wrap;";
+    const evidenceEl = this.contentEl.createEl("pre", {
+      text: "No synthetic QA evidence yet.",
+      cls: "vaultguard-permissions-graph-qa-evidence",
+    });
 
     this.listen(confirmation, "change", () => {
       runButton.disabled = !confirmation.checked || this.resources.hasActiveRun;
