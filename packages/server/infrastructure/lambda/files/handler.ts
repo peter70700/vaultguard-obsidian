@@ -29,6 +29,7 @@ import {
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
 import { KMSClient, DecryptCommand } from '@aws-sdk/client-kms';
+import { emitSecurityMetric } from '../shared/metrics';
 import {
   aesDecrypt,
   aesEncrypt,
@@ -226,9 +227,13 @@ async function canSeeFolderMarker(
   // (e.g. `pathPattern: /secret/**`) matches the same way it would for a
   // real file inside the folder.
   const probePath = `/${folder}/__vaultguard_marker_probe__`;
+  // LF1: role-scoped deny rules bind on the vault-membership role, not
+  // user.roles — otherwise a `{role:'editor',deny,read,/secret/**}` rule fails
+  // to hide the `/secret` folder marker from an editor who is denied that folder.
+  const permRoles = await resolveFileOpRoles(user, vault);
   const perm = await evaluatePermission(
     user.userId,
-    user.roles,
+    permRoles,
     'read',
     probePath,
     user.orgId,
@@ -676,6 +681,9 @@ async function requireVaultOverviewAdmin(user: UserContext, vault: VaultRecord):
  * 'admin' would otherwise be misread as an ORG admin by rolesIncludeOrgAdmin.
  */
 async function resolveFileOpRoles(user: UserContext, vault: VaultRecord): Promise<string[]> {
+  // Twin of shared/utils `resolveVaultEvaluationRoles` (used by the auth
+  // key-lease handler). Keep the two in sync — both must evaluate a
+  // non-org-admin member on [membership.role], never user.roles.
   if (isAdmin(user)) return user.roles;
   const membership = await getVaultMembership(vault.vaultId, user.userId);
   if (membership) return [membership.role];
@@ -969,6 +977,10 @@ async function handleReadFile(
         versionId: s3Response.VersionId,
       },
     });
+    // SD-09-F1: FileAccessCount backs the data-exfil alarm (Sum > 500 / 5min).
+    // Fire-and-forget (void) — this is the hot read path; do not add
+    // PutMetricData latency to the response.
+    void emitSecurityMetric('FileAccessCount');
 
     return formatSuccess(
       200,
@@ -1027,9 +1039,14 @@ async function handleReadDecrypted(
   }
 
   // Per-file permission gate — 404 on deny (D-02). Audit BEFORE returning per T-08-05.
+  // LF1: evaluate with the vault-membership role (resolveFileOpRoles), NOT
+  // user.roles — this decrypt endpoint returns plaintext, so a role-scoped
+  // read-deny evaluated against user.roles would silently be un-enforced and
+  // leak the denied file's cleartext.
+  const permRoles = await resolveFileOpRoles(user, vault);
   const permResult = await evaluatePermission(
     user.userId,
-    user.roles,
+    permRoles,
     'read',
     '/' + filePath,
     user.orgId,
@@ -1100,6 +1117,9 @@ async function handleReadDecrypted(
       keyId,
     },
   });
+  // SD-09-F1: FileAccessCount (server-side decrypt read path). Fire-and-forget
+  // (void) — hot path, no added response latency.
+  void emitSecurityMetric('FileAccessCount');
 
   return formatSuccess(
     200,
@@ -1196,7 +1216,9 @@ async function handleWriteFile(
     return formatError(403, 'Access denied: insufficient permissions to write this file', requestId);
   }
 
-  // Optimistic locking: check current version if expectedVersionId is provided
+  // Optimistic locking: check current version if expectedVersionId is provided.
+  // The matching ETag is sent as IfMatch on the PUT to close the HEAD->PUT race.
+  let currentEtag: string | undefined;
   if (expectedVersionId) {
     try {
       const headResponse = await s3Client.send(
@@ -1211,6 +1233,14 @@ async function handleWriteFile(
           409,
           'Conflict: file has been modified since your last read. ' +
             `Expected version ${expectedVersionId}, current version ${headResponse.VersionId}`,
+          requestId
+        );
+      }
+      currentEtag = headResponse.ETag;
+      if (!currentEtag) {
+        return formatError(
+          409,
+          'Conflict: current checksum is unavailable for guarded write',
           requestId
         );
       }
@@ -1233,19 +1263,33 @@ async function handleWriteFile(
   const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
 
   // Write to S3
-  const putResponse = await s3Client.send(
-    new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
-      Body: contentBuffer,
-      ContentType: contentType,
-      Metadata: {
-        'modified-by': user.userId,
-        'modified-at': new Date().toISOString(),
-        ...(activeKeyId ? { 'vaultguard-key-id': activeKeyId } : {}),
-      },
-    })
-  );
+  let putResponse;
+  try {
+    putResponse = await s3Client.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+        Body: contentBuffer,
+        ContentType: contentType,
+        Metadata: {
+          'modified-by': user.userId,
+          'modified-at': new Date().toISOString(),
+          ...(activeKeyId ? { 'vaultguard-key-id': activeKeyId } : {}),
+        },
+        ...(expectedVersionId && currentEtag ? { IfMatch: currentEtag } : {}),
+      })
+    );
+  } catch (err: unknown) {
+    const name = err && typeof err === 'object' && 'name' in err ? (err as { name: string }).name : '';
+    if (expectedVersionId && (name === 'PreconditionFailed' || name === 'NotFound')) {
+      return formatError(
+        409,
+        'Conflict: file has been modified or deleted since your write began',
+        requestId
+      );
+    }
+    throw err;
+  }
 
   // Track storage usage (best-effort, non-blocking)
   const orgResult = await getActiveOrg(user.orgId);
@@ -1304,6 +1348,11 @@ async function handleWriteFile(
  * The file remains recoverable through version history.
  * Only users with 'delete' permission on the path can perform this operation.
  *
+ * Optional JSON body:
+ * - expectedVersionId: current S3 version the client believes it is deleting.
+ *   When present, the server rejects stale deletes with 409 instead of placing
+ *   a delete marker over a newer peer write.
+ *
  * @param event - API Gateway event with path parameter
  * @param user - Authenticated user context
  * @param requestId - Request ID for tracing
@@ -1320,6 +1369,14 @@ async function handleDeleteFile(
 
   const rawPath = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
   const filePath = sanitizeFilePath(rawPath);
+  const body = parseBody(event);
+  const expectedVersionId =
+    typeof body.expectedVersionId === 'string' && body.expectedVersionId.trim().length > 0
+      ? body.expectedVersionId.trim()
+      : undefined;
+  if (body.expectedVersionId !== undefined && !expectedVersionId) {
+    return formatError(400, 'expectedVersionId must be a non-empty string when provided', requestId);
+  }
 
   // Permission check
   const permRoles = await resolveFileOpRoles(user, vault);
@@ -1341,8 +1398,10 @@ async function handleDeleteFile(
     return formatError(403, 'Access denied: insufficient permissions to delete this file', requestId);
   }
 
-  // Verify file exists and capture size for storage tracking
+  // Verify file exists and capture size/version for storage tracking and
+  // optional optimistic delete locking.
   let fileSize = 0;
+  let currentEtag: string | undefined;
   try {
     const headResult = await s3Client.send(
       new HeadObjectCommand({
@@ -1351,8 +1410,34 @@ async function handleDeleteFile(
       })
     );
     fileSize = headResult.ContentLength || 0;
+    currentEtag = headResult.ETag;
+    if (expectedVersionId) {
+      if (!headResult.VersionId || headResult.VersionId !== expectedVersionId) {
+        return formatError(
+          409,
+          'Conflict: file has been modified since your last read. ' +
+            `Expected version ${expectedVersionId}, current version ${headResult.VersionId ?? 'is unavailable'}`,
+          requestId
+        );
+      }
+      if (!currentEtag) {
+        return formatError(
+          409,
+          'Conflict: current checksum is unavailable for guarded delete',
+          requestId
+        );
+      }
+    }
   } catch (err: unknown) {
     if (err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'NotFound') {
+      if (expectedVersionId) {
+        return formatError(
+          409,
+          'Conflict: file has been modified or deleted since your last read. ' +
+            `Expected version ${expectedVersionId}, current version is missing`,
+          requestId
+        );
+      }
       return formatError(404, `File not found: ${filePath}`, requestId);
     }
     throw err;
@@ -1362,13 +1447,29 @@ async function handleDeleteFile(
   // log has chain-of-custody for which DEK protected the now-hidden version.
   const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
 
-  // Soft delete (S3 versioning creates a delete marker)
-  const deleteResponse = await s3Client.send(
-    new DeleteObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
-    })
-  );
+  // Soft delete (S3 versioning creates a delete marker). For guarded deletes,
+  // IfMatch closes the HEAD→DELETE race: if a newer write lands after the HEAD,
+  // S3 rejects the delete instead of hiding the newer object.
+  let deleteResponse;
+  try {
+    deleteResponse = await s3Client.send(
+      new DeleteObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+        ...(expectedVersionId && currentEtag ? { IfMatch: currentEtag } : {}),
+      })
+    );
+  } catch (err: unknown) {
+    const name = err && typeof err === 'object' && 'name' in err ? (err as { name: string }).name : '';
+    if (expectedVersionId && (name === 'PreconditionFailed' || name === 'NotFound')) {
+      return formatError(
+        409,
+        'Conflict: file has been modified or deleted since your delete began',
+        requestId
+      );
+    }
+    throw err;
+  }
 
   // Decrement storage usage
   if (fileSize > 0) {
@@ -1600,10 +1701,11 @@ async function handleRestoreDelete(
 
   // Per-path ACL check — write action, since restore re-promotes content at
   // the path and a denied 'write' rule should block restore the same way it
-  // blocks an overwrite.
+  // blocks an overwrite. LF1: evaluate on the vault-membership role, not user.roles.
+  const permRoles = await resolveFileOpRoles(user, vault);
   const permResult = await evaluatePermission(
     user.userId,
-    user.roles,
+    permRoles,
     'write',
     '/' + filePath,
     user.orgId,
@@ -1849,10 +1951,11 @@ async function handleRestoreVersion(
 
   // Per-path ACL check — write action, since restore re-promotes content at
   // the path. A denied 'write' rule should block restore the same way it
-  // blocks an overwrite.
+  // blocks an overwrite. LF1: evaluate on the vault-membership role, not user.roles.
+  const permRoles = await resolveFileOpRoles(user, vault);
   const permResult = await evaluatePermission(
     user.userId,
-    user.roles,
+    permRoles,
     'write',
     '/' + filePath,
     user.orgId,
@@ -1967,17 +2070,26 @@ async function handleRestoreVersion(
   // reconstructed from the GSI row's (orgId, scope, vaultId) — KMS refuses
   // with InvalidCiphertextException BEFORE producing plaintext if these don't
   // match what was used at GenerateDataKey time (T-07-02 mitigation).
-  const decryptResp = await kmsClient.send(
-    new DecryptCommand({
-      CiphertextBlob: Buffer.from(dekItem.encryptedDataKey, 'base64'),
-      EncryptionContext: scopeKmsContext(
-        dekItem.orgId || user.orgId,
-        dekItem.scope || '/**',
-        dekItem.vaultId || vault.vaultId
-      ),
-    })
-  );
+  let decryptResp;
+  try {
+    decryptResp = await kmsClient.send(
+      new DecryptCommand({
+        CiphertextBlob: Buffer.from(dekItem.encryptedDataKey, 'base64'),
+        EncryptionContext: scopeKmsContext(
+          dekItem.orgId || user.orgId,
+          dekItem.scope || '/**',
+          dekItem.vaultId || vault.vaultId
+        ),
+      })
+    );
+  } catch (err) {
+    // SD-09-F1: real KMS reject (AccessDenied / InvalidCiphertext) on the
+    // historical-DEK decrypt path. Awaited before rethrowing the original error.
+    await emitSecurityMetric('KMSDecryptFailure');
+    throw err;
+  }
   if (!decryptResp.Plaintext) {
+    await emitSecurityMetric('KMSDecryptFailure');
     throw new Error('KMS Decrypt returned no plaintext for historical DEK');
   }
   const oldDek = Buffer.from(decryptResp.Plaintext);
@@ -2074,6 +2186,10 @@ async function handleListDeleted(
   // even learn that soft-deleted files exist.
   await requireVaultMember(user, vault.vaultId, 'admin');
 
+  // LF1: role-scoped rules bind on the vault-membership role, not user.roles.
+  // Org admins pass through unchanged; a vault-admin-not-org-admin gets their
+  // 'admin' vault role so a role-scoped read-deny on `admin` is honored here.
+  const permRoles = await resolveFileOpRoles(user, vault);
   const prefix = vaultS3Prefix(user.orgId, vault.vaultId);
 
   interface DeletedFileEntry {
@@ -2108,7 +2224,7 @@ async function handleListDeleted(
       // Per-row permission filter — only include paths the caller can read.
       const perm = await evaluatePermission(
         user.userId,
-        user.roles,
+        permRoles,
         'read',
         '/' + relPath,
         user.orgId,

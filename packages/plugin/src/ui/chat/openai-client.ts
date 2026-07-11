@@ -8,6 +8,7 @@ import type { OpenAiReasoningEffort, OpenAiVerbosity } from "../../types";
 import { mapOpenAiError, redactOpenAiSecret } from "./openai-errors";
 
 const RESPONSES_URL = "https://api.openai.com/v1/responses";
+const MODELS_URL = "https://api.openai.com/v1/models";
 const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
@@ -88,6 +89,18 @@ export interface OpenAiResponse {
   usage?: OpenAiUsage;
 }
 
+export interface OpenAiModelInfo {
+  id: string;
+  object: "model";
+  created: number;
+  owned_by: string;
+}
+
+interface OpenAiModelsResponse {
+  object: "list";
+  data: OpenAiModelInfo[];
+}
+
 export class OpenAiResponsesClient {
   constructor(private readonly config: OpenAiClientConfig) {}
 
@@ -130,6 +143,35 @@ export class OpenAiResponsesClient {
     }
 
     return res.json as OpenAiResponse;
+  }
+
+  /** Return the model inventory available to this API key. */
+  async listModels(): Promise<OpenAiModelInfo[]> {
+    let res;
+    try {
+      res = await requestUrl({
+        url: MODELS_URL,
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${this.config.apiKey}`,
+        },
+        throw: false,
+      });
+    } catch (e) {
+      throw new NetworkError(
+        `Could not reach OpenAI: ${redactOpenAiSecret((e as Error).message ?? "connection failed")}`,
+      );
+    }
+
+    if (res.status < 200 || res.status >= 300) {
+      throw mapOpenAiError(res.status, res.json);
+    }
+
+    const payload = res.json as Partial<OpenAiModelsResponse> | null;
+    if (!payload || payload.object !== "list" || !Array.isArray(payload.data)) {
+      throw new VaultGuardError("OpenAI returned a malformed model catalog.");
+    }
+    return payload.data;
   }
 }
 

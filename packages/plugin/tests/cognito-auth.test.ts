@@ -13,6 +13,8 @@ import {
   cognitoVerifySoftwareToken,
   devServerLogin,
   isLocalDevAuth,
+  isNetworkConnectivityError,
+  NETWORK_OFFLINE_MESSAGE,
   vaultguardConfirmReset,
   vaultguardForgotPassword,
 } from "../src/plugin/cognito-auth";
@@ -547,5 +549,76 @@ describe("vaultguardConfirmReset", () => {
     ).rejects.toThrow(
       "Password must be 12+ characters with uppercase, lowercase, numbers, and symbols."
     );
+  });
+});
+
+describe("cognito-auth offline / connectivity translation", () => {
+  beforeEach(() => {
+    mockRequestUrl.mockReset();
+  });
+
+  it("classifies connection-level errors as offline, not auth failures", () => {
+    // The exact string Android's requestUrl surfaced in Pete's report.
+    expect(
+      isNetworkConnectivityError(
+        new Error(
+          'UnknownHostException: Unable to resolve host "cognito-idp.eu-central-1.amazonaws.com": No address associated with hostname'
+        )
+      )
+    ).toBe(true);
+    expect(isNetworkConnectivityError(new Error("net::ERR_NAME_NOT_RESOLVED"))).toBe(true);
+    expect(isNetworkConnectivityError(new Error("getaddrinfo ENOTFOUND cognito-idp"))).toBe(true);
+    expect(
+      isNetworkConnectivityError(new Error("The Internet connection appears to be offline."))
+    ).toBe(true);
+    // A genuine auth failure arrives as an HTTP status, never a rejection —
+    // it must NOT be misclassified as offline.
+    expect(isNetworkConnectivityError(new Error("Invalid email or password."))).toBe(false);
+    expect(isNetworkConnectivityError(undefined)).toBe(false);
+  });
+
+  it("cognitoLogin turns a DNS/offline rejection into the friendly message", async () => {
+    mockRequestUrl.mockRejectedValueOnce(
+      new Error(
+        'net::ERR_NAME_NOT_RESOLVED: Unable to resolve host "cognito-idp.eu-central-1.amazonaws.com"'
+      )
+    );
+    await expect(
+      cognitoLogin("eu-central-1_pool", "client-123", "user@example.com", "pw")
+    ).rejects.toThrow(NETWORK_OFFLINE_MESSAGE);
+  });
+
+  it("cognitoLogin does NOT rewrite a real HTTP auth failure as offline", async () => {
+    mockRequestUrl.mockResolvedValueOnce(
+      jsonResponse(400, {
+        __type: "NotAuthorizedException",
+        message: "Incorrect username or password.",
+      })
+    );
+    await expect(
+      cognitoLogin("eu-central-1_pool", "client-123", "user@example.com", "pw")
+    ).rejects.toThrow("Invalid email or password.");
+  });
+
+  it("devServerLogin and cognitoRespondToChallenge translate offline too", async () => {
+    mockRequestUrl.mockRejectedValueOnce(new Error("ETIMEDOUT"));
+    await expect(
+      devServerLogin("http://localhost:3000", "user@example.com", "pw")
+    ).rejects.toThrow(NETWORK_OFFLINE_MESSAGE);
+
+    mockRequestUrl.mockRejectedValueOnce(
+      new Error(
+        'UnknownHostException: Unable to resolve host "cognito-idp.eu-central-1.amazonaws.com"'
+      )
+    );
+    await expect(
+      cognitoRespondToChallenge(
+        "eu-central-1_pool",
+        "client-123",
+        "SOFTWARE_TOKEN_MFA",
+        "session-abc",
+        { SOFTWARE_TOKEN_MFA_CODE: "123456", USERNAME: "user@example.com" }
+      )
+    ).rejects.toThrow(NETWORK_OFFLINE_MESSAGE);
   });
 });

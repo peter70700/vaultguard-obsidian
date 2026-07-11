@@ -142,6 +142,10 @@ export interface AgentBridgeLeaseInput {
   // on disk via the LAK) and dies on logout. Stricter scope/writeMode
   // rules apply — see createLease().
   persistent?: boolean;
+  // Internal plugin flag for in-app chat while Local Project Memory Mode is
+  // active. Allows a session-bound, in-process lease without a server vault.
+  // External HTTP/MCP leases and persistent leases must never set this.
+  localProjectMemoryMode?: boolean;
 }
 
 export interface AgentBridgeLeaseSummary {
@@ -621,6 +625,10 @@ interface AgentBridgeLease extends AgentBridgeLeaseSummary {
   // null for ephemeral leases.
   sessionUserId: string | null;
   sessionVaultId: string | null;
+  // True only for the official in-app chat lease while Local Project Memory
+  // Mode is active. It stays in-process and is never persisted or served over
+  // HTTP/MCP.
+  localProjectMemoryMode: boolean;
 }
 
 type AgentBridgeTransport = "rpc" | "mcp" | "inproc" | "chatgpt-mcp";
@@ -1690,6 +1698,7 @@ export class VaultGuardAgentBridge {
         token: record.token,
         sessionUserId: record.sessionUserId,
         sessionVaultId: record.sessionVaultId,
+        localProjectMemoryMode: false,
       };
       this.leases.set(lease.leaseId, lease);
       this.tokenIndex.set(lease.token, lease.leaseId);
@@ -2006,10 +2015,16 @@ export class VaultGuardAgentBridge {
   }
 
   createLease(input: AgentBridgeLeaseInput = {}): AgentBridgeLeaseSecret {
-    this.assertBridgePrereqs();
-
     const persistent = input.persistent === true;
     const expiresWithSession = persistent || input.expiresWithSession === true;
+    const localProjectMemoryMode = input.localProjectMemoryMode === true;
+    if (localProjectMemoryMode && (persistent || !expiresWithSession)) {
+      throw new Error(
+        "Local Project Memory Mode only allows session-bound in-process chat leases."
+      );
+    }
+    this.assertBridgePrereqs({ allowMissingServerVault: localProjectMemoryMode });
+
     const scopes = this.normalizeScopes(input.scope ?? "/**");
     const writeMode = input.writeMode ?? "deny";
 
@@ -2094,6 +2109,7 @@ export class VaultGuardAgentBridge {
       token: this.randomId("agt"),
       sessionUserId: persistent ? session?.userId ?? null : null,
       sessionVaultId: persistent ? vaultId || null : null,
+      localProjectMemoryMode,
     };
 
     this.leases.set(lease.leaseId, lease);
@@ -4186,22 +4202,26 @@ export class VaultGuardAgentBridge {
     return raw.split("/").some((segment) => segment === "..");
   }
 
-  private assertBridgePrereqs(): void {
+  private assertBridgePrereqs(
+    options: { allowMissingServerVault?: boolean } = {}
+  ): void {
     if (!this.deps.getSession()) {
       throw new Error("VaultGuard agent bridge requires an active VaultGuard login.");
     }
-    if (!this.deps.getServerVaultId()) {
+    if (!options.allowMissingServerVault && !this.deps.getServerVaultId()) {
       throw new Error("VaultGuard agent bridge requires this Obsidian folder to be bound to a server vault.");
     }
   }
 
   private requireLease(leaseId: string): AgentBridgeLease {
-    this.assertBridgePrereqs();
     this.pruneExpiredLeases();
     const lease = this.leases.get(leaseId);
     if (!lease) {
       throw new Error("VaultGuard agent lease is missing, expired, or revoked.");
     }
+    this.assertBridgePrereqs({
+      allowMissingServerVault: lease.localProjectMemoryMode,
+    });
     return lease;
   }
 
@@ -4301,6 +4321,7 @@ export class VaultGuardAgentBridge {
       token: "",
       sessionUserId: session.userId,
       sessionVaultId: session.vaultId,
+      localProjectMemoryMode: false,
     };
   }
 
@@ -4651,9 +4672,42 @@ export class VaultGuardAgentBridge {
     return http;
   }
 
+  // SD-13-F3: DNS-rebinding defense for the localhost bridge. The per-lease
+  // bearer is the primary auth (a rebinding page holds no token); additionally,
+  // per the MCP local-server guidance we validate Origin — a browser performing
+  // DNS rebinding (a public page re-pointed to 127.0.0.1) sends a cross-origin
+  // Origin header on any fetch/XHR that could read the response, so rejecting a
+  // non-localhost Origin closes that pre-auth surface. Non-browser MCP/CLI
+  // clients and the ChatGPT connector send no browser Origin, so they pass.
+  private isAllowedBridgeOrigin(req: NodeIncomingMessage): boolean {
+    const rawOrigin = req.headers["origin"];
+    const origin = ((Array.isArray(rawOrigin) ? rawOrigin[0] : rawOrigin) ?? "").trim();
+    if (!origin) return true;
+    let hostname: string;
+    try {
+      hostname = new URL(origin).hostname;
+    } catch {
+      return false;
+    }
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname === "[::1]"
+    );
+  }
+
   private async handleHttpRequest(req: NodeIncomingMessage, res: NodeServerResponse): Promise<void> {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
+
+    if (!this.isAllowedBridgeOrigin(req)) {
+      this.writeJson(res, 403, {
+        ok: false,
+        error: { message: "Forbidden: cross-origin request blocked (DNS-rebinding guard)." },
+      });
+      return;
+    }
 
     const url = (req.url ?? "").split("?")[0] || "/";
     if (req.method === "GET" && (url === CHATGPT_CONNECTOR_METADATA_PATH || url === CHATGPT_CONNECTOR_METADATA_ALT_PATH)) {
@@ -5299,7 +5353,11 @@ export class VaultGuardAgentBridge {
     this.pruneExpiredLeases();
     const leaseId = this.tokenIndex.get(token);
     if (!leaseId) return null;
-    return this.leases.get(leaseId) ?? null;
+    const lease = this.leases.get(leaseId) ?? null;
+    // Local Project Memory leases belong exclusively to the in-process chat
+    // surface. Keep them unusable over RPC/MCP even if a stale local server
+    // survives a mode transition or an internal token is exposed by a defect.
+    return lease?.localProjectMemoryMode ? null : lease;
   }
 
   // Wrap every tool invocation with an audit emit. Outcome is "success" if

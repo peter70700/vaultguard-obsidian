@@ -59,6 +59,10 @@ export interface PutFileOptions {
   expectedVersionId?: string;
 }
 
+export interface DeleteFileOptions {
+  expectedVersionId?: string;
+}
+
 export interface PermissionRule {
   id: string;
   /** Vault this rule lives in. Permissions are vault-scoped post-multi-vault. */
@@ -716,8 +720,11 @@ export class VaultGuardApiClient {
     return response;
   }
 
-  async deleteFile(path: string): Promise<void> {
-    await this.request<void>("DELETE", `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}`);
+  async deleteFile(path: string, options: DeleteFileOptions = {}): Promise<void> {
+    const body = options.expectedVersionId
+      ? { expectedVersionId: options.expectedVersionId }
+      : undefined;
+    await this.request<void>("DELETE", `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}`, body);
   }
 
   async getFileHistory(path: string): Promise<{ version: string; timestamp: string; userId: string }[]> {
@@ -763,7 +770,15 @@ export class VaultGuardApiClient {
   // ─── Permission Operations (vault-scoped) ───────────────────────────
 
   async getPermissions(path?: string): Promise<PermissionRule[]> {
-    const params = path ? `?pathFilter=${encodeURIComponent(path)}` : "";
+    // SD-03-F9: for the delegated file-admin path (pathFilter present → the
+    // server returns a non-fullRuleList result sliced to `limit`, default 50),
+    // request the server's max page (500) so ALL rules overlapping the
+    // pathFilter are returned. Vault admins call without a pathFilter and get
+    // the full unsliced set regardless, so the no-filter URL is left unchanged.
+    let params = "";
+    if (path) {
+      params = `?${new URLSearchParams({ pathFilter: path, limit: "500" }).toString()}`;
+    }
     const response = await this.request<{ rules: PermissionRule[] }>("GET", `${this.vaultBase()}/permissions${params}`);
     return response.rules ?? [];
   }

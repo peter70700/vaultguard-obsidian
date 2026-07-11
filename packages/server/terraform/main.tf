@@ -137,6 +137,7 @@ module "lambda" {
   # tfvars override this without editing main.tf.
   turnstile_secret_arn = var.turnstile_secret_arn != "" ? var.turnstile_secret_arn : ""
   sender_email         = var.sender_email
+  sender_domain        = var.sender_domain
   domain_name          = var.domain_name
 }
 
@@ -147,7 +148,8 @@ module "lambda" {
 module "apigateway" {
   source = "./modules/apigateway"
 
-  production_hardening = var.production_hardening
+  production_hardening   = var.production_hardening
+  api_data_trace_enabled = var.api_data_trace_enabled
 
   stage                          = var.stage
   is_prod                        = local.is_prod

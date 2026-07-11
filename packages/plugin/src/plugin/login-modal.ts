@@ -1,6 +1,10 @@
 import { App, ButtonComponent, Modal, setIcon } from "obsidian";
 import { setButtonLoading } from "../ui/loading-button";
 import { createShieldIcon } from "../ui/icons";
+import {
+  applyLoginStyleFallbackIfNeeded,
+  clearLoginStyleFallback,
+} from "../ui/login-style-fallback";
 
 export type EncryptionMode = 'server-managed' | 'hybrid-zk';
 
@@ -65,6 +69,8 @@ export class LoginModal extends Modal {
   private firstTimeSetup: boolean;
   /** Whether the hosted org slug field is required before login. */
   private requireOrgSlug: boolean;
+  /** True only when Obsidian failed to attach the shipped plugin stylesheet. */
+  private styleFallbackApplied: boolean = false;
 
   constructor(
     app: App,
@@ -335,9 +341,15 @@ export class LoginModal extends Modal {
     if (this.firstTimeSetup && this.onForgotPassword && this.onConfirmReset) {
       this.showForgotPasswordForm();
     }
+
+    this.styleFallbackApplied = applyLoginStyleFallbackIfNeeded(this.modalEl, contentEl);
   }
 
   onClose(): void {
+    if (this.styleFallbackApplied) {
+      clearLoginStyleFallback(this.modalEl, this.contentEl);
+      this.styleFallbackApplied = false;
+    }
     this.modalEl.removeClass("vaultguard-login-modal");
     this.contentEl.removeClass("vaultguard-login-modal-content");
     this.contentEl.empty();

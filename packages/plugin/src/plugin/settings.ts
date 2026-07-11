@@ -33,6 +33,10 @@ import {
   OPENAI_VERBOSITIES,
 } from "../ui/chat/models";
 import {
+  providerModelCatalog,
+  type ProviderModelCatalogProvider,
+} from "../ui/chat/model-catalog";
+import {
   getClaudeAuthStatus,
   type ClaudeAuthStatus,
 } from "../ui/chat/claude-cli/claude-detector";
@@ -217,8 +221,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .setName("Plugin allowlist (vault-wide)")
       .setDesc(
         "Plugins your vault admin has approved for the team. Each entry prompts you " +
-        "for consent once before being enabled in Obsidian; bytes themselves arrive " +
-        "via the regular sync channel."
+        "for consent once before enabling the locally installed copy; VaultGuard syncs " +
+        "only the allowlist metadata."
       )
       .addButton((button) =>
         button
@@ -397,6 +401,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           saveBtn.textContent = "Saving...";
           try {
             await this.aiChatKeyStore.setKey(newKey);
+            providerModelCatalog.invalidate("anthropic");
             // Wipe the plaintext from the field immediately after storing.
             inputEl.value = "";
             // Best-effort: push a DEK-wrapped copy to Cloud so the key roams to
@@ -425,6 +430,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             clearBtn.disabled = true;
             try {
               await this.aiChatKeyStore.clearKey();
+              providerModelCatalog.invalidate("anthropic");
               // Best-effort: remove the roaming copy from Cloud too.
               void this.plugin.aiKeySync.deleteRemote();
               this.showStatus(containerEl, "Anthropic API key removed.", false);
@@ -467,11 +473,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       });
 
     // ── Model ───────────────────────────────────────────────────────────────
-    new Setting(containerEl)
+    const anthropicModelSetting = new Setting(containerEl)
       .setName("Model")
-      .setDesc("Anthropic model used for AI chat turns.")
+      .setDesc("Anthropic model used for AI chat turns. Available models load from your API account.")
       .addDropdown((dropdown) => {
-        for (const m of AI_CHAT_MODELS) dropdown.addOption(m.id, m.label);
+        this.populateModelSelect(
+          dropdown.selectEl,
+          AI_CHAT_MODELS,
+          this.plugin.settings.aiChatModel,
+        );
         dropdown
           .setValue(this.plugin.settings.aiChatModel)
           .onChange(async (value) => {
@@ -479,6 +489,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+    const anthropicModelStatus = anthropicModelSetting.descEl.createDiv({
+      cls: "vaultguard-model-catalog-status",
+      text: hasKey ? "Loading models available to this Anthropic key…" : "Add an API key to load account models.",
+    });
+    void this.refreshProviderModelSelect(
+      "anthropic",
+      anthropicModelSetting.controlEl.querySelector("select"),
+      anthropicModelStatus,
+    );
 
     // ── Effort ──────────────────────────────────────────────────────────────
     new Setting(containerEl)
@@ -591,6 +610,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           saveBtn.textContent = "Saving...";
           try {
             await this.openAiKeyStore.setKey(newKey);
+            providerModelCatalog.invalidate("openai");
             inputEl.value = "";
             this.showStatus(containerEl, "OpenAI API key saved.", false);
             this.display();
@@ -615,6 +635,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             clearBtn.disabled = true;
             try {
               await this.openAiKeyStore.clearKey();
+              providerModelCatalog.invalidate("openai");
               this.showStatus(containerEl, "OpenAI API key removed.", false);
               this.display();
             } catch (error) {
@@ -630,11 +651,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         }
       });
 
-    new Setting(containerEl)
+    const openAiModelSetting = new Setting(containerEl)
       .setName("Model")
-      .setDesc("OpenAI model used for AI chat turns.")
+      .setDesc("OpenAI model used for AI chat turns. Available models load from your API account, including previews.")
       .addDropdown((dropdown) => {
-        for (const m of OPENAI_CHAT_MODELS) dropdown.addOption(m.id, m.label);
+        this.populateModelSelect(
+          dropdown.selectEl,
+          OPENAI_CHAT_MODELS,
+          this.plugin.settings.openAiModel,
+        );
         dropdown
           .setValue(this.plugin.settings.openAiModel)
           .onChange(async (value) => {
@@ -642,6 +667,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+    const openAiModelStatus = openAiModelSetting.descEl.createDiv({
+      cls: "vaultguard-model-catalog-status",
+      text: hasKey ? "Loading models available to this OpenAI key…" : "Add an API key to load account models.",
+    });
+    void this.refreshProviderModelSelect(
+      "openai",
+      openAiModelSetting.controlEl.querySelector("select"),
+      openAiModelStatus,
+    );
 
     new Setting(containerEl)
       .setName("Reasoning effort")
@@ -676,6 +710,58 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .setDesc(
         "OpenAI / GPT uses the non-streaming Responses API path in this phase. Anthropic streaming remains unchanged.",
       );
+  }
+
+  private populateModelSelect(
+    selectEl: HTMLSelectElement,
+    options: ReadonlyArray<{ id: string; label: string }>,
+    selectedModel: string,
+  ): void {
+    selectEl.replaceChildren();
+    const seen = new Set<string>();
+    const merged = options.some((option) => option.id === selectedModel)
+      ? options
+      : [{ id: selectedModel, label: `${selectedModel} (current)` }, ...options];
+    for (const option of merged) {
+      if (!option.id || seen.has(option.id)) continue;
+      seen.add(option.id);
+      selectEl.add(new Option(option.label, option.id));
+    }
+    selectEl.value = selectedModel;
+  }
+
+  private async refreshProviderModelSelect(
+    provider: ProviderModelCatalogProvider,
+    selectEl: HTMLSelectElement | null,
+    statusEl: HTMLElement,
+  ): Promise<void> {
+    if (!selectEl) return;
+    const keyStore = provider === "openai" ? this.openAiKeyStore : this.aiChatKeyStore;
+    const selectedModel =
+      provider === "openai"
+        ? this.plugin.settings.openAiModel
+        : this.plugin.settings.aiChatModel;
+    const apiKey = await keyStore.getKey();
+    const catalog = await providerModelCatalog.resolve({
+      provider,
+      apiKey,
+      selectedModel,
+    });
+    if (!selectEl.isConnected || !statusEl.isConnected) return;
+
+    const currentModel =
+      provider === "openai"
+        ? this.plugin.settings.openAiModel
+        : this.plugin.settings.aiChatModel;
+    this.populateModelSelect(selectEl, catalog.options, currentModel);
+    statusEl.setText(
+      catalog.warning ??
+        (catalog.source === "live"
+          ? "Loaded from the provider API for this account."
+          : catalog.source === "cache"
+            ? "Loaded from a recent provider API result."
+            : "Using bundled choices until an API key is available."),
+    );
   }
 
   /**

@@ -104,8 +104,28 @@ export function modelLabel(id: string): string {
   return (
     AI_CHAT_MODELS.find((m) => m.id === id)?.label ??
     OPENAI_CHAT_MODELS.find((m) => m.id === id)?.label ??
-    id
+    humanizeModelId(id)
   );
+}
+
+/** Stable display label for provider-returned ids that were not bundled. */
+export function humanizeModelId(id: string): string {
+  const trimmed = id.trim();
+  if (/^gpt-/i.test(trimmed)) {
+    const [version, ...suffix] = trimmed.slice(4).split("-");
+    return `GPT-${version}${
+      suffix.length > 0 ? ` ${suffix.map(capitalizeModelWord).join(" ")}` : ""
+    }`;
+  }
+  if (/^claude-/i.test(trimmed)) {
+    return `Claude ${trimmed.slice(7).split("-").map(capitalizeModelWord).join(" ")}`;
+  }
+  return trimmed;
+}
+
+function capitalizeModelWord(value: string): string {
+  if (/^\d+$/.test(value)) return value;
+  return value.length > 0 ? `${value[0].toUpperCase()}${value.slice(1)}` : value;
 }
 
 /** Short label for compact surfaces such as the chat status footer. */

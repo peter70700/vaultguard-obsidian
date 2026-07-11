@@ -1905,6 +1905,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 
 .modal.vaultguard-login-modal .modal-content,
 .vaultguard-login-modal-content {
+  --vaultguard-login-styles-ready: 1;
   padding: 32px 28px 24px;
   overflow-x: hidden;
   overflow-y: auto;
@@ -3049,7 +3050,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 
    1. iOS notch / Dynamic Island. Obsidian does NOT auto-pad .view-content
       for safe-area-inset-top, so an element injected at viewContent.firstChild
-      (which is exactly what file-permission-header.ts:114 does) lands behind
+      (which is exactly what file-permission-header.ts injects) lands behind
       the status bar on notched devices.
 
    2. Floating navigation (Settings → Appearance → Floating navigation,
@@ -3058,15 +3059,48 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
       overlap our badge + chips. When the setting is OFF, the native
       .view-header sibling provides spacing; when ON, nothing does.
 
+   CRITICAL — scope the two rules below to [data-type="markdown"] ONLY.
+   On phones Obsidian clears the fixed, floating .view-header by giving
+   .view-content `margin-top: var(--view-top-spacing)` (= safe-area-inset-top +
+   view-header-height + 8px). But it ZEROES that variable for markdown
+   (`[data-type="markdown"] .view-content { --view-top-spacing: 0 }`) and clears
+   via the inner scroller's padding instead — so ONLY the markdown-hosted header
+   (a .view-content firstChild, above that scroller) has no inherited clearance
+   and must add its own. Image / pdf / audio / video / binary FileViews keep the
+   full --view-top-spacing margin, which ALREADY clears the header; adding these
+   rules there too stacked a second ~110px of dead space above the bar (the bug
+   this scoping fixes — the header now lines up snug under the floating nav on
+   every file type, matching markdown).
+
    Reference: chrisgurney/obsidian-note-toolbar src/Styles/body.css L104-141.
    Scoped to .is-phone (not .is-mobile) — iPads render desktop-style and
    don't need this clearance. */
-body.is-phone .vaultguard-file-header {
+body.is-phone .workspace-leaf-content[data-type="markdown"] .vaultguard-file-header {
   padding-top: var(--safe-area-inset-top, env(safe-area-inset-top, 0px));
 }
 
-body.is-phone.is-floating-nav .vaultguard-file-header {
+body.is-phone.is-floating-nav .workspace-leaf-content[data-type="markdown"] .vaultguard-file-header {
   margin-top: var(--navbar-height, 48px);
+}
+
+/* image / audio / video (and any other binary) .view-content also carry a base
+   `padding: var(--size-4-3) …` inset that markdown and pdf don't (they are
+   padding:0). Left alone, it pushed the injected header down 12px and inset it
+   12px horizontally, so image / binary headers sat slightly lower and narrower
+   than markdown and pdf. Drop that inset (top + inline) on exactly the views
+   that HOST the header so every file type's header is pixel-identical; the
+   bottom padding stays for scroll clearance, and the horizontally-centered media
+   below is unaffected.
+
+   `:has(> .vaultguard-file-header)` scopes this to only the FileViews actually
+   showing the header (any data-type — covers binaries beyond image/audio/video)
+   and leaves logged-out / banner-off media views untouched. It's a progressive
+   enhancement: on the rare webview without :has() support the header still
+   clears correctly via the markdown-scoped rules above — only this 12px polish
+   is skipped, never the ~110px clearance fix. */
+body.is-phone .view-content:has(> .vaultguard-file-header) {
+  padding-top: 0;
+  padding-inline: 0;
 }
 
 /* ─── Mobile layout: .is-phone branch ──────────────────────────────────────
@@ -3250,7 +3284,7 @@ body.is-phone .vaultguard-fh-popover-inner {
     gap: 0;
   }
 
-  .vaultguard-fh-btn > span:not(.vaultguard-fh-btn-icon) {
+  body:not(.is-phone) .vaultguard-fh-btn > span:not(.vaultguard-fh-btn-icon) {
     display: none;
   }
 
@@ -6054,13 +6088,6 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-chat-collapsible.is-open > .vaultguard-chat-collapsible-body > * {
   display: block;
 }
-.vaultguard-chat-collapsible.is-open .vaultguard-chat-tool-code {
-  max-height: none;
-  overflow: visible;
-}
-.vaultguard-chat-collapsible.is-open .vaultguard-chat-tool-error-text {
-  overflow: visible;
-}
 .vaultguard-chat-collapsible.vaultguard-chat-is-collapsed {
   height: 32px;
   min-height: 32px;
@@ -6265,6 +6292,13 @@ button .vaultguard-btn-spinner:only-child {
   font-size: 12px;
   color: var(--text-error, #ff5a52);
   white-space: pre-wrap;
+}
+.vaultguard-chat-collapsible.is-open .vaultguard-chat-tool-code {
+  max-height: none;
+  overflow: visible;
+}
+.vaultguard-chat-collapsible.is-open .vaultguard-chat-tool-error-text {
+  overflow: visible;
 }
 
 /* Inline error row */

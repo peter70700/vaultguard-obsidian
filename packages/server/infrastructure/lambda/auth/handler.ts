@@ -21,12 +21,14 @@ import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { KMSClient, GenerateDataKeyCommand, DecryptCommand } from '@aws-sdk/client-kms';
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
 import { createHmac, randomInt, timingSafeEqual } from 'crypto';
+import { emitSecurityMetric } from '../shared/metrics';
 import {
   docClient,
   verifyToken,
   verifyActiveUser,
   evaluatePermission,
   findApplicableDenyRulesInScope,
+  resolveVaultEvaluationRoles,
   logAudit,
   formatError,
   formatSuccess,
@@ -485,9 +487,11 @@ async function handleRefresh(
   }
 
   const permissionProbePath = scopeToPermissionProbePath(renewalScope);
+  // LF1: evaluate the scope probe on the vault-membership role, not user.roles.
+  const renewalEvalRoles = await resolveVaultEvaluationRoles(user, renewalVaultId);
   const permission = await evaluatePermission(
     user.userId,
-    user.roles,
+    renewalEvalRoles,
     'read',
     permissionProbePath,
     user.orgId,
@@ -597,6 +601,29 @@ async function handleLogout(
   await invalidateSession(sessionId);
   const revokedLeaseCount = await revokeSessionLeases(sessionId, user.userId, user.orgId);
 
+  // SD-02-F1: persist a per-user logout cutoff so a stolen token replayed
+  // WITHOUT the X-VaultGuard-Session-Id header (which otherwise bypasses the
+  // header-gated session check) is still rejected until the user signs in
+  // again. verifyActiveUser (shared/utils.ts:assertTokenNewerThanLogoutCutoff)
+  // rejects any token whose auth_time/iat predates `logoutAt`. This reuses
+  // SESSIONS_TABLE with a synthetic sessionId namespace — real session ids are
+  // UUIDs, so `logout-cutoff#<userId>` never collides — and deliberately does
+  // NOT touch REVOKED_KEYS_TABLE, so a fresh post-logout login works
+  // immediately. expiresAtTtl auto-cleans the marker after 24h (safely longer
+  // than the max id-token lifetime, so the replay window never reopens).
+  const logoutNowMs = Date.now();
+  await docClient.send(
+    new PutCommand({
+      TableName: SESSIONS_TABLE,
+      Item: {
+        sessionId: `logout-cutoff#${user.userId}`,
+        userId: user.userId,
+        logoutAt: logoutNowMs,
+        expiresAtTtl: Math.floor(logoutNowMs / 1000) + 24 * 60 * 60,
+      },
+    })
+  );
+
   const auditVaultId = await resolveAuditVaultId(user, body);
   await logAudit({
     userId: user.userId,
@@ -687,6 +714,9 @@ async function handleGetKeyLease(
       userAgent: getUserAgent(event),
       metadata: { reason: 'keys_revoked', sessionId },
     });
+    // SD-09-F1: back the RevokedSessionAccess alarm (fires at >= 1). Awaited so
+    // the data point flushes before the 403 throw freezes the execution env.
+    await emitSecurityMetric('RevokedSessionAccess');
     throw new AuthError('Access has been revoked. Contact your administrator.', 403);
   }
 
@@ -1102,14 +1132,24 @@ function scopeKmsContext(orgId: string, scope: string, vaultId?: string): Record
 }
 
 async function decryptScopeDataKey(record: ScopeDataKey): Promise<Buffer> {
-  const response = await kmsClient.send(
-    new DecryptCommand({
-      CiphertextBlob: Buffer.from(record.encryptedDataKey, 'base64'),
-      EncryptionContext: scopeKmsContext(record.orgId, record.scope, record.vaultId),
-    })
-  );
+  let response;
+  try {
+    response = await kmsClient.send(
+      new DecryptCommand({
+        CiphertextBlob: Buffer.from(record.encryptedDataKey, 'base64'),
+        EncryptionContext: scopeKmsContext(record.orgId, record.scope, record.vaultId),
+      })
+    );
+  } catch (err) {
+    // SD-09-F1: a real KMS reject (AccessDenied / InvalidCiphertext / disabled
+    // key) lands here — the KMSDecryptFailure alarm's intended signal. Awaited
+    // so it flushes before we rethrow the ORIGINAL error unchanged.
+    await emitSecurityMetric('KMSDecryptFailure');
+    throw err;
+  }
 
   if (!response.Plaintext) {
+    await emitSecurityMetric('KMSDecryptFailure');
     throw new Error('KMS Decrypt did not return usable key material');
   }
 
@@ -1735,6 +1775,10 @@ async function handleScopedKeyLease(
   // Check revocation
   const isRevoked = await checkKeyRevocation(user.userId);
   if (isRevoked) {
+    // SD-09-F1: revoked user requesting a scoped key lease — same token-replay
+    // signal as the full key-lease path, for the RevokedSessionAccess alarm.
+    // This path writes no audit row, so the metric is the only signal here.
+    await emitSecurityMetric('RevokedSessionAccess');
     throw new AuthError('Access has been revoked. Contact your administrator.', 403);
   }
 
@@ -1744,9 +1788,11 @@ async function handleScopedKeyLease(
   await assertScopeHasNoReadDenyRules(user, vaultId, scope, event, requestId);
 
   const permissionProbePath = scopeToPermissionProbePath(scope);
+  // LF1: evaluate the scope probe on the vault-membership role, not user.roles.
+  const scopedEvalRoles = await resolveVaultEvaluationRoles(user, vaultId);
   const permission = await evaluatePermission(
     user.userId,
-    user.roles,
+    scopedEvalRoles,
     'read',
     permissionProbePath,
     user.orgId,
@@ -1795,9 +1841,14 @@ async function assertScopeHasNoReadDenyRules(
   event: APIGatewayProxyEvent,
   requestId: string
 ): Promise<void> {
+  // LF1: role-scoped deny rules bind on the vault-membership role, not
+  // user.roles (the org/Cognito roles). Evaluating this read-deny gate against
+  // user.roles let a role-scoped `{role:'editor',deny,read,...}` slip through,
+  // handing the member a full `/**` vault DEK instead of forcing limited-access.
+  const evalRoles = await resolveVaultEvaluationRoles(user, vaultId);
   const denyRules = await findApplicableDenyRulesInScope(
     user.userId,
-    user.roles,
+    evalRoles,
     'read',
     scope,
     user.orgId,
@@ -2325,6 +2376,27 @@ async function handleForgotPassword(
   event: APIGatewayProxyEvent,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
+  // SD-02-F4: flatten response latency so a fast "unknown user" or throttled
+  // reply cannot be distinguished from the slow real-send path (Cognito lookup +
+  // DynamoDB Put + SES round-trip) — that timing would otherwise enumerate which
+  // emails have accounts. Every generic-success reply is padded up to a uniform
+  // floor (mirrors the recovery-verify flatten sleep below). The 500 error
+  // replies use a distinct body and are not an existence oracle, so they are
+  // intentionally left unpadded.
+  const forgotStartedAt = Date.now();
+  const FORGOT_MIN_DURATION_MS = 500;
+  const respondFlattened = async (
+    resp: APIGatewayProxyResult
+  ): Promise<APIGatewayProxyResult> => {
+    const elapsed = Date.now() - forgotStartedAt;
+    if (elapsed < FORGOT_MIN_DURATION_MS) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, FORGOT_MIN_DURATION_MS - elapsed)
+      );
+    }
+    return resp;
+  };
+
   const body = parseBody(event);
   validateRequiredFields(body, ['email', 'clientId']);
 
@@ -2354,7 +2426,7 @@ async function handleForgotPassword(
       const elapsedMs = Date.now() - new Date(lastSent).getTime();
       if (elapsedMs >= 0 && elapsedMs < FORGOT_REQUEST_COOLDOWN_SECONDS * 1000) {
         // Don't tell the caller they hit the throttle (would leak existence).
-        return passwordResetSuccessResponse(requestId);
+        return respondFlattened(passwordResetSuccessResponse(requestId));
       }
     }
   }
@@ -2371,7 +2443,7 @@ async function handleForgotPassword(
   } catch (err: unknown) {
     if (isCognitoUserNotFound(err)) {
       console.log('[AUTH] ForgotPassword requested for unknown user (suppressed)');
-      return passwordResetSuccessResponse(requestId);
+      return respondFlattened(passwordResetSuccessResponse(requestId));
     }
 
     logPasswordResetFailure('cognito_lookup', err);
@@ -2428,7 +2500,7 @@ async function handleForgotPassword(
     return formatError(500, 'Unable to send reset code right now. Please try again later.', requestId);
   }
 
-  return passwordResetSuccessResponse(requestId);
+  return respondFlattened(passwordResetSuccessResponse(requestId));
 }
 
 // ─── POST /auth/confirm-reset ──────────────────────────────────────────────
@@ -2548,7 +2620,7 @@ const RECOVERY_CODE_HASH_REGEX = /^[a-f0-9]{64}$/;
  *
  * 10 attempts/hour gives a legitimate user plenty of room to fat-finger
  * codes when they're locked out, but keeps the brute-force probability
- * against 8 × 52-bit codes negligible (~10 × 8 × 2^-52 ≈ 1.7e-14 per hour).
+ * against 8 × 64-bit codes negligible (~10 × 8 × 2^-64 ≈ 4.3e-18 per hour).
  */
 const RECOVERY_ATTEMPT_LIMIT = 10;
 const RECOVERY_ATTEMPT_WINDOW_MS = 60 * 60 * 1000;
@@ -2806,6 +2878,12 @@ async function handleVerifyRecoveryCode(
       userAgent,
       metadata: { attempts },
     });
+    // SD-09-F1: FailedAuthentication covers the Lambda-visible brute-force
+    // surface — recovery-code guessing (this rate-limit trip + the verify
+    // denials below). Login credential rejection happens at Cognito (the
+    // plugin does direct USER_PASSWORD_AUTH), so pre-authorizer login
+    // brute-force is covered by the native 4XXError alarm + WAF (SD-08/SD-12).
+    await emitSecurityMetric('FailedAuthentication');
     return formatError(
       429,
       'Too many recovery attempts. Try again in an hour or contact your administrator.',
@@ -2852,6 +2930,7 @@ async function handleVerifyRecoveryCode(
       ipAddress,
       userAgent,
     });
+    await emitSecurityMetric('FailedAuthentication');
     return formatError(400, 'Invalid recovery code.', requestId);
   }
 
@@ -2879,6 +2958,7 @@ async function handleVerifyRecoveryCode(
       userAgent,
       metadata: { reason: 'race_consumed' },
     });
+    await emitSecurityMetric('FailedAuthentication');
     return formatError(400, 'Invalid recovery code.', requestId);
   }
 

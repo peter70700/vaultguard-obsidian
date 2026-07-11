@@ -6,6 +6,7 @@ import type {
   AttachmentPreviewReport,
   VaultGuardCommandContext,
 } from "./plugin-runtime-types";
+import { registerPermissionsGraphVirtualQaCommand } from "../ui/graph/permissions-graph-qa-command";
 
 /**
  * The sync engine's text/binary split is CONTENT-based, not extension-based:
@@ -858,6 +859,13 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
       void ctx.openNewVaultGuardChatTab();
     },
   });
+
+  if (process.env.NODE_ENV !== "production") {
+    registerPermissionsGraphVirtualQaCommand(ctx, {
+      isDevelopment: true,
+      isMobileApp: Platform.isMobileApp,
+    });
+  }
 
   if (process.env.NODE_ENV !== "production") {
     ctx.addCommand({

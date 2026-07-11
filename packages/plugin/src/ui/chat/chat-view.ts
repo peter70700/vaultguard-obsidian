@@ -103,14 +103,13 @@ import {
 import {
   AI_CHAT_MODELS,
   AI_CHAT_EFFORTS,
-  AI_CHAT_MODEL_IDS,
   AI_CHAT_PERMISSION_MODES,
   OPENAI_CHAT_MODELS,
-  OPENAI_CHAT_MODEL_IDS,
   OPENAI_REASONING_EFFORTS,
   chatPermissionWriteMode,
   permissionModeLabel,
 } from "./models";
+import { providerModelCatalog } from "./model-catalog";
 import type { AiChatEffort, AiChatPermissionMode, AiChatProvider } from "../../types";
 import {
   isLocalImportAvailable,
@@ -387,17 +386,19 @@ export class VaultGuardChatView extends ItemView {
       return;
     }
 
-    // Provider auto-default + history restore are BEST-EFFORT and run AFTER the
-    // panel is painted — they must never block first paint or blank the view.
-    // The subscription detector spawns `claude`, which can be slow, so it is
-    // explicitly NOT awaited here (that was the likely cause of a blank panel).
-    void this.maybeAutoDefaultProvider()
-      .catch((e) => console.error("[VaultGuard Chat] provider auto-default failed", e))
-      .finally(() => {
-        // First-run empty state (API-key mode; subscription decides lazily on
-        // first submit). Runs the async provision-or-connect decision below.
-        void this.renderInitialEmptyState();
-      });
+    // SD-13-F1 (Option C): do NOT probe for a Claude Code subscription on panel
+    // open. Auto-detection silently spawned `claude` — a binary resolved from the
+    // user's unrestricted PATH — with no user action, i.e. a drive-by child
+    // process on every panel open. Detection is now strictly user-triggered: the
+    // user opts in by choosing "Claude subscription" in Settings → AI provider,
+    // which is what runs the detector (settings.ts, gated on that choice). This
+    // removes the exploitation trigger (passive PATH-resolved spawn) and is a
+    // privacy win — a fresh install launches no child process until the user
+    // opts in. renderInitialEmptyState() stays best-effort and must never block
+    // first paint, so it is fired-and-forgotten with its own error boundary.
+    void this.renderInitialEmptyState().catch((e) =>
+      console.error("[VaultGuard Chat] initial empty state failed", e),
+    );
 
     // Resolve which conversation this leaf shows. Defer one tick so a setState()
     // that Obsidian fires alongside onOpen during workspace restore lands first
@@ -557,14 +558,6 @@ export class VaultGuardChatView extends ItemView {
     this.runtimeProvider = null;
     this.cliClient?.reset();
     this.cliClient = null;
-  }
-
-  private currentModelOptions() {
-    return this.currentProvider() === "openai" ? OPENAI_CHAT_MODELS : AI_CHAT_MODELS;
-  }
-
-  private currentModelIds(): ReadonlyArray<string> {
-    return this.currentProvider() === "openai" ? OPENAI_CHAT_MODEL_IDS : AI_CHAT_MODEL_IDS;
   }
 
   private hasCurrentProviderKey(): boolean {
@@ -1089,24 +1082,6 @@ export class VaultGuardChatView extends ItemView {
     return this.cliClient;
   }
 
-  // One-time provider auto-default. No-op once the user has chosen explicitly,
-  // on mobile, or if the detector reports anything other than a logged-in
-  // subscription. Spawns only `claude auth status` (read-only, no token).
-  private async maybeAutoDefaultProvider(): Promise<void> {
-    if (this.plugin.settings.aiChatProviderExplicit) return;
-    if (Platform.isMobileApp) return;
-    if (this.plugin.settings.aiChatProvider === "subscription") return;
-    try {
-      const status = await getClaudeAuthStatus();
-      if (status.isSubscription && status.loggedIn) {
-        this.plugin.settings.aiChatProvider = "subscription";
-        await this.plugin.saveSettings();
-      }
-    } catch {
-      // Detection failure → leave the default (apiKey) untouched.
-    }
-  }
-
   private captureAndSaveSubscription(): void {
     if (!this.convo) return;
     this.convo.model = this.model;
@@ -1177,13 +1152,19 @@ export class VaultGuardChatView extends ItemView {
       return;
     }
     if (cmd.kind === "model") {
-      if (!this.currentModelIds().includes(cmd.model)) {
-        new Notice(`VaultGuard Chat: unknown model "${cmd.model}".`);
-        return;
-      }
-      this.setModel(cmd.model);
-      new Notice(`VaultGuard Chat: switched to ${cmd.model} for this session.`);
+      void this.handleModelCommand(cmd.model);
     }
+  }
+
+  private async handleModelCommand(model: string): Promise<void> {
+    const catalog = await this.resolveCurrentModelCatalog();
+    if (catalog.provider !== this.currentApiKeyProvider()) return;
+    if (!catalog.options.some((option) => option.id === model)) {
+      new Notice(`VaultGuard Chat: model "${model}" is not available to this provider account.`);
+      return;
+    }
+    this.setModel(model);
+    new Notice(`VaultGuard Chat: switched to ${model} for this session.`);
   }
 
   // ─── /format-vault: agent-driven Obsidian Markdown cleanup ────────────────
@@ -2448,10 +2429,12 @@ export class VaultGuardChatView extends ItemView {
   // the next turn's client/lease). In subscription mode the Anthropic model id
   // is advisory (the CLI owns the actual model), so we still record it for the
   // next session.
-  private openModelMenu(evt: MouseEvent): void {
+  private async openModelMenu(evt: MouseEvent): Promise<void> {
+    const catalog = await this.resolveCurrentModelCatalog();
+    if (catalog.provider !== this.currentApiKeyProvider()) return;
     const menu = new Menu();
 
-    for (const m of this.currentModelOptions()) {
+    for (const m of catalog.options) {
       menu.addItem((item) =>
         item
           .setTitle(m.label)
@@ -2462,7 +2445,23 @@ export class VaultGuardChatView extends ItemView {
       );
     }
 
+    if (catalog.warning) new Notice(`VaultGuard Chat: ${catalog.warning}`);
     menu.showAtMouseEvent(evt);
+  }
+
+  private async resolveCurrentModelCatalog() {
+    const provider = this.currentApiKeyProvider();
+    const apiKey =
+      this.currentProvider() === "subscription"
+        ? null
+        : provider === "openai"
+          ? await new OpenAiKeyStore(this.plugin).getKey()
+          : await this.ensureAnthropicApiKey();
+    return providerModelCatalog.resolve({
+      provider,
+      apiKey,
+      selectedModel: this.model,
+    });
   }
 
   private openEffortMenu(evt: MouseEvent): void {

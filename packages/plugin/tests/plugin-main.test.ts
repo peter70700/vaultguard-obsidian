@@ -1537,6 +1537,69 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     );
   });
 
+  it("keeps the user logged in but skips vault binding and sync in Local Project Memory Mode", async () => {
+    const plugin = makePlugin();
+    plugin.settings.localProjectMemoryMode = true;
+    plugin.settings.manualConfig = true;
+    plugin.settings.serverVaultId = "";
+    plugin.openServerSession = vi.fn().mockResolvedValue({
+      sessionId: "server-session-1",
+      userId: "user-1",
+      email: "test@example.com",
+      roles: ["member"],
+      orgSettings: null,
+    });
+    plugin.decodeJwtPayload = vi.fn(() => ({
+      sub: "user-1",
+      email: "test@example.com",
+      name: "Test User",
+      "custom:org": "org-1",
+    }));
+    plugin.syncSettingsFromTokenPayload = vi.fn(() => false);
+    plugin.rebuildApiClient = vi.fn();
+    plugin.initializeApiClientFromSession = vi.fn();
+    plugin.persistSession = vi.fn().mockResolvedValue(undefined);
+    plugin.promptVaultBinding = vi.fn().mockResolvedValue(true);
+    plugin.initializeSyncEngine = vi.fn().mockResolvedValue(undefined);
+    plugin.startKeyRenewalMonitor = vi.fn();
+    plugin.startHeartbeatMonitor = vi.fn();
+    plugin.stopSyncTimer = vi.fn();
+    plugin.stopKeyRenewalMonitor = vi.fn();
+    plugin.stopHeartbeatMonitor = vi.fn();
+
+    await plugin.completeLogin(
+      {
+        tokens: {
+          idToken: "provider-id-token",
+          accessToken: "access-token",
+          refreshToken: "refresh-token",
+          expiresIn: 3600,
+        },
+      },
+      "test@example.com",
+    );
+
+    expect(plugin.session).toMatchObject({
+      sessionId: "server-session-1",
+      email: "test@example.com",
+    });
+    expect(plugin.persistSession).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "server-session-1" }),
+    );
+    expect(plugin.promptVaultBinding).not.toHaveBeenCalled();
+    expect(plugin.initializeSyncEngine).not.toHaveBeenCalled();
+    expect(plugin.startKeyRenewalMonitor).not.toHaveBeenCalled();
+    expect(plugin.startHeartbeatMonitor).not.toHaveBeenCalled();
+    expect(plugin.stopSyncTimer).toHaveBeenCalled();
+    expect(plugin.stopKeyRenewalMonitor).toHaveBeenCalled();
+    expect(plugin.stopHeartbeatMonitor).toHaveBeenCalled();
+    expect(plugin.connectionState.status).toBe("offline");
+    expect(mockNotice).toHaveBeenCalledWith(
+      expect.stringContaining("Logged in as Test User"),
+      8000,
+    );
+  });
+
   it("does not schedule retry timers while the browser reports offline", () => {
     const plugin = makePlugin();
     plugin.session = makeSession();
@@ -1874,6 +1937,48 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       remoteDeleted: true,
       resolution: null,
     });
+  });
+
+  it("keeps an offline queued delete pending when replay hits a version conflict", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.settings.deletionTombstones = { "a.md": "2026-01-01T00:00:00.000Z" };
+    plugin.offlineQueue = [
+      {
+        operation: "delete",
+        path: "a.md",
+        baseVersionId: "v1",
+        timestamp: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: false,
+      data: null,
+      error: {
+        code: "CONFLICT",
+        message: "stale delete",
+        details: null,
+        statusCode: 409,
+      },
+      requestId: "req-delete-conflict",
+    });
+
+    await plugin.flushOfflineQueue();
+
+    expect(plugin.apiRequest).toHaveBeenCalledWith(
+      "DELETE",
+      "/vaults/vault-abc/files/a.md",
+      { expectedVersionId: "v1" }
+    );
+    expect(plugin.offlineQueue).toHaveLength(1);
+    expect(plugin.offlineQueue[0]).toMatchObject({
+      operation: "delete",
+      path: "a.md",
+      baseVersionId: "v1",
+    });
+    expect(plugin.settings.deletionTombstones["a.md"]).toBe("2026-01-01T00:00:00.000Z");
   });
 
   it("resolves a pending remote-deleted conflict by keeping the remote deletion", async () => {
@@ -2267,6 +2372,42 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(mockRequestUrl).not.toHaveBeenCalled();
   });
 
+  it("allows org config resolution in Local Project Memory Mode for sign-in", async () => {
+    const plugin = makePlugin();
+    plugin.settings.localProjectMemoryMode = true;
+    plugin.settings.manualConfig = false;
+    plugin.settings.apiEndpoint = "https://api.vaultguard.test";
+    plugin.saveData = vi.fn().mockResolvedValue(undefined);
+    const body = {
+      orgSlug: "acme",
+      organizationId: "org-1",
+      apiEndpoint: "https://api.vaultguard.test",
+      cognitoUserPoolId: "eu-central-1_ACMEpool9",
+      cognitoClientId: "acmeclient0123456789ab",
+      edition: "pro",
+      features: {
+        shareLinks: true,
+        advancedAudit: true,
+        billing: true,
+        webAdmin: true,
+      },
+    };
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(200, body));
+
+    await plugin.resolveOrgConfig("acme");
+
+    expect(mockRequestUrl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "https://api.vaultguard.test/orgs/acme/config",
+        method: "GET",
+      }),
+    );
+    expect(plugin.settings.orgSlug).toBe("acme");
+    expect(plugin.settings.organizationId).toBe("org-1");
+    expect(plugin.settings.cognitoUserPoolId).toBe("eu-central-1_ACMEpool9");
+    expect(plugin.settings.cognitoClientId).toBe("acmeclient0123456789ab");
+  });
+
   it("applies a self-hosted server config URL in manual mode", async () => {
     const plugin = makePlugin();
     plugin.saveData = vi.fn().mockResolvedValue(undefined);
@@ -2459,6 +2600,43 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       })
     ).rejects.toThrow("cannot override");
     expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+
+  it("skips plugin allowlist entries whose ids are not safe path segments", async () => {
+    const plugin = makePlugin();
+    const adapterExists = vi.fn().mockResolvedValue(true);
+    const enablePluginAndSave = vi.fn();
+    plugin.app.vault.adapter.exists = adapterExists;
+    plugin.app.plugins = {
+      enabledPlugins: new Set<string>(),
+      loadManifests: vi.fn(),
+      enablePluginAndSave,
+    };
+    plugin.settings.serverPluginAllowlist = [
+      {
+        pluginId: "../secrets",
+        displayName: "Bad Plugin",
+        addedAt: "2026-07-10T00:00:00.000Z",
+        addedBy: "admin@example.com",
+      },
+    ];
+    plugin.promptPluginAllowlistDecision = vi.fn().mockResolvedValue("install");
+    plugin.emitAuditEvent = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.runPluginAllowlistReconciliation();
+
+    expect(adapterExists).not.toHaveBeenCalled();
+    expect(plugin.promptPluginAllowlistDecision).not.toHaveBeenCalled();
+    expect(enablePluginAndSave).not.toHaveBeenCalled();
+    expect(plugin.emitAuditEvent).toHaveBeenCalledWith(
+      "plugin.allowlist_skip",
+      "../secrets",
+      expect.objectContaining({ reason: "invalid-plugin-id" }),
+    );
+    expect(plugin.logError).toHaveBeenCalledWith(
+      expect.stringContaining('Allowlist: refused unsafe plugin id "../secrets"'),
+      expect.any(Error),
+    );
   });
 
   it("derives different session bindings for different vault filesystem paths", async () => {

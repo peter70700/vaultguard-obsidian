@@ -12,6 +12,10 @@ permissions:
 
 jobs:
   release:
+    # This workflow is copied verbatim into the public monorepo, where the
+    # plugin lives at packages/plugin/. Skip private-repo tags so a maintainer
+    # cannot accidentally publish from the wrong checkout layout.
+    if: github.repository == 'peter70700/vaultguard-obsidian'
     runs-on: ubuntu-latest
 
     steps:
@@ -52,6 +56,7 @@ jobs:
         with:
           subject-path: |
             packages/plugin/main.js
+            packages/plugin/manifest.json
             packages/plugin/styles.css
 
       - name: Publish GitHub release

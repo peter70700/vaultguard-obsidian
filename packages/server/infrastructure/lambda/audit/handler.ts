@@ -26,6 +26,7 @@ import {
   docClient,
   verifyActiveUser,
   logAudit,
+  buildApiHeaders,
   formatError,
   formatSuccess,
   parseBody,
@@ -46,6 +47,7 @@ import {
   getEffectiveOrgSettings,
 } from '../shared/utils';
 import { FEATURES } from '../shared/edition';
+import { isOffHours } from '../shared/time';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -70,9 +72,9 @@ const ANOMALY_THRESHOLD_BULK = parseInt(process.env.ANOMALY_THRESHOLD_BULK || '5
 const ANOMALY_WINDOW_MINUTES = parseInt(process.env.ANOMALY_WINDOW_MINUTES || '10', 10);
 const ANOMALY_THRESHOLD_DISTINCT_IPS = parseInt(process.env.ANOMALY_THRESHOLD_DISTINCT_IPS || '3', 10);
 const ANOMALY_THRESHOLD_DISTINCT_PATHS = parseInt(process.env.ANOMALY_THRESHOLD_DISTINCT_PATHS || '12', 10);
-const OFF_HOURS_START_HOUR_UTC = parseInt(process.env.OFF_HOURS_START_HOUR_UTC || '20', 10);
-const OFF_HOURS_END_HOUR_UTC = parseInt(process.env.OFF_HOURS_END_HOUR_UTC || '6', 10);
-const ALLOWED_CORS_ORIGIN = process.env.ALLOWED_CORS_ORIGIN || 'https://admin.example.com';
+// OFF_HOURS_* + isOffHours() moved to ../shared/time so the permissions handler
+// can reuse the same off-hours definition for the OffHoursPermissionChange
+// metric (SD-09-F1). Imported above.
 
 // ─── Bridge audit endpoint limits ────────────────────────────────────────────
 //
@@ -743,14 +745,10 @@ async function handleExport(
 
   return {
     statusCode: 200,
-    headers: {
+    headers: buildApiHeaders(requestId, {
       'Content-Type': 'text/csv',
       'Content-Disposition': `attachment; filename="audit-log-${startDate.split('T')[0]}-to-${endDate.split('T')[0]}.csv"`,
-      'Access-Control-Allow-Origin': ALLOWED_CORS_ORIGIN,
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-VaultGuard-Session-Id',
-      'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-      'X-Request-Id': requestId,
-    },
+    }),
     body: csv,
   };
 }
@@ -884,13 +882,41 @@ function sanitizeBridgeMetadata(input: unknown): Record<string, unknown> {
  * @returns Array of newly detected security alerts
  */
 async function detectAnomalies(user: UserContext, vaultId: string): Promise<SecurityAlert[]> {
-  const windowStart = new Date(Date.now() - ANOMALY_WINDOW_MINUTES * 60 * 1000).toISOString();
+  // Dashboard-triggered path (GET /audit/alerts): scope to the caller's org
+  // and the base detection window. Delegates to the shared scope function so
+  // the scheduled detector Lambda (SD-09-F2) runs the exact same logic.
+  return detectAnomaliesForScope({ orgId: user.orgId, vaultId });
+}
+
+/**
+ * Anomaly detection over a single (orgId, vaultId) scope. Extracted from
+ * detectAnomalies so the scheduled detector Lambda (SD-09-F2,
+ * infrastructure/lambda/detector/handler.ts) can run detection proactively
+ * across vaults on a schedule — without an admin opening the dashboard, which
+ * is the F2 gap. Exported for cross-handler reuse (same pattern as
+ * billing/handler exporting syncStripeSeats for the reconciler).
+ *
+ * `windowMinutes` is the lookback (how far back to scan); it defaults to the
+ * dashboard's ANOMALY_WINDOW_MINUTES. The scheduled detector passes a value
+ * >= its run cadence so consecutive runs leave no coverage gap. Alert ids are
+ * always bucketed on the base ANOMALY_WINDOW_MINUTES grid so the detector and
+ * the dashboard dedupe to the same id for the same anomaly in the same window
+ * (persistAlert is idempotent on the id).
+ */
+export async function detectAnomaliesForScope(scope: {
+  orgId: string;
+  vaultId: string;
+  windowMinutes?: number;
+}): Promise<SecurityAlert[]> {
+  const { orgId, vaultId } = scope;
+  const lookbackMinutes = scope.windowMinutes ?? ANOMALY_WINDOW_MINUTES;
+  const windowStart = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
   const recentEntries = await queryAllAuditEntries({
     indexName: 'vaultId-index',
     keyConditionExpression: 'vaultId = :vaultId AND #ts >= :windowStart',
     expressionAttributeValues: {
       ':vaultId': vaultId,
-      ':orgId': user.orgId,
+      ':orgId': orgId,
       ':windowStart': windowStart,
     },
     expressionAttributeNames: {
@@ -914,8 +940,8 @@ async function detectAnomalies(user: UserContext, vaultId: string): Promise<Secu
   for (const [userId, denials] of denialsByUser) {
     if (denials.length >= ANOMALY_THRESHOLD_DENIED) {
       alerts.push({
-        id: buildAlertId('repeated_denial', user.orgId, vaultId, userId, String(windowBucket)),
-        orgId: user.orgId,
+        id: buildAlertId('repeated_denial', orgId, vaultId, userId, String(windowBucket)),
+        orgId,
         vaultId,
         type: 'repeated_denial',
         severity: denials.length >= ANOMALY_THRESHOLD_DENIED * 2 ? 'high' : 'medium',
@@ -946,8 +972,8 @@ async function detectAnomalies(user: UserContext, vaultId: string): Promise<Secu
   for (const [userId, reads] of readsByUser) {
     if (reads.length >= ANOMALY_THRESHOLD_BULK) {
       alerts.push({
-        id: buildAlertId('bulk_download', user.orgId, vaultId, userId, String(windowBucket)),
-        orgId: user.orgId,
+        id: buildAlertId('bulk_download', orgId, vaultId, userId, String(windowBucket)),
+        orgId,
         vaultId,
         type: 'bulk_download',
         severity: 'high',
@@ -971,8 +997,8 @@ async function detectAnomalies(user: UserContext, vaultId: string): Promise<Secu
 
   for (const attempt of revokedAttempts) {
     alerts.push({
-      id: buildAlertId('revoked_access_attempt', user.orgId, vaultId, attempt.id),
-      orgId: user.orgId,
+      id: buildAlertId('revoked_access_attempt', orgId, vaultId, attempt.id),
+      orgId,
       vaultId,
       type: 'revoked_access_attempt',
       severity: 'critical',
@@ -1002,8 +1028,8 @@ async function detectAnomalies(user: UserContext, vaultId: string): Promise<Secu
 
   for (const [userId, entries] of offHoursByUser) {
     alerts.push({
-      id: buildAlertId('off_hours_access', user.orgId, vaultId, userId, String(windowBucket)),
-      orgId: user.orgId,
+      id: buildAlertId('off_hours_access', orgId, vaultId, userId, String(windowBucket)),
+      orgId,
       vaultId,
       type: 'off_hours_access',
       severity: entries.length >= 3 ? 'medium' : 'low',
@@ -1045,8 +1071,8 @@ async function detectAnomalies(user: UserContext, vaultId: string): Promise<Secu
     }
 
     alerts.push({
-      id: buildAlertId('unusual_pattern', user.orgId, vaultId, userId, String(windowBucket)),
-      orgId: user.orgId,
+      id: buildAlertId('unusual_pattern', orgId, vaultId, userId, String(windowBucket)),
+      orgId,
       vaultId,
       type: 'unusual_pattern',
       severity: triggeredByIps && uniqueIps.length >= ANOMALY_THRESHOLD_DISTINCT_IPS + 1 ? 'high' : 'medium',
@@ -1413,20 +1439,6 @@ function isAccessAction(action: string): boolean {
     || action === 'auth.key-lease.issued'
     || action === 'auth.key-lease.scoped'
   );
-}
-
-function isOffHours(timestamp: string): boolean {
-  const hour = new Date(timestamp).getUTCHours();
-
-  if (OFF_HOURS_START_HOUR_UTC === OFF_HOURS_END_HOUR_UTC) {
-    return false;
-  }
-
-  if (OFF_HOURS_START_HOUR_UTC < OFF_HOURS_END_HOUR_UTC) {
-    return hour >= OFF_HOURS_START_HOUR_UTC && hour < OFF_HOURS_END_HOUR_UTC;
-  }
-
-  return hour >= OFF_HOURS_START_HOUR_UTC || hour < OFF_HOURS_END_HOUR_UTC;
 }
 
 /**

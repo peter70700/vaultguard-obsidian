@@ -1,6 +1,10 @@
 variable "stage" { type = string }
 variable "is_prod" { type = bool }
 variable "production_hardening" { type = bool }
+variable "api_data_trace_enabled" {
+  type    = bool
+  default = false
+}
 variable "cognito_user_pool_arn" { type = string }
 variable "auth_lambda_invoke_arn" { type = string }
 variable "auth_lambda_name" { type = string }
@@ -77,7 +81,7 @@ resource "aws_api_gateway_gateway_response" "cors_4xx" {
 
   response_parameters = {
     "gatewayresponse.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
-    "gatewayresponse.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id'"
+    "gatewayresponse.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id,X-VG-Agent-Name,X-VG-Lease-Id'"
     "gatewayresponse.header.Access-Control-Allow-Methods" = "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
   }
 
@@ -94,7 +98,7 @@ resource "aws_api_gateway_gateway_response" "cors_5xx" {
 
   response_parameters = {
     "gatewayresponse.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
-    "gatewayresponse.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id'"
+    "gatewayresponse.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id,X-VG-Agent-Name,X-VG-Lease-Id'"
     "gatewayresponse.header.Access-Control-Allow-Methods" = "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
   }
 
@@ -1758,9 +1762,10 @@ resource "aws_api_gateway_method_settings" "vaultguard" {
     # CRITICAL: data-trace logging writes full request/response BODIES to
     # CloudWatch, including the plaintext AES-256 DEK returned by
     # GET /auth/key-lease. It must be OFF wherever real user data flows.
-    # Gated on production_hardening (default true) — NOT the stage name — because
-    # the live production stack runs stage="dev".
-    data_trace_enabled = !var.production_hardening
+    # SD-12 F8: driven by a dedicated api_data_trace_enabled var (default false,
+    # unconditional) — decoupled from production_hardening so a durability
+    # opt-out (production_hardening=false) can never re-enable DEK logging.
+    data_trace_enabled = var.api_data_trace_enabled
   }
 }
 

@@ -80,6 +80,14 @@ export interface AtRestStorage {
   clearWrappedLak(): Promise<void>;
   /** Read the device-local fallback KEK, or null if none is provisioned. */
   loadFallbackKek?(): Promise<string | null>;
+  /**
+   * Read EVERY distinct fallback-KEK candidate the device can offer (e.g. a
+   * localStorage copy AND a durable on-disk copy that may transiently disagree),
+   * so the UNWRAP path can try each and never has to guess. Pure read: it must
+   * never mint or persist. Implementations that omit it fall back to
+   * `loadFallbackKek()` as a single-candidate source.
+   */
+  loadFallbackKekCandidates?(): Promise<string[]>;
   /** Persist the device-local fallback KEK. */
   saveFallbackKek?(kekBase64: string): Promise<void>;
   /** Remove the device-local fallback KEK. */
@@ -492,26 +500,93 @@ export class AtRestCipher {
       if (!nonceB64 || !ctB64) {
         throw new Error("Malformed wrapped LAK blob (ls).");
       }
-      const kek = await this.getOrCreateFallbackKek();
-      const cryptoKek = await crypto.subtle.importKey(
-        "raw",
-        kek as BufferSource,
-        { name: "AES-GCM" },
-        false,
-        ["encrypt", "decrypt"]
-      );
       const nonce = this.base64ToBytes(nonceB64);
       const ct = this.base64ToBytes(ctB64);
-      const lak = new Uint8Array(
-        await crypto.subtle.decrypt(
-          { name: "AES-GCM", iv: nonce as BufferSource },
-          cryptoKek,
-          ct as BufferSource
-        )
+      // An `ls:` envelope IS a localstorage-fallback wrap — record the tier now so
+      // that even if no KEK unwraps it, a subsequent lock() reports "locked"
+      // (localstorage-fallback), not "uninitialized". (Pre-fix, the mint inside
+      // getOrCreateFallbackKek set this as a side effect; the read path no longer
+      // mints, so set it explicitly.)
+      this.method = "localstorage-fallback";
+
+      // READ path: gather every KEK the device can offer and try each. CRITICAL:
+      // never mint here. getOrCreateFallbackKek() would mint+persist a fresh KEK
+      // when none is *readable* — but `null`/empty conflates "genuinely absent"
+      // with "transient read error / torn file", so a single flaky read (common
+      // on mobile, where localStorage is also evicted) would overwrite the real,
+      // still-recoverable KEK and PERMANENTLY orphan the LAK. A fresh random KEK
+      // can never unwrap a pre-existing LAK anyway. If nothing unwraps we throw,
+      // and init() routes to needs-recovery — non-destructive and retryable.
+      const candidates = await this.loadFallbackKekCandidates();
+      if (candidates.length === 0) {
+        throw new Error(
+          "The device-local fallback KEK is missing or unreadable — cannot unwrap the local at-rest key. This is usually transient (reopen the vault) or recoverable via your recovery code."
+        );
+      }
+      let lastErr: unknown = null;
+      for (const kek of candidates) {
+        try {
+          const cryptoKek = await crypto.subtle.importKey(
+            "raw",
+            kek as BufferSource,
+            { name: "AES-GCM" },
+            false,
+            ["encrypt", "decrypt"]
+          );
+          const lak = new Uint8Array(
+            await crypto.subtle.decrypt(
+              { name: "AES-GCM", iv: nonce as BufferSource },
+              cryptoKek,
+              ct as BufferSource
+            )
+          );
+          // Heal divergence: converge both homes on the KEK that actually works,
+          // so a poisoned/partial localStorage can't keep shadowing the good
+          // durable KEK on later loads. Best-effort — never blocks the unwrap.
+          if (this.storage.saveFallbackKek) {
+            try {
+              await this.storage.saveFallbackKek(this.bytesToBase64(kek));
+            } catch {
+              // ignore — the unwrap already succeeded
+            }
+          }
+          return lak;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw new Error(
+        `Could not unwrap the local at-rest key with any available device KEK: ${
+          lastErr instanceof Error ? lastErr.message : String(lastErr)
+        }`
       );
-      return lak;
     }
     throw new Error("Unknown wrapped LAK envelope format.");
+  }
+
+  /**
+   * READ-ONLY fetch of every distinct fallback-KEK candidate, for the unwrap
+   * path. NEVER mints or persists (contrast getOrCreateFallbackKek, which the
+   * WRAP/provision path uses). Prefers the storage's multi-candidate hook so a
+   * divergent localStorage-vs-durable-file pair yields BOTH; falls back to the
+   * single-value loadFallbackKek for older/simple storage implementations.
+   */
+  private async loadFallbackKekCandidates(): Promise<Uint8Array[]> {
+    const seen = new Set<string>();
+    const out: Uint8Array[] = [];
+    const push = (value: string | null | undefined): void => {
+      if (typeof value !== "string") return;
+      const trimmed = value.trim();
+      if (trimmed.length === 0 || seen.has(trimmed)) return;
+      seen.add(trimmed);
+      out.push(this.base64ToBytes(trimmed));
+    };
+    if (this.storage.loadFallbackKekCandidates) {
+      for (const v of await this.storage.loadFallbackKekCandidates()) push(v);
+    } else if (this.storage.loadFallbackKek) {
+      push(await this.storage.loadFallbackKek());
+    }
+    return out;
   }
 
   /**

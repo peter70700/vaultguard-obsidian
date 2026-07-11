@@ -38,7 +38,7 @@ own keys, its own recovery story, its own threat model.
 ┌──────────────────────────────────────────────────────────────────┐
 │  CLOUD LAYER (server / sync wire)                                 │
 │  ─ Per-vault CMK in AWS KMS                                       │
-│  ─ Per-file DEKs wrapped by CMK                                   │
+│  ─ Per-vault/scope cloud DEKs wrapped by CMK                      │
 │  ─ Per-session lease tokens (1h default, configurable)             │
 │  ─ Hybrid ZK mode: per-user UMK derived from passphrase           │
 │  Recovery: Manage Organization → Recovery (admin only, escrow)    │
@@ -171,11 +171,38 @@ init time and falls back gracefully:
 | Method | When used | Strength | Recovery story |
 |---|---|---|---|
 | `safe-storage` | OS keychain available (the normal case) | OS-level encryption, bound to the logged-in user | Recovery code restores on a different machine |
-| `localstorage-fallback` | Keychain unavailable / refused | KEK lives in Electron's localStorage; defeats raw filesystem inspection but a full Electron-profile theft can recover the LAK | Same recovery code works; status badge warns the user |
+| `localstorage-fallback` | Keychain unavailable / refused (the normal case on **mobile**) | KEK lives in localStorage **and** a durable adapter file (`at-rest-kek.dat`); a full profile/plugin-folder theft can recover the LAK | Same recovery code works; status badge warns the user |
 | `ephemeral` | No persistent storage at all (tests, headless) | KEK lives only in memory | Files written this session are unreadable after restart — by design |
 
 The settings UI surfaces the active method in the status badge so the
 user can tell whether they're getting full or degraded protection.
+
+#### Fallback-KEK durability (mobile)
+
+On mobile there is no OS keychain, so the LAK is wrapped by a device-local
+**fallback KEK**. That KEK used to live **only** in the WebView's
+`localStorage`, which Obsidian mobile does **not** durably persist — the OS
+evicts it when the app is backgrounded. Once the KEK was gone the LAK could no
+longer be unwrapped, so the cipher fell into `needs-recovery` **and the at-rest
+sealed session (which survives in `data.json`) became undecryptable — the user
+was silently logged out**, with the last-opened file failing to decrypt.
+
+The KEK is therefore **dual-homed**: `localStorage` stays the fast primary, and
+a durable adapter file (`.obsidian/plugins/<id>/at-rest-kek.dat`, a sibling of
+`lak.envelope`) is the backup. On load, if `localStorage` is empty the KEK is
+recovered from the file and `localStorage` is re-seeded; existing installs are
+back-filled on first load after upgrade.
+
+**Security trade-off (honest).** The durable copy sits next to `lak.envelope` in
+the (at-rest-**excluded**, non-synced) plugin folder, so anyone with the plugin
+folder holds both the KEK and the wrapped LAK. That is the same "file access →
+decrypt" posture a no-PIN / passkey-model device already accepts (see
+*PIN passkey model* — the transparent wrap is kept on purpose). Users who want a
+stronger guarantee **enroll a PIN**: the PIN-derived key never touches disk, and
+`requirePinOnStartup` removes the transparent `lak.envelope` entirely, so the
+durable KEK then wraps nothing decryptable. On mobile, durable persistence is
+impossible without *some* on-disk key material — so this is the correct default,
+with the PIN as the opt-in hardening.
 
 ---
 

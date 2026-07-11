@@ -244,10 +244,26 @@ server must implement.
 VaultGuard Sync connects to the effective API endpoint shown in plugin settings
 and to the configured AWS Cognito User Pool endpoint for authentication. Fresh
 installs default to `https://api.vaultguard.cloud`, but the plugin does not make
-Cloud requests on load; network calls begin when you sign in, redeem an invite,
-connect an organization, or restore an existing session. Manual configuration
-bypasses the bundled Cloud fallback. The plugin uses Obsidian's `requestUrl` API
-for all HTTP calls.
+**Cloud** requests on load: Cloud/sync network calls begin only when you sign in,
+redeem an invite, connect an organization, or restore an existing session. Manual
+configuration bypasses the bundled Cloud fallback.
+
+Two network paths are independent of Cloud sign-in and are listed here for full
+disclosure:
+
+- **Update check (on load).** Shortly after the plugin loads it queries the
+  GitHub Releases API (`api.github.com` / `github.com`) to check for a newer
+  VaultGuard version. This sends no vault data or account information — only a
+  standard version request — and simply no-ops when you are offline.
+- **AI chat (opt-in).** If you use the built-in AI chat and supply your own
+  Anthropic or OpenAI API key, chat requests go directly to `api.anthropic.com`
+  or `api.openai.com`. No AI calls are made until you enable chat and provide a
+  key, and vault content reaches the provider only through VaultGuard's
+  permission-gated tools, never as raw file paths.
+
+The plugin uses Obsidian's `requestUrl` API for all HTTP calls; the desktop-only
+AI chat streaming transport uses Node's `https.request` to `api.anthropic.com`
+only.
 
 ## Account, Data, and Privacy
 

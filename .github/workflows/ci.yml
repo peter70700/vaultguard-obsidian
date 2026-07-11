@@ -72,6 +72,12 @@ jobs:
       - name: Install workspace dependencies
         run: npm install
 
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: SBOM smoke check
+        run: npm sbom --sbom-format=cyclonedx --json > /tmp/vaultguard-sbom.cdx.json
+
       - name: Lint (Biome)
         run: npx biome check .
 

@@ -17,6 +17,13 @@ const forbiddenPatterns = [
   },
 ];
 
+const forbiddenStrings = [
+  "vaultguard-debug-permissions-graph-virtual-qa",
+  "VaultGuard (debug): Open virtual permissions graph QA",
+  "Virtual permissions graph synthetic QA",
+  "Use a disposable vault for synthetic QA only.",
+];
+
 const hits = [];
 
 for (const { label, pattern } of forbiddenPatterns) {
@@ -28,6 +35,18 @@ for (const { label, pattern } of forbiddenPatterns) {
       snippet: snippetAt(bundle, match.index),
     });
     match = pattern.exec(bundle);
+  }
+}
+
+for (const forbidden of forbiddenStrings) {
+  let index = bundle.indexOf(forbidden);
+  while (index >= 0) {
+    hits.push({
+      label: `development-only string: ${forbidden}`,
+      index,
+      snippet: snippetAt(bundle, index),
+    });
+    index = bundle.indexOf(forbidden, index + forbidden.length);
   }
 }
 

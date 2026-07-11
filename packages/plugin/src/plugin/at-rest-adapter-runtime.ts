@@ -478,6 +478,13 @@ export class AtRestAdapterRuntime {
     return body;
   }
 
+  private buildDeleteBody(
+    path: string,
+    expectedVersionId = this.getExpectedVersionId(path),
+  ): Record<string, unknown> | undefined {
+    return expectedVersionId ? { expectedVersionId } : undefined;
+  }
+
   private recordSuccessfulWrite(
     path: string,
     hash: string,
@@ -631,6 +638,25 @@ export class AtRestAdapterRuntime {
     const pluginId = this.manifest?.id ?? "vaultguard-sync";
     const envelopePath = this.vaultConfigPath("plugins", pluginId, "lak.envelope");
     const adapter = this.app.vault.adapter;
+
+    // Durable home for the device-local fallback KEK (the key that wraps the LAK
+    // when the OS keychain / safeStorage is unavailable — the normal case on
+    // mobile). It was historically single-homed in localStorage, which Obsidian
+    // mobile does NOT durably persist: the OS evicts the WebView store on
+    // backgrounding, the LAK could then no longer be unwrapped, and the user was
+    // silently logged out with their files un-decryptable. Mirror it to an
+    // adapter file (a sibling of lak.envelope, inside the at-rest-EXCLUDED plugin
+    // folder) so eviction can't orphan the LAK. localStorage stays the fast
+    // primary; the file is the durable backup. Security note: the durable copy
+    // shares lak.envelope's posture — anyone with the plugin folder holds both
+    // the KEK and the wrapped LAK. That is the same "file access → decrypt"
+    // trade-off a no-PIN / passkey-model device already accepts; users who want
+    // more enroll a PIN (PIN-derived key, nothing on disk unwraps the LAK) and
+    // requirePinOnStartup removes the transparent envelope entirely, so the
+    // durable KEK then wraps nothing decryptable. See docs/AT-REST-ENCRYPTION.md.
+    const fallbackKekPath = this.vaultConfigPath("plugins", pluginId, "at-rest-kek.dat");
+    const fallbackKekLsKey = "vaultguard.at-rest.kek.v1";
+
     const localProjectMemoryMode = this.isLocalProjectMemoryModeEnabled();
 
     if (localProjectMemoryMode) {
@@ -784,14 +810,114 @@ export class AtRestAdapterRuntime {
         }
       },
       loadFallbackKek: async () => {
-        const value: unknown = this.app.loadLocalStorage("vaultguard.at-rest.kek.v1");
-        return typeof value === "string" && value.length > 0 ? value : null;
+        // Single "best value" reader used by the WRAP/provision path
+        // (getOrCreateFallbackKek). The UNWRAP path uses loadFallbackKekCandidates
+        // below, which never triggers a mint — so a transient read here can no
+        // longer clobber the real KEK.
+        const ls: unknown = this.app.loadLocalStorage(fallbackKekLsKey);
+        if (typeof ls === "string" && ls.length > 0) {
+          // Repair the durable copy when it is absent OR present-but-empty/torn (a
+          // partial adapter.write). Guarding on `!exists` alone left a torn file
+          // latent until the next eviction. Do NOT overwrite a present, NON-empty
+          // durable value — it may be the authoritative one; the candidate unwrap
+          // reconciles any disagreement.
+          try {
+            let durableUsable = false;
+            if (await adapter.exists(fallbackKekPath)) {
+              durableUsable = (await adapter.read(fallbackKekPath)).trim().length > 0;
+            }
+            if (!durableUsable) {
+              await adapter.write(fallbackKekPath, ls);
+            }
+          } catch (err) {
+            this.logError(`Back-filling durable fallback KEK at ${fallbackKekPath} failed`, err);
+          }
+          return ls;
+        }
+        // localStorage empty (e.g. mobile eviction after backgrounding) — recover
+        // from the durable adapter file and RE-SEED localStorage so subsequent
+        // reads take the fast path again.
+        try {
+          if (await adapter.exists(fallbackKekPath)) {
+            const trimmed = (await adapter.read(fallbackKekPath)).trim();
+            if (trimmed.length > 0) {
+              try {
+                this.app.saveLocalStorage(fallbackKekLsKey, trimmed);
+              } catch {
+                // Re-seed is best-effort; the durable file is authoritative.
+              }
+              return trimmed;
+            }
+          }
+        } catch (err) {
+          this.logError(`Reading durable fallback KEK at ${fallbackKekPath} failed`, err);
+        }
+        return null;
+      },
+      loadFallbackKekCandidates: async () => {
+        // READ-ONLY: every distinct, non-empty KEK the device can offer. The
+        // cipher's unwrap path tries each and NEVER mints — so a transient
+        // durable-file read error coincident with an evicted localStorage routes
+        // to needs-recovery (retryable) instead of overwriting the real,
+        // still-recoverable KEK with a fresh one (permanent data loss).
+        const out: string[] = [];
+        const push = (v: unknown): void => {
+          if (typeof v === "string" && v.trim().length > 0 && !out.includes(v.trim())) {
+            out.push(v.trim());
+          }
+        };
+        try {
+          push(this.app.loadLocalStorage(fallbackKekLsKey));
+        } catch {
+          // localStorage unavailable — the durable file may still carry the KEK.
+        }
+        try {
+          if (await adapter.exists(fallbackKekPath)) {
+            push(await adapter.read(fallbackKekPath));
+          }
+        } catch (err) {
+          this.logError(`Reading durable fallback KEK candidate at ${fallbackKekPath} failed`, err);
+        }
+        return out;
       },
       saveFallbackKek: async (kekBase64: string) => {
-        this.app.saveLocalStorage("vaultguard.at-rest.kek.v1", kekBase64);
+        // Write BOTH homes: localStorage (fast/common) and the durable adapter
+        // file (survives mobile localStorage eviction). The file is what makes
+        // the KEK — and therefore the LAK and the persisted session — outlive a
+        // background kill.
+        try {
+          this.app.saveLocalStorage(fallbackKekLsKey, kekBase64);
+        } catch (err) {
+          this.logError("Persisting fallback KEK to localStorage failed", err);
+        }
+        try {
+          await adapter.write(fallbackKekPath, kekBase64);
+        } catch (err) {
+          this.logError(`Persisting durable fallback KEK at ${fallbackKekPath} failed`, err);
+        }
       },
       clearFallbackKek: async () => {
-        this.app.saveLocalStorage("vaultguard.at-rest.kek.v1", null);
+        try {
+          this.app.saveLocalStorage(fallbackKekLsKey, null);
+        } catch {
+          // Storage may be unavailable in tests / restricted renderer contexts.
+        }
+        try {
+          if (await adapter.exists(fallbackKekPath)) {
+            await adapter.remove(fallbackKekPath);
+          }
+        } catch (err) {
+          this.logError(`Removing durable fallback KEK at ${fallbackKekPath} failed`, err);
+          // If remove() failed, neutralize the residue so a later re-provision
+          // ROTATES the device KEK instead of silently reusing the old one. An
+          // empty file reads as "absent" everywhere (candidates skip it,
+          // loadFallbackKek returns null → getOrCreateFallbackKek mints fresh).
+          try {
+            await adapter.write(fallbackKekPath, "");
+          } catch {
+            // best-effort — the localStorage copy is already cleared above
+          }
+        }
       },
     };
 
@@ -867,6 +993,24 @@ export class AtRestAdapterRuntime {
       }
       const status = this.atRestCipher.getStatus();
       if (!ok) {
+        if (status.kind === "needs-recovery" && pinEnrolled) {
+          // P1a: a failed transparent unwrap is NOT the end of the road when a
+          // PIN is enrolled — the PIN envelope (lak-pin.envelope) is an
+          // INDEPENDENT wrap that can still recover the LAK. The landing probe
+          // above is presence-only: it can't tell a decryptable transparent wrap
+          // from an orphaned one (e.g. both fallback-KEK homes were lost), so it
+          // may have taken the transparent path and dead-ended here. Route to the
+          // PIN instead: transition the cipher to LOCKED (fail-closed, awaiting
+          // unlock) rather than raising the needs-recovery banner, so a PIN
+          // unlock can recover the LAK and self-heal the wrap. ("disabled" is a
+          // different failure the PIN can't fix — it falls through below.)
+          this.atRestCipher.lock();
+          this.locked = true;
+          this.log(
+            "AtRestCipher: transparent unwrap failed but a PIN is enrolled — landing LOCKED for PIN recovery instead of needs-recovery."
+          );
+          return;
+        }
         if (status.kind === "needs-recovery") {
           // Defer the banner until layout is ready — the recovery flow
           // routes through the settings tab, which doesn't exist yet at
@@ -1478,6 +1622,12 @@ export class AtRestAdapterRuntime {
     }
     const remainingCiphertextPaths = await this.findAtRestCiphertextFiles();
     const verified = remainingCiphertextPaths.length === 0;
+    if (verified && failed === 0) {
+      await cipher.reset();
+      this.atRestCipher = null;
+      this.cipherInitPromise = null;
+      this.locked = false;
+    }
     operation.complete(
       verified
         ? `${decrypted} decrypted, ${skipped} already plaintext, ${failed} failed.`
@@ -2759,16 +2909,17 @@ export class AtRestAdapterRuntime {
     // hostWritePlainBinaryToDisk) + a real contentType label + the large-body
     // upload timeout. AC-API1 status discipline is copied verbatim.
     const contentType = contentTypeForPath(path);
+    const hash = await this.computeHashBytes(data);
+    const baseVersionId = this.getExpectedVersionId(path);
     try {
       // In manual mode, defer remote writes until the user runs a sync explicitly.
       if (this.shouldUploadChangesImmediately() && this.isOnline() && this.keyLease) {
         const encrypted = await this.encryptContentBytes(data);
-        const response = await this.apiRequest(
+        const response = await this.apiRequest<RemoteFileWriteResponse>(
           "PUT",
           this.vaultPath(`/files/${encodeURIComponent(path)}`),
           {
-            content: encrypted,
-            hash: await this.computeHashBytes(data),
+            ...this.buildWriteBody(path, encrypted, hash, { expectedVersionId: baseVersionId }),
             contentType,
           },
           undefined,
@@ -2776,6 +2927,13 @@ export class AtRestAdapterRuntime {
         );
 
         if (!response.success) {
+          if (response.error?.statusCode === 409) {
+            new Notice(
+              `VaultGuard Sync: Remote copy of "${path}" changed before this attachment upload completed. Run sync to reconcile before retrying.`,
+              10000
+            );
+            throw new Error(response.error.message);
+          }
           if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
             throw new Error(response.error.message);
           }
@@ -2790,11 +2948,13 @@ export class AtRestAdapterRuntime {
               "write",
               path,
               uint8ToBase64Chunked(new Uint8Array(data)),
-              { encoding: "base64", contentType }
+              { encoding: "base64", contentType, baseVersionId, baseHash: hash }
             );
           } else {
             throw new Error(response.error?.message ?? "Remote write failed.");
           }
+        } else {
+          this.recordSuccessfulWrite(path, hash, response);
         }
 
         // CR-1: PUT first, local VG1 write second. A permanent PUT failure
@@ -2809,7 +2969,7 @@ export class AtRestAdapterRuntime {
           "write",
           path,
           uint8ToBase64Chunked(new Uint8Array(data)),
-          { encoding: "base64", contentType }
+          { encoding: "base64", contentType, baseVersionId, baseHash: hash }
         );
       }
 
@@ -2824,7 +2984,7 @@ export class AtRestAdapterRuntime {
           "write",
           path,
           uint8ToBase64Chunked(new Uint8Array(data)),
-          { encoding: "base64", contentType }
+          { encoding: "base64", contentType, baseVersionId, baseHash: hash }
         );
       } else {
         throw error;
@@ -2952,7 +3112,8 @@ export class AtRestAdapterRuntime {
       if (this.shouldUploadChangesImmediately() && this.isOnline()) {
         const response = await this.apiRequest(
           "DELETE",
-          this.vaultPath(`/files/${encodeURIComponent(path)}`)
+          this.vaultPath(`/files/${encodeURIComponent(path)}`),
+          this.buildDeleteBody(path)
         );
 
         if (response.success || response.error?.statusCode === 404) {
@@ -3182,7 +3343,8 @@ export class AtRestAdapterRuntime {
 
       const delResp = await this.apiRequest(
         "DELETE",
-        this.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`)
+        this.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`),
+        this.buildDeleteBody(oldNormalized)
       );
 
       if (!delResp.success && delResp.error?.statusCode !== 404) {
@@ -3262,6 +3424,8 @@ export class AtRestAdapterRuntime {
     }
 
     const contentType = contentTypeForPath(newNormalized);
+    const hash = await this.computeHashBytes(bytes);
+    const baseVersionId = this.getExpectedVersionId(newNormalized);
 
     if (!this.shouldUploadChangesImmediately() || !this.isOnline() || !this.keyLease) {
       // Offline / manual: queue the byte write (base64 + encoding marker) and the
@@ -3270,6 +3434,8 @@ export class AtRestAdapterRuntime {
       this.queueOfflineOperation("write", newNormalized, base64, {
         encoding: "base64",
         contentType,
+        baseVersionId,
+        baseHash: hash,
       });
       this.queueOfflineOperation("delete", oldNormalized);
       // Pitfall 5: rename emits OLD path.
@@ -3280,12 +3446,11 @@ export class AtRestAdapterRuntime {
     try {
       const encrypted = await this.encryptContentBytes(bytes);
 
-      const putResp = await this.apiRequest(
+      const putResp = await this.apiRequest<RemoteFileWriteResponse>(
         "PUT",
         this.vaultPath(`/files/${encodeURIComponent(newNormalized)}`),
         {
-          content: encrypted,
-          hash: await this.computeHashBytes(bytes),
+          ...this.buildWriteBody(newNormalized, encrypted, hash, { expectedVersionId: baseVersionId }),
           contentType,
         },
         undefined,
@@ -3293,20 +3458,30 @@ export class AtRestAdapterRuntime {
       );
 
       if (!putResp.success) {
+        if (putResp.error?.statusCode === 409) {
+          new Notice(
+            `VaultGuard Sync: Remote copy of "${newNormalized}" changed before this attachment rename completed. Run sync to reconcile before retrying.`,
+            10000
+          );
+        }
         throw new Error(putResp.error?.message ?? `Rename: writing "${newPath}" failed.`);
       }
+      this.recordSuccessfulWrite(newNormalized, hash, putResp);
 
       const delResp = await this.apiRequest(
         "DELETE",
-        this.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`)
+        this.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`),
+        this.buildDeleteBody(oldNormalized)
       );
 
-      if (!delResp.success) {
+      if (!delResp.success && delResp.error?.statusCode !== 404) {
         this.logError(
           `Rename: DELETE of old path "${oldNormalized}" failed`,
           new Error(delResp.error?.message ?? "unknown")
         );
         this.queueOfflineOperation("delete", oldNormalized);
+      } else {
+        this.recordRemoteFileAbsent(oldNormalized);
       }
 
       // Pitfall 5: rename emits OLD path.
@@ -3321,6 +3496,8 @@ export class AtRestAdapterRuntime {
         this.queueOfflineOperation("write", newNormalized, base64, {
           encoding: "base64",
           contentType,
+          baseVersionId,
+          baseHash: hash,
         });
         this.queueOfflineOperation("delete", oldNormalized);
         // Pitfall 5: rename emits OLD path.

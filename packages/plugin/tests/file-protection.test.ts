@@ -688,6 +688,7 @@ describe('File Protection: Vault Adapter Interception', () => {
       plugin.keyLease = makeKeyLease();
       plugin.connectionState.status = 'online';
       plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+      plugin.remoteFileState.recordPresent('img/pic.png', { versionId: 'v1' });
 
       const bytes = PNG();
       const puts: any[] = [];
@@ -697,7 +698,7 @@ describe('File Protection: Vault Adapter Interception', () => {
           puts.push({ endpoint, body, options });
           callOrder.push('PUT');
         }
-        return { success: true, data: {}, error: null, requestId: 'r' };
+        return { success: true, data: { versionId: 'v2' }, error: null, requestId: 'r' };
       });
       plugin.originalAdapterMethods.writeBinary = vi.fn(async () => { callOrder.push('writeBinary'); });
 
@@ -706,6 +707,7 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(puts).toHaveLength(1);
       expect(puts[0].endpoint).toContain('img%2Fpic.png');
       expect(puts[0].body.contentType).toBe('image/png');
+      expect(puts[0].body.expectedVersionId).toBe('v1');
       expect(puts[0].options).toEqual({ timeoutMs: 120_000 });
       // The PUT hash is the byte hash of the PLAINTEXT bytes…
       expect(puts[0].body.hash).toBe(await plugin.computeHashBytes(bytes.buffer));
@@ -715,12 +717,14 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(new Uint8Array(decrypted)).toEqual(bytes);
       // CR-1 ordering: successful/queued PUT first, local VG1 write second.
       expect(callOrder).toEqual(['PUT', 'writeBinary']);
+      expect(plugin.remoteFileState.getExpectedVersionId('img/pic.png')).toBe('v2');
     });
 
     it('queues an in-size binary (base64 + encoding + contentType) and writes VG1 when offline', async () => {
       plugin.session = makeSession('editor');
       plugin.connectionState.status = 'offline';
       plugin.permissionCache.set('img/pic.png', PermissionLevel.WRITE);
+      plugin.remoteFileState.recordPresent('img/pic.png', { versionId: 'v-base' });
 
       const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
       plugin.apiRequest = vi.fn();
@@ -732,7 +736,12 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(plugin.apiRequest).not.toHaveBeenCalled();
       expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
       const writeOp = plugin.offlineQueue.find((op: any) => op.operation === 'write');
-      expect(writeOp).toMatchObject({ path: 'img/pic.png', encoding: 'base64', contentType: 'image/png' });
+      expect(writeOp).toMatchObject({
+        path: 'img/pic.png',
+        encoding: 'base64',
+        contentType: 'image/png',
+        baseVersionId: 'v-base',
+      });
       expect(new Uint8Array(Buffer.from(writeOp.data, 'base64'))).toEqual(bytes);
     });
 
@@ -899,20 +908,31 @@ describe('File Protection: Vault Adapter Interception', () => {
       plugin.keyLease = makeKeyLease();
       plugin.connectionState.status = 'online';
       plugin.permissionCache.set('img/new.png', PermissionLevel.WRITE);
+      plugin.remoteFileState.recordPresent('img/new.png', { versionId: 'v-new-base' });
+      plugin.remoteFileState.recordPresent('img/old.png', { versionId: 'v-old-base' });
 
       const bytes = PNG();
       plugin.originalAdapterMethods.rename = vi.fn().mockResolvedValue(undefined);
       plugin.originalAdapterMethods.readBinary = vi.fn().mockResolvedValue(bytes.buffer);
 
       const puts: any[] = [];
-      plugin.apiRequest = capturingApiRequest(puts);
+      const calls: any[] = [];
+      plugin.apiRequest = vi.fn(async (method: string, endpoint: string, body: any, _id?: unknown, options?: unknown) => {
+        calls.push({ method, endpoint, body, options });
+        if (method === 'PUT' && endpoint.includes('/files/')) puts.push({ endpoint, body, options });
+        return { success: true, data: { versionId: method === 'PUT' ? 'v-new' : 'dm-old' }, error: null, requestId: 'r' };
+      });
 
       await plugin.interceptedRename('img/old.png', 'img/new.png');
 
       expect(puts).toHaveLength(1);
       expect(puts[0].endpoint).toContain('img%2Fnew.png');
       expect(puts[0].body.contentType).toBe('image/png');
+      expect(puts[0].body.expectedVersionId).toBe('v-new-base');
       expect(puts[0].options).toEqual({ timeoutMs: 120_000 });
+      expect(calls.find((c) => c.method === 'DELETE')?.body).toEqual({
+        expectedVersionId: 'v-old-base',
+      });
       // Byte hash of the plain bytes…
       expect(puts[0].body.hash).toBe(await plugin.computeHashBytes(bytes.buffer));
       // …and the ciphertext decrypts back to the EXACT original bytes — proving
@@ -925,6 +945,8 @@ describe('File Protection: Vault Adapter Interception', () => {
       plugin.session = makeSession('editor');
       plugin.connectionState.status = 'offline';
       plugin.permissionCache.set('img/new.png', PermissionLevel.WRITE);
+      plugin.remoteFileState.recordPresent('img/new.png', { versionId: 'v-new-base' });
+      plugin.remoteFileState.recordPresent('img/old.png', { versionId: 'v-old-base' });
 
       const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
       plugin.originalAdapterMethods.rename = vi.fn().mockResolvedValue(undefined);
@@ -936,8 +958,13 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(plugin.apiRequest).not.toHaveBeenCalled();
       const writeOp = plugin.offlineQueue.find((op: any) => op.operation === 'write');
       const deleteOp = plugin.offlineQueue.find((op: any) => op.operation === 'delete');
-      expect(writeOp).toMatchObject({ path: 'img/new.png', encoding: 'base64', contentType: 'image/png' });
-      expect(deleteOp).toMatchObject({ path: 'img/old.png' });
+      expect(writeOp).toMatchObject({
+        path: 'img/new.png',
+        encoding: 'base64',
+        contentType: 'image/png',
+        baseVersionId: 'v-new-base',
+      });
+      expect(deleteOp).toMatchObject({ path: 'img/old.png', baseVersionId: 'v-old-base' });
       // The queued base64 decodes back to the original bytes.
       expect(new Uint8Array(Buffer.from(writeOp.data, 'base64'))).toEqual(bytes);
     });

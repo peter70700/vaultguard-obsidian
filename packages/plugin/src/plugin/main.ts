@@ -102,6 +102,7 @@ import type {
   CodexSkillInstallStatus,
 } from "./agent-bridge-codex-skill/installer";
 import { collectAttachmentPreviewData, registerVaultGuardCommands } from "./commands";
+import { redactSecretString, stringifyForLog } from "./log-redaction";
 import {
   registerFocusSyncHandlers as registerFocusSyncHandlersLifecycle,
   registerFolderLifecycleListeners as registerFolderLifecycleListenersLifecycle,
@@ -519,6 +520,13 @@ export default class VaultGuardPlugin extends Plugin {
   private lastSessionDegradedNoticeAt = 0;
 
   /**
+   * P2: mobile has no status bar, so a needs-recovery cipher used to be
+   * completely invisible there. This gates a one-per-episode mobile Notice; it
+   * resets when the cipher leaves needs-recovery so a later relapse re-alarms.
+   */
+  private atRestMobileRecoveryNoticeShown = false;
+
+  /**
    * Paths known to hold 36-byte VG1 placeholders pending hydration via the
    * server-side decrypt endpoint. In-memory only per D-09 (never persisted
    * to data.json). Populated by performInitialReconciliation in limited-
@@ -816,6 +824,7 @@ export default class VaultGuardPlugin extends Plugin {
   private agentBridgeRuntime: AgentBridgeRuntime | null = null;
   private vaultOrientationService: VaultOrientationService | null = null;
   private permissionsGraphRuntime: PermissionsGraphRuntime | null = null;
+  private permissionsGraphVirtualQaModal: { close(): void } | null = null;
   private readonly longOperations = new LongOperationManager();
   private longOperationUi: LongOperationUiController | null = null;
   private longOperationStatusUnsubscribe: (() => void) | null = null;
@@ -1238,6 +1247,7 @@ export default class VaultGuardPlugin extends Plugin {
       manifestId: this.manifest?.id,
       getSession: () => this.session,
       getServerVaultId: () => this.settings.serverVaultId,
+      isLocalProjectMemoryModeEnabled: () => this.isLocalProjectMemoryModeEnabled(),
       getApiClient: () => this.apiClient,
       getAtRestCipher: () => this.getAtRestCipher(),
       getVaultOrientationService: () => this.getVaultOrientationService(),
@@ -1483,6 +1493,35 @@ export default class VaultGuardPlugin extends Plugin {
       copyShareLinkForPath: (path) => this.copyShareLinkForPath(path),
       activateVaultGuardChat: () => this.activateVaultGuardChat(),
       activatePermissionsGraph: () => this.activatePermissionsGraph(),
+      openPermissionsGraphVirtualQaModal:
+        process.env.NODE_ENV !== "production"
+          ? async () => {
+              try {
+                if (Platform.isMobileApp || !this.settings.debugLogging) return;
+                const { PermissionsGraphVirtualQaModal } = await import(
+                  "../ui/graph/permissions-graph-qa-modal"
+                );
+                if (Platform.isMobileApp || !this.settings.debugLogging) return;
+
+                this.permissionsGraphVirtualQaModal?.close();
+                const modal = new PermissionsGraphVirtualQaModal(this.app, {
+                  onClosed: (closedModal) => {
+                    if (this.permissionsGraphVirtualQaModal === closedModal) {
+                      this.permissionsGraphVirtualQaModal = null;
+                    }
+                  },
+                });
+                this.permissionsGraphVirtualQaModal = modal;
+                modal.open();
+              } catch (error) {
+                this.logError("Opening virtual permissions graph QA failed", error);
+                new Notice(
+                  "VaultGuard Sync: the virtual permissions graph QA window could not be opened. Check the developer console for details.",
+                  8000
+                );
+              }
+            }
+          : async () => {},
       openVaultGuardChatHistory: () => this.openVaultGuardChatHistory(),
       openNewVaultGuardChatTab: () => this.openNewVaultGuardChatTab(),
       copyVaultGuardChatDomDebugReport: () => this.copyVaultGuardChatDomDebugReport(),
@@ -1834,6 +1873,16 @@ export default class VaultGuardPlugin extends Plugin {
     // the live-session idle→lock transition, not this restart/login unlock.
     this.maybeEnterLockOnAuth();
 
+    // P1a completion (mobile): on mobile the session is at-rest-sealed, so if the
+    // cipher landed LOCKED before restoreSession ran (a lost fallback KEK routed
+    // to the PIN via P1a-core, or a legacy/max-security PIN device), the session
+    // could not be decrypted and this.session is null — so maybeEnterLockOnAuth
+    // (which requires a session) did NOT curtain, leaving the user stranded with
+    // no visible unlock. Show the PIN curtain so they can unlock and recover the
+    // session (recoverSessionAfterPinUnlock re-runs restoreSession once the LAK
+    // is back).
+    this.maybeEnterPinRecoveryCurtain();
+
     // Wire the folder-lifecycle vault listeners NOW, unconditionally, decoupled
     // from sync-engine init. This is the fix for folder deletes never reaching
     // the server: registration used to live only inside initializeSyncEngine(),
@@ -1969,6 +2018,9 @@ export default class VaultGuardPlugin extends Plugin {
    */
   async onunload(): Promise<void> {
     this.log("Unloading VaultGuard plugin...");
+
+    this.permissionsGraphVirtualQaModal?.close();
+    this.permissionsGraphVirtualQaModal = null;
 
     // SY5: flush the pending (debounced) offline-queue persist so queued
     // edits survive the unload instead of dying with the timer.
@@ -2186,9 +2238,24 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   async createAgentBridgeLease(input: AgentBridgeLeaseInput = {}): Promise<AgentBridgeLeaseSecret> {
-    const lease = this.ensureAgentBridgeRuntime().createLease(input);
+    const localProjectMemoryMode = this.isLocalProjectMemoryModeEnabled();
+    if (localProjectMemoryMode && !this.isLocalProjectMemoryInAppChatLease(input)) {
+      throw new Error("Agent bridge server leases are disabled in Local Project Memory Mode.");
+    }
+    const lease = this.ensureAgentBridgeRuntime().createLease(
+      localProjectMemoryMode ? { ...input, localProjectMemoryMode: true } : input
+    );
     this.vaultOrientationService?.invalidate("agent-bridge-lease-created");
     return lease;
+  }
+
+  private isLocalProjectMemoryInAppChatLease(input: AgentBridgeLeaseInput): boolean {
+    return (
+      input.persistent !== true &&
+      input.expiresWithSession === true &&
+      typeof input.agentName === "string" &&
+      input.agentName.startsWith("VaultGuard Chat")
+    );
   }
 
   describeChatGptConnector(): ChatGptConnectorDescription {
@@ -2837,10 +2904,6 @@ export default class VaultGuardPlugin extends Plugin {
     firstTimeSetup?: boolean;
     requireOrgSlug?: boolean;
   }): void {
-    if (this.isLocalProjectMemoryModeEnabled()) {
-      new Notice("VaultGuard Sync: organization login is disabled in Local Project Memory Mode.", 6000);
-      return;
-    }
     const manualMode = this.settings.manualConfig === true;
     const hasBundledCloudAuth =
       Boolean(SAAS_DEFAULTS.cognitoUserPoolId) &&
@@ -2951,10 +3014,6 @@ export default class VaultGuardPlugin extends Plugin {
     exp?: string;
     [key: string]: string | undefined;
   }): Promise<void> {
-    if (this.isLocalProjectMemoryModeEnabled()) {
-      new Notice("VaultGuard Sync: invite redemption is disabled in Local Project Memory Mode.");
-      return;
-    }
     const slug = (params.org ?? params.slug ?? "").trim().toLowerCase();
     if (!slug) {
       new Notice("VaultGuard Sync invite link is missing the org slug.");
@@ -3529,6 +3588,12 @@ export default class VaultGuardPlugin extends Plugin {
       // Subscriptions in the four init* methods invoke readOnlyGuard /
       // file-explorer / sidebar / header invalidations; the bus listener
       // replaces the explicit per-surface fan-out that lived here.
+      // SD-03-F5: a vault switch invalidates the ENTIRE permission context, so
+      // fully clear the cache — including the root sentinel "". emit()'s
+      // wildcard handler deliberately PRESERVES root (WR-04), which would let
+      // vault A's root level bleed into vault B and bypass its glob-deny rules.
+      // Mirror the logout path: invalidate() (full clear) then emit().
+      this.permissionStore.invalidate();
       this.permissionStore.emit("changed", { serverConfirmed: true });
       this.localOnlyCatchupCompleted = false;
       this.stopSyncTimer();
@@ -5165,15 +5230,27 @@ export default class VaultGuardPlugin extends Plugin {
     }).plugins;
 
     for (const entry of allowlist) {
-      if (ignored.has(entry.pluginId)) continue;
-
-      // Already enabled? Nothing to do.
-      const enabledPlugins = pluginManager?.enabledPlugins;
-      if (enabledPlugins instanceof Set && enabledPlugins.has(entry.pluginId)) {
+      const pluginId = entry.pluginId;
+      if (!this.isSafeObsidianPluginId(pluginId)) {
+        this.logError(
+          `Allowlist: refused unsafe plugin id "${pluginId}"`,
+          new Error("unsafe plugin id"),
+        );
+        await this.emitAuditEvent("plugin.allowlist_skip", pluginId, {
+          reason: "invalid-plugin-id",
+        });
         continue;
       }
 
-      const pluginRoot = this.vaultConfigPath("plugins", entry.pluginId);
+      if (ignored.has(pluginId)) continue;
+
+      // Already enabled? Nothing to do.
+      const enabledPlugins = pluginManager?.enabledPlugins;
+      if (enabledPlugins instanceof Set && enabledPlugins.has(pluginId)) {
+        continue;
+      }
+
+      const pluginRoot = this.vaultConfigPath("plugins", pluginId);
       const mainPath = `${pluginRoot}/main.js`;
       const manifestPath = `${pluginRoot}/manifest.json`;
 
@@ -5200,13 +5277,13 @@ export default class VaultGuardPlugin extends Plugin {
           }
         }
       } catch (err) {
-        this.logError(`Allowlist: failed to inspect "${entry.pluginId}"`, err);
+        this.logError(`Allowlist: failed to inspect "${pluginId}"`, err);
         // Surface as missing — the user can retry after the next sync.
         hashStatus = "missing";
       }
 
       const decision = await this.promptPluginAllowlistDecision({
-        pluginId: entry.pluginId,
+        pluginId,
         displayName: entry.displayName,
         version: entry.version,
         note: entry.note,
@@ -5218,16 +5295,16 @@ export default class VaultGuardPlugin extends Plugin {
 
       if (decision === "ignore") {
         const ignoredList = new Set(this.settings.pluginAllowlistIgnored ?? []);
-        ignoredList.add(entry.pluginId);
+        ignoredList.add(pluginId);
         this.settings.pluginAllowlistIgnored = [...ignoredList];
         await this.saveSettings();
-        await this.emitAuditEvent("plugin.allowlist_skip", entry.pluginId, {
+        await this.emitAuditEvent("plugin.allowlist_skip", pluginId, {
           permanent: true,
         });
         continue;
       }
       if (decision === "skip") {
-        await this.emitAuditEvent("plugin.allowlist_skip", entry.pluginId);
+        await this.emitAuditEvent("plugin.allowlist_skip", pluginId);
         continue;
       }
 
@@ -5247,9 +5324,9 @@ export default class VaultGuardPlugin extends Plugin {
           await pluginManager.loadManifests();
         }
         if (typeof pluginManager?.enablePluginAndSave === "function") {
-          await pluginManager.enablePluginAndSave(entry.pluginId);
+          await pluginManager.enablePluginAndSave(pluginId);
           new Notice(`VaultGuard Sync: Enabled "${entry.displayName}".`);
-          await this.emitAuditEvent("plugin.allowlist_install", entry.pluginId, {
+          await this.emitAuditEvent("plugin.allowlist_install", pluginId, {
             verified: hashStatus === "verified",
             version: entry.version,
           });
@@ -5259,12 +5336,19 @@ export default class VaultGuardPlugin extends Plugin {
           );
         }
       } catch (err) {
-        this.logError(`Allowlist: enable "${entry.pluginId}" failed`, err);
+        this.logError(`Allowlist: enable "${pluginId}" failed`, err);
         new Notice(
           `VaultGuard Sync: Failed to enable "${entry.displayName}" — ${err instanceof Error ? err.message : "unknown error"}.`
         );
       }
     }
+  }
+
+  private isSafeObsidianPluginId(pluginId: string): boolean {
+    return (
+      /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(pluginId) &&
+      !pluginId.includes("..")
+    );
   }
 
   private promptPluginAllowlistDecision(
@@ -5299,12 +5383,6 @@ export default class VaultGuardPlugin extends Plugin {
    * SaaS API base URL or the currently configured apiEndpoint to discover it.
    */
   async resolveOrgConfig(slug: string, options: { silent?: boolean } = {}): Promise<void> {
-    if (this.isLocalProjectMemoryModeEnabled()) {
-      if (!options.silent) {
-        new Notice("VaultGuard Sync: organization connection is disabled in Local Project Memory Mode.");
-      }
-      return;
-    }
     await this.getSettingsRuntime().resolveOrgConfig(slug, options);
   }
 
@@ -5480,6 +5558,72 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * P1a completion — mobile "session sealed behind a locked cipher".
+   *
+   * On mobile the session is encrypted with the at-rest LAK (no OS keychain),
+   * so `restoreSession()` cannot decrypt it while the cipher is LOCKED. When the
+   * cipher lands locked at startup (P1a-core routed a lost fallback KEK to the
+   * PIN, or it's a legacy/max-security PIN device), `this.session` is therefore
+   * null and `maybeEnterLockOnAuth()` — which returns early without a session —
+   * never showed the unlock curtain. The user was stranded: content fails closed
+   * and there is no visible way in.
+   *
+   * Show the PIN curtain here regardless of session. There is no session to
+   * preserve, so we deliberately do NOT call `enterLockState()` (which requires
+   * one and stops session-scoped timers); we just assert the fail-closed gate and
+   * render the curtain. `unlockWithPin()` recovers the LAK and then
+   * `recoverSessionAfterPinUnlock()` re-runs `restoreSession()` now that the LAK
+   * is back. Desktop is unaffected (its session loads via safeStorage, so
+   * `this.session` is set and this early-returns).
+   */
+  private maybeEnterPinRecoveryCurtain(): void {
+    if (this.session || this.isVaultLocked) return;
+    if (!this.pinLockManager?.isEnrolled()) return;
+    // Only the LOCKED (PIN-recoverable) state — not needs-recovery/disabled,
+    // which the PIN can't fix and which have their own recovery surfaces.
+    if (this.getAtRestCipher()?.isReady() ?? false) return;
+    if (!this.ensureAtRestAdapterRuntimeObject().isLocked()) return;
+
+    this.isVaultLocked = true;
+    this.ensureAtRestAdapterRuntimeObject().setLocked(true);
+    this.showLockCurtain();
+    this.log(
+      "PIN recovery curtain shown at startup (cipher locked, session sealed behind it)."
+    );
+  }
+
+  /**
+   * P1a completion — after a PIN unlock that had NO in-memory session (the mobile
+   * "session sealed behind the cipher" path from maybeEnterPinRecoveryCurtain).
+   * The LAK is back now, so load the at-rest-sealed session, tear the recovery
+   * curtain down, and resume. Distinct from exitLockState(), which requires a
+   * live session (it re-acquires the vault key lease).
+   */
+  private async recoverSessionAfterPinUnlock(): Promise<void> {
+    try {
+      await this.restoreSession();
+    } catch (err) {
+      this.logError("Post-PIN-unlock session restore failed", err);
+    }
+    // The cipher is unlocked → local content is readable regardless — always tear
+    // the recovery curtain down so the user is never stranded behind it.
+    this.isVaultLocked = false;
+    this.ensureAtRestAdapterRuntimeObject().setLocked(false);
+    this.lockCurtain?.hide();
+    this.lockCurtain = null;
+    this.updateStatusBar();
+    if (this.session) {
+      void this.resumeStoredSession().catch((err) =>
+        this.logError("Post-PIN-unlock session resume failed", err)
+      );
+    } else {
+      // Cipher recovered but no stored session was present — the user is simply
+      // logged out; the normal login surfaces apply.
+      this.log("PIN unlock recovered the cipher but no stored session was present.");
+    }
+  }
+
+  /**
    * User-facing "Lock vault" command (quick 260708-g9m). Locks the vault on
    * demand — but ONLY when a PIN is enrolled, so a user can never strand
    * themselves behind an unlockable curtain (D-01). The four guard branches are
@@ -5648,6 +5792,15 @@ export default class VaultGuardPlugin extends Plugin {
       } catch (err) {
         this.logError("Passkey migration (persistWrappedLak after PIN unlock) failed", err);
       }
+    }
+
+    // P1a completion: a PIN unlock that had NO in-memory session (mobile — the
+    // session was sealed behind the cipher, so it couldn't be decrypted at
+    // startup) recovers the session here. exitLockState() can't be used: it
+    // re-acquires the vault key lease and early-returns without a session.
+    if (!this.session) {
+      await this.recoverSessionAfterPinUnlock();
+      return;
     }
 
     await this.exitLockState();
@@ -6248,7 +6401,10 @@ export default class VaultGuardPlugin extends Plugin {
       return PermissionLevel.NONE;
     }
 
-    const roles = this.session.roles?.length ? this.session.roles : [this.session.role];
+    // SD-03-F13: do NOT transmit org-level session roles. The server re-derives
+    // roles from the verified identity and ignores body.roles (permissions
+    // handler handleCheckPermission); sending the wider org role was a latent
+    // risk for any self-hosted fork that trusted body.roles.
     const permissionPath = this.toPermissionPath(path);
     const checks: Array<{ action: "admin" | "write" | "read"; level: PermissionLevel }> = [
       { action: "admin", level: PermissionLevel.ADMIN },
@@ -6264,7 +6420,6 @@ export default class VaultGuardPlugin extends Plugin {
       checks.map((check) =>
         this.apiRequest<{ allowed: boolean }>("POST", this.vaultPath('/permissions/check'), {
           userId: this.session!.userId,
-          roles,
           action: check.action,
           path: permissionPath,
         })
@@ -8912,6 +9067,21 @@ export default class VaultGuardPlugin extends Plugin {
     this.pushAtRestRecoveryStateToSidebar(state);
     if (!state.needsRecovery) {
       this.atRestAdapterRuntime?.clearAtRestRecoveryStickyNotice();
+      this.atRestMobileRecoveryNoticeShown = false;
+      return;
+    }
+    // P2: the status-bar alarm (updateStatusBar) is desktop-only — Obsidian does
+    // not render a status bar on mobile — and the sidebar banner is only visible
+    // when the sidebar is open. So on mobile a needs-recovery cipher was silent
+    // (the "! never shows on mobile" report). Fire a mobile Notice with a clear
+    // CTA, once per needs-recovery episode.
+    if (Platform.isMobileApp && !this.atRestMobileRecoveryNoticeShown) {
+      this.atRestMobileRecoveryNoticeShown = true;
+      new Notice(
+        "VaultGuard: local encryption is locked on this device and can't unlock automatically. " +
+          "Open Settings → VaultGuard to restore from your recovery code.",
+        15000,
+      );
     }
   }
 
@@ -9958,6 +10128,18 @@ export default class VaultGuardPlugin extends Plugin {
    * @param error - The error object
    */
   private logError(message: string, error: unknown): void {
-    console.error(`${LOG_PREFIX} ${message}:`, error);
+    // SD-14-F3: this console.error is intentionally always-on (real errors must
+    // surface regardless of debugLogging/NODE_ENV). Redact known secret shapes
+    // first as defense-in-depth — but only swap in the sanitized string when a
+    // secret was actually found, so the common (clean) case keeps DevTools'
+    // clickable Error object + stack for debugging.
+    const safeMessage = redactSecretString(message);
+    const raw = stringifyForLog(error);
+    const redacted = redactSecretString(raw);
+    if (redacted === raw) {
+      console.error(`${LOG_PREFIX} ${safeMessage}:`, error);
+    } else {
+      console.error(`${LOG_PREFIX} ${safeMessage}:`, redacted);
+    }
   }
 }

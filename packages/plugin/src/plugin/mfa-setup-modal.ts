@@ -261,15 +261,20 @@ export class MfaSetupModal extends Modal {
   private generateRecoveryCodes(): string[] {
     const codes: string[] = [];
     for (let i = 0; i < RECOVERY_CODE_COUNT; i++) {
-      const bytes = new Uint8Array(5);
+      // SD-02-F5: 8 random bytes = 64 bits of entropy per code (was 5 bytes /
+      // 40 bits, well below the server's stated 52-bit assumption). Each byte
+      // base36-encodes to 2 chars → 16 chars; the server normalizes (strips
+      // non-alphanumerics, lowercases) then SHA-256s, so this longer same-charset
+      // code stays byte-compatible with existing storage and verification.
+      const bytes = new Uint8Array(8);
       crypto.getRandomValues(bytes);
       const code = Array.from(bytes)
         .map((b) => b.toString(36).padStart(2, "0"))
         .join("")
-        .substring(0, 10)
+        .substring(0, 16)
         .toUpperCase();
-      // Format as XXXXX-XXXXX
-      codes.push(code.substring(0, 5) + "-" + code.substring(5, 10));
+      // Format as XXXX-XXXX-XXXX-XXXX (16 chars in 4 groups)
+      codes.push((code.match(/.{1,4}/g) ?? [code]).join("-"));
     }
     return codes;
   }

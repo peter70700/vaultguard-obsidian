@@ -189,6 +189,21 @@ describe("VaultGuardApiClient surface", () => {
     });
   });
 
+  it("sends expectedVersionId for guarded file deletes", async () => {
+    const client = makeClient();
+    mockRequestUrl.mockResolvedValueOnce(emptyResponse());
+
+    await expect(client.deleteFile("/docs/a.md", { expectedVersionId: "v1" })).resolves.toBeUndefined();
+
+    expect(mockRequestUrl.mock.calls[0]![0].method).toBe("DELETE");
+    expect(mockRequestUrl.mock.calls[0]![0].url).toBe(
+      "https://api.vaultguard.test/vaults/vault-abc/files/%2Fdocs%2Fa.md"
+    );
+    expect(JSON.parse(mockRequestUrl.mock.calls[0]![0].body as string)).toEqual({
+      expectedVersionId: "v1",
+    });
+  });
+
   it("maps permission and user-management endpoints to the expected routes", async () => {
     const client = makeClient();
     const rule = {
@@ -276,7 +291,7 @@ describe("VaultGuardApiClient surface", () => {
     await client.getUserActivity("user-1", 25);
 
     expect(mockRequestUrl.mock.calls.map((call) => [call[0].method, call[0].url])).toEqual([
-      ["GET", "https://api.vaultguard.test/vaults/vault-abc/permissions?pathFilter=%2Fdocs"],
+      ["GET", "https://api.vaultguard.test/vaults/vault-abc/permissions?pathFilter=%2Fdocs&limit=500"],
       ["POST", "https://api.vaultguard.test/vaults/vault-abc/permissions"],
       ["PUT", "https://api.vaultguard.test/vaults/vault-abc/permissions/rule-1"],
       ["DELETE", "https://api.vaultguard.test/vaults/vault-abc/permissions/rule-1"],

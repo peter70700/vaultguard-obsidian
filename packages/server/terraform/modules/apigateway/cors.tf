@@ -33,6 +33,7 @@ locals {
     auth_recover               = aws_api_gateway_resource.auth_recover.id
     auth_recovery_codes        = aws_api_gateway_resource.auth_recovery_codes.id
     auth_recovery_codes_verify = aws_api_gateway_resource.auth_recovery_codes_verify.id
+    auth_ai_key                = aws_api_gateway_resource.auth_ai_key.id
     files                      = aws_api_gateway_resource.files.id
     files_sync                 = aws_api_gateway_resource.files_sync.id
     files_path                 = aws_api_gateway_resource.files_path.id

@@ -276,7 +276,7 @@ export type AuditAction =
   | "bridge.skill_uninstalled";
 
 /**
- * Represents an immutable audit log entry for compliance and security tracking.
+ * Represents an audit log entry for compliance and security tracking.
  * All sensitive operations generate audit events sent to the backend.
  */
 export interface AuditEvent {

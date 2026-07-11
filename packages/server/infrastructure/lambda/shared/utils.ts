@@ -24,8 +24,10 @@ import {
 import { AdminGetUserCommand, CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { randomBytes, randomUUID } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import { EDITION } from './edition';
+import { emitSecurityMetric } from './metrics';
+import { isOffHours } from './time';
 
 // ─── Environment Configuration ───────────────────────────────────────────────
 
@@ -53,7 +55,12 @@ const VAULTS_TABLE = process.env.VAULTS_TABLE!;
 const VAULT_MEMBERS_TABLE = process.env.VAULT_MEMBERS_TABLE!;
 const VAULT_ACTIVITY_TABLE = process.env.VAULT_ACTIVITY_TABLE!;
 const SUBSCRIPTIONS_TABLE = process.env.SUBSCRIPTIONS_TABLE!;
-const ORG_SETTINGS_CACHE_TTL_MS = 60_000;
+// SD-02-F3: 15s (was 60s) bounds the window in which a just-enabled `requireMfa`
+// can still be served stale (false) by other warm Lambda containers —
+// invalidateOrgSettingsCache only clears the container that wrote the change, so
+// the cache is per-instance. A short TTL is a proportionate mitigation for this
+// self-healing gap; a per-request uncached read was rejected as disproportionate.
+const ORG_SETTINGS_CACHE_TTL_MS = 15_000;
 const VAULT_ACTIVITY_TTL_DAYS = 14;
 
 // ─── DynamoDB Client ─────────────────────────────────────────────────────────
@@ -96,6 +103,13 @@ export interface UserContext {
   emailVerified: boolean;
   /** Unix timestamp of the upstream Cognito authentication event, if present. */
   authTime: number | null;
+  /**
+   * Unix timestamp (epoch seconds) at which THIS token was issued (the `iat`
+   * claim). Used as the fallback for the per-user logout cutoff (SD-02-F1)
+   * when `auth_time` is absent — e.g. tokens minted via refresh, or access
+   * tokens that omit `auth_time`.
+   */
+  iat: number | null;
 }
 
 interface ServerSessionRecord {
@@ -362,6 +376,10 @@ export async function verifyToken(event: APIGatewayProxyEvent): Promise<UserCont
           typeof (payload as Record<string, unknown>).auth_time === 'number'
             ? ((payload as Record<string, unknown>).auth_time as number)
             : null,
+        iat:
+          typeof (payload as Record<string, unknown>).iat === 'number'
+            ? ((payload as Record<string, unknown>).iat as number)
+            : null,
       };
     } catch {
       // Try next token type
@@ -401,6 +419,7 @@ export async function verifyActiveUser(
   const user = await verifyToken(event);
   requireOrgId(user);
   await assertUserNotRevoked(user);
+  await assertTokenNewerThanLogoutCutoff(user);
   await assertSessionActiveIfPresent(event, user);
   await assertOrgMfaSatisfied(user);
   if (!options.allowPendingCheckout) {
@@ -620,6 +639,46 @@ export async function assertUserNotRevoked(user: UserContext): Promise<void> {
 
   if (result.Item) {
     throw new AuthError('Access has been revoked. Contact your administrator.', 403);
+  }
+}
+
+/**
+ * SD-02-F1 — per-user logout cutoff (header-independent session invalidation).
+ *
+ * `assertSessionActiveIfPresent` only fires when the caller sends the
+ * `X-VaultGuard-Session-Id` header, so a stolen Cognito token replayed WITHOUT
+ * that header keeps working for the residual token lifetime after the victim
+ * logs out. This check closes that bypass for ALL clients: on logout the auth
+ * handler records `logoutAt = now` under the synthetic SESSIONS_TABLE key
+ * `logout-cutoff#<userId>`; here we reject any token whose issuance time
+ * (`auth_time`, falling back to `iat`) predates that moment.
+ *
+ * Deliberately isolated from admin-revoke (`assertUserNotRevoked`): it reads a
+ * SESSIONS_TABLE marker, never REVOKED_KEYS_TABLE, and trips no blanket 403 —
+ * so a fresh token minted AFTER `logoutAt` passes and re-login works
+ * immediately. When there is no cutoff item (the common case), behaviour is
+ * unchanged (allow).
+ */
+async function assertTokenNewerThanLogoutCutoff(user: UserContext): Promise<void> {
+  const result = await docClient.send(
+    new GetCommand({
+      TableName: SESSIONS_TABLE,
+      Key: { sessionId: `logout-cutoff#${user.userId}` },
+    })
+  );
+
+  const logoutAt = result.Item?.logoutAt;
+  if (typeof logoutAt !== 'number') return; // no cutoff recorded → unchanged behaviour
+
+  // `auth_time` / `iat` are epoch SECONDS; `logoutAt` is epoch MS — compare in ms.
+  // Only judge tokens that actually carry an issuance time; a token with neither
+  // claim is left untouched (fail-open, unchanged behaviour). Cognito tokens
+  // always carry `iat`, so this fallback is defensive.
+  const tokenIssuedSec = user.authTime ?? user.iat;
+  if (typeof tokenIssuedSec !== 'number') return;
+
+  if (tokenIssuedSec * 1000 < logoutAt) {
+    throw new AuthError('Session ended. Please sign in again.', 401);
   }
 }
 
@@ -1469,9 +1528,14 @@ export class ValidationError extends Error {
 }
 
 const ALLOWED_CORS_ORIGIN = process.env.ALLOWED_CORS_ORIGIN || 'https://admin.example.com';
+const ALLOWED_CORS_HEADERS = 'Content-Type,Authorization,X-VaultGuard-Session-Id,X-VG-Agent-Name,X-VG-Lease-Id';
+const ALLOWED_CORS_METHODS = 'GET,POST,PUT,PATCH,DELETE,OPTIONS';
 
 /** Standard security headers applied to every API response. */
-function SECURITY_HEADERS(requestId?: string): Record<string, string> {
+export function buildApiHeaders(
+  requestId?: string,
+  overrides: Record<string, string> = {}
+): Record<string, string> {
   return {
     'Content-Type': 'application/json',
     'X-Request-Id': requestId || '',
@@ -1481,7 +1545,9 @@ function SECURITY_HEADERS(requestId?: string): Record<string, string> {
     'Cache-Control': 'no-store',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
     'Access-Control-Allow-Origin': ALLOWED_CORS_ORIGIN,
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-VaultGuard-Session-Id',
+    'Access-Control-Allow-Headers': ALLOWED_CORS_HEADERS,
+    'Access-Control-Allow-Methods': ALLOWED_CORS_METHODS,
+    ...overrides,
   };
 }
 
@@ -1511,7 +1577,7 @@ export function formatError(
 
   return {
     statusCode,
-    headers: SECURITY_HEADERS(requestId),
+    headers: buildApiHeaders(requestId),
     body: JSON.stringify(body),
   };
 }
@@ -1531,7 +1597,7 @@ export function formatSuccess(
 ): APIGatewayProxyResult {
   return {
     statusCode,
-    headers: SECURITY_HEADERS(requestId),
+    headers: buildApiHeaders(requestId),
     body: JSON.stringify(body),
   };
 }
@@ -1679,12 +1745,30 @@ export function isAdmin(user: UserContext): boolean {
 // investigations — add an email here, insert one-off `debugUserLog`
 // calls in the code paths under investigation, redeploy, query via
 // `scripts/query-debug-logs.mjs`, then empty this set again.
+//
+// SD-14-F4: the emitted log never contains the raw email — it is reduced to a
+// stable truncated SHA-256 `userTag` (see debugUserTag) so no plaintext PII
+// sits in CloudWatch. The allow-list below still matches the real email; only
+// the OUTPUT is hashed, and `query-debug-logs.mjs` hashes the same way to
+// filter. Emails are low-entropy, so the tag is confirmable by a guesser who
+// already has the address — the guarantee is "no standing plaintext PII in
+// logs", not anonymity against a determined insider.
 const DEBUG_USER_EMAILS = new Set<string>();
 
 interface DebugUserContext {
   email?: string;
   userId?: string;
   roles?: string[];
+}
+
+/**
+ * SD-14-F4: reduce an email to a stable, non-plaintext tag for debug logs so no
+ * raw PII lands in CloudWatch. Deterministic (same email → same tag) so an
+ * operator can correlate a known target's rows by hashing the address; the
+ * reader (`scripts/query-debug-logs.mjs`) recomputes the identical tag to filter.
+ */
+export function debugUserTag(email: string): string {
+  return createHash('sha256').update(email.trim().toLowerCase()).digest('hex').slice(0, 16);
 }
 
 export function debugUserLog(
@@ -1700,7 +1784,7 @@ export function debugUserLog(
     JSON.stringify({
       _dbg: 1,
       ts: new Date().toISOString(),
-      user: email,
+      userTag: debugUserTag(email),
       userId: user?.userId,
       roles: user?.roles,
       event,
@@ -1823,12 +1907,10 @@ export interface OrgSettings {
    */
   allowAdminPerFileRestrictions: boolean;
   /**
-   * Audit actions the org has opted OUT of recording. `logAudit` skips
-   * writing a row whenever its `action` appears here. Empty by default, so
-   * every action is logged and any action added in a future release is
-   * logged automatically until an admin explicitly disables it. Configured
-   * via the "Audit logging" modal in the admin panel and the Obsidian
-   * ribbon menu.
+   * Low-risk, high-volume audit actions the org has opted OUT of recording.
+   * Security/admin/auth/mutation/recovery events are intentionally not
+   * disableable; normalizeDisabledAuditActions drops anything outside
+   * DISABLEABLE_AUDIT_ACTIONS.
    */
   disabledAuditActions: string[];
 }
@@ -1853,6 +1935,20 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
   allowAdminPerFileRestrictions: false,
   disabledAuditActions: [],
 };
+
+export const DISABLEABLE_AUDIT_ACTIONS = [
+  'files.list',
+  'files.read',
+  'files.history',
+  'files.sync',
+  'vault.overview',
+  'permissions.check',
+  'permissions.access',
+  'permissions.access.batch',
+  'shares.list',
+] as const;
+
+const DISABLEABLE_AUDIT_ACTION_SET = new Set<string>(DISABLEABLE_AUDIT_ACTIONS);
 
 const orgSettingsCache = new Map<string, {
   settings: OrgSettings;
@@ -2009,8 +2105,10 @@ export function normalizeStoredOrgSettings(
 
 /**
  * Normalizes a stored `disabledAuditActions` value into a deduplicated array
- * of non-empty action strings. Returns `fallback` when the input is not an
- * array so callers can distinguish "not provided" from "explicitly empty".
+ * of supported low-risk/noisy action strings. Security, admin, auth, mutation,
+ * recovery, bridge, billing, and audit-management rows are always mandatory.
+ * Returns `fallback` when the input is not an array so callers can distinguish
+ * "not provided" from "explicitly empty".
  */
 export function normalizeDisabledAuditActions(
   value: unknown,
@@ -2022,7 +2120,7 @@ export function normalizeDisabledAuditActions(
   const cleaned = value
     .filter((action): action is string => typeof action === 'string')
     .map((action) => action.trim())
-    .filter((action) => action.length > 0);
+    .filter((action) => DISABLEABLE_AUDIT_ACTION_SET.has(action));
   return Array.from(new Set(cleaned));
 }
 
@@ -2510,6 +2608,16 @@ export async function recordVaultActivity(params: {
   const changedAt = now.toISOString();
   const ttl = Math.floor(epochMs / 1000) + VAULT_ACTIVITY_TTL_DAYS * 24 * 60 * 60;
 
+  // SD-09-F1: a permission change outside business hours feeds the
+  // OffHoursPermissionChange alarm. recordVaultActivity is the single chokepoint
+  // every permission mutation routes through (permissions/handler.ts), so
+  // emitting here covers all mutation sites without touching each one. Only the
+  // permissions handler passes 'permission_changed'; vaults/files callers pass
+  // other actions and never emit. Fire-and-forget — never block the activity write.
+  if (params.action === 'permission_changed' && isOffHours(changedAt)) {
+    void emitSecurityMetric('OffHoursPermissionChange');
+  }
+
   let logWritten = false;
   try {
     await docClient.send(
@@ -2641,6 +2749,35 @@ export function vaultRoleAllowsAction(
   action: PermissionAction
 ): boolean {
   return VAULT_ROLE_DEFAULT_ACTIONS[role].includes(action);
+}
+
+/**
+ * The role namespace to use for per-file / per-scope permission evaluation of a
+ * caller: their VAULT-membership role, NOT `user.roles` (the org/Cognito roles).
+ *
+ * Role-scoped permission rules (`{role:'editor', deny, read, /secret/**}`) are
+ * keyed on the vault role, and `fetchApplicableRules` only fetches role-index
+ * rows for the role strings actually passed in. A normal member's vault role
+ * lives in VAULT_MEMBERS, never in the Cognito token, so evaluating with
+ * `user.roles` silently fails to fetch (and therefore enforce) role-scoped
+ * rules — the LF1 drift class. Org admins/owners keep `user.roles`: they
+ * legitimately bypass membership (`evaluatePermission` short-circuits them, and
+ * `findApplicableDenyRulesInScope` returns [] for them).
+ *
+ * This is the single source of truth for that decision. `files/handler.ts`
+ * `resolveFileOpRoles` delegates here; the auth key-lease handler uses it for
+ * the read-deny gate and scope probes. Never fold the vault role into
+ * `user.roles` — a vault 'admin' would then be misread as an ORG admin by
+ * `rolesIncludeOrgAdmin`.
+ */
+export async function resolveVaultEvaluationRoles(
+  user: UserContext,
+  vaultId: string
+): Promise<string[]> {
+  if (isAdmin(user)) return user.roles;
+  const membership = await getVaultMembership(vaultId, user.userId);
+  if (membership) return [membership.role];
+  return user.roles;
 }
 
 /**

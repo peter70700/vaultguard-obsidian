@@ -15,9 +15,12 @@ import { streamMessages, type StreamHandlers } from "./anthropic-stream";
 
 const MESSAGES_URL = "https://api.anthropic.com/v1/messages";
 const COUNT_TOKENS_URL = "https://api.anthropic.com/v1/messages/count_tokens";
+const MODELS_URL = "https://api.anthropic.com/v1/models";
 const ANTHROPIC_VERSION = "2023-06-01";
 const DEFAULT_MODEL = "claude-opus-4-8";
 const DEFAULT_MAX_TOKENS = 8192;
+const MODEL_PAGE_LIMIT = 1000;
+const MODEL_PAGE_MAX = 10;
 
 // ─── Content block shapes (assistant side) ──────────────────────────────────
 
@@ -120,6 +123,35 @@ export interface CountTokensRequest {
   messages: AnthropicConversationMessage[];
 }
 
+export interface AnthropicCapabilitySupport {
+  supported?: boolean;
+}
+
+export interface AnthropicModelCapabilities {
+  effort?: AnthropicCapabilitySupport;
+  thinking?: AnthropicCapabilitySupport & {
+    types?: { adaptive?: AnthropicCapabilitySupport };
+  };
+  [key: string]: unknown;
+}
+
+export interface AnthropicModelInfo {
+  id: string;
+  display_name: string;
+  created_at: string;
+  type: "model";
+  capabilities?: AnthropicModelCapabilities;
+  max_input_tokens?: number;
+  max_tokens?: number;
+}
+
+interface AnthropicModelsPage {
+  data: AnthropicModelInfo[];
+  first_id?: string;
+  has_more: boolean;
+  last_id?: string;
+}
+
 export class AnthropicClient {
   constructor(private readonly config: AnthropicClientConfig) {}
 
@@ -128,6 +160,56 @@ export class AnthropicClient {
       "x-api-key": this.config.apiKey,
       "anthropic-version": ANTHROPIC_VERSION,
     };
+  }
+
+  /**
+   * Return every model available to this API key. The provider paginates this
+   * endpoint independently of Messages, so follow its cursor with hard local
+   * page/record bounds and reject broken cursors instead of looping forever.
+   */
+  async listModels(): Promise<AnthropicModelInfo[]> {
+    const models: AnthropicModelInfo[] = [];
+    const seenCursors = new Set<string>();
+    let afterId: string | undefined;
+
+    for (let page = 0; page < MODEL_PAGE_MAX; page++) {
+      const query = `limit=${MODEL_PAGE_LIMIT}${
+        afterId ? `&after_id=${encodeURIComponent(afterId)}` : ""
+      }`;
+      let res;
+      try {
+        res = await requestUrl({
+          url: `${MODELS_URL}?${query}`,
+          method: "GET",
+          headers: this.headers(),
+          throw: false,
+        });
+      } catch (e) {
+        throw new NetworkError(
+          `Could not reach Anthropic: ${(e as Error).message ?? "connection failed"}`,
+        );
+      }
+
+      if (res.status < 200 || res.status >= 300) {
+        throw mapAnthropicError(res.status, res.json);
+      }
+
+      const payload = res.json as Partial<AnthropicModelsPage> | null;
+      if (!payload || !Array.isArray(payload.data) || typeof payload.has_more !== "boolean") {
+        throw new VaultGuardError("Anthropic returned a malformed model catalog.");
+      }
+      models.push(...payload.data.slice(0, MODEL_PAGE_LIMIT));
+
+      if (!payload.has_more) return models;
+      const next = typeof payload.last_id === "string" ? payload.last_id.trim() : "";
+      if (!next || seenCursors.has(next)) {
+        throw new VaultGuardError("Anthropic returned malformed model catalog pagination.");
+      }
+      seenCursors.add(next);
+      afterId = next;
+    }
+
+    throw new VaultGuardError("Anthropic model catalog exceeded the pagination safety limit.");
   }
 
   /**

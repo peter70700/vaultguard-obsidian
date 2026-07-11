@@ -10,6 +10,7 @@
     "blast-trial": "npx esbuild --bundle blast-trial-activation.ts --platform=node --format=cjs --packages=external --outfile=dist/blast-trial.cjs && node dist/blast-trial.cjs"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1085.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1032.0",
     "@aws-sdk/client-cost-explorer": "^3.1078.0",
     "@aws-sdk/client-dynamodb": "^3.500.0",

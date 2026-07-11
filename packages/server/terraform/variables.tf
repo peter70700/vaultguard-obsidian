@@ -37,6 +37,18 @@ variable "production_hardening" {
   default     = true
 }
 
+variable "api_data_trace_enabled" {
+  description = <<-EOT
+    API Gateway request/response body tracing writes full bodies — including the
+    plaintext GET /auth/key-lease DEK — to CloudWatch. SD-12 F8 splits this from
+    production_hardening so a durability opt-out (production_hardening=false on a
+    throwaway stack) can NEVER re-enable DEK logging. Defaults false (secure)
+    unconditionally; set true ONLY for a debug stack that never sees real data.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "admin_email" {
   description = "Email address for admin SNS notifications"
   type        = string

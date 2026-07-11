@@ -163,6 +163,13 @@ export class SyncRuntime {
     return body;
   }
 
+  private buildDeleteBody(
+    path: string,
+    expectedVersionId = this.ctx.getExpectedVersionId(path)
+  ): Record<string, unknown> | undefined {
+    return expectedVersionId ? { expectedVersionId } : undefined;
+  }
+
   private recordSuccessfulWrite(
     path: string,
     hash: string,
@@ -1256,7 +1263,8 @@ export class SyncRuntime {
 
     const delResp = await this.ctx.apiRequest(
       "DELETE",
-      this.ctx.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`)
+      this.ctx.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`),
+      this.buildDeleteBody(oldNormalized)
     );
     if (!delResp.success && delResp.error?.statusCode !== 404) {
       this.ctx.logError(
@@ -1284,7 +1292,8 @@ export class SyncRuntime {
 
     const response = await this.ctx.apiRequest(
       "DELETE",
-      this.ctx.vaultPath(`/files/${encodeURIComponent(normalized)}`)
+      this.ctx.vaultPath(`/files/${encodeURIComponent(normalized)}`),
+      this.buildDeleteBody(normalized)
     );
     if (response.success || response.error?.statusCode === 404) {
       this.clearDeletionTombstone(normalized);
@@ -3532,7 +3541,8 @@ export class SyncRuntime {
           case "delete": {
             const response = await this.ctx.apiRequest(
               "DELETE",
-              this.ctx.vaultPath(`/files/${encodeURIComponent(op.path)}`)
+              this.ctx.vaultPath(`/files/${encodeURIComponent(op.path)}`),
+              this.buildDeleteBody(op.path, op.baseVersionId)
             );
             // Returns on success / 404 / 401 / 403 (throws on other failures,
             // leaving the tombstone in place to retry). Any return means the
@@ -3587,6 +3597,9 @@ export class SyncRuntime {
     const status = response.error?.statusCode ?? 0;
     if (op.operation === "delete" && status === 404) {
       return;
+    }
+    if (op.operation === "delete" && status === 409) {
+      throw new Error(response.error?.message ?? "Offline delete conflict.");
     }
     if (op.operation === "write" && status === 409) {
       throw new Error(response.error?.message ?? "Offline write conflict.");

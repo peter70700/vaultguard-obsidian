@@ -77,6 +77,12 @@ variable "sender_email" {
   type    = string
   default = "noreply@example.com"
 }
+# Verified SES domain identity (e.g. example.com). Used to scope the
+# Lambdas' ses:SendEmail/SendRawEmail to this one identity ARN instead of "*"
+# (SD-12 F5) — mirrors modules/ses which grants send on the same identity.
+variable "sender_domain" {
+  type = string
+}
 variable "domain_name" {
   type    = string
   default = ""
@@ -106,8 +112,19 @@ variable "reconciler_schedule" {
   default     = "cron(0 3 * * ? *)"
   description = "EventBridge schedule expression for the nightly user-count reconciler. Override per-stage if desired."
 }
+variable "detector_schedule" {
+  type        = string
+  default     = "rate(15 minutes)"
+  description = "EventBridge schedule expression for the SD-09-F2 security anomaly detector sweep."
+}
+variable "detector_lookback_minutes" {
+  type        = number
+  default     = 20
+  description = "How far back (minutes) each detector run scans audit rows. Keep >= the detector_schedule cadence so consecutive runs leave no coverage gap; overlap is deduped by the idempotent alert id."
+}
 
 data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
 
 locals {
   common_env = {
@@ -200,6 +217,12 @@ data "archive_file" "reconciler_lambda" {
   output_path = "${path.module}/.build/reconciler.zip"
 }
 
+data "archive_file" "detector_lambda" {
+  type        = "zip"
+  source_dir  = "${path.module}/../../../infrastructure/dist/detector"
+  output_path = "${path.module}/.build/detector.zip"
+}
+
 data "archive_file" "vaults_lambda" {
   type        = "zip"
   source_dir  = "${path.module}/../../../infrastructure/dist/vaults"
@@ -238,7 +261,7 @@ data "aws_iam_policy_document" "lambda_logging" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:aws:logs:*:*:*"]
+    resources = ["arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:*"]
   }
 }
 
@@ -340,11 +363,24 @@ data "aws_iam_policy_document" "auth_lambda" {
   }
   statement {
     actions   = ["events:PutEvents"]
-    resources = ["*"]
+    resources = ["arn:aws:events:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:event-bus/default"]
   }
   statement {
     actions   = ["ses:SendEmail", "ses:SendRawEmail"]
+    resources = ["arn:aws:ses:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:identity/${var.sender_domain}"]
+  }
+  # SD-09-F1: publish the custom security metrics that back the SNS alarms in
+  # modules/monitoring (RevokedSessionAccess, KMSDecryptFailure,
+  # FailedAuthentication). PutMetricData has no resource-level ARN, so the
+  # namespace condition is the least-privilege boundary.
+  statement {
+    actions   = ["cloudwatch:PutMetricData"]
     resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["ObsidianVaultGuard"]
+    }
   }
 }
 
@@ -464,6 +500,17 @@ data "aws_iam_policy_document" "files_lambda" {
     actions   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"]
     resources = [var.kms_key_arn]
   }
+  # SD-09-F1: publish the FileAccessCount + KMSDecryptFailure security metrics.
+  # Namespace-scoped condition = least privilege (PutMetricData has no ARN).
+  statement {
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["ObsidianVaultGuard"]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "files_lambda" {
@@ -559,9 +606,22 @@ data "aws_iam_policy_document" "permissions_lambda" {
     actions   = ["dynamodb:GetItem", "dynamodb:Query"]
     resources = [var.organizations_table_arn, "${var.organizations_table_arn}/index/*"]
   }
+  # SD-12 F6: removed an unused kms:Decrypt/DescribeKey grant on the vault CMK.
+  # The permissions Lambda performs no KMS operations — the wrapped-DEK rows it
+  # would need live in USER_KEYS_TABLE, which this role has no access to — so the
+  # grant was a latent over-grant. Re-add WITH an encryption-context constraint
+  # if a genuine decrypt need ever arises.
+  # SD-09-F1: publish the OffHoursPermissionChange security metric (emitted from
+  # recordVaultActivity when a permission mutation lands off-hours).
+  # Namespace-scoped condition = least privilege (PutMetricData has no ARN).
   statement {
-    actions   = ["kms:Decrypt", "kms:DescribeKey"]
-    resources = [var.kms_key_arn]
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["ObsidianVaultGuard"]
+    }
   }
 }
 
@@ -742,7 +802,7 @@ data "aws_iam_policy_document" "billing_lambda" {
   # SES — send billing emails
   statement {
     actions   = ["ses:SendEmail", "ses:SendRawEmail"]
-    resources = ["*"]
+    resources = ["arn:aws:ses:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:identity/${var.sender_domain}"]
   }
 }
 
@@ -842,15 +902,18 @@ data "aws_iam_policy_document" "signup_lambda" {
     actions   = ["dynamodb:Scan"]
     resources = [var.organizations_table_arn]
   }
-  # KMS — decrypt DynamoDB table data (tables use KMS encryption)
-  statement {
-    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
-    resources = [var.kms_key_arn]
-  }
+  # SD-12 least-privilege (sibling of the F6 permissions-role cleanup below):
+  # removed an unused kms:Decrypt/DescribeKey/GenerateDataKey grant on the master
+  # CMK. The signup Lambda performs NO KMS operations (verified: zero KMS calls in
+  # infrastructure/lambda/signup and the shared module it imports). The old comment
+  # ("decrypt DynamoDB table data") was a misconception — DynamoDB decrypts
+  # CMK-encrypted tables via its own service grant, not via the caller's IAM, so
+  # this was a latent over-grant. Re-add WITH an encryption-context constraint if a
+  # genuine decrypt need ever arises.
   # SES — send welcome email
   statement {
     actions   = ["ses:SendEmail", "ses:SendRawEmail"]
-    resources = ["*"]
+    resources = ["arn:aws:ses:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:identity/${var.sender_domain}"]
   }
 }
 
@@ -954,17 +1017,20 @@ data "aws_iam_policy_document" "users_lambda" {
     actions   = ["dynamodb:Query", "dynamodb:UpdateItem"]
     resources = [var.leases_table_arn, "${var.leases_table_arn}/index/*"]
   }
-  statement {
-    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
-    resources = [var.kms_key_arn]
-  }
+  # SD-12 least-privilege (sibling of the F6 permissions-role cleanup): removed an
+  # unused kms:Decrypt/DescribeKey/GenerateDataKey grant on the master CMK. The
+  # users Lambda performs NO KMS operations (verified: zero KMS calls in
+  # infrastructure/lambda/users and the shared module). Offboarding fires a
+  # UserAccessRevoked event and the reencryption Lambda (which keeps its own KMS
+  # grant) does the crypto; CMK-encrypted DynamoDB is decrypted by DynamoDB, not
+  # the caller. Re-add WITH an encryption-context constraint if a genuine need arises.
   statement {
     actions   = ["ses:SendEmail", "ses:SendRawEmail"]
-    resources = ["*"]
+    resources = ["arn:aws:ses:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:identity/${var.sender_domain}"]
   }
   statement {
     actions   = ["events:PutEvents"]
-    resources = ["*"]
+    resources = ["arn:aws:events:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:event-bus/default"]
   }
   # Secrets Manager — read Stripe secret for server-side seat sync after
   # invite/revoke/reactivate. Guarded for Community Edition where
@@ -1264,6 +1330,103 @@ resource "aws_lambda_permission" "allow_eventbridge_reconciler" {
   function_name = aws_lambda_function.reconciler.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.reconciler_schedule.arn
+}
+
+# ─── Security Anomaly Detector Lambda (SD-09-F2) ─────────────────────────────
+# Proactive anomaly detection: runs the SAME detectAnomaliesForScope logic the
+# audit dashboard uses (exported from audit/handler), across every vault on an
+# EventBridge schedule, so alert rows are generated without an admin opening the
+# dashboard. Complements the SD-09-F1 CloudWatch metric alarms. EventBridge-only
+# — no API Gateway surface. Mirrors the reconciler wiring above.
+
+resource "aws_iam_role" "detector_lambda" {
+  name               = "vaultguard-${var.stage}-detector-lambda"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "detector_logging" {
+  role       = aws_iam_role.detector_lambda.name
+  policy_arn = aws_iam_policy.lambda_logging.arn
+}
+
+data "aws_iam_policy_document" "detector_lambda" {
+  # Vaults — Scan to enumerate every (orgId, vaultId) pair to run detection on.
+  statement {
+    actions   = ["dynamodb:Scan"]
+    resources = [var.vaults_table_arn]
+  }
+  # Audit — Query the vaultId-index for each vault's recent detection window.
+  statement {
+    actions   = ["dynamodb:Query"]
+    resources = [var.audit_table_arn, "${var.audit_table_arn}/index/*"]
+  }
+  # Alerts — persist detected anomalies (idempotent PutItem with a condition).
+  statement {
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.alerts_table_arn]
+  }
+  # KMS — audit / alerts / vaults tables are SSE-KMS encrypted with the project
+  # master key; without Decrypt/GenerateDataKey the first table access errors
+  # (same rationale as the reconciler role).
+  statement {
+    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+    resources = [var.kms_key_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "detector_lambda" {
+  name   = "detector-lambda-policy"
+  role   = aws_iam_role.detector_lambda.id
+  policy = data.aws_iam_policy_document.detector_lambda.json
+}
+
+resource "aws_lambda_function" "detector" {
+  function_name = "vaultguard-detector-${var.stage}"
+  description   = "Scheduled security anomaly detector (SD-09-F2)"
+  role          = aws_iam_role.detector_lambda.arn
+  handler       = "handler.handler"
+  runtime       = "nodejs22.x"
+  architectures = ["arm64"]
+  memory_size   = 512
+  timeout       = 300
+
+  filename         = data.archive_file.detector_lambda.output_path
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/detector/handler.js")
+
+  tracing_config { mode = "Active" }
+
+  environment {
+    variables = merge(local.common_env, {
+      DETECTOR_LOOKBACK_MINUTES = tostring(var.detector_lookback_minutes)
+    })
+  }
+
+  tags = { Name = "vaultguard-detector-${var.stage}" }
+}
+
+resource "aws_cloudwatch_log_group" "detector" {
+  name              = "/aws/lambda/${aws_lambda_function.detector.function_name}"
+  retention_in_days = local.log_retention
+}
+
+resource "aws_cloudwatch_event_rule" "detector_schedule" {
+  name                = "vaultguard-${var.stage}-detector-schedule"
+  description         = "Scheduled security anomaly detection sweep (SD-09-F2)"
+  schedule_expression = var.detector_schedule
+}
+
+resource "aws_cloudwatch_event_target" "detector" {
+  rule      = aws_cloudwatch_event_rule.detector_schedule.name
+  target_id = "vaultguard-detector-${var.stage}"
+  arn       = aws_lambda_function.detector.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge_detector" {
+  statement_id  = "AllowExecutionFromDetectorSchedule"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.detector.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.detector_schedule.arn
 }
 
 # ─── Vaults Lambda ──────────────────────────────────────────────────────────

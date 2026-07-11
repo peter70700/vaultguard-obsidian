@@ -21,6 +21,7 @@ const LAMBDAS = [
   { name: "billing", entry: "lambda/billing/handler.ts" },
   { name: "reencryption", entry: "lambda/reencryption/handler.ts" },
   { name: "reconciler", entry: "lambda/reconciler/handler.ts" },
+  { name: "detector", entry: "lambda/detector/handler.ts" },
   { name: "email", entry: "lambda/email/handler.ts" },
   { name: "vaults", entry: "lambda/vaults/handler.ts" },
   { name: "shares", entry: "lambda/shares/handler.ts" },

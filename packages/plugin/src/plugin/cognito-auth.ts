@@ -6,6 +6,57 @@
 import { RequestUrlResponse, requestUrl } from "obsidian";
 
 /**
+ * User-facing message for a connection-level failure — the device is offline,
+ * DNS can't resolve the host, or the connection was refused/timed out. Obsidian's
+ * `requestUrl` REJECTS on these before any HTTP status exists, so `throw: false`
+ * (which only suppresses status-based throwing) does NOT catch them. Without
+ * translation the raw platform string leaks into the login modal — e.g. Android's
+ * `UnknownHostException: Unable to resolve host "cognito-idp.eu-central-1.amazonaws.com"`.
+ */
+export const NETWORK_OFFLINE_MESSAGE =
+  "No network connection — VaultGuard can't reach the sign-in server. Check your internet connection and try again.";
+
+/**
+ * Heuristic: does this thrown error look like a connection-level failure (no HTTP
+ * response was ever received)? Covers the strings `requestUrl` surfaces across
+ * platforms — Chromium/Electron `net::ERR_*`, Node `ENOTFOUND`/`ECONNREFUSED`/
+ * `ETIMEDOUT`/`EAI_AGAIN`, Android `UnknownHostException`, and iOS
+ * "The Internet connection appears to be offline". Deliberately conservative:
+ * only well-known connectivity markers match, so a genuine auth failure (which
+ * arrives as an HTTP status, not a rejection) is never misclassified as offline.
+ */
+export function isNetworkConnectivityError(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  if (!message) return false;
+  return /unknownhostexception|unable to resolve host|no address associated|err_name_not_resolved|err_internet_disconnected|err_connection|err_network|err_address_unreachable|enotfound|eai_again|econnrefused|econnreset|etimedout|network request failed|failed to fetch|networkerror|internet connection appears to be offline|net::err/i.test(
+    message
+  );
+}
+
+/**
+ * Run a `requestUrl` thunk and translate a connection-level rejection into the
+ * friendly, actionable {@link NETWORK_OFFLINE_MESSAGE}. HTTP error *statuses* are
+ * untouched — with `throw: false` those come back on the response and each caller
+ * keeps its own status handling. Only a true "never reached the server" rejection
+ * is rewritten.
+ */
+async function withOfflineErrorTranslation<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (isNetworkConnectivityError(error)) {
+      throw new Error(NETWORK_OFFLINE_MESSAGE);
+    }
+    throw error;
+  }
+}
+
+/**
  * Build the ordered list of base URLs to try for an *unauthenticated*
  * VaultGuard backend call (forgot-password, confirm-reset, recovery-code
  * verify). These flows run before the user has a token, so they can't go
@@ -85,13 +136,15 @@ async function postToVaultGuardAuth(
   let lastResponse: RequestUrlResponse | null = null;
 
   for (const base of bases) {
-    const response = await requestUrl({
-      url: `${base}${path}`,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      throw: false,
-    });
+    const response = await withOfflineErrorTranslation(() =>
+      requestUrl({
+        url: `${base}${path}`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        throw: false,
+      })
+    );
     lastResponse = response;
     if (!isGatewayResourceMiss(response)) {
       return response;
@@ -148,13 +201,15 @@ export async function devServerLogin(
     throw new Error("API endpoint must be configured for local dev login.");
   }
 
-  const response = await requestUrl({
-    url: `${base}/auth/login`,
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-    throw: false,
-  });
+  const response = await withOfflineErrorTranslation(() =>
+    requestUrl({
+      url: `${base}/auth/login`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+      throw: false,
+    })
+  );
 
   const data = response.json ?? {};
 
@@ -190,23 +245,25 @@ export async function cognitoLogin(
   const region = userPoolId.split("_")[0];
   const endpoint = `https://cognito-idp.${region}.amazonaws.com/`;
 
-  const response = await requestUrl({
-    url: endpoint,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-amz-json-1.1",
-      "X-Amz-Target": "AWSCognitoIdentityProviderService.InitiateAuth",
-    },
-    body: JSON.stringify({
-      AuthFlow: "USER_PASSWORD_AUTH",
-      ClientId: clientId,
-      AuthParameters: {
-        USERNAME: email,
-        PASSWORD: password,
+  const response = await withOfflineErrorTranslation(() =>
+    requestUrl({
+      url: endpoint,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-amz-json-1.1",
+        "X-Amz-Target": "AWSCognitoIdentityProviderService.InitiateAuth",
       },
-    }),
-    throw: false,
-  });
+      body: JSON.stringify({
+        AuthFlow: "USER_PASSWORD_AUTH",
+        ClientId: clientId,
+        AuthParameters: {
+          USERNAME: email,
+          PASSWORD: password,
+        },
+      }),
+      throw: false,
+    })
+  );
 
   const data = response.json;
 
@@ -263,21 +320,23 @@ export async function cognitoRespondToChallenge(
   const region = userPoolId.split("_")[0];
   const endpoint = `https://cognito-idp.${region}.amazonaws.com/`;
 
-  const response = await requestUrl({
-    url: endpoint,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-amz-json-1.1",
-      "X-Amz-Target": "AWSCognitoIdentityProviderService.RespondToAuthChallenge",
-    },
-    body: JSON.stringify({
-      ChallengeName: challengeName,
-      ClientId: clientId,
-      Session: session,
-      ChallengeResponses: responses,
-    }),
-    throw: false,
-  });
+  const response = await withOfflineErrorTranslation(() =>
+    requestUrl({
+      url: endpoint,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-amz-json-1.1",
+        "X-Amz-Target": "AWSCognitoIdentityProviderService.RespondToAuthChallenge",
+      },
+      body: JSON.stringify({
+        ChallengeName: challengeName,
+        ClientId: clientId,
+        Session: session,
+        ChallengeResponses: responses,
+      }),
+      throw: false,
+    })
+  );
 
   const data = response.json;
 

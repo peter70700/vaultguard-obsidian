@@ -251,6 +251,11 @@ function stringifyToolContent(content: unknown): string {
 // ─── Node module resolution (desktop-only) ────────────────────────────────────
 
 interface SpawnedChild {
+  stdin: {
+    write(chunk: string): void;
+    end(): void;
+    on(ev: "error", cb: (err: Error) => void): void;
+  } | null;
   stdout: { on(ev: "data", cb: (chunk: Buffer | string) => void): void } | null;
   stderr: { on(ev: "data", cb: (chunk: Buffer | string) => void): void } | null;
   on(ev: "error", cb: (err: Error) => void): void;
@@ -376,7 +381,7 @@ export class ClaudeCliClient {
       );
       return;
     }
-    const args = this.buildArgs(text, mcpConfigPath);
+    const args = this.buildArgs(mcpConfigPath);
 
     return new Promise<void>((resolve) => {
       let child: SpawnedChild;
@@ -386,9 +391,11 @@ export class ClaudeCliClient {
           // Inherit PATH/HOME so `claude` finds its keychain + config; we do NOT
           // set any Anthropic token. No --bare, so OAuth/keychain auth is used.
           env: this.buildChildEnv(),
-          // No stdin (/dev/null). `claude -p` otherwise waits ~3s for piped
-          // stdin and logs a "no stdin data received" warning before proceeding.
-          stdio: ["ignore", "pipe", "pipe"],
+          // SD-13-F2: pipe stdin so the prompt is delivered off-argv (written +
+          // closed right after the handlers are wired, below). An OPEN-but-
+          // unwritten stdin is what makes `claude -p` stall ~3s with a "no stdin
+          // data received" warning; writing + ending immediately avoids that.
+          stdio: ["pipe", "pipe", "pipe"],
         });
       } catch (e) {
         handlers.onError?.(`Could not start Claude Code: ${(e as Error).message}`);
@@ -495,6 +502,27 @@ export class ClaudeCliClient {
         }
         finish();
       });
+
+      // SD-13-F2 (CWE-214): deliver the user's prompt via stdin, never argv.
+      // `claude -p` with no positional prompt reads it from stdin, so the
+      // message stays off the process command line where any local `ps` could
+      // read it — mirroring the 0600-file treatment of the MCP lease token.
+      // Done after the handlers above are wired so a pipe/spawn failure is
+      // reported through the child's own 'error'/'close' path.
+      if (child.stdin) {
+        // Swallow EPIPE: if the child dies before draining stdin, the write
+        // surfaces an async 'error' on the pipe; absorb it here so it cannot
+        // crash the process (the failure is already surfaced via the child).
+        child.stdin.on("error", () => {
+          /* child gone before stdin drained — reported via child 'error'/'close' */
+        });
+        try {
+          child.stdin.write(text);
+          child.stdin.end();
+        } catch {
+          /* stdin already closed — child 'error'/'close' handles the turn */
+        }
+      }
     });
   }
 
@@ -571,10 +599,11 @@ export class ClaudeCliClient {
   }
 
   // Build the argv. NOTE: NOT --bare (keeps subscription keychain auth).
-  private buildArgs(text: string, mcpConfigPath: string): string[] {
+  // SD-13-F2: the user's prompt is deliberately NOT in argv — it's delivered
+  // via stdin in runTurn so it never lands on the process command line (CWE-214).
+  private buildArgs(mcpConfigPath: string): string[] {
     const args: string[] = [
       "-p",
-      text,
       "--output-format",
       "stream-json",
       "--include-partial-messages",

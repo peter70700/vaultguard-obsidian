@@ -172,6 +172,7 @@ export interface VaultGuardCommandContext {
   copyShareLinkForPath(path: string): Promise<void>;
   activateVaultGuardChat(): Promise<void>;
   activatePermissionsGraph(): Promise<void>;
+  openPermissionsGraphVirtualQaModal(): Promise<void>;
   openVaultGuardChatHistory(): Promise<void>;
   openNewVaultGuardChatTab(): Promise<void>;
   copyVaultGuardChatDomDebugReport(): Promise<void>;
@@ -472,7 +473,7 @@ export interface AtRestAdapterRuntimeContext {
     path: string,
     data?: string,
     // BIN-A / D-09 + version-guard: binary payloads stamp encoding "base64" + a
-    // MIME contentType; version-guard writes stamp baseVersionId/baseHash.
+    // MIME contentType; version-guarded writes/deletes stamp baseVersionId/baseHash.
     options?: {
       encoding?: "base64";
       contentType?: string;
@@ -743,6 +744,7 @@ export interface AgentBridgeRuntimeContext {
   readonly manifestId: string | undefined;
   getSession(): UserSession | null;
   getServerVaultId(): string;
+  isLocalProjectMemoryModeEnabled(): boolean;
   getApiClient(): VaultGuardApiClient | null;
   getAtRestCipher(): AtRestCipher | null;
   getVaultOrientationService(): VaultOrientationService | null;
