@@ -1338,7 +1338,10 @@ export class AdminModal extends Modal {
     let syncIntervalValue = String(settings.syncIntervalMinutes);
     let maxSessionValue = String(settings.maxSessionDurationHours);
     let autoLockValue = String(settings.autoLockMinutes);
-    let idleActionValue: "lock" | "logout" = settings.idleAction ?? "logout";
+    // Seed an absent idleAction to "lock" (quick 260711-l2e) to match the server
+    // default (DEFAULT_ORG_SETTINGS). The server sends an explicit value in
+    // practice; this only bites a partial/legacy response.
+    let idleActionValue: "lock" | "logout" = settings.idleAction ?? "lock";
     let allowedDomainsValue = (settings.allowedDomains ?? []).join("\n");
     let retentionValue = String(settings.retentionDays);
 

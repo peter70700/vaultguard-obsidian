@@ -424,10 +424,12 @@ async function handleSignup(
       allowedDomains: [],
       retentionDays: 365,
       autoLockMinutes: 30,
-      // O-1 humane default: brand-new orgs LOCK (evict keys + local-PIN
-      // unlock) instead of full logout on idle. Existing orgs have no
-      // idleAction key and normalize to 'logout' via normalizeStoredOrgSettings
-      // — so shipping this never silently switches a deployed org to lock.
+      // Humane default: brand-new orgs LOCK (evict keys + local-PIN unlock)
+      // instead of full logout on idle. Written explicitly here; since quick
+      // 260711-l2e the server DEFAULT also resolves an absent idleAction to
+      // 'lock' (was 'logout' under O-1), so a legacy org that never set the
+      // field picks up lock on the next deploy too. An org that explicitly
+      // stored 'logout' still round-trips unchanged.
       idleAction: 'lock',
     },
     createdAt: now,

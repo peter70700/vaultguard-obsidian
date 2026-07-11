@@ -1373,6 +1373,8 @@ export default class VaultGuardPlugin extends Plugin {
       syncFileExplorerDecorationsState: (refresh) =>
         this.syncFileExplorerDecorationsState(refresh),
       isPermissionBannerEnabled: () => this.settings.showPermissionBanner,
+      isOnline: () => this.isOnline(),
+      reconnectNow: () => this.reconnectNow(),
     };
   }
 
@@ -5490,12 +5492,17 @@ export default class VaultGuardPlugin extends Plugin {
     const action = this.orgSettings?.idleAction; // may be undefined (field undeployed)
     const enrolled = this.pinLockManager?.isEnrolled() ?? false;
 
-    // (1) EXPLICIT, server-deployed "logout" policy → honor it (admin compliance).
-    // Fires only once 12-02's idleAction field is actually deployed by the org.
+    // (1) EXPLICIT "logout" policy → honor it (admin compliance). After quick
+    // 260711-l2e the server default is "lock", so this branch fires only for an
+    // org that DELIBERATELY stored idleAction="logout"; precedence keeps explicit
+    // "logout" ahead of the PIN-lock branch, so we log out even if a PIN exists.
     if (action === "logout") {
       this.log(`Auto-logout (org policy) after ${autoLockMinutes} minutes of inactivity.`);
+      // Actionable notice: the word "inactivity" is load-bearing — forceLogout's
+      // rememberLogoutAuthState classifies the persistent sidebar state by
+      // matching it (→ "Session locked"). Tell the user WHY and HOW to stop it.
       await this.forceLogout(
-        `VaultGuard Sync: Session ended after ${autoLockMinutes} minutes of inactivity (org policy).`
+        `VaultGuard Sync: Signed out after ${autoLockMinutes} min of inactivity — your organization's idle policy is set to log out. An org admin can switch it to "Lock" in Manage organization → Org settings → On idle timeout, then set a PIN to unlock without a full re-login.`
       );
       return;
     }
@@ -8172,12 +8179,15 @@ export default class VaultGuardPlugin extends Plugin {
 
     this.updateStatusBar();
 
-    // Populate any open Permissions graph that was waiting on connectivity.
-    // The "online" flip is deferred until the first sync, so a panel opened on
-    // launch renders its offline empty state first; re-render it on the
-    // offline→online edge so it loads without the user reopening it.
+    // Populate any open Permissions graph that was waiting on connectivity, and
+    // refresh the per-file permission header on the SAME edge for the same
+    // reason. The "online" flip is deferred until the first sync, so a graph or
+    // header that rendered its offline/unavailable state on launch self-corrects
+    // on the offline→online edge — without the user reopening the panel or
+    // switching files.
     if (status === "online" && previousStatus !== "online") {
       this.refreshPermissionsGraph();
+      this.refreshFilePermissionHeader();
     }
   }
 

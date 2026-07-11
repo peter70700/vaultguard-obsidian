@@ -39,19 +39,20 @@ describe("settings-support", () => {
       syncMode: "periodic",
       syncIntervalMinutes: 1,
       enforceEncryption: true,
-      maxSessionDurationHours: 24,
+      maxSessionDurationHours: 720,
       requireMfa: false,
       allowedDomains: [],
       retentionDays: 365,
       autoLockMinutes: 30,
-      idleAction: "logout",
+      idleAction: "lock",
     });
   });
 
-  it("defaults idleAction to the safe logout value in the fallback", () => {
-    // Offline / unknown-org fallback must never engage a cryptographic lock
-    // the user cannot unlock offline — it mirrors the server normalizer's
-    // absent -> "logout" so behavior is unsurprising when settings are missing.
-    expect(buildFallbackOrgSettings("org-123").idleAction).toBe("logout");
+  it("defaults idleAction to 'lock' in the fallback (260711-l2e)", () => {
+    // Offline / unknown-org fallback mirrors the server default
+    // (DEFAULT_ORG_SETTINGS = "lock") so an idle vault locks instead of forcing a
+    // re-login. Safe offline: no PIN -> the plugin keeps the session (never logs
+    // out on idle); with a PIN the lock is offline-unlockable.
+    expect(buildFallbackOrgSettings("org-123").idleAction).toBe("lock");
   });
 });

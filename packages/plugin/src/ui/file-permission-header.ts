@@ -69,6 +69,21 @@ interface HeaderContext {
    *  without a session (no permissions to show), so update() tears it down —
    *  making image/PDF/audio FileViews match .md (no header when logged out). */
   isLoggedIn?: () => boolean;
+  /**
+   * Presentation hint: is the plugin currently online? ADVISORY ONLY — it can
+   * be stale in both directions (the online flip is deferred until the first
+   * sync). update() still fires its fetch when this returns false, so a stale
+   * offline flag self-heals into a real render on success; never gate the
+   * fetch on it. Used only to choose the immediate render (honest "unavailable"
+   * / Offline pill) and to suppress the refresh spinner while offline.
+   */
+  isOnline?: () => boolean;
+  /**
+   * User-initiated reconnect probe (→ plugin.reconnectNow()). Wired to the
+   * Retry button in the honest "unavailable" state; after it resolves the
+   * header forces a refresh so a recovered connection re-renders immediately.
+   */
+  onRetryConnection?: () => Promise<void>;
 }
 
 interface RuleCacheEntry {
@@ -209,9 +224,21 @@ export class FilePermissionHeader {
 
     const cached = this.ruleCache.get(file.path);
     const needsAuthoritativeLevelRefresh = Boolean(cached?.rules && this.ctx.getPermissionLevel);
+    // Presentation hint only — advisory, may be stale in both directions. We
+    // never gate the fetch below on it (a cold cache already forces the fetch,
+    // which is the self-heal); it only selects the immediate render and
+    // suppresses the refresh spinner while offline.
+    const offline = this.ctx.isOnline?.() === false;
     if (cached?.rules && !needsAuthoritativeLevelRefresh) {
       this.renderHeader(headerEl, file, cached.rules, this.optionsFromData(cached));
       this.updateActivePanel(cached.rules, this.optionsFromData(cached));
+    } else if (!cached?.rules && offline) {
+      // Cold cache + offline flag: render the honest "unavailable" state NOW
+      // instead of a loading skeleton, but STILL fall through to the background
+      // fetch below so a stale offline flag self-heals into a real render.
+      const currentUserLevel = await this.fetchCurrentUserLevel(file.path);
+      if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
+      this.renderUnavailable(headerEl, file, { offline: true, currentUserLevel });
     } else {
       this.renderSkeleton(headerEl, file);
     }
@@ -226,26 +253,45 @@ export class FilePermissionHeader {
     }
 
     // Show a subtle refresh indicator only when we have stale cached data
-    // already on screen — otherwise the skeleton already conveys loading.
-    const showRefreshing = Boolean(cached?.rules);
+    // already on screen — otherwise the skeleton (or the offline "unavailable"
+    // note) already conveys the state. Suppressed while offline: the Offline
+    // pill already signals stale/cached data, and a spinner that cannot resolve
+    // offline would spin indefinitely.
+    const showRefreshing = Boolean(cached?.rules) && !offline;
     if (showRefreshing) this.setRefreshing(headerEl, true);
 
     try {
       const data = await this.fetchHeaderDataForPath(file.path, options.force === true);
       // Check the element is still mounted (user may have switched files)
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
-      this.renderHeader(headerEl, file, data.rules, this.optionsFromData(data));
-      this.updateActivePanel(data.rules, this.optionsFromData(data));
+      // Honest-render guard: when the fetch comes back with no authoritative
+      // access picture (no access summary AND rules unavailable — the offline /
+      // total-failure case, where every access endpoint is caught and the fetch
+      // resolves EMPTY rather than throwing), there is nothing real to show.
+      // Rendering the normal header here would route through optionsFromData →
+      // withCurrentUserPrincipalLevel and SYNTHESIZE a lone current-user chip
+      // that reads as an authoritative "only me" access list — the exact lie
+      // this change removes. Render the honest unavailable state instead, and
+      // leave any open panel's last-known content untouched (feeding it [] would
+      // wipe a still-useful last-known list).
+      if (!data.access && data.rulesAvailable !== true) {
+        this.renderUnavailable(headerEl, file, {
+          offline: this.ctx.isOnline?.() === false,
+          currentUserLevel: data.currentUserLevel,
+        });
+      } else {
+        this.renderHeader(headerEl, file, data.rules, this.optionsFromData(data));
+        this.updateActivePanel(data.rules, this.optionsFromData(data));
+      }
     } catch {
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
       const currentUserLevel = await this.fetchCurrentUserLevel(file.path);
       if (!headerEl.isConnected || this.activeHeader !== headerEl || this.activePath !== file.path) return;
-      this.renderHeader(headerEl, file, [], {
-        includeVaultMemberDefaults: false,
-        currentUserLevel,
-      });
-      this.updateActivePanel([], {
-        includeVaultMemberDefaults: false,
+      // Honest unavailable render — never the me-chip synth. The last-known
+      // panel content is intentionally left in place: feeding updateActivePanel
+      // an empty [] here would wipe a still-useful last-known access list.
+      this.renderUnavailable(headerEl, file, {
+        offline: this.ctx.isOnline?.() === false,
         currentUserLevel,
       });
     } finally {
@@ -848,6 +894,94 @@ export class FilePermissionHeader {
     }
   }
 
+  /**
+   * Renders a small "Offline" pill (cloud-off icon + label) as the first child
+   * of the header's inner row. Presentation only — signals that the data shown
+   * is cached/stale, or unavailable, because the connection flag reads offline.
+   */
+  private renderOfflinePill(inner: HTMLElement): void {
+    const pill = inner.createSpan({ cls: "vaultguard-fh-offline-pill" });
+    const icon = pill.createSpan({ cls: "vaultguard-fh-offline-pill-icon" });
+    setIcon(icon, "cloud-off");
+    pill.createSpan({ text: "Offline" });
+  }
+
+  /**
+   * Honest render for a failed or offline COLD-cache fetch. Replaces the old
+   * lie where an empty/failed fetch synthesized a lone current-user chip that
+   * read as an authoritative "only me" access list. We KEEP the locally
+   * resolved current-user level badge (local resolution is valid offline —
+   * it's the user's OWN level, not a claim about who else can access the file)
+   * but show an explicit "unavailable" note instead of a fabricated access
+   * list, plus an Offline pill and a Retry control when available.
+   *
+   * This path deliberately NEVER routes through visibleAccessPrincipals /
+   * withCurrentUserPrincipalLevel (the me-chip synth) — those stay frozen for
+   * the panel/modal consumers; the honest state is a separate render.
+   */
+  private renderUnavailable(
+    container: HTMLElement,
+    _file: TFile,
+    opts: { offline: boolean; currentUserLevel: AccessLevel }
+  ): void {
+    container.empty();
+    const inner = container.createDiv({ cls: "vaultguard-fh-inner" });
+
+    if (opts.offline) {
+      this.renderOfflinePill(inner);
+    }
+
+    // ── Section 1: Current user's effective level (locally resolved) ──────
+    const myLevel =
+      opts.currentUserLevel && opts.currentUserLevel !== "unknown"
+        ? opts.currentUserLevel
+        : "unknown";
+    container.dataset.vaultguardCurrentUserLevel = myLevel;
+    const levelSection = inner.createDiv({ cls: "vaultguard-fh-level" });
+
+    const lockIcon = levelSection.createSpan({ cls: "vaultguard-fh-lock-icon" });
+    setIcon(lockIcon, this.iconForLevel(myLevel));
+
+    const badge = levelSection.createSpan({
+      cls: `vaultguard-fh-badge vaultguard-fh-badge-${myLevel}`,
+    });
+    badge.setText(this.formatLevel(myLevel));
+
+    // ── Separator ────────────────────────────────────────────────────────
+    inner.createDiv({ cls: "vaultguard-fh-separator" });
+
+    // ── Section 2: Honest "unavailable" note (NO access list, NO me-chip) ──
+    const accessSection = inner.createDiv({ cls: "vaultguard-fh-access" });
+    accessSection.createSpan({
+      cls: "vaultguard-fh-unavailable-note",
+      text: opts.offline
+        ? "Offline — access list unavailable"
+        : "Access details unavailable",
+    });
+
+    // ── Retry: reconnect probe → forced header refresh ─────────────────────
+    if (this.ctx.onRetryConnection) {
+      const retryBtn = accessSection.createEl("button", {
+        cls: "vaultguard-fh-retry-btn",
+      });
+      const retryIcon = retryBtn.createSpan({ cls: "vaultguard-fh-btn-icon" });
+      setIcon(retryIcon, "refresh-cw");
+      retryBtn.createSpan({ text: "Retry" });
+      retryBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+          await this.ctx.onRetryConnection?.();
+        } catch {
+          // The probe result surfaces via the status bar / connection-lost
+          // notice; swallow here so a failed reconnect doesn't throw out of the
+          // click handler. The forced refresh below re-renders from current
+          // state regardless of the probe outcome.
+        }
+        void this.update({ force: true });
+      });
+    }
+  }
+
   private renderHeader(
     container: HTMLElement,
     file: TFile,
@@ -856,6 +990,13 @@ export class FilePermissionHeader {
   ): void {
     container.empty();
     const inner = container.createDiv({ cls: "vaultguard-fh-inner" });
+
+    // Cached data rendered while the connection flag reads offline carries a
+    // visible Offline pill (first child) so a stale/cached list is never
+    // mistaken for a live one. Online renders are byte-identical (no pill).
+    if (this.ctx.isOnline?.() === false) {
+      this.renderOfflinePill(inner);
+    }
 
     // ── Section 1: Current user's effective level ────────────────────
     const myLevel = this.resolveMyLevel(file.path, rules, options);

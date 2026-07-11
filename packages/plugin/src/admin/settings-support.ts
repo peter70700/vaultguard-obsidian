@@ -44,15 +44,17 @@ export function buildFallbackOrgSettings(
     syncMode: "periodic",
     syncIntervalMinutes: 1,
     enforceEncryption: true,
-    maxSessionDurationHours: 24,
+    maxSessionDurationHours: 720,
     requireMfa: false,
     allowedDomains: [],
     retentionDays: 365,
     autoLockMinutes: 30,
-    // Offline / unknown-org fallback: "logout" is the safe, no-surprise value
-    // (a cryptographically locked vault the user cannot unlock offline would be
-    // worse than a logout). Mirrors the server normalizer's absent -> "logout".
-    idleAction: "logout",
+    // Offline / unknown-org fallback: "lock" mirrors the server default
+    // (DEFAULT_ORG_SETTINGS, quick 260711-l2e) so an idle vault locks instead of
+    // forcing a re-login. Safe offline — the old "you can't unlock a locked vault
+    // offline" worry no longer holds: with no PIN the plugin keeps the session
+    // (branch 3, never logs out on idle); with a PIN the lock is offline-unlockable.
+    idleAction: "lock",
   };
 }
 

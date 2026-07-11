@@ -1202,6 +1202,31 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.flushOfflineQueue).toHaveBeenCalledOnce();
   });
 
+  it("refreshes the file permission header on the offline→online edge", () => {
+    const plugin = makePlugin();
+    plugin.connectionState.status = "reconnecting";
+    plugin.flushOfflineQueue = vi.fn().mockResolvedValue(undefined);
+    plugin.refreshFilePermissionHeader = vi.fn();
+
+    plugin.setConnectionStatus("online");
+
+    // The header rendered its offline/unavailable state on launch (the online
+    // flip is deferred until first sync); refresh it on the edge so it
+    // self-corrects without the user switching files.
+    expect(plugin.refreshFilePermissionHeader).toHaveBeenCalledOnce();
+  });
+
+  it("does not refresh the file permission header when already online (edge-only)", () => {
+    const plugin = makePlugin();
+    plugin.connectionState.status = "online";
+    plugin.flushOfflineQueue = vi.fn().mockResolvedValue(undefined);
+    plugin.refreshFilePermissionHeader = vi.fn();
+
+    plugin.setConnectionStatus("online");
+
+    expect(plugin.refreshFilePermissionHeader).not.toHaveBeenCalled();
+  });
+
   it("counts a failed reconnection attempt only once", async () => {
     const plugin = makePlugin();
     plugin.session = {

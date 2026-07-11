@@ -1886,9 +1886,14 @@ export interface OrgSettings {
   /**
    * Whether an idle timeout LOCKS the vault (evict keys + local-PIN unlock,
    * session preserved) or fully LOGS OUT. `DEFAULT_ORG_SETTINGS` resolves an
-   * absent value to `'logout'` so orgs created before this field existed keep
-   * today's behavior; brand-new orgs are seeded `'lock'` at signup. See the
-   * D3 control model / O-1 default resolution in the phase-12 planning docs.
+   * absent value to `'lock'` (quick 260711-l2e) so an idle vault locks instead
+   * of forcing a full re-login; brand-new orgs are still seeded `'lock'` at
+   * signup, and any org that EXPLICITLY stored `'logout'` keeps it unchanged.
+   * This deliberately reverses the earlier O-1 back-compat default (`'logout'`):
+   * legacy orgs that never set the field move logout->lock on the next Lambda
+   * deploy. Safe by construction — with no PIN the plugin keeps the session
+   * (never logs out on idle); with a PIN the lock is offline-unlockable. See the
+   * D3 control model in the phase-12 planning docs.
    */
   idleAction: 'lock' | 'logout';
   /**
@@ -1936,7 +1941,10 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
   allowedDomains: [],
   retentionDays: 365,
   autoLockMinutes: 30,
-  idleAction: 'logout',
+  // 'lock' (quick 260711-l2e): an idle vault locks (PIN unlock, session kept)
+  // instead of forcing a full re-login. Reverses the earlier O-1 'logout'
+  // default for absent-field orgs; explicitly-stored values still win.
+  idleAction: 'lock',
   allowAdminPerFileRestrictions: false,
   disabledAuditActions: [],
 };
@@ -2085,9 +2093,11 @@ export function normalizeStoredOrgSettings(
   }
 
   // idleAction: keep ONLY the two known values. Absent or garbage is left
-  // unset so buildOrgSettings falls through to DEFAULT ('logout'). New-org
-  // 'lock' is written explicitly at signup — never defaulted here — so an
-  // already-deployed org never silently switches to lock on upgrade (O-1).
+  // unset so buildOrgSettings falls through to DEFAULT ('lock' since quick
+  // 260711-l2e — was 'logout' under O-1). This intentionally lets a legacy
+  // org that never set the field pick up 'lock' on upgrade so idle locks
+  // instead of logging the user out; an org that EXPLICITLY stored 'logout'
+  // still round-trips unchanged. New orgs keep writing 'lock' at signup.
   const idleAction =
     rawSettings.idleAction === 'lock' || rawSettings.idleAction === 'logout'
       ? rawSettings.idleAction

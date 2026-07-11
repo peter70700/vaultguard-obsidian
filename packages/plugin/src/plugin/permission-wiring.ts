@@ -37,6 +37,8 @@ export function initFilePermissionHeader(
     getPermissionLevel: (path) => ctx.getEffectivePermission(path),
     isEnabled: () => ctx.isPermissionBannerEnabled(),
     isLoggedIn: () => ctx.session !== null,
+    isOnline: () => ctx.isOnline(),
+    onRetryConnection: () => ctx.reconnectNow(),
     onRulesChanged: () => {
       ctx.permissionStore.emit("changed", { serverConfirmed: true });
     },

@@ -260,6 +260,14 @@ export interface PermissionSurfaceContext {
   isFileExplorerDecorationDataReady(): boolean;
   syncFileExplorerDecorationsState(refresh?: boolean): void;
   isPermissionBannerEnabled(): boolean;
+  /**
+   * Backend connection state as a PRESENTATION HINT only. It may be stale in
+   * both directions (the "online" flip is deferred until the first sync), so UI
+   * surfaces treat it as advisory and must never gate a network fetch on it.
+   */
+  isOnline(): boolean;
+  /** User-initiated reconnect probe (flips status online on success). */
+  reconnectNow(): Promise<void>;
 }
 
 export interface PermissionSurfaceInstances {
