@@ -3103,6 +3103,42 @@ body.is-phone .view-content:has(> .vaultguard-file-header) {
   padding-inline: 0;
 }
 
+/* Uniform 10px breathing gap directly BELOW the injected header on mobile —
+   identical across markdown / image / PDF. The header is the .view-content
+   firstChild in every file view, so a single margin-bottom spaces it from
+   whatever follows it (the markdown scroller, the image, the pdf-container).
+   One lever, same result for every type — no per-view-type rules needed.
+   Measured (headless Chromium, real app.css cascade): md/image/pdf all land
+   at exactly 10px below the header. */
+body.is-phone .vaultguard-file-header {
+  margin-bottom: 10px;
+}
+
+/* Markdown-only companion to the rule above. Obsidian pads the markdown inner
+   scroller (.cm-scroller / .markdown-preview-view) by --view-top-spacing-markdown
+   (safe-area-inset-top + view-header-height + 16px ≈ 119px on a notched phone,
+   ~60px without a notch) to clear the floating .view-header for the note text.
+   Our permission header is injected as the .view-content firstChild — ABOVE
+   that scroller — and already carries its own floating-nav + safe-area
+   clearance (the two markdown rules earlier in this section), so that inner
+   padding is redundant once the header is present. Left alone it would STACK
+   under the 10px margin above and reopen a ~129px empty band between the header
+   and the first line of text. Image / PDF FileViews have no equivalent inner
+   padding (Obsidian scopes the rule to markdown descendants only), so they need
+   nothing extra — the 10px margin is their whole gap.
+
+   Zero --view-top-spacing-markdown on the header-hosting markdown .view-content
+   — the same lever Obsidian itself uses to retune this spacing (see its
+   .document-search-container override) — so the ONLY gap below the header is
+   the uniform 10px, matching image / PDF. Scoped via
+   :has(> .vaultguard-file-header) so only header-hosting markdown views are
+   touched; logged-out / banner-off notes keep Obsidian's native spacing.
+   Progressive enhancement: on a rare webview without :has() support the native
+   padding simply remains (pre-fix behavior), never worse. */
+body.is-phone .workspace-leaf-content[data-type="markdown"] .view-content:has(> .vaultguard-file-header) {
+  --view-top-spacing-markdown: 0px;
+}
+
 /* ─── Mobile layout: .is-phone branch ──────────────────────────────────────
    Mirror of the @media (max-width: 600px) block below, but scoped to
    Obsidian's body.is-phone class. Belt-and-suspenders: real phones may

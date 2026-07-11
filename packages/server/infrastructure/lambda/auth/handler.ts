@@ -1841,11 +1841,18 @@ async function assertScopeHasNoReadDenyRules(
   event: APIGatewayProxyEvent,
   requestId: string
 ): Promise<void> {
-  // LF1: role-scoped deny rules bind on the vault-membership role, not
-  // user.roles (the org/Cognito roles). Evaluating this read-deny gate against
-  // user.roles let a role-scoped `{role:'editor',deny,read,...}` slip through,
-  // handing the member a full `/**` vault DEK instead of forcing limited-access.
-  const evalRoles = await resolveVaultEvaluationRoles(user, vaultId);
+  // HOTFIX (2026-07-11, reverts SD-03-F2 role source at this gate only): this
+  // gate hard-fails the ENTIRE lease when ANY overlapping deny-read rule
+  // exists (known overreach — see "lease-deny gate overreach", Fix B pending).
+  // Resolving vault-membership roles here (2bcee94) made previously-invisible
+  // role-scoped denies (e.g. {role:'viewer',deny,read,'/secret/**'}) kill the
+  // full-vault DEK lease AND every renewal for all non-admin members of that
+  // role — a prod outage where viewers/editors dropped into limited-access
+  // mode. Until Fix B degrades this gate to a scoped lease instead of a hard
+  // 403, evaluate it on user.roles as before. This does NOT reopen SD-03-F1:
+  // per-file plaintext reads (handleReadDecrypted) and the scope probes below
+  // still enforce role-scoped denies via resolveVaultEvaluationRoles.
+  const evalRoles = user.roles;
   const denyRules = await findApplicableDenyRulesInScope(
     user.userId,
     evalRoles,

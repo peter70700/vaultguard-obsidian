@@ -651,7 +651,7 @@ export async function assertUserNotRevoked(user: UserContext): Promise<void> {
  * logs out. This check closes that bypass for ALL clients: on logout the auth
  * handler records `logoutAt = now` under the synthetic SESSIONS_TABLE key
  * `logout-cutoff#<userId>`; here we reject any token whose issuance time
- * (`auth_time`, falling back to `iat`) predates that moment.
+ * (`iat`, falling back to `auth_time`) predates that moment.
  *
  * Deliberately isolated from admin-revoke (`assertUserNotRevoked`): it reads a
  * SESSIONS_TABLE marker, never REVOKED_KEYS_TABLE, and trips no blanket 403 —
@@ -671,10 +671,15 @@ async function assertTokenNewerThanLogoutCutoff(user: UserContext): Promise<void
   if (typeof logoutAt !== 'number') return; // no cutoff recorded → unchanged behaviour
 
   // `auth_time` / `iat` are epoch SECONDS; `logoutAt` is epoch MS — compare in ms.
-  // Only judge tokens that actually carry an issuance time; a token with neither
-  // claim is left untouched (fail-open, unchanged behaviour). Cognito tokens
-  // always carry `iat`, so this fallback is defensive.
-  const tokenIssuedSec = user.authTime ?? user.iat;
+  // Prefer `iat` (when THIS token was minted) over `auth_time`: Cognito
+  // preserves the ORIGINAL login's `auth_time` across refresh-minted tokens,
+  // so judging on `auth_time` locked out every OTHER refresh-restored session
+  // of a user for up to 24h after they logged out anywhere (prod incident
+  // 2026-07-11). `iat` still blocks the actual threat — replay of an access
+  // token stolen BEFORE the logout — while letting live sessions recover by
+  // refreshing. A token with neither claim is left untouched (fail-open,
+  // unchanged behaviour); Cognito tokens always carry `iat`.
+  const tokenIssuedSec = user.iat ?? user.authTime;
   if (typeof tokenIssuedSec !== 'number') return;
 
   if (tokenIssuedSec * 1000 < logoutAt) {

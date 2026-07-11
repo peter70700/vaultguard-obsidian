@@ -606,11 +606,26 @@ data "aws_iam_policy_document" "permissions_lambda" {
     actions   = ["dynamodb:GetItem", "dynamodb:Query"]
     resources = [var.organizations_table_arn, "${var.organizations_table_arn}/index/*"]
   }
-  # SD-12 F6: removed an unused kms:Decrypt/DescribeKey grant on the vault CMK.
-  # The permissions Lambda performs no KMS operations — the wrapped-DEK rows it
-  # would need live in USER_KEYS_TABLE, which this role has no access to — so the
-  # grant was a latent over-grant. Re-add WITH an encryption-context constraint
-  # if a genuine decrypt need ever arises.
+  # DynamoDB SSE-KMS caller decrypt — REQUIRED, do not remove. Every VaultGuard
+  # table is SSE-encrypted with the vault CMK (modules/dynamodb sets kms_key_arn
+  # on all tables), and DynamoDB issues kms:Decrypt for the table key with the
+  # CALLER's credentials — not a service grant, as SD-12 F6 assumed when it
+  # removed this. Because DynamoDB caches table keys per principal and only
+  # drops them after ~5 idle minutes, the removal surfaced as a DELAYED outage:
+  # 2026-07-11, every permissions rules/access/batch route 500'd with
+  # "not authorized to perform: kms:Decrypt" once the Permissions table key
+  # went cold. kms:ViaService pins the grant to DynamoDB's use, so this role
+  # still cannot decrypt vault-DEK ciphertexts directly — F6's least-privilege
+  # intent is preserved (narrower than the pre-F6 unconditioned grant).
+  statement {
+    actions   = ["kms:Decrypt", "kms:DescribeKey"]
+    resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${data.aws_region.current.name}.amazonaws.com"]
+    }
+  }
   # SD-09-F1: publish the OffHoursPermissionChange security metric (emitted from
   # recordVaultActivity when a permission mutation lands off-hours).
   # Namespace-scoped condition = least privilege (PutMetricData has no ARN).
@@ -902,14 +917,24 @@ data "aws_iam_policy_document" "signup_lambda" {
     actions   = ["dynamodb:Scan"]
     resources = [var.organizations_table_arn]
   }
-  # SD-12 least-privilege (sibling of the F6 permissions-role cleanup below):
-  # removed an unused kms:Decrypt/DescribeKey/GenerateDataKey grant on the master
-  # CMK. The signup Lambda performs NO KMS operations (verified: zero KMS calls in
-  # infrastructure/lambda/signup and the shared module it imports). The old comment
-  # ("decrypt DynamoDB table data") was a misconception — DynamoDB decrypts
-  # CMK-encrypted tables via its own service grant, not via the caller's IAM, so
-  # this was a latent over-grant. Re-add WITH an encryption-context constraint if a
-  # genuine decrypt need ever arises.
+  # DynamoDB SSE-KMS caller decrypt — REQUIRED, do not remove. SD-12 dropped
+  # this believing DynamoDB decrypts CMK-encrypted tables via a service grant;
+  # in fact DynamoDB calls kms:Decrypt with the CALLER's credentials (proven by
+  # the 2026-07-11 permissions-Lambda outage — see the twin comment on the
+  # permissions role). The signup Lambda writes Organizations/Vaults/
+  # VaultMembers/Permissions/Subscriptions rows, all CMK-encrypted, so without
+  # this grant new-customer signup 500s on the first cold table key. ViaService
+  # pins the grant to DynamoDB — no direct KMS use, and no GenerateDataKey
+  # (which the pre-SD-12 over-grant had); least-privilege intent preserved.
+  statement {
+    actions   = ["kms:Decrypt", "kms:DescribeKey"]
+    resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${data.aws_region.current.name}.amazonaws.com"]
+    }
+  }
   # SES — send welcome email
   statement {
     actions   = ["ses:SendEmail", "ses:SendRawEmail"]
@@ -1017,13 +1042,25 @@ data "aws_iam_policy_document" "users_lambda" {
     actions   = ["dynamodb:Query", "dynamodb:UpdateItem"]
     resources = [var.leases_table_arn, "${var.leases_table_arn}/index/*"]
   }
-  # SD-12 least-privilege (sibling of the F6 permissions-role cleanup): removed an
-  # unused kms:Decrypt/DescribeKey/GenerateDataKey grant on the master CMK. The
-  # users Lambda performs NO KMS operations (verified: zero KMS calls in
-  # infrastructure/lambda/users and the shared module). Offboarding fires a
-  # UserAccessRevoked event and the reencryption Lambda (which keeps its own KMS
-  # grant) does the crypto; CMK-encrypted DynamoDB is decrypted by DynamoDB, not
-  # the caller. Re-add WITH an encryption-context constraint if a genuine need arises.
+  # DynamoDB SSE-KMS caller decrypt — REQUIRED, do not remove. SD-12 dropped
+  # this believing DynamoDB decrypts CMK-encrypted tables via a service grant;
+  # in fact DynamoDB calls kms:Decrypt with the CALLER's credentials (proven by
+  # the 2026-07-11 permissions-Lambda outage — see the twin comment on the
+  # permissions role). The users Lambda reads/writes Organizations/Sessions/
+  # Audit/Leases/Subscriptions rows, all CMK-encrypted, so without this grant
+  # invite/revoke/list-user routes 500 on the first cold table key. Offboarding
+  # crypto still lives in the reencryption Lambda (own KMS grant); ViaService
+  # pins THIS grant to DynamoDB — no direct KMS use, and no GenerateDataKey
+  # (which the pre-SD-12 over-grant had); least-privilege intent preserved.
+  statement {
+    actions   = ["kms:Decrypt", "kms:DescribeKey"]
+    resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${data.aws_region.current.name}.amazonaws.com"]
+    }
+  }
   statement {
     actions   = ["ses:SendEmail", "ses:SendRawEmail"]
     resources = ["arn:aws:ses:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:identity/${var.sender_domain}"]
