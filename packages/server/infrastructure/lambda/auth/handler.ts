@@ -119,6 +119,13 @@ interface KeyLease {
   scope: string;
   /** Vault this lease is bound to. Omitted only for legacy pre-vault leases. */
   vaultId?: string;
+  /** Enforceable path carve-outs for a broad lease. Empty means no carve-outs. */
+  deniedPaths: LeaseDeniedPath[];
+}
+
+interface LeaseDeniedPath {
+  pathPattern: string;
+  ruleId: string;
 }
 
 /** Persisted lease record in the Leases DynamoDB table. */
@@ -138,6 +145,8 @@ interface LeaseRecord {
   scope: string;
   /** Vault this lease is bound to. Omitted only for legacy pre-vault leases. */
   vaultId?: string;
+  /** Authorization carve-outs that accompanied this lease issuance. */
+  deniedPaths?: LeaseDeniedPath[];
   /** Unix epoch seconds for DynamoDB TTL (7 days after expiry). */
   expiresAtTtl: number;
 }
@@ -474,29 +483,35 @@ async function handleRefresh(
   const renewalVaultId = existingLease.vaultId;
   await requireVaultMember(user, renewalVaultId, 'viewer');
 
-  // Re-run the same scope permission checks used for initial lease issuance.
+  // Re-run the same complete scope evaluation used for initial lease issuance.
   // Otherwise an existing broad `/**` lease could be renewed after an admin
   // adds a deny rule, keeping local decryption alive past the permission cut.
+  let renewalAuthorization: LeaseAuthorizationContext;
   try {
-    await assertScopeHasNoReadDenyRules(user, renewalVaultId, renewalScope, event, requestId);
+    renewalAuthorization = await collectScopeReadDenyRules(
+      user,
+      renewalVaultId,
+      renewalScope,
+      orgSettings.allowAdminPerFileRestrictions !== true
+    );
   } catch (err) {
-    if (err instanceof AuthError) {
-      await expireLease(existingLease.leaseId);
-    }
+    await expireLease(existingLease.leaseId);
     throw err;
   }
 
   const permissionProbePath = scopeToPermissionProbePath(renewalScope);
   // LF1: evaluate the scope probe on the vault-membership role, not user.roles.
-  const renewalEvalRoles = await resolveVaultEvaluationRoles(user, renewalVaultId);
   const permission = await evaluatePermission(
     user.userId,
-    renewalEvalRoles,
+    renewalAuthorization.evalRoles,
     'read',
     permissionProbePath,
     user.orgId,
     renewalVaultId,
-    { userAliases: user.email ? [user.email] : [] }
+    {
+      userAliases: user.email ? [user.email] : [],
+      respectAdminBypass: orgSettings.allowAdminPerFileRestrictions !== true,
+    }
   );
   if (!permission.allowed) {
     await logAudit({
@@ -542,7 +557,8 @@ async function handleRefresh(
     sessionId,
     user.orgId,
     renewalScope,
-    renewalVaultId
+    renewalVaultId,
+    renewalAuthorization.deniedPaths
   );
 
   await logAudit({
@@ -563,6 +579,7 @@ async function handleRefresh(
       sessionId,
       expiresAt: newExpiry.toISOString(),
       keyLease,
+      deniedPaths: keyLease.deniedPaths,
       orgSettings,
     },
     requestId
@@ -721,25 +738,65 @@ async function handleGetKeyLease(
   }
 
   await requireVaultMember(user, vaultId, 'viewer');
-  await assertScopeHasNoReadDenyRules(user, vaultId, '/**', event, requestId);
+  const authorization = await collectScopeReadDenyRules(
+    user,
+    vaultId,
+    '/**',
+    orgSettings.allowAdminPerFileRestrictions !== true
+  );
+
+  const permission = await evaluatePermission(
+    user.userId,
+    authorization.evalRoles,
+    'read',
+    scopeToPermissionProbePath('/**'),
+    user.orgId,
+    vaultId,
+    {
+      userAliases: user.email ? [user.email] : [],
+      respectAdminBypass: orgSettings.allowAdminPerFileRestrictions !== true,
+    }
+  );
+  if (!permission.allowed) {
+    throw new AuthError('Access denied: insufficient permissions for requested key scope', 403);
+  }
 
   await expireActiveSessionScopeLeases(user.userId, sessionId, '/**', user.orgId, vaultId);
-  const keyLease = await issueKeyLease(user.userId, sessionId, user.orgId, '/**', vaultId);
+  const keyLease = await issueKeyLease(
+    user.userId,
+    sessionId,
+    user.orgId,
+    '/**',
+    vaultId,
+    authorization.deniedPaths
+  );
 
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
     orgId: user.orgId,
     vaultId,
-    action: 'auth.key-lease.issued',
+    action: authorization.deniedPaths.length > 0
+      ? 'auth.key-lease.issued-with-denies'
+      : 'auth.key-lease.issued',
     resourcePath: `/vaults/${vaultId}/auth/key-lease`,
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { vaultId, leaseId: keyLease.leaseId, expiresAt: keyLease.expiresAt },
+    metadata: {
+      vaultId,
+      leaseId: keyLease.leaseId,
+      expiresAt: keyLease.expiresAt,
+      denyCount: authorization.deniedPaths.length,
+      deniedRuleIds: authorization.deniedPaths.map((entry) => entry.ruleId),
+    },
   });
 
-  return formatSuccess(200, { keyLease, orgSettings }, requestId);
+  return formatSuccess(200, {
+    keyLease,
+    deniedPaths: keyLease.deniedPaths,
+    orgSettings,
+  }, requestId);
 }
 
 // ─── GET/PUT/DELETE /auth/ai-key ─────────────────────────────────────────────
@@ -1264,7 +1321,8 @@ async function issueKeyLease(
   sessionId: string,
   orgId: string,
   scope: string,
-  vaultId: string
+  vaultId: string,
+  deniedPaths: LeaseDeniedPath[] = []
 ): Promise<KeyLease> {
   if (!vaultId) {
     throw new ValidationError('vaultId is required to issue a key lease');
@@ -1293,6 +1351,7 @@ async function issueKeyLease(
     expiresAt,
     scope,
     ...(vaultId ? { vaultId } : {}),
+    deniedPaths,
     expiresAtTtl,
   };
 
@@ -1313,6 +1372,7 @@ async function issueKeyLease(
     offlineCapable: true,
     scope,
     ...(vaultId ? { vaultId } : {}),
+    deniedPaths,
   };
 }
 
@@ -1785,19 +1845,26 @@ async function handleScopedKeyLease(
   // Vault membership check — leases are bound to a specific vault.
   await requireVaultMember(user, vaultId, 'viewer');
 
-  await assertScopeHasNoReadDenyRules(user, vaultId, scope, event, requestId);
+  const authorization = await collectScopeReadDenyRules(
+    user,
+    vaultId,
+    scope,
+    orgSettings.allowAdminPerFileRestrictions !== true
+  );
 
   const permissionProbePath = scopeToPermissionProbePath(scope);
   // LF1: evaluate the scope probe on the vault-membership role, not user.roles.
-  const scopedEvalRoles = await resolveVaultEvaluationRoles(user, vaultId);
   const permission = await evaluatePermission(
     user.userId,
-    scopedEvalRoles,
+    authorization.evalRoles,
     'read',
     permissionProbePath,
     user.orgId,
     vaultId,
-    { userAliases: user.email ? [user.email] : [] }
+    {
+      userAliases: user.email ? [user.email] : [],
+      respectAdminBypass: orgSettings.allowAdminPerFileRestrictions !== true,
+    }
   );
   if (!permission.allowed) {
     await logAudit({
@@ -1816,43 +1883,65 @@ async function handleScopedKeyLease(
   }
 
   await expireActiveSessionScopeLeases(user.userId, sessionId, scope, user.orgId, vaultId);
-  const keyLease = await issueKeyLease(user.userId, sessionId, user.orgId, scope, vaultId);
+  const keyLease = await issueKeyLease(
+    user.userId,
+    sessionId,
+    user.orgId,
+    scope,
+    vaultId,
+    authorization.deniedPaths
+  );
 
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
     orgId: user.orgId,
     vaultId,
-    action: 'auth.key-lease.scoped',
+    action: authorization.deniedPaths.length > 0
+      ? 'auth.key-lease.scoped.granted-with-denies'
+      : 'auth.key-lease.scoped',
     resourcePath: `/vaults/${vaultId}/auth/key-lease/scoped`,
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { vaultId, leaseId: keyLease.leaseId, scope, expiresAt: keyLease.expiresAt },
+    metadata: {
+      vaultId,
+      leaseId: keyLease.leaseId,
+      scope,
+      expiresAt: keyLease.expiresAt,
+      denyCount: authorization.deniedPaths.length,
+      deniedRuleIds: authorization.deniedPaths.map((entry) => entry.ruleId),
+    },
   });
 
-  return formatSuccess(200, { keyLease, orgSettings }, requestId);
+  return formatSuccess(200, {
+    keyLease,
+    deniedPaths: keyLease.deniedPaths,
+    orgSettings,
+  }, requestId);
 }
 
-async function assertScopeHasNoReadDenyRules(
+interface LeaseAuthorizationContext {
+  evalRoles: string[];
+  deniedPaths: LeaseDeniedPath[];
+}
+
+async function collectScopeReadDenyRules(
   user: UserContext,
   vaultId: string,
   scope: string,
-  event: APIGatewayProxyEvent,
-  requestId: string
-): Promise<void> {
-  // HOTFIX (2026-07-11, reverts SD-03-F2 role source at this gate only): this
-  // gate hard-fails the ENTIRE lease when ANY overlapping deny-read rule
-  // exists (known overreach — see "lease-deny gate overreach", Fix B pending).
-  // Resolving vault-membership roles here (2bcee94) made previously-invisible
-  // role-scoped denies (e.g. {role:'viewer',deny,read,'/secret/**'}) kill the
-  // full-vault DEK lease AND every renewal for all non-admin members of that
-  // role — a prod outage where viewers/editors dropped into limited-access
-  // mode. Until Fix B degrades this gate to a scoped lease instead of a hard
-  // 403, evaluate it on user.roles as before. This does NOT reopen SD-03-F1:
-  // per-file plaintext reads (handleReadDecrypted) and the scope probes below
-  // still enforce role-scoped denies via resolveVaultEvaluationRoles.
-  const evalRoles = user.roles;
+  respectAdminBypass: boolean
+): Promise<LeaseAuthorizationContext> {
+  // Fix B: resolve the vault role AND retain verified Cognito group roles for
+  // group-derived rules. A broad lease may still be issued for availability,
+  // but every overlapping live read deny is returned as an enforceable carve-
+  // out. Revocation/membership/session failures remain hard failures before
+  // this point; incomplete DynamoDB evaluation rejects rather than returning a
+  // partial set.
+  const vaultRoles = await resolveVaultEvaluationRoles(user, vaultId);
+  const evalRoles = isAdmin(user)
+    ? [...new Set(user.roles)]
+    : [...new Set([...user.roles, ...vaultRoles])];
   const denyRules = await findApplicableDenyRulesInScope(
     user.userId,
     evalRoles,
@@ -1860,29 +1949,28 @@ async function assertScopeHasNoReadDenyRules(
     scope,
     user.orgId,
     vaultId,
-    { userAliases: user.email ? [user.email] : [] }
+    {
+      userAliases: user.email ? [user.email] : [],
+      respectAdminBypass,
+    }
   );
 
-  if (denyRules.length === 0) return;
+  const deniedPaths: LeaseDeniedPath[] = [];
+  const seen = new Set<string>();
+  for (const rule of denyRules) {
+    if (!rule.id || !rule.pathPattern || !rule.pathPattern.startsWith('/')) {
+      throw new AuthError('Authorization evaluation incomplete; key lease not issued.', 500);
+    }
+    const key = `${rule.pathPattern}\u0000${rule.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deniedPaths.push({ pathPattern: rule.pathPattern, ruleId: rule.id });
+  }
+  deniedPaths.sort((a, b) =>
+    a.pathPattern.localeCompare(b.pathPattern) || a.ruleId.localeCompare(b.ruleId)
+  );
 
-  await logAudit({
-    userId: user.userId,
-    userEmail: user.email,
-    orgId: user.orgId,
-    vaultId,
-    action: 'auth.key-lease.scoped.denied',
-    resourcePath: scope,
-    outcome: 'denied',
-    ipAddress: getClientIp(event),
-    userAgent: getUserAgent(event),
-    metadata: {
-      vaultId,
-      reason: 'scope_contains_deny_rule',
-      deniedRuleIds: denyRules.map((rule) => rule.id),
-      requestId,
-    },
-  });
-  throw new AuthError('Access denied: requested key scope includes denied paths', 403);
+  return { evalRoles, deniedPaths };
 }
 
 function scopeToPermissionProbePath(scope: string): string {

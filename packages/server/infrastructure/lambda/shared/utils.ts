@@ -21,6 +21,7 @@ import {
   ScanCommand,
   BatchWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
+import type { QueryCommandInput } from '@aws-sdk/lib-dynamodb';
 import { AdminGetUserCommand, CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
@@ -1141,7 +1142,7 @@ export async function findApplicableDenyRulesInScope(
   vaultId: string,
   options: PermissionEvaluationOptions = {}
 ): Promise<PermissionRule[]> {
-  if (rolesIncludeOrgAdmin(roles)) {
+  if (options.respectAdminBypass !== false && rolesIncludeOrgAdmin(roles)) {
     return [];
   }
 
@@ -1194,48 +1195,60 @@ async function fetchApplicableRules(
     scopeValues: { ':orgId': orgId, ':vaultId': vaultId } as Record<string, unknown>,
   };
 
+  // Authorization must be complete. DynamoDB Query is capped at 1 MB and can
+  // return LastEvaluatedKey even when a filter leaves few visible rows. A
+  // single-page lookup can therefore miss a later deny rule and widen access.
+  // Paginate every principal/role/wildcard query; any failed page rejects the
+  // whole evaluation so callers fail closed.
+  const queryAll = async (input: QueryCommandInput): Promise<PermissionRule[]> => {
+    const items: PermissionRule[] = [];
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const page = await docClient.send(
+        new QueryCommand({
+          ...input,
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+        })
+      );
+      items.push(...((page.Items ?? []) as PermissionRule[]));
+      exclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (exclusiveStartKey);
+    return items;
+  };
+
   // Fetch user-specific rules. Include canonical subject id plus legacy
   // aliases (notably email-address principals) so old rules and new rules
   // are evaluated by the same backend source of truth.
   for (const lookupUserId of userIds) {
-    const userRulesResult = await docClient.send(
-      new QueryCommand({
-        TableName: PERMISSIONS_TABLE,
-        IndexName: 'userId-index',
-        KeyConditionExpression: 'userId = :uid',
-        FilterExpression: scopeFilter.FilterExpression,
-        ExpressionAttributeValues: { ':uid': lookupUserId, ...scopeFilter.scopeValues },
-      })
-    );
-    pushRules(userRulesResult.Items as PermissionRule[] | undefined);
-  }
-
-  // Fetch role-based rules
-  for (const role of roles) {
-    const roleRulesResult = await docClient.send(
-      new QueryCommand({
-        TableName: PERMISSIONS_TABLE,
-        IndexName: 'role-index',
-        KeyConditionExpression: '#role = :role',
-        ExpressionAttributeNames: { '#role': 'role' },
-        FilterExpression: scopeFilter.FilterExpression,
-        ExpressionAttributeValues: { ':role': role, ...scopeFilter.scopeValues },
-      })
-    );
-    pushRules(roleRulesResult.Items as PermissionRule[] | undefined);
-  }
-
-  // Fetch wildcard rules (apply to all users within the same org+vault)
-  const wildcardResult = await docClient.send(
-    new QueryCommand({
+    pushRules(await queryAll({
       TableName: PERMISSIONS_TABLE,
       IndexName: 'userId-index',
       KeyConditionExpression: 'userId = :uid',
       FilterExpression: scopeFilter.FilterExpression,
-      ExpressionAttributeValues: { ':uid': '*', ...scopeFilter.scopeValues },
-    })
-  );
-  pushRules(wildcardResult.Items as PermissionRule[] | undefined);
+      ExpressionAttributeValues: { ':uid': lookupUserId, ...scopeFilter.scopeValues },
+    }));
+  }
+
+  // Fetch role-based rules
+  for (const role of roles) {
+    pushRules(await queryAll({
+      TableName: PERMISSIONS_TABLE,
+      IndexName: 'role-index',
+      KeyConditionExpression: '#role = :role',
+      ExpressionAttributeNames: { '#role': 'role' },
+      FilterExpression: scopeFilter.FilterExpression,
+      ExpressionAttributeValues: { ':role': role, ...scopeFilter.scopeValues },
+    }));
+  }
+
+  // Fetch wildcard rules (apply to all users within the same org+vault)
+  pushRules(await queryAll({
+    TableName: PERMISSIONS_TABLE,
+    IndexName: 'userId-index',
+    KeyConditionExpression: 'userId = :uid',
+    FilterExpression: scopeFilter.FilterExpression,
+    ExpressionAttributeValues: { ':uid': '*', ...scopeFilter.scopeValues },
+  }));
 
   return results;
 }

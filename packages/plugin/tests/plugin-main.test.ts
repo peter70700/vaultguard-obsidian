@@ -981,6 +981,70 @@ describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => 
     expect(runtime.writeLocalBinaryFileFromRemote).not.toHaveBeenCalled();
   });
 
+  it("does not decrypt previously cached cloud ciphertext outside lease-authorized paths", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.keyLease = {
+      ...plugin.keyLease,
+      deniedPaths: [{ pathPattern: "/secret/**", ruleId: "deny-secret" }],
+    };
+    plugin.decryptContent = vi.fn().mockResolvedValue("should-not-decrypt");
+    const runtime = plugin.ensureSyncRuntime();
+
+    await expect(runtime.decodeRemoteFileContent("secret/cached.md", {
+      content: "cached-cloud-ciphertext",
+      contentType: "text/markdown",
+    })).rejects.toThrow("key lease explicitly denies this path");
+    expect(plugin.decryptContent).not.toHaveBeenCalled();
+
+    plugin.fetchRemoteFileContent = vi.fn();
+    await runtime.applyRemoteChange({ path: "secret/cached.md", size: 42 });
+    expect(plugin.fetchRemoteFileContent).not.toHaveBeenCalled();
+  });
+
+  it("returns server-decrypted plaintext for a carve-out path the server authorized (SD-03-F8/F2 allow-override, no over-block)", async () => {
+    // A deniedPaths carve-out is a RAW deny rule (the backend does not resolve
+    // allow-overrides), so a path whose deny is beaten by a higher-priority
+    // allow is still listed. When the server returns already-decrypted bytes it
+    // has run its own authoritative per-file gate and allowed the read — the
+    // client must honor that instead of over-blocking a readable file.
+    const plugin = makeApplyRemotePlugin();
+    plugin.keyLease = {
+      ...plugin.keyLease,
+      deniedPaths: [{ pathPattern: "/secret/**", ruleId: "deny-secret" }],
+    };
+    plugin.decryptContent = vi.fn().mockResolvedValue("should-not-local-decrypt");
+    const runtime = plugin.ensureSyncRuntime();
+
+    const plaintext = "server-authorized body";
+    await expect(
+      runtime.decodeRemoteFileContent("secret/allowed-by-override.md", {
+        content: Buffer.from(plaintext, "utf8").toString("base64"),
+        decrypted: true,
+        contentType: "text/markdown",
+      })
+    ).resolves.toBe(plaintext);
+    // Server already decrypted it — the local vault DEK must NOT be used.
+    expect(plugin.decryptContent).not.toHaveBeenCalled();
+  });
+
+  it("still decrypts a non-denied path's raw ciphertext with the vault DEK (normal path intact)", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.keyLease = {
+      ...plugin.keyLease,
+      deniedPaths: [{ pathPattern: "/secret/**", ruleId: "deny-secret" }],
+    };
+    plugin.decryptContent = vi.fn().mockResolvedValue("decrypted body");
+    const runtime = plugin.ensureSyncRuntime();
+
+    await expect(
+      runtime.decodeRemoteFileContent("notes/ok.md", {
+        content: "raw-ciphertext",
+        contentType: "text/markdown",
+      })
+    ).resolves.toBe("decrypted body");
+    expect(plugin.decryptContent).toHaveBeenCalledWith("raw-ciphertext");
+  });
+
   it("materializes a serverOnly binary through the SAME applyRemoteChange fork during reconciliation", async () => {
     // Proves the chokepoint covers the reconciliation download surface (and, by
     // construction, the delta-loop and repair surfaces that call the identical
@@ -1099,6 +1163,26 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       }
     );
     expect(plugin.keyLease.leaseId).toBe("lease-2");
+  });
+
+  it("merges lease and response deniedPaths deterministically and rejects malformed carve-outs", () => {
+    const plugin = makePlugin();
+    const normalized = plugin.normalizeKeyLease(
+      {
+        ...makeKeyLease(),
+        deniedPaths: [{ pathPattern: "/z/**", ruleId: "z" }],
+      },
+      [{ pathPattern: "/a/**", ruleId: "a" }]
+    );
+    expect(normalized.deniedPaths).toEqual([
+      { pathPattern: "/a/**", ruleId: "a" },
+      { pathPattern: "/z/**", ruleId: "z" },
+    ]);
+
+    expect(() => plugin.normalizeKeyLease({
+      ...makeKeyLease(),
+      deniedPaths: [{ pathPattern: "relative/**", ruleId: "bad" }],
+    })).toThrow("malformed key-lease denied paths");
   });
 
   it("recovers an expired key lease without clearing the stored login", async () => {

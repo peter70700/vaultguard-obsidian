@@ -854,7 +854,8 @@ export class SyncRuntime {
     path: string
   ): Promise<ApiResponse<RemoteFileContentResponse>> {
     const normalizedPath = this.ctx.normalizeVaultPath(path);
-    const serverDecrypt = !this.hasValidKeyLease();
+    const serverDecrypt =
+      !this.hasValidKeyLease() || this.ctx.isPathDeniedByKeyLease(normalizedPath);
     if (serverDecrypt) {
       return this.ctx.readFileDecrypted(normalizedPath);
     }
@@ -869,8 +870,27 @@ export class SyncRuntime {
     data: RemoteFileContentResponse
   ): Promise<string> {
     const normalizedPath = this.ctx.normalizeVaultPath(path);
+    // Server-authorized plaintext takes precedence over the lease carve-out.
+    // A `deniedPaths` entry is a *raw* deny rule (the backend's
+    // findApplicableDenyRulesInScope does not resolve allow-overrides), so a
+    // path whose deny is beaten by a higher-priority/more-specific allow is
+    // still listed here. When the server returns already-decrypted bytes it
+    // means its own authoritative per-file gate (evaluatePermission over the
+    // vault-membership role) allowed the read — that is the source of truth,
+    // so honor it rather than over-block a file the user can legitimately read
+    // (SD-03-F8/F2 over-block regression).
     if (data.decrypted === true) {
       return this.decodeBase64Utf8(data.content);
+    }
+    // Raw-ciphertext branch only: refuse to decrypt a carve-out-denied path
+    // with the broad vault DEK. fetchRemoteFileContent already routes denied
+    // paths to the server (so a denied path never reaches here with raw
+    // bytes) — this is defense-in-depth for any direct caller.
+    if (this.ctx.isPathDeniedByKeyLease(normalizedPath)) {
+      throw this.remoteDecryptError(
+        normalizedPath,
+        new Error("key lease explicitly denies this path")
+      );
     }
 
     if (!this.hasValidKeyLease()) {
@@ -947,6 +967,10 @@ export class SyncRuntime {
     const normalizedPath = this.ctx.normalizeVaultPath(metadata.path);
     if (this.ctx.isPathExcluded(normalizedPath)) {
       this.ctx.log(`Sync: skipping excluded path "${normalizedPath}".`);
+      return;
+    }
+    if (this.ctx.isPathDeniedByKeyLease(normalizedPath)) {
+      this.ctx.log(`Sync: skipping key-lease-denied path "${normalizedPath}".`);
       return;
     }
 

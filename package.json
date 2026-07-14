@@ -1,6 +1,6 @@
 {
   "name": "vaultguard-monorepo",
-  "version": "1.2.9",
+  "version": "1.2.10",
   "private": true,
   "workspaces": [
     "packages/*"
@@ -14,6 +14,6 @@
     "typecheck": "tsc -noEmit -skipLibCheck"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.15"
+    "@biomejs/biome": "2.5.2"
   }
 }

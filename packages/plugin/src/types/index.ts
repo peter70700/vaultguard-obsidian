@@ -184,6 +184,8 @@ export interface KeyLease {
   scope: string;
   /** Server vault this lease is bound to. Omitted only for legacy leases. */
   vaultId?: string;
+  /** Live read-deny carve-outs returned with a broad lease. */
+  deniedPaths?: Array<{ pathPattern: string; ruleId: string }>;
 }
 
 /** Supported encryption strength levels for local cache */

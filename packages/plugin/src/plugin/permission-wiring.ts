@@ -35,6 +35,7 @@ export function initFilePermissionHeader(
     allowAdminPerFileRestrictions:
       ctx.orgSettings?.allowAdminPerFileRestrictions === true,
     getPermissionLevel: (path) => ctx.getEffectivePermission(path),
+    getPermissionDecision: (path) => ctx.permissionStore.getPermissionDecision(path),
     isEnabled: () => ctx.isPermissionBannerEnabled(),
     isLoggedIn: () => ctx.session !== null,
     isOnline: () => ctx.isOnline(),

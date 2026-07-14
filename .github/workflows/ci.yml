@@ -14,21 +14,12 @@ concurrency:
 
 jobs:
   forbidden-artifacts:
-    # Standalone, intentionally independent of build-test-lint. On the public
-    # monorepo (where this workflow file is copied via export) it fails the
-    # push when a Terraform state / plan / dev-tfvars file lands in the tree.
-    #
-    # Skipped on this private source repo for the same reason build-test-lint
-    # is: the private repo's runners never come online (pre-existing quota /
-    # availability issue — jobs queue, get a runner ID, then exit with no
-    # step logs). Defence-in-depth on the private side comes from
-    # scripts/git-hooks/pre-commit (auto-installed via npm prepare) and the
-    # post-copy validator in scripts/export-public-server-repo.mjs.
-    if: github.repository != 'peter70700/vaultguard-obsidian-plugin'
+    # Standalone and intentionally independent of the build jobs. The regex
+    # handles both the private flat layout and the exported public monorepo.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Refuse Terraform state/plan/dev-tfvars in tree
         run: |
@@ -47,6 +38,37 @@ jobs:
           fi
           echo "OK: no forbidden Terraform artifacts in tree."
 
+  private-build-test-lint:
+    # The private source repo has a flat root plus nested infrastructure and
+    # admin-panel packages. Keep its authoritative verifier here instead of in
+    # the public drift monitor so CI remains meaningful even when the public
+    # sync credential is unavailable.
+    if: github.repository == 'peter70700/vaultguard-obsidian-plugin'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            infrastructure/package-lock.json
+            admin-panel/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install nested test dependencies
+        run: npm run setup:test-deps
+
+      - name: Verify private repo
+        run: npm run verify
+
   build-test-lint:
     # The job body targets the public monorepo's packages/{plugin,server}/
     # layout. This file is the single source of truth (CONTEXT.md D-40) and
@@ -54,23 +76,22 @@ jobs:
     #
     # On THIS private repo the layout is flat (root package.json, src/,
     # infrastructure/) — the monorepo paths don't exist, so running these
-    # steps here would always fail. The `if:` guard skips the job entirely
-    # when the workflow runs on the private source repo, leaving the
-    # forbidden-artifacts guard above as the only CI on this repo.
+    # steps here would always fail. The `if:` guard selects the public job;
+    # private-build-test-lint above covers the flat source layout instead.
     if: github.repository != 'peter70700/vaultguard-obsidian-plugin'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install workspace dependencies
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: Dependency audit
         run: npm audit --audit-level=high

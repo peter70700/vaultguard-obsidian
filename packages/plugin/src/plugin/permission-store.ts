@@ -112,6 +112,11 @@ export type PermissionStoreState =
   | { kind: "warmed"; warmedAt: number }
   | { kind: "fetch-failed"; statusCode: number | null; failedAt: number };
 
+export type PermissionDecision =
+  | { kind: "verified"; level: PermissionLevel }
+  | { kind: "cached"; level: PermissionLevel }
+  | { kind: "unknown" };
+
 export class PermissionStore extends Events {
   /** Unified permission cache. Empty-string key = vault root (warm-up seed). */
   private cache: Map<string, CacheEntry> = new Map();
@@ -120,7 +125,7 @@ export class PermissionStore extends Events {
   private state: PermissionStoreState = { kind: "cold" };
 
   /** Concurrent-call deduplication (R-09-01). Same in-flight promise returned for same path. */
-  private inFlight: Map<string, Promise<PermissionLevel>> = new Map();
+  private inFlight: Map<string, Promise<PermissionDecision>> = new Map();
 
   /** Vault-default level derived during warm-up — mirrors removed main.ts field. */
   private vaultDefaultPermission: PermissionLevel | null = null;
@@ -197,33 +202,49 @@ export class PermissionStore extends Events {
    * promise (R-09-01 dedup acceptance).
    */
   async getPermission(path: string): Promise<PermissionLevel> {
+    const decision = await this.getPermissionDecision(path);
+    return decision.kind === "unknown" ? PermissionLevel.NONE : decision.level;
+  }
+
+  /**
+   * Resolves permission without overloading NONE as "no information". UI
+   * callers use this discriminated result so a cold offline lookup stays
+   * unknown, while hard enforcement callers keep using getPermission() and
+   * therefore fail closed on unknown.
+   */
+  async getPermissionDecision(path: string): Promise<PermissionDecision> {
     // Cache check first — TTL gated, sentinel-zero exempt.
     const entry = this.cache.get(path);
     if (entry && !this.isExpired(entry)) {
-      return entry.level;
+      return { kind: "cached", level: entry.level };
     }
 
     const session = this.cfg.getSession();
 
     // No session means no permission can be established; fail closed.
     if (!session) {
-      return PermissionLevel.NONE;
+      return { kind: "verified", level: PermissionLevel.NONE };
     }
 
     // Admin and owner roles always have full access — no server round-trip needed.
     if (session.role === "admin" || session.role === "owner") {
       this.cache.set(path, { level: PermissionLevel.ADMIN, fetchedAt: Date.now() });
-      return PermissionLevel.ADMIN;
+      return { kind: "verified", level: PermissionLevel.ADMIN };
     }
 
     // Cache walk-up — when warm-up has seeded specific paths plus a
     // vault-default at the root, the parent walk usually answers without
     // a network round-trip. Hot path for non-admin viewers post-warm-up.
     const cached = this.resolvePermissionFromCache(path);
-    if (cached > PermissionLevel.NONE) {
+    if (cached && cached.level > PermissionLevel.NONE) {
       // Cache the walk-up answer with sentinel 0 so it doesn't TTL-expire —
       // walk-up answers are invalidated by event, not by clock (D-10).
-      this.cache.set(path, { level: cached, fetchedAt: 0 });
+      this.cache.set(path, { level: cached.level, fetchedAt: 0 });
+      return cached;
+    }
+    // A cached denial is authoritative offline, but online we still probe so
+    // a reconnect can replace it with current server truth immediately.
+    if (!this.cfg.isOnline() && cached) {
       return cached;
     }
 
@@ -691,22 +712,22 @@ export class PermissionStore extends Events {
 
   // ── Private: server probe + cache walk-up + helpers ────────────────────────
 
-  private async probeServer(path: string): Promise<PermissionLevel> {
+  private async probeServer(path: string): Promise<PermissionDecision> {
     try {
       if (this.cfg.isOnline()) {
         const level = await this.cfg.fetchPermissionLevelFromServer(path);
         this.cache.set(path, { level, fetchedAt: Date.now() });
-        return level;
+        return { kind: "verified", level };
       }
       // Offline: cache-only resolution.
-      return this.resolvePermissionFromCache(path);
+      return this.resolvePermissionFromCache(path) ?? { kind: "unknown" };
     } catch (error) {
       if (this.cfg.isNetworkError(error)) {
         this.cfg.onOfflineDetected?.();
-        return this.resolvePermissionFromCache(path);
+        return this.resolvePermissionFromCache(path) ?? { kind: "unknown" };
       }
       this.cfg.log(`Permission check failed for "${path}", falling back to cache: ${error}`);
-      return this.resolvePermissionFromCache(path);
+      return this.resolvePermissionFromCache(path) ?? { kind: "unknown" };
     }
   }
 
@@ -717,16 +738,20 @@ export class PermissionStore extends Events {
    * are ignored so a stale server-fetched answer doesn't shadow a fresh
    * re-probe (the original didn't have TTL so this case never existed).
    */
-  private resolvePermissionFromCache(path: string): PermissionLevel {
+  private resolvePermissionFromCache(
+    path: string
+  ): { kind: "cached"; level: PermissionLevel } | null {
     const segments = path.split("/");
     for (let i = segments.length; i > 0; i--) {
       const parentPath = segments.slice(0, i).join("/");
       const entry = this.cache.get(parentPath);
-      if (entry && !this.isExpired(entry)) return entry.level;
+      if (entry && !this.isExpired(entry)) return { kind: "cached", level: entry.level };
     }
     const rootEntry = this.cache.get("");
-    if (rootEntry && !this.isExpired(rootEntry)) return rootEntry.level;
-    return PermissionLevel.NONE;
+    if (rootEntry && !this.isExpired(rootEntry)) {
+      return { kind: "cached", level: rootEntry.level };
+    }
+    return null;
   }
 
   /** TTL check — sentinel-zero entries (warm-up seeds + walk-up cached) are exempt (D-10). */

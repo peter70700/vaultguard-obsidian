@@ -571,6 +571,7 @@ export interface SyncRuntimeContext {
   getConnectionState(): ConnectionState;
   getKeyLease(): KeyLease | null;
   setKeyLease(lease: KeyLease | null): void;
+  isPathDeniedByKeyLease(path: string): boolean;
   isVaultLeaseDenied(): boolean;
   /**
    * Phase 12 (vault idle-lock): true while the vault is cryptographically locked.

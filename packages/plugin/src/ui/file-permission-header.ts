@@ -17,6 +17,7 @@ import {
   VaultMemberRecord,
 } from "../api/client";
 import { PermissionLevel } from "../types";
+import type { PermissionDecision } from "../plugin/permission-store";
 import { EffectiveAccessPrincipal, FilePermissionPanel } from "./file-permission-panel";
 import { setButtonLoading, setControlBusy } from "./loading-button";
 import {
@@ -53,6 +54,8 @@ interface HeaderContext {
    * backend check that enforces editor read/write protection.
    */
   getPermissionLevel?: (path: string) => Promise<PermissionLevel>;
+  /** Provenance-aware resolver. Preferred over getPermissionLevel when set. */
+  getPermissionDecision?: (path: string) => Promise<PermissionDecision>;
   /**
    * Org-level "allow per-file restrictions on admins" toggle (mirrors the
    * backend setting of the same name). When true the header lets you
@@ -1769,6 +1772,16 @@ export class FilePermissionHeader {
   }
 
   private async fetchCurrentUserLevel(path: string): Promise<AccessLevel> {
+    if (this.ctx.getPermissionDecision) {
+      try {
+        const decision = await this.ctx.getPermissionDecision(path);
+        return decision.kind === "unknown"
+          ? "unknown"
+          : this.permissionLevelToAccessLevel(decision.level);
+      } catch {
+        return "unknown";
+      }
+    }
     if (!this.ctx.getPermissionLevel) {
       return "unknown";
     }

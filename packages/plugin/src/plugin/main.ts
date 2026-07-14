@@ -311,6 +311,66 @@ type WarmupRulesResult =
   | { kind: "ok"; rules: PermissionRule[] }
   | { kind: "fetch-failed"; statusCode: number | null; error: unknown };
 
+interface LeaseDeniedPath {
+  pathPattern: string;
+  ruleId: string;
+}
+
+function normalizeLeaseDeniedPaths(value: unknown): LeaseDeniedPath[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error("VaultGuard Sync: Server returned malformed key-lease denied paths.");
+  }
+  const seen = new Set<string>();
+  const result: LeaseDeniedPath[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") {
+      throw new Error("VaultGuard Sync: Server returned malformed key-lease denied paths.");
+    }
+    const candidate = entry as { pathPattern?: unknown; ruleId?: unknown };
+    if (
+      typeof candidate.pathPattern !== "string" ||
+      !candidate.pathPattern.startsWith("/") ||
+      typeof candidate.ruleId !== "string" ||
+      candidate.ruleId.length === 0
+    ) {
+      throw new Error("VaultGuard Sync: Server returned malformed key-lease denied paths.");
+    }
+    const key = `${candidate.pathPattern}\u0000${candidate.ruleId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ pathPattern: candidate.pathPattern, ruleId: candidate.ruleId });
+  }
+  return result.sort((a, b) =>
+    a.pathPattern.localeCompare(b.pathPattern) || a.ruleId.localeCompare(b.ruleId)
+  );
+}
+
+function keyLeasePathMatchesPattern(filePath: string, pattern: string): boolean {
+  const normalize = (value: string) => {
+    const normalized = value.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/g, "");
+    return normalized.startsWith("/") ? normalized : `/${normalized}`;
+  };
+  const normalizedPath = normalize(filePath);
+  const normalizedPattern = normalize(pattern);
+  if (normalizedPath === normalizedPattern) return true;
+
+  const regexStr = normalizedPattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*/g, "{{GLOBSTAR}}")
+    .replace(/\*/g, "[^/]+")
+    .replace(/\?/g, "[^/]")
+    .replace(/{{GLOBSTAR}}/g, ".*");
+  const regex = new RegExp(`^${regexStr}$`);
+  if (regex.test(normalizedPath)) return true;
+
+  const segments = normalizedPath.split("/");
+  for (let index = segments.length - 1; index >= 1; index -= 1) {
+    if (regex.test(segments.slice(0, index).join("/"))) return true;
+  }
+  return false;
+}
+
 interface RemoteFileContentResponse {
   content: string;
   encoding?: string;
@@ -1042,6 +1102,7 @@ export default class VaultGuardPlugin extends Plugin {
       setKeyLease: (lease) => {
         this.keyLease = lease;
       },
+      isPathDeniedByKeyLease: (path) => this.isPathDeniedByKeyLease(path),
       isVaultLeaseDenied: () => this.vaultLeaseDenied,
       // Phase 12 (NN-2 / key-renewal guard): the heartbeat survives the lock,
       // but checkKeyLeaseRenewal consults this to no-op while locked.
@@ -4061,7 +4122,10 @@ export default class VaultGuardPlugin extends Plugin {
     }
   }
 
-  private normalizeKeyLease(rawLease: Partial<KeyLease>): KeyLease {
+  private normalizeKeyLease(
+    rawLease: Partial<KeyLease>,
+    responseDeniedPaths?: LeaseDeniedPath[]
+  ): KeyLease {
     if (!rawLease.key || !rawLease.expiresAt || !rawLease.refreshToken || !rawLease.leaseId) {
       throw new Error("VaultGuard Sync: Server did not return a usable encryption key lease.");
     }
@@ -4076,7 +4140,18 @@ export default class VaultGuardPlugin extends Plugin {
       encryptedDataKey: rawLease.encryptedDataKey,
       scope: rawLease.scope ?? '/**',
       vaultId: rawLease.vaultId,
+      deniedPaths: normalizeLeaseDeniedPaths([
+        ...normalizeLeaseDeniedPaths(rawLease.deniedPaths),
+        ...normalizeLeaseDeniedPaths(responseDeniedPaths),
+      ]),
     };
+  }
+
+  private isPathDeniedByKeyLease(path: string): boolean {
+    const normalizedPath = this.normalizeVaultPath(path);
+    return Boolean(this.keyLease?.deniedPaths?.some((entry) =>
+      keyLeasePathMatchesPattern(normalizedPath, entry.pathPattern)
+    ));
   }
 
   private async openServerSession(idToken: string): Promise<{
@@ -4235,6 +4310,7 @@ export default class VaultGuardPlugin extends Plugin {
     });
     let leaseResponse: ApiResponse<{
       keyLease: KeyLease;
+      deniedPaths?: LeaseDeniedPath[];
       orgSettings?: OrgSettingsResponse;
     }> | null = null;
 
@@ -4247,7 +4323,11 @@ export default class VaultGuardPlugin extends Plugin {
         sessionId: session.sessionId,
         vaultId: this.settings.serverVaultId,
       });
-      leaseResponse = await this.apiRequest<{ keyLease: KeyLease }>(
+      leaseResponse = await this.apiRequest<{
+        keyLease: KeyLease;
+        deniedPaths?: LeaseDeniedPath[];
+        orgSettings?: OrgSettingsResponse;
+      }>(
         "GET",
         `/auth/key-lease?${params.toString()}`,
         undefined,
@@ -4259,7 +4339,10 @@ export default class VaultGuardPlugin extends Plugin {
       this.session = session;
       this.clearLogoutAuthState();
       // GET /auth/key-lease?vaultId=... returns the vault-scoped lease.
-      this.keyLease = this.normalizeKeyLease(leaseResponse.data.keyLease);
+      this.keyLease = this.normalizeKeyLease(
+        leaseResponse.data.keyLease,
+        leaseResponse.data.deniedPaths
+      );
       this.applyOrgSettings(leaseResponse.data.orgSettings ?? this.orgSettings);
     } else {
       const serverSession = await this.openServerSession(session.idToken);
@@ -7560,6 +7643,7 @@ export default class VaultGuardPlugin extends Plugin {
 
     const response = await this.apiRequest<{
       keyLease: KeyLease;
+      deniedPaths?: LeaseDeniedPath[];
       orgSettings?: OrgSettingsResponse;
     }>(
       "POST",
@@ -7572,7 +7656,10 @@ export default class VaultGuardPlugin extends Plugin {
     );
 
     if (response.success && response.data) {
-      this.keyLease = this.normalizeKeyLease(response.data.keyLease);
+      this.keyLease = this.normalizeKeyLease(
+        response.data.keyLease,
+        response.data.deniedPaths
+      );
       this.applyOrgSettings(response.data.orgSettings ?? this.orgSettings);
       this.vaultLeaseDenied = false;
       this.leaseRetryNeeded = false;
@@ -7723,6 +7810,7 @@ export default class VaultGuardPlugin extends Plugin {
         sessionId: string;
         expiresAt: string;
         keyLease: KeyLease;
+        deniedPaths?: LeaseDeniedPath[];
         orgSettings?: OrgSettingsResponse;
       }>(
         "POST",
@@ -7735,7 +7823,10 @@ export default class VaultGuardPlugin extends Plugin {
       );
 
       if (response.success && response.data) {
-        this.keyLease = this.normalizeKeyLease(response.data.keyLease);
+        this.keyLease = this.normalizeKeyLease(
+          response.data.keyLease,
+          response.data.deniedPaths
+        );
         this.applyOrgSettings(response.data.orgSettings ?? this.orgSettings);
         this.log("Key lease renewed successfully.");
         if (this.session) {
