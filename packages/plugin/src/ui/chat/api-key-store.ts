@@ -28,7 +28,9 @@ type ApiVersionCheck = (minimumVersion: string) => boolean;
 /**
  * Native secrets shipped experimentally in 1.11.4, but VaultGuard only offers
  * the boundary from 1.11.5 where Obsidian documents encrypted-at-rest storage.
- * Structural checks keep the plugin safe on its supported 1.8.7 baseline.
+ * The structural checks keep the plugin safe when the host lacks or only
+ * partially exposes native secret storage, regardless of the declared minimum
+ * version (the manifest floor is 1.11.5; these guards remain as defense).
  */
 export function canUseObsidianSecretStorage(
   app: App,

@@ -1,8 +1,8 @@
 {
   "id": "vaultguard-sync",
   "name": "VaultGuard Sync",
-  "version": "1.2.11",
-  "minAppVersion": "1.8.7",
+  "version": "1.2.12",
+  "minAppVersion": "1.11.5",
   "description": "End-to-end encrypted sync with per-file permissions, audit logging, a permission-aware AI chat, a visual permissions graph, and an MCP server exposing vault tools to AI agents. Built for teams that need compliance-grade vault security.",
   "author": "Peter Sedmak",
   "isDesktopOnly": false
