@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Menu, Notice, TFile, requestUrl } from "obsidian";
 
 import VaultGuardPlugin from "../src/plugin/main";
+import { IN_APP_CHAT_CAPABILITY } from "../src/ui/chat/in-app-chat-capability";
+import { VaultGuardSidebarView } from "../src/ui/vaultguard-sidebar-view";
 import { DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "../src/plugin/settings";
 import { ConflictResolutionStrategy, PermissionLevel } from "../src/types";
 import { BINARY_SYNC_MAX_BYTES } from "../src/plugin/binary-content";
@@ -583,8 +585,8 @@ describe("VaultGuardPlugin uploadReconciledBinaryFile (BIN-A / D-07)", () => {
     const runtime = plugin.ensureSyncRuntime();
     await runtime.uploadReconciledBinaryFile("attachments/photo.png", BINARY_BYTES.buffer);
 
-    // Completes the binary breadcrumb family (pull / oversize-skip / size-gate
-    // already covered by 11-04/05) with the push-success event.
+    // Completes the binary breadcrumb family with the JSON-path push-success
+    // event; direct-transfer pending behavior is covered separately.
     const pushCrumb = plugin.syncDiagnostics
       .snapshot()
       .find((entry: any) => entry.event === "upload.binary-push");
@@ -595,26 +597,31 @@ describe("VaultGuardPlugin uploadReconciledBinaryFile (BIN-A / D-07)", () => {
     });
   });
 
-  it("returns skipped-too-large with NO network call and a limit+BIN-B Notice for oversize bytes", async () => {
+  it("direct-uploads oversize bytes without using the JSON API path", async () => {
     const plugin = makeBinaryUploadPlugin();
     plugin.apiRequest = vi.fn();
+    plugin.uploadLargeEncryptedFile = vi.fn().mockResolvedValue({
+      path: "attachments/huge.png",
+      hash: "h",
+      size: BINARY_SYNC_MAX_BYTES + 1,
+      lastModified: "2026-07-13T00:00:00.000Z",
+      versionId: "v-large",
+      transferId: "transfer-large",
+    });
     const oversize = new Uint8Array(BINARY_SYNC_MAX_BYTES + 1);
     oversize[8] = 0xff;
 
     const runtime = plugin.ensureSyncRuntime();
     const outcome = await runtime.uploadReconciledBinaryFile("attachments/huge.png", oversize.buffer);
 
-    expect(outcome).toBe("skipped-too-large");
+    expect(outcome).toBe("uploaded");
     expect(plugin.apiRequest).not.toHaveBeenCalled();
-    // Notice names the file, the 7 MiB limit, and BIN-B.
-    const noticed = mockNotice.mock.calls.some(
-      ([message]) =>
-        typeof message === "string" &&
-        message.includes("attachments/huge.png") &&
-        message.includes("7 MiB") &&
-        message.includes("BIN-B")
+    expect(plugin.uploadLargeEncryptedFile).toHaveBeenCalledWith(
+      "attachments/huge.png",
+      oversize.buffer,
+      "image/png",
+      undefined,
     );
-    expect(noticed).toBe(true);
   });
 
   it("returns skipped-no-lease without a PUT when no key lease is available", async () => {
@@ -1707,6 +1714,80 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       expect.stringContaining("Logged in as Test User"),
       8000,
     );
+  });
+
+  it("keeps generic bridge APIs blocked but permits a forced session-bound in-app chat bridge", async () => {
+    const plugin = makePlugin();
+    plugin.settings.localProjectMemoryMode = true;
+    const createLease = vi.fn().mockReturnValue({
+      leaseId: "lease-chat",
+      token: "agt_chat",
+      expiresAt: "2026-07-13T12:00:00.000Z",
+    });
+    const startServer = vi.fn().mockResolvedValue({
+      host: "127.0.0.1",
+      port: 47711,
+      rpcEndpoint: "http://127.0.0.1:47711/rpc",
+      mcpEndpoint: "http://127.0.0.1:47711/mcp",
+      startedAt: "2026-07-13T11:00:00.000Z",
+    });
+    plugin.agentBridgeRuntime = { createLease, startServer };
+
+    await expect(
+      plugin.createAgentBridgeLease({ agentName: "spoofed VaultGuard Chat" }),
+    ).rejects.toThrow("disabled in Local Project Memory Mode");
+    await expect(plugin.startAgentBridgeServer()).rejects.toThrow(
+      "disabled in Local Project Memory Mode",
+    );
+    expect(createLease).not.toHaveBeenCalled();
+    expect(startServer).not.toHaveBeenCalled();
+
+    await expect(
+      plugin.createInAppChatAgentBridgeLease(Symbol("forged"), {
+        agentName: "forged",
+      }),
+    ).rejects.toThrow("Trusted in-app chat capability required");
+
+    await plugin.createInAppChatAgentBridgeLease(IN_APP_CHAT_CAPABILITY, {
+      agentName: "VaultGuard Chat (Codex subscription)",
+      persistent: true,
+      expiresWithSession: false,
+      localProjectMemoryMode: false,
+    });
+    await expect(
+      plugin.startInAppChatAgentBridgeServer(Symbol("forged")),
+    ).rejects.toThrow("Trusted in-app chat capability required");
+    await expect(
+      plugin.startInAppChatAgentBridgeServer(IN_APP_CHAT_CAPABILITY),
+    ).resolves.toMatchObject({
+      mcpEndpoint: "http://127.0.0.1:47711/mcp",
+    });
+
+    expect(createLease).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentName: "VaultGuard Chat (Codex subscription)",
+        persistent: false,
+        expiresWithSession: true,
+        localProjectMemoryMode: true,
+      }),
+    );
+    expect(startServer).toHaveBeenCalledTimes(1);
+  });
+
+  it("notifies every open AI Chat view when the provider changes", () => {
+    const plugin = makePlugin();
+    const first = { handleProviderConfigurationChanged: vi.fn() };
+    const second = { handleProviderConfigurationChanged: vi.fn() };
+    plugin.app.workspace.getLeavesOfType = vi.fn().mockReturnValue([
+      { view: first },
+      { view: second },
+    ]);
+
+    plugin.notifyAiChatProviderChanged();
+
+    expect(plugin.app.workspace.getLeavesOfType).toHaveBeenCalledWith("vaultguard-chat-view");
+    expect(first.handleProviderConfigurationChanged).toHaveBeenCalledTimes(1);
+    expect(second.handleProviderConfigurationChanged).toHaveBeenCalledTimes(1);
   });
 
   it("does not schedule retry timers while the browser reports offline", () => {
@@ -3640,10 +3721,10 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     });
     plugin.clearStoredSession = vi.fn().mockResolvedValue(undefined);
     plugin.revokeAgentBridgeLeasesForSessionEnd = vi.fn().mockResolvedValue(undefined);
-    const sidebarView = {
+    const sidebarView = Object.assign(Object.create(VaultGuardSidebarView.prototype), {
       configure: vi.fn(),
       reload: vi.fn().mockResolvedValue(undefined),
-    };
+    });
     plugin.app.workspace.getLeavesOfType = vi.fn(() => [{ view: sidebarView }]);
 
     await plugin.forceLogout("VaultGuard Sync: Session expired. Please log in again.");
@@ -3729,6 +3810,34 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       "title",
       expect.stringContaining("Session locked after 15 minutes of inactivity.")
     );
+  });
+
+  it("groups the ribbon icons shield -> chat -> graph and honours the show/hide setting", () => {
+    const plugin = makePlugin();
+    const makeEl = () => ({ insertAdjacentElement: vi.fn(), remove: vi.fn() });
+    const shield = makeEl();
+    const chat = makeEl();
+    const graph = makeEl();
+    plugin.vaultGuardRibbonEl = shield;
+    plugin.vaultGuardChatRibbonEl = chat;
+    plugin.vaultGuardGraphRibbonEl = graph;
+
+    // Default (shown): the icons are forced into a shield -> chat -> graph group,
+    // regardless of whatever order Obsidian may have saved for the vault.
+    plugin.settings.showRibbonIcons = true;
+    plugin.applyRibbonIconLayout();
+    expect(shield.insertAdjacentElement).toHaveBeenCalledWith("afterend", chat);
+    expect(chat.insertAdjacentElement).toHaveBeenCalledWith("afterend", graph);
+    expect(chat.remove).not.toHaveBeenCalled();
+    expect(graph.remove).not.toHaveBeenCalled();
+
+    // Hidden: the AI chat + permissions graph icons are removed; the shield stays.
+    plugin.settings.showRibbonIcons = false;
+    plugin.applyRibbonIconLayout();
+    expect(chat.remove).toHaveBeenCalled();
+    expect(graph.remove).toHaveBeenCalled();
+    expect(plugin.vaultGuardChatRibbonEl).toBeNull();
+    expect(plugin.vaultGuardGraphRibbonEl).toBeNull();
   });
 
   it("marks the shield when logged out and all VaultGuard ribbon icons when signed in", () => {
@@ -4114,7 +4223,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.readPlainBinaryFromDisk).not.toHaveBeenCalled();
   });
 
-  it("uploadLocalOnlyFiles skips an oversize binary (no PUT, no hygiene) and counts it skipped (L10)", async () => {
+  it("uploadLocalOnlyFiles direct-uploads an oversize binary and encrypts it locally only after durability", async () => {
     const plugin = makePlugin();
     plugin.settings.serverVaultId = "vault-abc";
     plugin.session = makeSession();
@@ -4134,6 +4243,14 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     plugin.app.vault.getFiles = vi.fn(() => [{ path: "attachments/huge.png" }]);
     plugin.collectLocalFolderPaths = vi.fn(() => []);
     plugin.ensureAtRestEncryptedInPlace = vi.fn(async () => true);
+    plugin.uploadLargeEncryptedFile = vi.fn().mockResolvedValue({
+      path: "attachments/huge.png",
+      hash: "h",
+      size: oversize.byteLength,
+      lastModified: "2026-07-13T00:00:00.000Z",
+      versionId: "v-large",
+      transferId: "transfer-large",
+    });
     plugin.apiRequest = vi.fn(async (method: string, path: string) => {
       if (method === "POST" && path.endsWith("/files/sync")) {
         return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
@@ -4143,9 +4260,10 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     const result = await plugin.uploadLocalOnlyFiles();
 
-    expect(result?.skippedFiles).toBe(1);
-    expect(result?.uploadedFiles).toBe(0);
-    // CR-1/L10: no PUT and no LAK-encrypt path for an unsendable file.
+    expect(result?.skippedFiles).toBe(0);
+    expect(result?.uploadedFiles).toBe(1);
+    // No JSON PUT; direct transfer finalizes first, then local hygiene receives
+    // the explicit remote-durable flag.
     expect(plugin.apiRequest).not.toHaveBeenCalledWith(
       "PUT",
       expect.any(String),
@@ -4153,7 +4271,11 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       undefined,
       expect.anything()
     );
-    expect(plugin.ensureAtRestEncryptedInPlace).not.toHaveBeenCalled();
+    expect(plugin.uploadLargeEncryptedFile).toHaveBeenCalled();
+    expect(plugin.ensureAtRestEncryptedInPlace).toHaveBeenCalledWith(
+      "attachments/huge.png",
+      true,
+    );
   });
 
   it("uploadLocalOnlyFiles re-encrypts an uploaded local-only text file in place (external-add hygiene)", async () => {
@@ -4508,7 +4630,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
   });
 
-  it("performInitialReconciliation excludes an oversize local binary — never uploaded, serverOnly, or overwritten (L10)", async () => {
+  it("performInitialReconciliation compares an oversize local binary through direct download", async () => {
     const plugin = makePlugin();
     plugin.settings.serverVaultId = "vault-abc";
     plugin.settings.bindingReconciledVaultId = undefined;
@@ -4532,6 +4654,13 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     plugin.collectLocalFolderPaths = vi.fn(() => []);
     plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
     plugin.applyRemoteChange = vi.fn();
+    plugin.downloadLargeEncryptedFile = vi.fn().mockImplementation(async () => ({
+      bytes: oversize.buffer,
+      plaintextSize: oversize.byteLength,
+      plaintextSha256: await plugin.computeHashBytes(oversize.buffer),
+      contentType: "image/png",
+      versionId: "v-large",
+    }));
     plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
     plugin.askReconciliationPlan = vi
       .fn()
@@ -4567,8 +4696,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
 
-    // Invisible to the plan: not serverOnly (no overwrite), not localOnly (no
-    // upload), not a conflict.
+    // Byte-equal remote content is already in sync, so no mutation is planned.
     expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
       serverOnly: [],
       localOnly: [],
@@ -4576,14 +4704,9 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     });
     expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
     expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
-    // A throttled size Notice named the ~7 MiB limit + BIN-B.
-    const sizedNotice = mockNotice.mock.calls.some(
-      ([message]) =>
-        typeof message === "string" &&
-        message.includes("7 MiB") &&
-        message.includes("BIN-B")
+    expect(plugin.downloadLargeEncryptedFile).toHaveBeenCalledWith(
+      "/attachments/huge.png",
     );
-    expect(sizedNotice).toBe(true);
   });
 
   it("resolveReconciliationConflict KEEP_LOCAL byte-uploads a binary entry, never the string uploader (BIN-A / L4)", async () => {
@@ -4844,7 +4967,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(typeof plugin.settings.deletionTombstones["attachments/old.png"]).toBe("string");
   });
 
-  it("syncFileRenameToServer skips ALL server ops for an oversize binary rename (no PUT/queue/delete + Notice, L10)", async () => {
+  it("syncFileRenameToServer finalizes an oversize replacement before deleting the old path", async () => {
     const plugin = makePlugin();
     plugin.settings.serverVaultId = "vault-abc";
     plugin.session = makeSession();
@@ -4863,23 +4986,36 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       remove: null,
       rename: null,
     };
-    plugin.apiRequest = vi.fn();
+    plugin.uploadLargeEncryptedFile = vi.fn().mockResolvedValue({
+      path: "attachments/huge-new.png",
+      hash: "h",
+      size: oversize.byteLength,
+      lastModified: "2026-07-13T00:00:00.000Z",
+      versionId: "v-large",
+      transferId: "transfer-large",
+    });
+    plugin.ensureAtRestEncryptedInPlace = vi.fn().mockResolvedValue(true);
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: {},
+      error: null,
+      requestId: "req-delete",
+    });
     mockNotice.mockClear();
 
     await plugin.syncFileRenameToServer("attachments/huge-old.png", "attachments/huge-new.png");
 
-    // Same conservative rule as interceptedRename (11-02): never a PUT, never a
-    // queued write, never a delete of the old server copy we can't replace.
-    expect(plugin.apiRequest).not.toHaveBeenCalled();
+    expect(plugin.uploadLargeEncryptedFile).toHaveBeenCalled();
+    expect(plugin.apiRequest).toHaveBeenCalledWith(
+      "DELETE",
+      expect.stringContaining("attachments%2Fhuge-old.png"),
+    );
+    expect(plugin.uploadLargeEncryptedFile.mock.invocationCallOrder[0]).toBeLessThan(
+      plugin.apiRequest.mock.invocationCallOrder[0],
+    );
     expect(plugin.offlineQueue).toHaveLength(0);
     expect(plugin.settings.deletionTombstones).toEqual({});
-    const noticed = mockNotice.mock.calls.some(
-      ([message]) =>
-        typeof message === "string" &&
-        message.includes("7 MiB") &&
-        message.includes("BIN-B")
-    );
-    expect(noticed).toBe(true);
+    expect(mockNotice).not.toHaveBeenCalled();
   });
 
   it("syncFileRenameToServer on a legacy adapter (no readBinary) keeps the string PUT path (AR2/D-10)", async () => {

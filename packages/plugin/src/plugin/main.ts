@@ -12,7 +12,7 @@
  * - Offline support: Graceful degradation with cached keys and queued changes.
  */
 
-import { Modal, Notice, Plugin, Platform, TFile, TFolder, Menu, normalizePath, requestUrl, RequestUrlResponse } from "obsidian";
+import { Modal, Notice, Plugin, Platform, TFile, TFolder, Menu, normalizePath, requestUrl, RequestUrlResponse, requireApiVersion } from "obsidian";
 import { VaultGuardSettingTab, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
 import type { ConversationStore } from "../ui/chat/conversation-store";
@@ -22,8 +22,6 @@ import { PluginAllowlistModal, PluginAllowlistPrompt } from "./plugin-allowlist-
 import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoRevokeToken, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, vaultguardForgotPassword, vaultguardConfirmReset, vaultguardVerifyRecoveryCode, devServerLogin, isLocalDevAuth, CognitoAuthResult } from "./cognito-auth";
 import { MfaSetupModal } from "./mfa-setup-modal";
 import { deriveConnectionConfigFromTokenPayload } from "./session-config";
-import { AdminModal } from "../admin/admin-modal";
-import { AuditConfigModal } from "../admin/audit-config-modal";
 import { VaultGuardApiClient } from "../api/client";
 import type {
   OrgSettingsResponse,
@@ -39,7 +37,6 @@ import {
   normalizeVaultGuardApiBaseUrl,
   resolveVaultGuardApiBaseUrl,
 } from "../api/endpoint-resolver";
-import { PermissionEditor } from "../admin/permission-editor";
 import { FilePermissionHeader } from "../ui/file-permission-header";
 import { ReadOnlyGuard } from "./readonly-guard";
 import { PermissionStore } from "./permission-store";
@@ -66,15 +63,26 @@ import {
   isLocalProjectMemoryModeEnabled,
 } from "./local-project-memory-mode";
 import { PathPermissionsModal } from "../ui/path-permissions-modal";
-import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
 import { VaultGuardSidebarView, VAULTGUARD_VIEW_TYPE } from "../ui/vaultguard-sidebar-view";
+import { createI18n } from "../i18n";
+import {
+  VAULTGUARD_CHAT_VIEW_TYPE,
+  VAULTGUARD_DISCOVERY_VIEW_TYPE,
+  VAULTGUARD_GRAPH_VIEW_TYPE,
+} from "../ui/view-types";
+import { RecoveryCenterModal, type RecoveryCenterTab } from "../ui/recovery-center-modal";
 import { registerChatDebugCommand } from "../ui/chat/chat-debug-command";
 import {
   type PermissionsGraphDataSource,
   type PermissionsGraphDataset,
 } from "../ui/graph/permissions-graph-view";
 import { findClaudeBinary } from "../ui/chat/claude-cli/claude-detector";
+import { findCodexBinary } from "../ui/chat/codex-cli/codex-detector";
+import {
+  IN_APP_CHAT_CAPABILITY,
+  type InAppChatCapability,
+} from "../ui/chat/in-app-chat-capability";
 import { ApiKeySync } from "../ui/chat/api-key-sync";
 import type {
   VaultGuardSidebarAuthState,
@@ -111,7 +119,6 @@ import {
   registerObsidianSyncWarning,
   registerSessionActivityTracking as registerSessionActivityTrackingLifecycle,
   registerShareProtocolHandler as registerShareProtocolHandlerLifecycle,
-  registerSidebarLayoutLifecycle,
   registerSidebarPermissionLifecycle,
   renderObsidianSyncNotice as renderObsidianSyncNoticeLifecycle,
 } from "./lifecycle-events";
@@ -149,6 +156,10 @@ import {
   createPluginSettingsRuntime,
   type PluginSettingsRuntime,
 } from "./settings-runtime";
+import {
+  didConnectionBoundaryChange,
+  snapshotConnectionBoundary,
+} from "./external-settings";
 import {
   createSyncRuntime,
   type SyncRuntime,
@@ -201,6 +212,8 @@ import {
   SyncConflict,
   ConflictResolutionStrategy,
   ApiResponse,
+  PendingLargeFileRecord,
+  OptionalModuleId,
 } from "../types";
 
 export { VAULTGUARD_CHAT_ICON_ID };
@@ -399,6 +412,7 @@ interface RemoteFileContentResponse {
  * 4. Supports offline use with automatic conflict resolution
  */
 export default class VaultGuardPlugin extends Plugin {
+  private readonly i18n = createI18n();
   /** Runtime stylesheet fallback for installs where Obsidian misses styles.css. */
 
   /** Plugin settings persisted to disk */
@@ -871,9 +885,26 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Background poller for new public releases of the plugin */
   private updateChecker: UpdateChecker | null = null;
+  private settingTab: VaultGuardSettingTab | null = null;
+  private externalSettingsReload: Promise<void> | null = null;
 
   /** Sidebar view configuration (set once, injected into view instances) */
   private sidebarViewConfig: VaultGuardSidebarViewConfig | null = null;
+  private chatViewRegistered = false;
+  private graphViewRegistered = false;
+  private discoveryViewRegistered = false;
+  private discoveryBasesRegistered = false;
+  private discoveryCliRegistered = false;
+  private discoveryCommandRegistered = false;
+  private discoveryRuntime: import("./discovery/discovery-runtime").DiscoveryRuntime | null = null;
+  private discoveryRuntimePromise: Promise<import("./discovery/discovery-runtime").DiscoveryRuntime> | null = null;
+  private semanticRuntime: import("./discovery/semantic-search-runtime").SemanticSearchRuntime | null = null;
+  private semanticRuntimePromise: Promise<import("./discovery/semantic-search-runtime").SemanticSearchRuntime> | null = null;
+  private readonly discoveryLifecycleListeners = new Set<() => void>();
+  private readonly semanticStatusListeners = new Set<
+    (status: import("./discovery/semantic-search-runtime").SemanticRuntimeStatus) => void
+  >();
+  private optionalViewRegistrationPromises = new Map<OptionalModuleId, Promise<boolean>>();
 
   /**
    * Explicit LLM/agent bridge. This is intentionally off by default and only
@@ -1045,6 +1076,10 @@ export default class VaultGuardPlugin extends Plugin {
       encryptContentBytes: (content) => this.encryptContentBytes(content),
       decryptContentBytes: (content) => this.decryptContentBytes(content),
       computeHashBytes: (content) => this.computeHashBytes(content),
+      uploadLargeEncryptedFile: (path, plaintext, contentType, expectedVersionId) =>
+        this.uploadLargeEncryptedFile(path, plaintext, contentType, expectedVersionId),
+      upsertPendingLargeFile: (record) => this.upsertPendingLargeFile(record),
+      clearPendingLargeFile: (path) => this.clearPendingLargeFile(path),
       apiRequest: <T>(
         method: string,
         endpoint: string,
@@ -1177,7 +1212,10 @@ export default class VaultGuardPlugin extends Plugin {
       askReconciliationPlan: (plan) => this.askReconciliationPlan(plan),
       uploadReconciledFile: (path, content, options) =>
         this.uploadReconciledFile(path, content, options),
-      ensureAtRestEncryptedInPlace: (path) => this.ensureAtRestEncryptedInPlace(path),
+      ensureAtRestEncryptedInPlace: (path, remoteDurable) =>
+        remoteDurable === undefined
+          ? this.ensureAtRestEncryptedInPlace(path)
+          : this.ensureAtRestEncryptedInPlace(path, remoteDurable),
       getPermissionStoreState: () => this.permissionStore.getStoreState(),
       removeUnsyncedLocalFile: (path) => this.removeUnsyncedLocalFile(path),
       uploadLocalOnlyFiles: () => this.uploadLocalOnlyFiles(),
@@ -1246,6 +1284,14 @@ export default class VaultGuardPlugin extends Plugin {
       encryptContentBytes: (content) => this.encryptContentBytes(content),
       decryptContentBytes: (content) => this.decryptContentBytes(content),
       computeHashBytes: (content) => this.computeHashBytes(content),
+      uploadLargeEncryptedFile: (path, plaintext, contentType, expectedVersionId) =>
+        this.uploadLargeEncryptedFile(path, plaintext, contentType, expectedVersionId),
+      downloadLargeEncryptedFile: (path, versionId) =>
+        versionId === undefined
+          ? this.downloadLargeEncryptedFile(path)
+          : this.downloadLargeEncryptedFile(path, versionId),
+      upsertPendingLargeFile: (record) => this.upsertPendingLargeFile(record),
+      clearPendingLargeFile: (path) => this.clearPendingLargeFile(path),
       apiRequest: <T>(
         method: string,
         endpoint: string,
@@ -1377,7 +1423,7 @@ export default class VaultGuardPlugin extends Plugin {
       // Backs the sidebar's W1 pull-getter with the single source of truth so a
       // freshly-instantiated leaf reflects the cipher's CURRENT state on paint.
       getAtRestRecoveryState: () => this.computeAtRestRecoveryState(),
-      handleLogin: () => this.handleLogin(),
+      handleLogin: () => this.handlePrimaryProtectionAction(),
       openVaultGuardSettings: () => this.openVaultGuardSettings(),
       startAtRestRecoveryFlow: () => this.startAtRestRecoveryFlow(),
       startAtRestRecoveryFromRecoveryCode: () =>
@@ -1388,6 +1434,9 @@ export default class VaultGuardPlugin extends Plugin {
   private createSidebarActivationContext(): VaultGuardSidebarActivationContext {
     return {
       app: this.app,
+      isOptionalModuleEnabled: (moduleId) => this.isOptionalModuleEnabled(moduleId),
+      ensureOptionalViewRegistered: (moduleId) =>
+        this.ensureOptionalViewRegistered(moduleId),
       createSidebarViewConfig: () => this.createSidebarViewConfig(),
       getSidebarViewConfig: () => this.sidebarViewConfig,
       setSidebarViewConfig: (config) => {
@@ -1514,6 +1563,8 @@ export default class VaultGuardPlugin extends Plugin {
       get vaultMemberRole() {
         return thisPlugin.vaultMemberRole;
       },
+      isOptionalModuleEnabled: (moduleId) =>
+        this.isOptionalModuleEnabled(moduleId),
       get permissionStore() {
         return thisPlugin.permissionStore;
       },
@@ -1832,6 +1883,17 @@ export default class VaultGuardPlugin extends Plugin {
     // `await`. Ribbon buttons created *after* an await can be appended after
     // Obsidian has already taken its initial ribbon snapshot.
     registerVaultGuardRibbons(this.createRibbonContext());
+    // Once the workspace (and thus the ribbon) is built, enforce the VaultGuard
+    // icon order (shield -> chat -> graph) and the show/hide preference. This
+    // runs AFTER Obsidian applies any per-vault ribbon order it persisted, so the
+    // plugin gets the last word on grouping rather than depending on Obsidian's
+    // saved order (which drifts when icons are added/removed across versions).
+    const ribbonWorkspace = this.app.workspace;
+    if (typeof ribbonWorkspace.onLayoutReady === "function") {
+      ribbonWorkspace.onLayoutReady(() => this.applyRibbonIconLayout());
+    } else {
+      this.applyRibbonIconLayout();
+    }
 
     // (sd4) The sd2 "Import local files" ribbon was retired. Importing is now an
     // agent-driven chat slash command (/import-knowledge) inside the AI chat
@@ -1851,7 +1913,8 @@ export default class VaultGuardPlugin extends Plugin {
     this.checkForObsidianSync();
 
     // Register the settings tab
-    this.addSettingTab(new VaultGuardSettingTab(this.app, this));
+    this.settingTab = new VaultGuardSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
 
     // Initialize status bar
     if (this.settings.showStatusBar) {
@@ -1876,6 +1939,64 @@ export default class VaultGuardPlugin extends Plugin {
     // first-run). Must precede any init* method that subscribes via
     // `this.registerEvent(this.permissionStore.on('changed', ...))`.
     this.permissionStore = createPermissionStore(this.createPermissionStoreContext());
+    this.registerEvent(
+      this.permissionStore.on("changed", (...data: unknown[]) => {
+        const payload = data[0] as {
+          path?: string;
+          serverConfirmed?: boolean;
+          semanticAuthorityChanged?: boolean;
+        } | undefined;
+        if (
+          payload?.serverConfirmed === true &&
+          payload.semanticAuthorityChanged === true &&
+          this.isOptionalModuleEnabled("secureDiscovery") &&
+          this.settings.semanticSearchEnabled === true
+        ) {
+          // A confirmed authorization change invalidates every persisted vector.
+          // Purge through the LAK-backed store while the session/cipher boundary
+          // is still available; no provider request is made by this path.
+          void this.purgeSemanticRuntime("manual").catch((error) =>
+            this.logError("Purging semantic index after confirmed permission change failed", error),
+          );
+          return;
+        }
+        this.semanticRuntime?.handlePermissionInvalidation(payload?.path);
+      }),
+    );
+
+    // Local file events only mark/remove in-memory semantic entries. They never
+    // call the embedding provider; rebuilds remain explicit user actions.
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        if (file instanceof TFile && file.extension.toLocaleLowerCase("en-US") === "md") {
+          this.semanticRuntime?.markFileChanged(file.path);
+        }
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (file instanceof TFile && file.extension.toLocaleLowerCase("en-US") === "md") {
+          this.semanticRuntime?.markFileChanged(file.path);
+        }
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (file instanceof TFile && file.extension.toLocaleLowerCase("en-US") === "md") {
+          this.semanticRuntime?.removeFile(file.path);
+        }
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        if (oldPath.toLocaleLowerCase("en-US").endsWith(".md")) {
+          this.semanticRuntime?.removeFile(oldPath);
+        }
+        if (file instanceof TFile && file.extension.toLocaleLowerCase("en-US") === "md") {
+          this.semanticRuntime?.markFileChanged(file.path);
+        }
+      }),
+    );
 
     // Install the adapter intercept BEFORE any awaited startup work. Reads that
     // Obsidian fires during plugin load (workspace restore, initial indexer)
@@ -2007,15 +2128,14 @@ export default class VaultGuardPlugin extends Plugin {
     // (moved earlier — interceptVaultAdapter() now runs before initAtRestCipher()
     //  so adapter reads issued during plugin startup route through the guarded path.)
 
-    // Prepare the explicit LLM bridge. It remains inert until the user mints
-    // a scoped lease; no server or token is created during normal plugin load.
-    this.initAgentBridge();
-
     // Restore persistent agent bridge leases (encrypted on disk via the LAK)
     // for the current session. Fire-and-forget so any persistence error
     // doesn't block the rest of plugin startup. Only persistent leases that
     // match this session's userId+vaultId are restored; orphans are dropped.
-    if (!this.isLocalProjectMemoryModeEnabled()) {
+    if (
+      !this.isLocalProjectMemoryModeEnabled() &&
+      this.isOptionalModuleEnabled("agentAccess")
+    ) {
       void this.restorePersistentAgentBridgeLeases();
     }
 
@@ -2033,6 +2153,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.initReadOnlyGuard();
 
     registerVaultGuardViews(this.createViewRegistrationContext());
+    await this.registerEnabledOptionalViews();
 
     // Phase 9: subscribe the sidebar to the unified permission bus. One
     // emit fans out to decorations + header + sidebar + readOnlyGuard.
@@ -2046,9 +2167,6 @@ export default class VaultGuardPlugin extends Plugin {
 
     // Initialize file explorer decorations (permission dots + avatar stacks)
     this.initFileExplorerDecorations();
-
-    // Auto-open the VaultGuard sidebar in the right panel on first load.
-    registerSidebarLayoutLifecycle(this.createLifecycleEventsContext());
 
     // Restore server-side session state and encryption lease in background.
     if (this.session) {
@@ -2069,9 +2187,143 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     this.updateChecker = new UpdateChecker(this);
-    this.updateChecker.start();
 
     this.log("VaultGuard plugin loaded successfully.");
+  }
+
+  async onExternalSettingsChange(): Promise<void> {
+    const previousReload = this.externalSettingsReload ?? Promise.resolve();
+    const reload = previousReload
+      .catch(() => {
+        // A prior external reload already surfaced its own failure. Continue
+        // with the latest disk state instead of permanently wedging updates.
+      })
+      .then(() => this.applyExternalSettingsChange());
+    this.externalSettingsReload = reload;
+    try {
+      await reload;
+    } finally {
+      if (this.externalSettingsReload === reload) {
+        this.externalSettingsReload = null;
+      }
+    }
+  }
+
+  private async applyExternalSettingsChange(): Promise<void> {
+    const before = this.settings;
+    const previousModules = { ...before.optionalModules };
+    const previousSemanticSearchEnabled = before.semanticSearchEnabled === true;
+    const previousSemanticEmbeddingEndpoint = before.semanticEmbeddingEndpoint;
+    const previousSemanticEmbeddingModel = before.semanticEmbeddingModel;
+    const previousSyncInterval = before.syncInterval;
+    const previousShowStatusBar = before.showStatusBar;
+    const previousConnection = snapshotConnectionBoundary(before);
+
+    await this.getSettingsRuntime().loadSettings("external");
+
+    const connectionChanged = didConnectionBoundaryChange(
+      previousConnection,
+      this.settings,
+    );
+    if (this.session && connectionChanged) {
+      Object.assign(this.settings, previousConnection);
+      await this.getSettingsRuntime().saveSettings();
+      new Notice(
+        "VaultGuard Sync: synchronized connection or vault changes were not applied while signed in. Sign out before changing that security boundary.",
+        9000,
+      );
+    } else if (connectionChanged) {
+      this.rebuildApiClient();
+    }
+
+    let externalSemanticAlreadyPurged = false;
+    if (
+      previousModules.secureDiscovery === true &&
+      this.settings.optionalModules?.secureDiscovery !== true
+    ) {
+      try {
+        await this.purgeSemanticRuntime("disable");
+        externalSemanticAlreadyPurged = true;
+      } catch (error) {
+        this.settings.optionalModules = {
+          ...this.settings.optionalModules,
+          secureDiscovery: true,
+        };
+        await this.getSettingsRuntime().saveSettings();
+        throw error;
+      }
+    }
+
+    await this.reconcileOptionalModuleSettings(
+      previousModules,
+      externalSemanticAlreadyPurged,
+    );
+
+    const secureDiscoveryDisabled =
+      previousModules.secureDiscovery === true &&
+      this.settings.optionalModules?.secureDiscovery !== true;
+    const secureDiscoveryEnabled = this.settings.optionalModules?.secureDiscovery === true;
+    const semanticDisabled =
+      previousSemanticSearchEnabled && this.settings.semanticSearchEnabled !== true;
+    const semanticProviderChanged =
+      previousSemanticEmbeddingEndpoint !== this.settings.semanticEmbeddingEndpoint ||
+      previousSemanticEmbeddingModel !== this.settings.semanticEmbeddingModel;
+    if (
+      !secureDiscoveryDisabled &&
+      secureDiscoveryEnabled &&
+      (semanticDisabled || semanticProviderChanged)
+    ) {
+      await this.purgeSemanticRuntime(semanticDisabled ? "disable" : "provider-change");
+    }
+    if (
+      previousSemanticSearchEnabled !== (this.settings.semanticSearchEnabled === true) ||
+      semanticProviderChanged
+    ) {
+      this.notifyDiscoveryLifecycleChanged();
+    }
+
+    if (this.settings.syncInterval !== previousSyncInterval && this.session) {
+      this.restartSyncTimer();
+    }
+    if (this.settings.showStatusBar !== previousShowStatusBar) {
+      this.toggleStatusBar(this.settings.showStatusBar);
+    } else {
+      this.updateStatusBar();
+    }
+
+    this.refreshFileExplorerDecorations();
+    this.refreshFilePermissionHeader();
+    this.reloadVaultGuardSidebar();
+    this.updateRibbonAuthIndicator();
+    if (this.settingTab?.containerEl?.isConnected) {
+      this.settingTab.display();
+    }
+    this.vaultOrientationService?.invalidate("external-settings-changed");
+  }
+
+  private async reconcileOptionalModuleSettings(
+    previous: VaultGuardSettings["optionalModules"],
+    semanticAlreadyPurged = false,
+  ): Promise<void> {
+    for (const moduleId of [
+      "aiChat",
+      "permissionsGraph",
+      "agentAccess",
+      "secureDiscovery",
+    ] as const) {
+      const wasEnabled = previous?.[moduleId] === true;
+      const enabled = this.isOptionalModuleEnabled(moduleId);
+      if (enabled && !wasEnabled) {
+        await this.ensureOptionalViewRegistered(moduleId).catch((error) =>
+          this.logError(`Loading optional module ${moduleId} after settings sync failed`, error),
+        );
+      } else if (!enabled && wasEnabled) {
+        await this.deactivateOptionalModule(
+          moduleId,
+          semanticAlreadyPurged && moduleId === "secureDiscovery",
+        );
+      }
+    }
   }
 
   /**
@@ -2081,6 +2333,19 @@ export default class VaultGuardPlugin extends Plugin {
    */
   async onunload(): Promise<void> {
     this.log("Unloading VaultGuard plugin...");
+    this.discoveryRuntime?.cancel();
+    this.discoveryRuntime = null;
+    this.discoveryRuntimePromise = null;
+    const semanticRuntime = this.semanticRuntime;
+    semanticRuntime?.cancel();
+    this.semanticRuntime = null;
+    this.semanticRuntimePromise = null;
+    await semanticRuntime?.cancelAndWait().catch((error) =>
+      this.logError("Waiting for semantic work to stop during unload failed", error),
+    );
+    this.semanticStatusListeners.clear();
+    this.discoveryLifecycleListeners.clear();
+    this.settingTab = null;
 
     this.permissionsGraphVirtualQaModal?.close();
     this.permissionsGraphVirtualQaModal = null;
@@ -2301,24 +2566,695 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   async createAgentBridgeLease(input: AgentBridgeLeaseInput = {}): Promise<AgentBridgeLeaseSecret> {
-    const localProjectMemoryMode = this.isLocalProjectMemoryModeEnabled();
-    if (localProjectMemoryMode && !this.isLocalProjectMemoryInAppChatLease(input)) {
+    if (this.isLocalProjectMemoryModeEnabled()) {
       throw new Error("Agent bridge server leases are disabled in Local Project Memory Mode.");
     }
-    const lease = this.ensureAgentBridgeRuntime().createLease(
-      localProjectMemoryMode ? { ...input, localProjectMemoryMode: true } : input
-    );
+    if (!this.isOptionalModuleEnabled("agentAccess")) {
+      throw new Error("External agent access is off. Enable it in VaultGuard settings first.");
+    }
+    const lease = this.ensureAgentBridgeRuntime().createLease(input);
     this.vaultOrientationService?.invalidate("agent-bridge-lease-created");
     return lease;
   }
 
-  private isLocalProjectMemoryInAppChatLease(input: AgentBridgeLeaseInput): boolean {
-    return (
-      input.persistent !== true &&
-      input.expiresWithSession === true &&
-      typeof input.agentName === "string" &&
-      input.agentName.startsWith("VaultGuard Chat")
+  isOptionalModuleEnabled(moduleId: OptionalModuleId): boolean {
+    return this.settings.optionalModules?.[moduleId] === true;
+  }
+
+  async setOptionalModuleEnabled(
+    moduleId: OptionalModuleId,
+    enabled: boolean,
+  ): Promise<void> {
+    const semanticAlreadyPurged = moduleId === "secureDiscovery" && !enabled;
+    if (semanticAlreadyPurged) {
+      // Do not persist the parent module as off until its derived-content
+      // envelope is gone. A purge failure leaves the prior toggle truthful.
+      await this.purgeSemanticRuntime("disable");
+    }
+    const current = this.settings.optionalModules ?? DEFAULT_SETTINGS.optionalModules;
+    this.settings.optionalModules = {
+      schemaVersion: 2,
+      aiChat: current.aiChat === true,
+      permissionsGraph: current.permissionsGraph === true,
+      agentAccess: current.agentAccess === true,
+      secureDiscovery: current.secureDiscovery === true,
+      [moduleId]: enabled,
+    };
+    await this.saveSettings();
+
+    if (enabled) {
+      try {
+        await this.ensureOptionalViewRegistered(moduleId);
+      } catch (error) {
+        this.settings.optionalModules = {
+          ...this.settings.optionalModules,
+          [moduleId]: false,
+        };
+        await this.saveSettings();
+        throw error;
+      }
+      if (moduleId === "secureDiscovery") this.notifyDiscoveryLifecycleChanged();
+      return;
+    }
+
+    await this.deactivateOptionalModule(moduleId, semanticAlreadyPurged);
+  }
+
+  private async deactivateOptionalModule(
+    moduleId: OptionalModuleId,
+    semanticAlreadyPurged = false,
+  ): Promise<void> {
+    switch (moduleId) {
+      case "aiChat":
+        this.app.workspace.detachLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
+        this.notifyAiChatProviderChanged();
+        return;
+      case "permissionsGraph":
+        this.app.workspace.detachLeavesOfType(VAULTGUARD_GRAPH_VIEW_TYPE);
+        return;
+      case "agentAccess":
+        if (this.agentBridgeRuntime) {
+          this.agentBridgeRuntime.revokeAllLeases();
+          await this.agentBridgeRuntime.stopServerIfInitialized();
+        }
+        return;
+      case "secureDiscovery":
+        if (!semanticAlreadyPurged) await this.purgeSemanticRuntime("disable");
+        this.discoveryRuntime?.cancel();
+        this.discoveryRuntime = null;
+        this.discoveryRuntimePromise = null;
+        this.app.workspace.detachLeavesOfType(VAULTGUARD_DISCOVERY_VIEW_TYPE);
+        this.notifyDiscoveryLifecycleChanged();
+        return;
+    }
+  }
+
+  private async registerEnabledOptionalViews(): Promise<void> {
+    if (this.isOptionalModuleEnabled("aiChat")) {
+      await this.ensureOptionalViewRegistered("aiChat").catch((error) =>
+        this.logError("Registering the optional Chat view failed", error),
+      );
+    }
+    if (this.isOptionalModuleEnabled("permissionsGraph")) {
+      await this.ensureOptionalViewRegistered("permissionsGraph").catch((error) =>
+        this.logError("Registering the optional Permissions Graph view failed", error),
+      );
+    }
+    if (this.isOptionalModuleEnabled("secureDiscovery")) {
+      await this.ensureOptionalViewRegistered("secureDiscovery").catch((error) =>
+        this.logError("Registering optional Secure Discovery failed", error),
+      );
+    }
+  }
+
+  private async ensureOptionalViewRegistered(
+    moduleId: OptionalModuleId,
+  ): Promise<boolean> {
+    if (!this.isOptionalModuleEnabled(moduleId)) return false;
+    if (moduleId === "agentAccess") return true;
+    if (moduleId === "aiChat" && this.chatViewRegistered) return true;
+    if (moduleId === "permissionsGraph" && this.graphViewRegistered) return true;
+    if (moduleId === "secureDiscovery" && this.discoveryViewRegistered) return true;
+
+    const existing = this.optionalViewRegistrationPromises.get(moduleId);
+    if (existing) return existing;
+
+    const registration = (async (): Promise<boolean> => {
+      switch (moduleId) {
+        case "aiChat": {
+          const { VaultGuardChatView } = await import("../ui/chat/chat-view");
+          if (!this.isOptionalModuleEnabled(moduleId)) return false;
+          this.registerView(
+            VAULTGUARD_CHAT_VIEW_TYPE,
+            (leaf) =>
+              new VaultGuardChatView(
+                leaf,
+                this as ConstructorParameters<typeof VaultGuardChatView>[1],
+              ),
+          );
+          this.chatViewRegistered = true;
+          return true;
+        }
+        case "permissionsGraph": {
+          const { PermissionsGraphView } = await import(
+            "../ui/graph/permissions-graph-view"
+          );
+          if (!this.isOptionalModuleEnabled(moduleId)) return false;
+          this.registerView(
+            VAULTGUARD_GRAPH_VIEW_TYPE,
+            (leaf) =>
+              new PermissionsGraphView(
+                leaf,
+                this as ConstructorParameters<typeof PermissionsGraphView>[1],
+              ),
+          );
+          this.graphViewRegistered = true;
+          return true;
+        }
+        case "secureDiscovery": {
+          const { SecureSearchView } = await import("../ui/discovery/secure-search-view");
+          if (!this.isOptionalModuleEnabled(moduleId)) return false;
+          this.registerView(
+            VAULTGUARD_DISCOVERY_VIEW_TYPE,
+            (leaf) => new SecureSearchView(leaf, this.createSecureSearchViewContext()),
+          );
+          this.discoveryViewRegistered = true;
+          await this.registerSecureDiscoveryNativeSurfaces();
+          return true;
+        }
+      }
+    })().finally(() => {
+      this.optionalViewRegistrationPromises.delete(moduleId);
+    });
+
+    this.optionalViewRegistrationPromises.set(moduleId, registration);
+    return registration;
+  }
+
+  private notifyDiscoveryLifecycleChanged(): void {
+    this.discoveryRuntime?.cancel();
+    for (const listener of this.discoveryLifecycleListeners) {
+      try {
+        listener();
+      } catch (error) {
+        this.logError("Secure Discovery lifecycle listener failed", error);
+      }
+    }
+  }
+
+  private subscribeDiscoveryLifecycle(listener: () => void): () => void {
+    this.discoveryLifecycleListeners.add(listener);
+    return () => this.discoveryLifecycleListeners.delete(listener);
+  }
+
+  private createSecureSearchViewContext(): import("../ui/discovery/secure-search-view").SecureSearchViewContext {
+    return {
+      isEnabled: () => this.isOptionalModuleEnabled("secureDiscovery"),
+      isReady: () =>
+        Boolean(
+          this.session &&
+          this.apiClient &&
+          this.settings.serverVaultId &&
+          !this.isVaultLocked,
+        ),
+      search: async (request) => (await this.ensureDiscoveryRuntime()).search(request),
+      cancel: () => this.discoveryRuntime?.cancel(),
+      openLocalPath: (path) => this.openDiscoveryLocalPath(path),
+      subscribeLifecycle: (listener) => this.subscribeDiscoveryLifecycle(listener),
+      isSemanticSupported: () => Platform.isDesktopApp === true,
+      isSemanticEnabled: () => this.settings.semanticSearchEnabled === true,
+      getSemanticPreferences: () => ({
+        origin: this.settings.semanticEmbeddingEndpoint,
+        model: this.settings.semanticEmbeddingModel,
+      }),
+      getSemanticStatus: () => this.getSemanticSearchStatus(),
+      subscribeSemanticStatus: (listener) => this.subscribeSemanticSearchStatus(listener),
+      setSemanticEnabled: (enabled) => this.setSemanticSearchEnabled(enabled),
+      updateSemanticPreferences: (origin, model) =>
+        this.updateSemanticProviderPreferences(origin, model),
+      testSemanticProvider: () => this.testSemanticProvider(),
+      buildSemanticIndex: () => this.buildSemanticIndex(),
+      cancelSemanticWork: () => this.cancelSemanticIndexWork(),
+      purgeSemanticIndex: () => this.purgeSemanticIndex(),
+    };
+  }
+
+  private async ensureDiscoveryRuntime(): Promise<import("./discovery/discovery-runtime").DiscoveryRuntime> {
+    if (!this.isOptionalModuleEnabled("secureDiscovery")) {
+      throw new Error("Secure Discovery is disabled.");
+    }
+    if (this.discoveryRuntime) return this.discoveryRuntime;
+    if (this.discoveryRuntimePromise) return this.discoveryRuntimePromise;
+
+    this.discoveryRuntimePromise = (async () => {
+      const { DiscoveryRuntime } = await import("./discovery/discovery-runtime");
+      if (!this.isOptionalModuleEnabled("secureDiscovery")) {
+        throw new Error("Secure Discovery is disabled.");
+      }
+      const runtime = new DiscoveryRuntime({
+        isModuleEnabled: () => this.isOptionalModuleEnabled("secureDiscovery"),
+        getSession: () => this.session,
+        getBoundVault: () =>
+          this.settings.serverVaultId
+            ? {
+                id: this.settings.serverVaultId,
+                name: this.settings.serverVaultName || "Bound vault",
+              }
+            : null,
+        getLocalFiles: () =>
+          this.app.vault.getMarkdownFiles().map((file) => ({
+            path: file.path,
+            size: file.stat.size,
+          })),
+        readLocalText: async (path) => {
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (!(file instanceof TFile) || file.extension.toLocaleLowerCase("en-US") !== "md") {
+            throw new Error("Local Markdown file is unavailable.");
+          }
+          return await this.app.vault.cachedRead(file);
+        },
+        getPermissionDecision: (path) => this.permissionStore.getPermissionDecision(path),
+        isPathExcluded: (path) => this.isPathExcluded(path),
+        isMetadataSuppressed: (path) => this.permissionStore.isMetadataSuppressed(path),
+        listVaults: async () => {
+          if (!this.apiClient) throw new Error("VaultGuard API client unavailable.");
+          return await this.apiClient.listVaults();
+        },
+        listVaultFilesPage: async (vaultId, options) => {
+          if (!this.apiClient) throw new Error("VaultGuard API client unavailable.");
+          return await this.apiClient.listVaultFilesPage(vaultId, options);
+        },
+        readVaultFileDecrypted: async (vaultId, path) => {
+          if (!this.apiClient) throw new Error("VaultGuard API client unavailable.");
+          return await this.apiClient.readVaultFileDecrypted(vaultId, path);
+        },
+        searchSemantic: async (request) => (await this.ensureSemanticRuntime()).query(request),
+        cancelSemantic: () => this.semanticRuntime?.cancel(),
+        yieldControl: () => new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0)),
+        now: () => Date.now(),
+      });
+      this.discoveryRuntime = runtime;
+      return runtime;
+    })().finally(() => {
+      this.discoveryRuntimePromise = null;
+    });
+    return this.discoveryRuntimePromise;
+  }
+
+  private async ensureSemanticRuntime(): Promise<import("./discovery/semantic-search-runtime").SemanticSearchRuntime> {
+    if (this.semanticRuntime) return this.semanticRuntime;
+    if (this.semanticRuntimePromise) return this.semanticRuntimePromise;
+    this.semanticRuntimePromise = (async () => {
+      const [runtimeModule, providerModule, storeModule] = await Promise.all([
+        import("./discovery/semantic-search-runtime"),
+        import("./discovery/ollama-embedding-provider"),
+        import("./discovery/semantic-index-store"),
+      ]);
+      const indexPath = this.vaultConfigPath(
+        "plugins",
+        this.manifest.id,
+        "semantic",
+        "index.v1.envelope",
+      );
+      const store = new storeModule.SemanticIndexStore({
+        path: indexPath,
+        getCipher: () => this.getAtRestCipher(),
+        getStorage: () => {
+          const methods = this.originalAdapterMethods;
+          if (
+            !methods.readBinary ||
+            !methods.writeBinary ||
+            !methods.remove ||
+            !methods.rename
+          ) {
+            return null;
+          }
+          return {
+            exists: (path: string) => this.app.vault.adapter.exists(path),
+            readBinary: methods.readBinary,
+            writeBinary: methods.writeBinary,
+            remove: methods.remove,
+            rename: methods.rename,
+          };
+        },
+        ensureParent: (path) => this.ensureParentFoldersForPath(path),
+      });
+      const runtime = new runtimeModule.SemanticSearchRuntime({
+        isParentEnabled: () => this.isOptionalModuleEnabled("secureDiscovery"),
+        isSemanticEnabled: () =>
+          Platform.isDesktopApp === true && this.settings.semanticSearchEnabled === true,
+        getSession: () => this.session,
+        getBoundVault: () =>
+          this.settings.serverVaultId
+            ? {
+                id: this.settings.serverVaultId,
+                name: this.settings.serverVaultName || "Bound vault",
+              }
+            : null,
+        getLocalVaultId: () => this.derivedBindingId,
+        getProviderConfig: () => ({
+          origin: this.settings.semanticEmbeddingEndpoint,
+          model: this.settings.semanticEmbeddingModel,
+        }),
+        createProvider: (config) => new providerModule.OllamaEmbeddingProvider(config),
+        repository: store,
+        getLocalFiles: () => this.app.vault.getMarkdownFiles().map((file) => ({
+          path: file.path,
+          size: file.stat.size,
+        })),
+        readLocalText: async (path) => {
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (!(file instanceof TFile) || file.extension.toLocaleLowerCase("en-US") !== "md") {
+            throw new Error("Local Markdown file is unavailable.");
+          }
+          return await this.app.vault.cachedRead(file);
+        },
+        getPermissionDecision: (path) => this.permissionStore.getPermissionDecision(path),
+        isPathExcluded: (path) => this.isPathExcluded(path),
+        isMetadataSuppressed: (path) => this.permissionStore.isMetadataSuppressed(path),
+        yieldControl: () => new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0)),
+        now: () => Date.now(),
+      });
+      runtime.subscribe((status) => this.notifySemanticStatus(status));
+      this.semanticRuntime = runtime;
+      return runtime;
+    })().finally(() => {
+      this.semanticRuntimePromise = null;
+    });
+    return this.semanticRuntimePromise;
+  }
+
+  getSemanticSearchStatus(): import("./discovery/semantic-search-runtime").SemanticRuntimeStatus {
+    return this.semanticRuntime?.getStatus() ?? {
+      state: "absent",
+      indexedFiles: 0,
+      indexedChunks: 0,
+      stale: false,
+    };
+  }
+
+  subscribeSemanticSearchStatus(
+    listener: (status: import("./discovery/semantic-search-runtime").SemanticRuntimeStatus) => void,
+  ): () => void {
+    this.semanticStatusListeners.add(listener);
+    listener(this.getSemanticSearchStatus());
+    return () => this.semanticStatusListeners.delete(listener);
+  }
+
+  private notifySemanticStatus(
+    status: import("./discovery/semantic-search-runtime").SemanticRuntimeStatus,
+  ): void {
+    for (const listener of this.semanticStatusListeners) {
+      try {
+        listener({ ...status });
+      } catch (error) {
+        this.logError("Semantic status listener failed", error);
+      }
+    }
+  }
+
+  async setSemanticSearchEnabled(enabled: boolean): Promise<void> {
+    if (enabled && !this.isOptionalModuleEnabled("secureDiscovery")) {
+      throw new Error("Enable Secure Discovery before semantic search.");
+    }
+    if (enabled && Platform.isDesktopApp !== true) {
+      throw new Error("Local Ollama semantic search is available on desktop only.");
+    }
+    if (!enabled) await this.purgeSemanticRuntime("disable");
+    this.settings.semanticSearchEnabled = enabled;
+    await this.saveSettings();
+    this.notifyDiscoveryLifecycleChanged();
+  }
+
+  async updateSemanticProviderPreferences(origin: string, model: string): Promise<void> {
+    const { normalizeOllamaOrigin, validateOllamaModel } = await import(
+      "./discovery/ollama-embedding-provider"
     );
+    const normalizedOrigin = normalizeOllamaOrigin(origin);
+    const normalizedModel = validateOllamaModel(model);
+    const changed =
+      normalizedOrigin !== this.settings.semanticEmbeddingEndpoint ||
+      normalizedModel !== this.settings.semanticEmbeddingModel;
+    if (changed) await this.purgeSemanticRuntime("provider-change");
+    this.settings.semanticEmbeddingEndpoint = normalizedOrigin;
+    this.settings.semanticEmbeddingModel = normalizedModel;
+    await this.saveSettings();
+    this.notifyDiscoveryLifecycleChanged();
+  }
+
+  async testSemanticProvider(): Promise<number> {
+    if (!this.isOptionalModuleEnabled("secureDiscovery") || !this.settings.semanticSearchEnabled) {
+      throw new Error("Enable semantic search before testing the provider.");
+    }
+    const { OllamaEmbeddingProvider } = await import("./discovery/ollama-embedding-provider");
+    const provider = new OllamaEmbeddingProvider({
+      origin: this.settings.semanticEmbeddingEndpoint,
+      model: this.settings.semanticEmbeddingModel,
+    });
+    const vector = (await provider.embed(["VaultGuard semantic provider test"]))[0]!;
+    return vector.length;
+  }
+
+  async buildSemanticIndex(): Promise<import("./discovery/semantic-search-runtime").SemanticRuntimeStatus> {
+    return await (await this.ensureSemanticRuntime()).build();
+  }
+
+  cancelSemanticIndexWork(): void {
+    this.semanticRuntime?.cancel();
+  }
+
+  async purgeSemanticIndex(): Promise<void> {
+    await this.purgeSemanticRuntime("manual");
+  }
+
+  private async purgeSemanticRuntime(
+    reason: import("./discovery/semantic-search-runtime").SemanticPurgeReason,
+  ): Promise<void> {
+    const runtime = this.semanticRuntime ?? await this.ensureSemanticRuntime();
+    await runtime.purge(reason);
+    this.semanticRuntime = null;
+    this.semanticRuntimePromise = null;
+    this.notifySemanticStatus(this.getSemanticSearchStatus());
+  }
+
+  private shouldPurgeSemanticIndex(): boolean {
+    return Boolean(
+      this.semanticRuntime ||
+      (
+        this.isOptionalModuleEnabled("secureDiscovery") &&
+        this.settings.semanticSearchEnabled === true
+      ),
+    );
+  }
+
+  private async openDiscoveryLocalPath(path: string): Promise<void> {
+    if (
+      !this.isOptionalModuleEnabled("secureDiscovery") ||
+      !this.session ||
+      this.isVaultLocked ||
+      this.isPathExcluded(path) ||
+      this.permissionStore.isMetadataSuppressed(path)
+    ) {
+      throw new Error("Local result is no longer available.");
+    }
+    const decision = await this.permissionStore.getPermissionDecision(path);
+    if (decision.kind === "unknown" || decision.level < PermissionLevel.READ) {
+      throw new Error("Local result access could not be re-established.");
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) throw new Error("Local result no longer exists.");
+    await this.app.workspace.getLeaf(false).openFile(file);
+  }
+
+  private registerSecureDiscoveryCommand(): void {
+    if (this.discoveryCommandRegistered) return;
+    this.addCommand({
+      id: "vaultguard-open-secure-search",
+      name: this.i18n.t("discovery.search.title"),
+      checkCallback: (checking) => {
+        const available = Boolean(
+          this.isOptionalModuleEnabled("secureDiscovery") &&
+          this.session &&
+          this.settings.serverVaultId &&
+          !this.isVaultLocked,
+        );
+        if (!available) return false;
+        if (!checking) {
+          void this.activateSecureSearch().catch((error) => {
+            this.logError("Opening Secure Search failed", error);
+            new Notice("VaultGuard: Secure Search could not be opened.");
+          });
+        }
+        return true;
+      },
+    });
+    this.discoveryCommandRegistered = true;
+  }
+
+  private async activateSecureSearch(): Promise<void> {
+    if (!(await this.ensureOptionalViewRegistered("secureDiscovery"))) {
+      throw new Error("Secure Discovery is disabled.");
+    }
+    const { SecureSearchView } = await import("../ui/discovery/secure-search-view");
+    const existing = this.app.workspace.getLeavesOfType(VAULTGUARD_DISCOVERY_VIEW_TYPE);
+    if (existing.length > 0) {
+      await this.app.workspace.revealLeaf(existing[0]!);
+      if (existing[0]!.view instanceof SecureSearchView) existing[0]!.view.focusQuery();
+      return;
+    }
+    const leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: VAULTGUARD_DISCOVERY_VIEW_TYPE, active: true });
+    await this.app.workspace.revealLeaf(leaf);
+    if (leaf.view instanceof SecureSearchView) leaf.view.focusQuery();
+  }
+
+  private async registerSecureDiscoveryNativeSurfaces(): Promise<void> {
+    this.registerSecureDiscoveryCommand();
+    await this.tryRegisterDiscoveryBases();
+    await this.tryRegisterDiscoveryCli();
+  }
+
+  private async tryRegisterDiscoveryBases(): Promise<boolean> {
+    if (this.discoveryBasesRegistered) return true;
+    if (
+      !this.isOptionalModuleEnabled("secureDiscovery") ||
+      typeof requireApiVersion !== "function" ||
+      !requireApiVersion("1.10.0")
+    ) {
+      return false;
+    }
+    type BasesRegistrar = (
+      viewId: string,
+      registration: import("obsidian").BasesViewRegistration,
+    ) => boolean;
+    const registrar = (this as unknown as { registerBasesView?: BasesRegistrar }).registerBasesView;
+    if (typeof registrar !== "function") return false;
+
+    // Keep the BasesView subclass out of the startup module graph. Obsidian
+    // 1.8.x cannot evaluate a class extending an export it does not have.
+    const { VAULTGUARD_BASES_VIEW_ID, createPermissionBasesRegistration } =
+      await import("../ui/discovery/permission-bases-view");
+    if (!this.isOptionalModuleEnabled("secureDiscovery")) return false;
+
+    const registration = createPermissionBasesRegistration({
+      isEnabled: () => this.isOptionalModuleEnabled("secureDiscovery"),
+      getBatchPathAccess: async (paths) => {
+        if (!this.apiClient) throw new Error("VaultGuard API client unavailable");
+        return await this.apiClient.getBatchPathAccess(paths);
+      },
+      peekPermissionDecision: (path) => this.permissionStore.peekPermissionDecision(path),
+      isMetadataSuppressed: (path) => this.permissionStore.isMetadataSuppressed(path),
+      isPathExcluded: (path) => this.isPathExcluded(path),
+      isCurrentLocalPath: (path) => this.app.vault.getAbstractFileByPath(path) instanceof TFile,
+      openPath: async (path) => {
+        await this.app.workspace.openLinkText(path, "", false);
+      },
+      subscribePermissionChanges: (handler) => {
+        const changed = this.permissionStore.on("changed", handler);
+        const stateChanged = this.permissionStore.on("state-changed", handler);
+        return () => {
+          this.permissionStore.offref(changed);
+          this.permissionStore.offref(stateChanged);
+        };
+      },
+      subscribeModuleChanges: (handler) => this.subscribeDiscoveryLifecycle(handler),
+      yieldControl: () => new Promise<void>((resolve) => window.setTimeout(resolve, 0)),
+      labels: {
+        off: this.i18n.t("discovery.bases.off"),
+        verifying: this.i18n.t("discovery.bases.verifying"),
+        prefix: this.i18n.t("discovery.bases.prefix"),
+        readable: (count) => this.i18n.t("discovery.bases.readable", { count }),
+        showing: (count) => this.i18n.t("discovery.bases.showing", { count }),
+        unavailable: (count) => this.i18n.t("discovery.bases.unavailable", { count }),
+        verified: this.i18n.t("discovery.provenance.verified"),
+        cached: this.i18n.t("discovery.provenance.cached"),
+      },
+    });
+    const registered = registrar.call(this, VAULTGUARD_BASES_VIEW_ID, registration);
+    this.discoveryBasesRegistered = registered === true;
+    return this.discoveryBasesRegistered;
+  }
+
+  private async tryRegisterDiscoveryCli(): Promise<boolean> {
+    if (this.discoveryCliRegistered) return true;
+    if (
+      !this.isOptionalModuleEnabled("secureDiscovery") ||
+      Platform.isDesktopApp !== true ||
+      typeof requireApiVersion !== "function" ||
+      !requireApiVersion("1.12.2")
+    ) {
+      return false;
+    }
+    type CliRegistrar = (
+      command: string,
+      description: string,
+      flags: import("obsidian").CliFlags | null,
+      handler: import("obsidian").CliHandler,
+    ) => void;
+    const registrar = (this as unknown as { registerCliHandler?: CliRegistrar }).registerCliHandler;
+    if (typeof registrar !== "function") return false;
+    const { createDiscoveryCliHandlers } = await import("./discovery/cli-handlers");
+    if (!this.isOptionalModuleEnabled("secureDiscovery")) return false;
+    const handlers = createDiscoveryCliHandlers({
+      isModuleEnabled: () => this.isOptionalModuleEnabled("secureDiscovery"),
+      isCliRuntimeSupported: () =>
+        Platform.isDesktopApp === true &&
+        typeof requireApiVersion === "function" &&
+        requireApiVersion("1.12.2"),
+      getSession: () => this.session,
+      getConnectionStatus: () => this.connectionState.status,
+      getBoundVault: () =>
+        this.settings.serverVaultId
+          ? {
+              id: this.settings.serverVaultId,
+              name: this.settings.serverVaultName || "Bound vault",
+            }
+          : null,
+      getSemanticStatus: () => {
+        const status = this.getSemanticSearchStatus();
+        return {
+          enabled: this.settings.semanticSearchEnabled === true,
+          indexState: status.state,
+          indexedFiles: status.indexedFiles,
+          stale: status.stale,
+        };
+      },
+      getCapabilities: () => ({
+        bases: this.discoveryBasesRegistered,
+        cli: this.discoveryCliRegistered,
+        semanticProvider:
+          Platform.isDesktopApp === true && this.settings.semanticSearchEnabled === true,
+      }),
+      getPermissionDecision: (path) => this.permissionStore.getPermissionDecision(path),
+      search: async (request) => (await this.ensureDiscoveryRuntime()).search(request),
+    });
+    registrar.call(this, "vaultguard-sync:status", "Show safe VaultGuard discovery status", null, handlers.status);
+    registrar.call(
+      this,
+      "vaultguard-sync:access",
+      "Show effective access for one current-vault path",
+      { path: { value: "<path>", description: "Vault-relative path", required: true } },
+      handlers.access,
+    );
+    registrar.call(
+      this,
+      "vaultguard-sync:search",
+      "Search authorized VaultGuard knowledge",
+      {
+        query: { value: "<text>", description: "Search text", required: true },
+        scope: { value: "<current|all>", description: "Vault scope" },
+        content: { description: "Allow bounded note-content reads" },
+        semantic: { description: "Use the current local semantic index" },
+        limit: { value: "<1-100>", description: "Maximum results" },
+      },
+      handlers.search,
+    );
+    this.discoveryCliRegistered = true;
+    return true;
+  }
+
+  /**
+   * Trusted in-app chat lease factory. Unlike the public bridge API this method
+   * force-binds the lease to the current login session and never persists it.
+   * Local Project Memory Mode may use this capability through the loopback MCP
+   * endpoint; callers cannot opt into a generic or longer-lived lease.
+   */
+  async createInAppChatAgentBridgeLease(
+    capability: InAppChatCapability,
+    input: AgentBridgeLeaseInput = {},
+  ): Promise<AgentBridgeLeaseSecret> {
+    if (capability !== IN_APP_CHAT_CAPABILITY) {
+      throw new Error("Trusted in-app chat capability required.");
+    }
+    const localProjectMemoryMode = this.isLocalProjectMemoryModeEnabled();
+    const lease = this.ensureAgentBridgeRuntime().createLease({
+      ...input,
+      persistent: false,
+      expiresWithSession: true,
+      localProjectMemoryMode,
+    });
+    this.vaultOrientationService?.invalidate("agent-bridge-lease-created");
+    return lease;
   }
 
   describeChatGptConnector(): ChatGptConnectorDescription {
@@ -2328,6 +3264,9 @@ export default class VaultGuardPlugin extends Plugin {
   async createChatGptConnectorSession(
     input: ChatGptConnectorSessionInput = {},
   ): Promise<ChatGptConnectorSessionSecret> {
+    if (!this.isOptionalModuleEnabled("agentAccess")) {
+      throw new Error("External agent access is off. Enable it in VaultGuard settings first.");
+    }
     if (this.isLocalProjectMemoryModeEnabled()) {
       throw new Error("ChatGPT connector sessions are disabled in Local Project Memory Mode.");
     }
@@ -2477,7 +3416,31 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.isLocalProjectMemoryModeEnabled()) {
       throw new Error("Agent bridge server leases are disabled in Local Project Memory Mode.");
     }
+    if (!this.isOptionalModuleEnabled("agentAccess")) {
+      throw new Error("External agent access is off. Enable it in VaultGuard settings first.");
+    }
     return this.ensureAgentBridgeRuntime().startServer();
+  }
+
+  /** Start the loopback server for a trusted in-app CLI chat transport. */
+  async startInAppChatAgentBridgeServer(
+    capability: InAppChatCapability,
+  ): Promise<AgentBridgeServerInfo> {
+    if (capability !== IN_APP_CHAT_CAPABILITY) {
+      throw new Error("Trusted in-app chat capability required.");
+    }
+    return this.ensureAgentBridgeRuntime().startServer();
+  }
+
+  /** Immediately tear down active provider sessions after a settings switch. */
+  notifyAiChatProviderChanged(): void {
+    const leaves = this.app.workspace.getLeavesOfType("vaultguard-chat-view");
+    for (const leaf of leaves) {
+      const view = leaf.view as unknown as {
+        handleProviderConfigurationChanged?: () => void;
+      };
+      view.handleProviderConfigurationChanged?.();
+    }
   }
 
   async stopAgentBridgeServer(): Promise<void> {
@@ -2552,6 +3515,10 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private openAgentBridgeLeaseModal(): void {
+    if (!this.isOptionalModuleEnabled("agentAccess")) {
+      new Notice("VaultGuard Sync: Enable External agent access in settings first.");
+      return;
+    }
     if (this.isLocalProjectMemoryModeEnabled()) {
       new Notice("VaultGuard Sync: server bridge leases are disabled in Local Project Memory Mode.", 6000);
       return;
@@ -2670,6 +3637,12 @@ export default class VaultGuardPlugin extends Plugin {
       id: "vaultguard-lock-vault",
       name: "Lock vault",
       callback: () => this.lockVaultViaCommand(),
+    });
+
+    this.addCommand({
+      id: "vaultguard-open-recovery-center",
+      name: "Open Recovery Center",
+      callback: () => this.openRecoveryCenter(),
     });
 
     // Dev-only testing aid (quick 260708-el6): force-open the PIN onboarding
@@ -2822,6 +3795,37 @@ export default class VaultGuardPlugin extends Plugin {
     }
     if (!this.apiClient || !this.session) return;
     new ShareManagementModal(this.app, this.apiClient).open();
+  }
+
+  private openRecoveryCenter(initialTab: RecoveryCenterTab = "history"): void {
+    if (!this.apiClient || !this.session || !this.settings.serverVaultId) {
+      new Notice("VaultGuard Sync: Protect this vault before opening Recovery Center.");
+      return;
+    }
+    const activePath = this.app.workspace.getActiveFile()?.path;
+    new RecoveryCenterModal({
+      app: this.app,
+      apiClient: this.apiClient,
+      initialPath: activePath ? this.normalizeVaultPath(activePath) : undefined,
+      initialTab,
+      getConflicts: () => [...this.syncState.conflicts],
+      getConflictFiles: () =>
+        this.app.vault
+          .getFiles()
+          .map((file) => this.normalizeVaultPath(file.path))
+          .filter((path) => / \(conflict [^)]+\)(?:\.[^/]+)?$/i.test(path)),
+      onOpenPath: async (path) => {
+        const file = this.app.vault.getAbstractFileByPath(this.normalizeVaultPath(path));
+        if (!(file instanceof TFile)) {
+          new Notice(`VaultGuard: "${path}" is not available on this device.`);
+          return;
+        }
+        await this.app.workspace.getLeaf(false).openFile(file);
+      },
+      onRestored: async () => {
+        await this.performSync({ userInitiated: true, forceCatchup: true });
+      },
+    }).open();
   }
 
   private async copyShareLinkForPath(path: string): Promise<void> {
@@ -3629,6 +4633,12 @@ export default class VaultGuardPlugin extends Plugin {
     const changed = this.settings.serverVaultId !== result.vaultId;
 
     if (changed) {
+      // Searches are authority-bound to the old server vault. Cancel before
+      // mutating the binding so no late result can cross the switch boundary.
+      this.notifyDiscoveryLifecycleChanged();
+      if (this.shouldPurgeSemanticIndex()) {
+        await this.purgeSemanticRuntime("vault-switch");
+      }
       // Drop the old vault's lease *before* the vaultId flips. Any read or
       // write that fires between the vaultId change and the
       // ensureVaultScopedKeyLease call below would otherwise route a
@@ -4135,6 +5145,7 @@ export default class VaultGuardPlugin extends Plugin {
       expiresAt: rawLease.expiresAt,
       refreshToken: rawLease.refreshToken,
       leaseId: rawLease.leaseId,
+      keyId: rawLease.keyId ?? rawLease.leaseId,
       algorithm: rawLease.algorithm ?? "AES-256-GCM",
       offlineCapable: rawLease.offlineCapable ?? true,
       encryptedDataKey: rawLease.encryptedDataKey,
@@ -4145,6 +5156,81 @@ export default class VaultGuardPlugin extends Plugin {
         ...normalizeLeaseDeniedPaths(responseDeniedPaths),
       ]),
     };
+  }
+
+  /**
+   * Launch the official `codex login` flow. Codex owns the browser OAuth and
+   * credential storage; VaultGuard never receives or reads the resulting token.
+   */
+  async startCodexCliLogin(): Promise<void> {
+    if (Platform.isMobileApp) {
+      throw new Error("Codex sign-in needs desktop Obsidian.");
+    }
+    const maybeWindow =
+      typeof window !== "undefined" ? (window as unknown as Record<string, unknown>) : {};
+    const req =
+      typeof maybeWindow.require === "function"
+        ? (maybeWindow.require as NodeRequire)
+        : null;
+    if (!req) {
+      throw new Error("Node child_process is unavailable in this runtime.");
+    }
+
+    const found = await findCodexBinary();
+    if (!found) {
+      throw new Error("Official Codex client not found. Install it from OpenAI and retry.");
+    }
+
+    const childProcess = req("child_process") as {
+      spawn(
+        cmd: string,
+        args: ReadonlyArray<string>,
+        opts: {
+          stdio?: "ignore" | "inherit";
+          env?: NodeJS.ProcessEnv;
+          shell?: boolean;
+          windowsHide?: boolean;
+        },
+      ): {
+        on(ev: "error", cb: (err: Error) => void): void;
+        on(ev: "close", cb: (code: number | null) => void): void;
+      };
+    };
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      try {
+        const env = typeof process !== "undefined" ? { ...process.env } : undefined;
+        if (env) {
+          // `codex login` without --with-api-key is the ChatGPT OAuth flow.
+          // Remove ambient API credentials as defense in depth so this action
+          // cannot silently fall back to a metered provider mode.
+          delete env.OPENAI_API_KEY;
+          delete env.CODEX_API_KEY;
+          delete env.OPENAI_ACCESS_TOKEN;
+        }
+        const child = childProcess.spawn(found.binaryPath, ["login"], {
+          stdio: "ignore",
+          env,
+          shell: /\.(?:cmd|bat)$/i.test(found.binaryPath),
+          windowsHide: true,
+        });
+        child.on("error", (error) => {
+          if (settled) return;
+          settled = true;
+          reject(new Error(`Could not start Codex sign-in: ${error.message}`));
+        });
+        child.on("close", () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        });
+      } catch (error) {
+        if (settled) return;
+        settled = true;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
   }
 
   private isPathDeniedByKeyLease(path: string): boolean {
@@ -4677,50 +5763,8 @@ export default class VaultGuardPlugin extends Plugin {
     new Notice("VaultGuard Sync: Open Settings → Community plugins → VaultGuard Sync.");
   }
 
-  /**
-   * Opens Obsidian's own Settings → Community plugins screen — the built-in tab
-   * that hosts each installed plugin's native Update button — after AWAITING a
-   * best-effort, read-only refresh of Obsidian's available-updates list. Waiting
-   * for the (async) refresh means the tab renders with the update already known,
-   * so Obsidian's per-plugin Update button is visible on arrival instead of
-   * appearing only after the user re-opens the tab a moment later.
-   *
-   * Policy: Obsidian's Developer Policies list updating the plugin itself under
-   * "Not allowed", so VaultGuard must never download, replace, or self-apply its
-   * own binary. This method therefore ONLY navigates to Obsidian's native
-   * updater plus a read-only refresh of the available-updates list; the real
-   * update is performed by Obsidian's built-in Update button, on the user's
-   * explicit action. It never touches the plugin binary on disk.
-   */
+  /** Opens Obsidian's native Community plugins updater without private APIs. */
   async openCommunityPluginsForUpdate(): Promise<void> {
-    // Best-effort, READ-ONLY refresh of Obsidian's available-updates list.
-    // Reaches into Obsidian's internal plugin manager the same stable way
-    // runAllowlistReconcileInternal does — not part of the public API but stable
-    // across releases for years. This only refreshes the list Obsidian shows; it
-    // is NOT an update mechanism and never installs anything.
-    const pm = (this.app as unknown as {
-      plugins?: { checkForUpdates?: () => unknown };
-    }).plugins;
-    if (pm?.checkForUpdates) {
-      // Immediate feedback while the (network) refresh runs.
-      new Notice("VaultGuard Sync: Checking for updates…");
-      try {
-        const result = pm.checkForUpdates();
-        // checkForUpdates is async (fetches the community registry to populate
-        // app.plugins.updates). AWAIT it so the Community plugins tab renders
-        // AFTER the update is known — otherwise Obsidian's per-plugin Update
-        // button isn't shown yet. Bounded so a hung network can't stall the UI.
-        if (result && typeof (result as { then?: unknown }).then === "function") {
-          await Promise.race([
-            result as Promise<unknown>,
-            new Promise<void>((resolve) => window.setTimeout(resolve, 10_000)),
-          ]);
-        }
-      } catch {
-        // Best-effort — still open the tab on failure.
-      }
-    }
-
     const settingsApp = this.app as unknown as {
       setting?: {
         open?: () => void;
@@ -4771,23 +5815,34 @@ export default class VaultGuardPlugin extends Plugin {
 
     menu.addSeparator();
 
+    if (!isLoggedIn) {
+      // Already-protected vault + no session ⇒ "Log in again"; only a brand-new,
+      // never-bound vault gets the first-run "Protect this vault" onboarding CTA.
+      const vaultProtected = !!this.settings.serverVaultId;
+      menu.addItem((item) =>
+        item
+          .setTitle(vaultProtected ? "Log in again" : "Protect this vault")
+          .setIcon(vaultProtected ? "log-in" : "shield-check")
+          .onClick(() => this.handlePrimaryProtectionAction())
+      );
+
+      menu.addSeparator();
+      menu.addItem((item) =>
+        item
+          .setTitle("Vault settings")
+          .setIcon("settings")
+          .onClick(() => this.openVaultGuardSettings())
+      );
+      this.showMenu(menu, evt);
+      return;
+    }
+
     menu.addItem((item) =>
       item
         .setTitle("Vault settings")
         .setIcon("settings")
         .onClick(() => this.openVaultGuardSettings())
     );
-
-    if (!isLoggedIn) {
-      menu.addItem((item) =>
-        item
-          .setTitle("Login")
-          .setIcon("log-in")
-          .onClick(() => this.handleLogin())
-      );
-      this.showMenu(menu, evt);
-      return;
-    }
 
     if (localProjectMemoryMode) {
       menu.addItem((item) =>
@@ -4838,6 +5893,14 @@ export default class VaultGuardPlugin extends Plugin {
         .onClick(() => {
           void this.activateVaultGuardSidebar();
         })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Recovery Center")
+        .setIcon("history")
+        .setDisabled(!this.apiClient || !this.settings.serverVaultId)
+        .onClick(() => this.openRecoveryCenter())
     );
 
     menu.addItem((item) =>
@@ -4972,11 +6035,43 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private getSidebarAuthState(): VaultGuardSidebarAuthState | null {
-    if (this.session) {
+    if (this.session && this.settings.serverVaultId) {
       return null;
     }
+    if (this.lastLogoutAuthState) return this.lastLogoutAuthState;
+    // An already-protected vault (bound to a server vault) with no active session
+    // is a returning user who needs to sign in again — NOT first-run setup. This
+    // is the state after a reload/restart, which drops the in-memory logout state
+    // (`lastLogoutAuthState`), so without this branch the sidebar wrongly showed
+    // the "Protect this vault" onboarding CTA to someone who is simply logged out.
+    if (!this.session && this.settings.serverVaultId) {
+      return {
+        title: "Logged out",
+        message: "Your VaultGuard session ended. Log in again to reconnect this protected vault.",
+        detail: "Your notes stay encrypted at rest until you reconnect.",
+        icon: "log-out",
+        tone: "warning",
+        actionLabel: "Log in again",
+      };
+    }
+    return {
+      title: "Protect this vault",
+      message: this.session
+        ? "Choose or create the server vault that should protect this Obsidian folder."
+        : "Sign in, choose a vault, and let VaultGuard protect it with encrypted sync.",
+      detail: "Join an existing team or configure self-hosting from the next screen.",
+      icon: "shield-check",
+      tone: "neutral",
+      actionLabel: "Protect this vault",
+    };
+  }
 
-    return this.lastLogoutAuthState;
+  private handlePrimaryProtectionAction(): void {
+    if (this.session) {
+      void this.switchServerVault();
+      return;
+    }
+    this.handleLogin();
   }
 
   private clearLogoutAuthState(): void {
@@ -5038,7 +6133,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private createSidebarViewConfig(): VaultGuardSidebarViewConfig | null {
-    if (!this.session || !this.apiClient) {
+    if (!this.session || !this.apiClient || !this.settings.serverVaultId) {
       return null;
     }
 
@@ -5052,6 +6147,18 @@ export default class VaultGuardPlugin extends Plugin {
       getPermissionLevel: (path) => this.getEffectivePermission(path),
       onOpenMenu: (evt?: MouseEvent) => this.showVaultGuardMenu(evt),
       onOpenSettings: () => this.openVaultGuardSettings(),
+      onOpenRecoveryCenter: () => this.openRecoveryCenter(),
+      getPendingLargeFileSummary: () => {
+        const records = Object.values(this.settings.pendingLargeFiles ?? {});
+        return {
+          count: records.length,
+          blocked: records.filter((record) => record.state === "blocked").length,
+          retryable: records.filter((record) => record.state !== "blocked").length,
+        };
+      },
+      onRetryPendingLargeFiles: () => {
+        void this.performSync({ userInitiated: true, forceCatchup: true });
+      },
     };
   }
 
@@ -5215,7 +6322,10 @@ export default class VaultGuardPlugin extends Plugin {
     // header invalidations. The `update({ force: true })` line is
     // preserved because it's a force-refresh of the CURRENT header view,
     // not an invalidation — the listener doesn't pass force: true.
-    this.permissionStore.emit("changed", { serverConfirmed: true });
+    this.permissionStore.emit("changed", {
+      serverConfirmed: true,
+      semanticAuthorityChanged: true,
+    });
     void this.filePermissionHeader?.update({ force: true });
   }
 
@@ -5761,6 +6871,13 @@ export default class VaultGuardPlugin extends Plugin {
     if (!this.session || this.isVaultLocked) {
       return;
     }
+    // Vectors are sensitive derived content. Purge the encrypted envelope and
+    // in-memory generation before evicting the LAK so deletion can complete.
+    if (this.shouldPurgeSemanticIndex()) {
+      await this.purgeSemanticRuntime("lock").catch((error) =>
+        this.logError("Purging semantic index before lock failed", error),
+      );
+    }
     this.atRestCipher?.lock(); // evict the in-memory LAK → managed reads fail closed
     this.keyLease = null; // evict the cloud DEK
     this.ensureAtRestAdapterRuntimeObject().setLocked(true); // fail-closed gate + revoke previews
@@ -6215,6 +7332,15 @@ export default class VaultGuardPlugin extends Plugin {
     });
     await this.agentBridgeRuntime?.stopServerIfInitialized().catch(() => {});
 
+    // Purge while the session identity and LAK are still present. A confirmed
+    // permission-store event below is a second fail-closed signal, not the
+    // primary lifecycle cleanup.
+    if (this.shouldPurgeSemanticIndex()) {
+      await this.purgeSemanticRuntime("logout").catch((error) =>
+        this.logError("Purging semantic index during logout failed", error),
+      );
+    }
+
     // PL6: actually kill the refresh token at Cognito — deleting local copies
     // alone leaves any backup of data.json holding a credential that can mint
     // fresh id tokens indefinitely. Best-effort (runs after every backend
@@ -6236,6 +7362,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     this.session = null;
+    this.notifyDiscoveryLifecycleChanged();
     this.updateRibbonAuthIndicator();
     this.sidebarViewConfig = null;
     this.keyLease = null;
@@ -6439,8 +7566,11 @@ export default class VaultGuardPlugin extends Plugin {
     return this.ensureAtRestAdapterRuntimeObject().interceptedWriteBinary(path, data);
   }
 
-  private ensureAtRestEncryptedInPlace(path: string): Promise<boolean> {
-    return this.ensureAtRestAdapterRuntimeObject().ensureAtRestEncryptedInPlace(path);
+  private ensureAtRestEncryptedInPlace(path: string, remoteDurable = false): Promise<boolean> {
+    return this.ensureAtRestAdapterRuntimeObject().ensureAtRestEncryptedInPlace(
+      path,
+      remoteDurable,
+    );
   }
 
   private encryptExternallyAddedFile(path: string): Promise<void> {
@@ -7978,6 +9108,11 @@ export default class VaultGuardPlugin extends Plugin {
    * @throws Error if no valid key lease is available
    */
   private async encryptContentBytes(content: ArrayBuffer): Promise<string> {
+    return this.bytesToBase64(new Uint8Array(await this.encryptContentBytesRaw(content)));
+  }
+
+  /** Encrypt raw bytes without base64 expansion for presigned direct transfer. */
+  private async encryptContentBytesRaw(content: ArrayBuffer): Promise<ArrayBuffer> {
     if (!this.keyLease || this.isKeyLeaseExpired()) {
       throw new Error(
         "VaultGuard Sync: Cannot encrypt - no valid key lease. Please reconnect."
@@ -8012,7 +9147,7 @@ export default class VaultGuardPlugin extends Plugin {
     combined.set(nonce);
     combined.set(new Uint8Array(ciphertext), nonce.length);
 
-    return this.bytesToBase64(combined);
+    return combined.buffer;
   }
 
   /**
@@ -8064,6 +9199,12 @@ export default class VaultGuardPlugin extends Plugin {
    * @throws Error if decryption fails or no valid key lease
    */
   private async decryptContentBytes(encryptedContent: string): Promise<ArrayBuffer> {
+    const combined = this.base64ToBytes(encryptedContent);
+    return this.decryptContentBytesRaw(combined.buffer as ArrayBuffer);
+  }
+
+  /** Decrypt raw direct-transfer bytes and authenticate the AES-GCM envelope. */
+  private async decryptContentBytesRaw(encryptedContent: ArrayBuffer): Promise<ArrayBuffer> {
     if (!this.keyLease || this.isKeyLeaseExpired()) {
       throw new Error(
         "VaultGuard Sync: Cannot decrypt - no valid key lease. Please reconnect."
@@ -8071,7 +9212,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
     this.assertLeaseMatchesBoundVault("decrypt");
 
-    const combined = this.base64ToBytes(encryptedContent);
+    const combined = new Uint8Array(encryptedContent);
 
     // Nonce (first 12 bytes) + ciphertext (remainder, includes auth tag).
     const nonce = combined.slice(0, 12);
@@ -8093,6 +9234,102 @@ export default class VaultGuardPlugin extends Plugin {
     );
 
     return decrypted;
+  }
+
+  /**
+   * Encrypts a large file once, uploads it through the isolated staging lane,
+   * then finalizes the canonical version. No presigned URL is persisted or
+   * included in errors, logs, diagnostics, or settings.
+   */
+  private async uploadLargeEncryptedFile(
+    path: string,
+    plaintext: ArrayBuffer,
+    contentType: string,
+    expectedVersionId?: string,
+  ) {
+    if (!this.apiClient) {
+      throw new Error("VaultGuard Sync: Direct transfer is unavailable before sign-in.");
+    }
+    if (!this.keyLease || this.isKeyLeaseExpired()) {
+      throw new Error("VaultGuard Sync: A current key lease is required for large files.");
+    }
+    this.assertLeaseMatchesBoundVault("encrypt");
+    const encrypted = await this.encryptContentBytesRaw(plaintext);
+    const plaintextSha256 = await this.computeHashBytes(plaintext);
+    const encryptedSha256 = await this.computeHashBytes(encrypted);
+    const result = await this.apiClient.uploadLargeEncryptedFile(path, encrypted, {
+      plaintextSize: plaintext.byteLength,
+      encryptedSize: encrypted.byteLength,
+      plaintextSha256,
+      encryptedSha256,
+      contentType,
+      activeKeyId: this.keyLease.keyId ?? this.keyLease.leaseId,
+      ...(expectedVersionId ? { expectedVersionId } : {}),
+    });
+    return {
+      path: this.normalizeVaultPath(result.path),
+      hash: plaintextSha256,
+      size: plaintext.byteLength,
+      lastModified: result.lastModified,
+      versionId: result.versionId,
+      transferId: result.transferId,
+    };
+  }
+
+  /** Download, hash-check, and decrypt a direct-transfer object before mutation. */
+  private async downloadLargeEncryptedFile(path: string, versionId?: string) {
+    if (!this.apiClient) {
+      throw new Error("VaultGuard Sync: Direct transfer is unavailable before sign-in.");
+    }
+    const capability = await this.apiClient.issueDirectDownload(path, versionId);
+    const encrypted = await this.apiClient.getDirectDownload(capability);
+    const encryptedSha256 = await this.computeHashBytes(encrypted);
+    if (encryptedSha256 !== capability.encryptedSha256) {
+      throw new Error("VaultGuard direct download failed encrypted integrity verification.");
+    }
+    const bytes = await this.decryptContentBytesRaw(encrypted);
+    if (bytes.byteLength !== capability.plaintextSize) {
+      throw new Error("VaultGuard direct download failed plaintext size verification.");
+    }
+    const plaintextSha256 = await this.computeHashBytes(bytes);
+    if (plaintextSha256 !== capability.plaintextSha256) {
+      throw new Error("VaultGuard direct download failed plaintext integrity verification.");
+    }
+    return {
+      bytes,
+      plaintextSize: capability.plaintextSize,
+      plaintextSha256,
+      contentType: capability.contentType,
+      versionId: capability.versionId,
+    };
+  }
+
+  private async upsertPendingLargeFile(record: PendingLargeFileRecord): Promise<void> {
+    const path = this.normalizeVaultPath(record.path);
+    const current = this.settings.pendingLargeFiles?.[path];
+    this.settings.pendingLargeFiles = {
+      ...(this.settings.pendingLargeFiles ?? {}),
+      [path]: {
+        ...record,
+        path,
+        attempts: Math.max(record.attempts, current?.attempts ?? 0),
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    await this.saveSettings();
+    this.updateStatusBar();
+    this.reloadVaultGuardSidebar();
+  }
+
+  private async clearPendingLargeFile(path: string): Promise<void> {
+    const normalized = this.normalizeVaultPath(path);
+    const pending = { ...(this.settings.pendingLargeFiles ?? {}) };
+    if (!(normalized in pending)) return;
+    delete pending[normalized];
+    this.settings.pendingLargeFiles = pending;
+    await this.saveSettings();
+    this.updateStatusBar();
+    this.reloadVaultGuardSidebar();
   }
 
   /**
@@ -8973,6 +10210,36 @@ export default class VaultGuardPlugin extends Plugin {
     doc.body.toggleClass("vaultguard-auth-logged-in", loggedIn);
   }
 
+  /**
+   * Enforce the VaultGuard ribbon icon presentation once the layout is ready:
+   * when the user has turned the quick-access icons off, remove the AI-chat and
+   * permissions-graph icons; otherwise force them into a stable
+   * shield -> chat -> graph group, overriding whatever per-vault ribbon order
+   * Obsidian may have persisted. The shield (VaultGuard menu) icon is always kept.
+   * Public so the settings toggle can re-apply it live.
+   */
+  applyRibbonIconLayout(): void {
+    try {
+      if (this.settings.showRibbonIcons === false) {
+        this.vaultGuardChatRibbonEl?.remove();
+        this.vaultGuardChatRibbonEl = null;
+        this.vaultGuardGraphRibbonEl?.remove();
+        this.vaultGuardGraphRibbonEl = null;
+        return;
+      }
+      const shield = this.vaultGuardRibbonEl;
+      if (shield && this.vaultGuardChatRibbonEl) {
+        shield.insertAdjacentElement("afterend", this.vaultGuardChatRibbonEl);
+      }
+      const anchor = this.vaultGuardChatRibbonEl ?? shield;
+      if (anchor && this.vaultGuardGraphRibbonEl) {
+        anchor.insertAdjacentElement("afterend", this.vaultGuardGraphRibbonEl);
+      }
+    } catch (error) {
+      this.logError("Applying VaultGuard ribbon icon layout failed", error);
+    }
+  }
+
   private updateRibbonAuthIndicator(): void {
     const shieldEl = this.vaultGuardRibbonEl;
     const ribbonEls = [
@@ -9038,6 +10305,10 @@ export default class VaultGuardPlugin extends Plugin {
     if (!this.statusBarEl) {
       return;
     }
+    this.i18n.applyToRoot(this.statusBarEl);
+    this.statusBarEl.setAttr("role", "status");
+    this.statusBarEl.setAttr("aria-live", "polite");
+    this.statusBarEl.setAttr("aria-atomic", "true");
 
     const longOperation = this.longOperations.getPrimarySnapshot();
     if (longOperation) {
@@ -9055,34 +10326,34 @@ export default class VaultGuardPlugin extends Plugin {
     // idle-state (it has its own curtain) or the intentional `disabled` state.
     if (this.getAtRestStatus().kind === "needs-recovery") {
       this.statusBarEl.classList?.add("vaultguard-status-at-rest-locked");
-      this.statusBarEl.setText("VaultGuard Sync 🔒 Encryption locked");
+      this.statusBarEl.setText(this.i18n.t("status.encryptionLocked"));
       this.statusBarEl.setAttr(
         "title",
-        "Local at-rest encryption can't unlock on this device — sync is paused. Click to fix."
+        this.i18n.t("status.encryptionLockedDetail")
       );
       return;
     }
 
     if (!this.session) {
       if (this.lastLogoutAuthState) {
-        this.statusBarEl.setText("VaultGuard Sync: Logged out");
+        this.statusBarEl.setText(this.i18n.t("status.loggedOut"));
         this.statusBarEl.setAttr(
           "title",
           `${this.lastLogoutAuthState.title}: ${this.lastLogoutAuthState.detail ?? this.lastLogoutAuthState.message}`
         );
       } else {
-        this.statusBarEl.setText("VaultGuard Sync: Not logged in");
+        this.statusBarEl.setText(this.i18n.t("status.notLoggedIn"));
         this.statusBarEl.setAttr(
           "title",
-          "VaultGuard Sync is not connected. Log in to enable cloud sync."
+          this.i18n.t("status.notConnectedDetail")
         );
       }
       return;
     }
 
     if (this.permissionWarmupInFlight > 0) {
-      this.statusBarEl.setText("VaultGuard Sync ↻ Loading permissions...");
-      this.statusBarEl.setAttr("title", "VaultGuard Sync is loading file permissions.");
+      this.statusBarEl.setText(this.i18n.t("status.loadingPermissions"));
+      this.statusBarEl.setAttr("title", this.i18n.t("status.loadingPermissionsDetail"));
       return;
     }
 
@@ -9094,14 +10365,14 @@ export default class VaultGuardPlugin extends Plugin {
           : "\u2717";
 
     const statusText = this.connectionState.status === "online"
-      ? "Connected"
-      : "Offline";
+      ? this.i18n.t("status.connected")
+      : this.i18n.t("status.offline");
 
     this.statusBarEl.setText(`VaultGuard Sync ${connectionIcon} ${statusText}`);
     this.statusBarEl.setAttr(
       "title",
       `VaultGuard Sync: ${statusText}${
-        this.session.email ? ` as ${this.session.email}` : ""
+        this.session.email ? this.i18n.t("status.asUser", { email: this.session.email }) : ""
       }`
     );
   }
@@ -9418,6 +10689,30 @@ export default class VaultGuardPlugin extends Plugin {
     this.syncFileExplorerDecorationsState(true);
   }
 
+  private openAdminModal(
+    initialTab: "users" | "permissions" | "audit" | "settings" | "recovery",
+    permissionsUserId: string | null,
+    permissionsInitialSearch?: string,
+  ): void {
+    const apiClient = this.apiClient;
+    if (!apiClient) return;
+    const context = this.createAdminModalContext(permissionsInitialSearch);
+    void import("../admin/admin-modal")
+      .then(({ AdminModal }) => {
+        new AdminModal(
+          this.app,
+          apiClient,
+          initialTab,
+          permissionsUserId,
+          context,
+        ).open();
+      })
+      .catch((error) => {
+        this.logError("Could not load organization administration", error);
+        new Notice("VaultGuard Sync: organization administration could not be opened.");
+      });
+  }
+
   /**
    * Shows a modal displaying the current user's permissions across the vault.
    */
@@ -9432,14 +10727,7 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
-    const modal = new AdminModal(
-      this.app,
-      this.apiClient,
-      "permissions",
-      this.session.userId,
-      this.createAdminModalContext()
-    );
-    modal.open();
+    this.openAdminModal("permissions", this.session.userId);
   }
 
   /**
@@ -9468,14 +10756,7 @@ export default class VaultGuardPlugin extends Plugin {
     }
     // Opens the Organization Admin modal at the "Vault access" tab, which now
     // renders the full permission-rules table (PermissionRulesView).
-    const modal = new AdminModal(
-      this.app,
-      this.apiClient,
-      "permissions",
-      null,
-      this.createAdminModalContext(initialSearch)
-    );
-    modal.open();
+    this.openAdminModal("permissions", null, initialSearch);
   }
 
   /**
@@ -9486,7 +10767,10 @@ export default class VaultGuardPlugin extends Plugin {
    */
   notifyPermissionRulesChanged(): void {
     this.permissionStore.invalidate();
-    this.permissionStore.emit("changed", { serverConfirmed: true });
+    this.permissionStore.emit("changed", {
+      serverConfirmed: true,
+      semanticAuthorityChanged: true,
+    });
     void this.runPermissionWarmup().catch((err) =>
       this.logError("Permission re-warm after rule change failed", err)
     );
@@ -9496,6 +10780,7 @@ export default class VaultGuardPlugin extends Plugin {
     return {
       orgId: this.settings.organizationId,
       orgSlug: this.settings.orgSlug,
+      currentVaultId: this.settings.serverVaultId || undefined,
       currentUser: this.session
         ? {
             id: this.session.userId,
@@ -9530,14 +10815,7 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
-    const modal = new AdminModal(
-      this.app,
-      this.apiClient,
-      "users",
-      null,
-      this.createAdminModalContext()
-    );
-    modal.open();
+    this.openAdminModal("users", null);
   }
 
   /**
@@ -9559,13 +10837,7 @@ export default class VaultGuardPlugin extends Plugin {
     // would hide the audit tab and override initialTab="audit" back to
     // "permissions" (admin-modal.ts:211). Pass null to get the full admin
     // view with all 5 tabs including audit.
-    new AdminModal(
-      this.app,
-      this.apiClient,
-      "audit",
-      null,
-      this.createAdminModalContext()
-    ).open();
+    this.openAdminModal("audit", null);
   }
 
   /**
@@ -9583,7 +10855,13 @@ export default class VaultGuardPlugin extends Plugin {
       new Notice("VaultGuard Sync: not connected to a server.");
       return;
     }
-    new AuditConfigModal(this.app, this.apiClient).open();
+    const apiClient = this.apiClient;
+    void import("../admin/audit-config-modal")
+      .then(({ AuditConfigModal }) => new AuditConfigModal(this.app, apiClient).open())
+      .catch((error) => {
+        this.logError("Could not load audit settings", error);
+        new Notice("VaultGuard Sync: audit settings could not be opened.");
+      });
   }
 
   /**
@@ -9598,7 +10876,9 @@ export default class VaultGuardPlugin extends Plugin {
     }
     if (!this.session) return;
     if (!this.featureEnabled("webAdmin")) {
-      new ProUpsellModal(this.app, "webAdmin").open();
+      void import("../ui/pro-upsell-modal")
+        .then(({ ProUpsellModal }) => new ProUpsellModal(this.app, "webAdmin").open())
+        .catch((error) => this.logError("Could not load the upgrade dialog", error));
       return;
     }
     const slug = this.settings.orgSlug?.trim() || "";
@@ -9648,7 +10928,10 @@ export default class VaultGuardPlugin extends Plugin {
         // `/docs/**` rule from this file's panel), so per-path invalidation
         // would leave sibling files showing stale colors. The four init*
         // bus subscriptions handle the surface invalidations.
-        this.permissionStore.emit("changed", { serverConfirmed: true });
+        this.permissionStore.emit("changed", {
+          serverConfirmed: true,
+          semanticAuthorityChanged: true,
+        });
       },
       onOpenRulesOverview: (filter) => this.showPermissionRulesModal(filter),
     });
@@ -9670,11 +10953,22 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     const rulePath = isFolder ? (path.endsWith("/") ? path : path + "/") : path;
-    const editor = new PermissionEditor(this.app, this.apiClient);
-    editor.showAddRuleForPath(rulePath, async () => {
-      // Phase 9: single bus emit replaces the 5-call fan-out.
-      this.permissionStore.emit("changed", { serverConfirmed: true });
-    });
+    const apiClient = this.apiClient;
+    void import("../admin/permission-editor")
+      .then(({ PermissionEditor }) => {
+        const editor = new PermissionEditor(this.app, apiClient);
+        editor.showAddRuleForPath(rulePath, async () => {
+          // Phase 9: single bus emit replaces the 5-call fan-out.
+          this.permissionStore.emit("changed", {
+            serverConfirmed: true,
+            semanticAuthorityChanged: true,
+          });
+        });
+      })
+      .catch((error) => {
+        this.logError("Could not load permission editing", error);
+        new Notice("VaultGuard Sync: permission editing could not be opened.");
+      });
   }
 
   // ─────────────────────────────────────────────────────────────────────────

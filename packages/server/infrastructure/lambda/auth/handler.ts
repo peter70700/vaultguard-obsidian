@@ -42,6 +42,7 @@ import {
   requireOrgId,
   assertUserNotRevoked,
   requireVaultMember,
+  getVaultMembership,
   AuthError,
   ValidationError,
   UserContext,
@@ -60,6 +61,7 @@ import {
   BatchWriteCommand,
   getEffectiveOrgSettings,
 } from '../shared/utils';
+import { clampLeaseExpiration } from '../shared/guest-access';
 import { sendEmail } from '../email/handler';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -111,6 +113,8 @@ interface KeyLease {
   refreshToken: string;
   /** Lease ID for tracking and revocation. */
   leaseId: string;
+  /** Stable identifier of the vault DEK carried by this lease. */
+  keyId: string;
   /** Encryption algorithm used by the plugin. */
   algorithm: 'AES-256-GCM';
   /** Whether the lease may be used while temporarily offline. */
@@ -135,6 +139,7 @@ interface LeaseRecord {
   sessionId: string;
   orgId: string;
   encryptedDataKey: string;
+  keyId: string;
   refreshToken: string;
   status: 'active' | 'expired' | 'revoked';
   issuedAt: string;
@@ -159,6 +164,8 @@ interface ScopeDataKey {
   vaultId?: string;
   scope: string;
   encryptedDataKey: string;
+  /** Stable DEK identifier. Absent only on pre-keyId legacy rows. */
+  keyId?: string;
   status: 'active' | 'rotated' | 'revoked';
   createdAt: string;
   lastUsedAt: string;
@@ -482,6 +489,7 @@ async function handleRefresh(
   const renewalScope = existingLease.scope || '/**';
   const renewalVaultId = existingLease.vaultId;
   await requireVaultMember(user, renewalVaultId, 'viewer');
+  const renewalAccessExpiresAt = await resolveLeaseAccessExpiry(user, renewalVaultId);
 
   // Re-run the same complete scope evaluation used for initial lease issuance.
   // Otherwise an existing broad `/**` lease could be renewed after an admin
@@ -558,7 +566,8 @@ async function handleRefresh(
     user.orgId,
     renewalScope,
     renewalVaultId,
-    renewalAuthorization.deniedPaths
+    renewalAuthorization.deniedPaths,
+    renewalAccessExpiresAt
   );
 
   await logAudit({
@@ -738,6 +747,7 @@ async function handleGetKeyLease(
   }
 
   await requireVaultMember(user, vaultId, 'viewer');
+  const accessExpiresAt = await resolveLeaseAccessExpiry(user, vaultId);
   const authorization = await collectScopeReadDenyRules(
     user,
     vaultId,
@@ -768,7 +778,8 @@ async function handleGetKeyLease(
     user.orgId,
     '/**',
     vaultId,
-    authorization.deniedPaths
+    authorization.deniedPaths,
+    accessExpiresAt
   );
 
   await logAudit({
@@ -786,6 +797,7 @@ async function handleGetKeyLease(
     metadata: {
       vaultId,
       leaseId: keyLease.leaseId,
+      keyId: keyLease.keyId,
       expiresAt: keyLease.expiresAt,
       denyCount: authorization.deniedPaths.length,
       deniedRuleIds: authorization.deniedPaths.map((entry) => entry.ruleId),
@@ -1228,6 +1240,7 @@ async function readScopeDataKey(orgId: string, scope: string, vaultId?: string):
 async function getOrCreateScopeDataKey(orgId: string, scope: string, vaultId?: string): Promise<{
   plaintextKey: Buffer;
   encryptedDataKey: string;
+  keyId: string;
 }> {
   const existing = await readScopeDataKey(orgId, scope, vaultId);
   if (existing) {
@@ -1243,6 +1256,7 @@ async function getOrCreateScopeDataKey(orgId: string, scope: string, vaultId?: s
     return {
       plaintextKey: await decryptScopeDataKey(existing),
       encryptedDataKey: existing.encryptedDataKey,
+      keyId: existing.keyId || 'legacy',
     };
   }
 
@@ -1260,6 +1274,7 @@ async function getOrCreateScopeDataKey(orgId: string, scope: string, vaultId?: s
 
   const now = new Date().toISOString();
   const encryptedDataKey = Buffer.from(dataKeyResponse.CiphertextBlob).toString('base64');
+  const keyId = generateId();
   const record: ScopeDataKey = {
     pk: scopeKeyPk(orgId, scope, vaultId),
     sk: 'ACTIVE',
@@ -1267,6 +1282,7 @@ async function getOrCreateScopeDataKey(orgId: string, scope: string, vaultId?: s
     ...(vaultId ? { vaultId } : {}),
     scope,
     encryptedDataKey,
+    keyId,
     status: 'active',
     createdAt: now,
     lastUsedAt: now,
@@ -1295,12 +1311,14 @@ async function getOrCreateScopeDataKey(orgId: string, scope: string, vaultId?: s
     return {
       plaintextKey: await decryptScopeDataKey(racedRecord),
       encryptedDataKey: racedRecord.encryptedDataKey,
+      keyId: racedRecord.keyId || 'legacy',
     };
   }
 
   return {
     plaintextKey: Buffer.from(dataKeyResponse.Plaintext),
     encryptedDataKey,
+    keyId,
   };
 }
 
@@ -1316,13 +1334,26 @@ async function getOrCreateScopeDataKey(orgId: string, scope: string, vaultId?: s
  *                  ciphertext from any vault in the org.
  * @returns A KeyLease object with usable key material and expiry
  */
+async function resolveLeaseAccessExpiry(
+  user: UserContext,
+  vaultId: string,
+): Promise<string | undefined> {
+  if (isAdmin(user)) return undefined;
+  const membership = await getVaultMembership(vaultId, user.userId);
+  if (!membership) {
+    throw new AuthError(`You are not an active member of this vault: ${vaultId}`, 403);
+  }
+  return membership.expiresAt;
+}
+
 async function issueKeyLease(
   userId: string,
   sessionId: string,
   orgId: string,
   scope: string,
   vaultId: string,
-  deniedPaths: LeaseDeniedPath[] = []
+  deniedPaths: LeaseDeniedPath[] = [],
+  accessExpiresAt?: string
 ): Promise<KeyLease> {
   if (!vaultId) {
     throw new ValidationError('vaultId is required to issue a key lease');
@@ -1333,7 +1364,11 @@ async function issueKeyLease(
   const leaseId = generateId();
   const now = new Date();
   const issuedAt = now.toISOString();
-  const expiresAt = new Date(now.getTime() + KEY_LEASE_DURATION_SECONDS * 1000).toISOString();
+  const expiresAt = clampLeaseExpiration(
+    now.getTime(),
+    KEY_LEASE_DURATION_SECONDS,
+    accessExpiresAt,
+  );
   const refreshToken = generateSecretToken();
   // TTL: 7 days after lease expiry for DynamoDB auto-cleanup
   const expiresAtTtl = Math.floor(new Date(expiresAt).getTime() / 1000) + 7 * 24 * 60 * 60;
@@ -1345,6 +1380,7 @@ async function issueKeyLease(
     sessionId,
     orgId,
     encryptedDataKey: scopeKey.encryptedDataKey,
+    keyId: scopeKey.keyId,
     refreshToken,
     status: 'active',
     issuedAt,
@@ -1368,6 +1404,7 @@ async function issueKeyLease(
     expiresAt,
     refreshToken,
     leaseId,
+    keyId: scopeKey.keyId,
     algorithm: 'AES-256-GCM',
     offlineCapable: true,
     scope,
@@ -1844,6 +1881,7 @@ async function handleScopedKeyLease(
 
   // Vault membership check — leases are bound to a specific vault.
   await requireVaultMember(user, vaultId, 'viewer');
+  const accessExpiresAt = await resolveLeaseAccessExpiry(user, vaultId);
 
   const authorization = await collectScopeReadDenyRules(
     user,
@@ -1889,7 +1927,8 @@ async function handleScopedKeyLease(
     user.orgId,
     scope,
     vaultId,
-    authorization.deniedPaths
+    authorization.deniedPaths,
+    accessExpiresAt
   );
 
   await logAudit({

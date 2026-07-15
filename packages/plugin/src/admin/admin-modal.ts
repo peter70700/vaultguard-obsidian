@@ -25,12 +25,14 @@ import { UserManager } from "./user-manager";
 import { getAccessUserDisplayName } from "../ui/access-user-utils";
 import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import type { ServerFeatures } from "../types";
+import { createI18n } from "../i18n";
 
 type TabId = "users" | "permissions" | "audit" | "settings" | "recovery";
 type OrgSettings = OrgSettingsResponse;
 type AdminModalContext = {
   orgId?: string;
   orgSlug?: string;
+  currentVaultId?: string;
   currentUser?: {
     id: string;
     displayName?: string;
@@ -117,6 +119,7 @@ function errorMessage(error: unknown): string {
 }
 
 export class AdminModal extends Modal {
+  private readonly i18n = createI18n();
   private activeTab: TabId;
   private apiClient: VaultGuardApiClient;
   private permissionsUserId: string | null;
@@ -149,7 +152,7 @@ export class AdminModal extends Modal {
     this.apiClient = apiClient;
     this.permissionsUserId = permissionsUserId;
     this.context = context;
-    this.userManager = new UserManager(app, apiClient);
+    this.userManager = new UserManager(app, apiClient, context.currentVaultId);
     this.permissionEditor = new PermissionEditor(app, apiClient);
     this.seedCurrentUserIdentity();
   }
@@ -159,6 +162,7 @@ export class AdminModal extends Modal {
     contentEl.replaceChildren();
     this.modalEl.classList.add("vaultguard-admin-modal");
     contentEl.classList.add("vaultguard-admin-modal-content");
+    this.i18n.applyToRoot(contentEl);
 
     // Modal header
     const header = this.createDivElement(contentEl, "vaultguard-admin-header");
@@ -166,10 +170,15 @@ export class AdminModal extends Modal {
     title.textContent = this.permissionsUserId
       ? "VaultGuard - My Vault Access"
       : "VaultGuard - Organization Admin";
+    title.id = "vaultguard-admin-modal-title";
     header.appendChild(title);
+    this.modalEl.setAttribute("aria-labelledby", title.id);
 
     // Connection status indicator (updates reactively)
     this.statusEl = this.createDivElement(header, "vaultguard-connection-status");
+    this.statusEl.setAttribute("role", "status");
+    this.statusEl.setAttribute("aria-live", "polite");
+    this.statusEl.setAttribute("aria-atomic", "true");
     this.renderConnectionStatus(this.statusEl);
     this.unsubscribeConnection = this.apiClient.onConnectionStatusChange(() => {
       this.renderConnectionStatus(this.statusEl);
@@ -177,10 +186,15 @@ export class AdminModal extends Modal {
 
     // Tab navigation
     this.tabContainer = this.createDivElement(contentEl, "vaultguard-tab-nav");
+    this.tabContainer.setAttribute("role", "tablist");
+    this.tabContainer.setAttribute("aria-label", "Organization administration");
     this.renderTabs();
 
     // Content area
     this.contentContainer = this.createDivElement(contentEl, "vaultguard-tab-content");
+    this.contentContainer.id = "vaultguard-admin-tabpanel";
+    this.contentContainer.setAttribute("role", "tabpanel");
+    this.contentContainer.setAttribute("tabindex", "0");
     this.renderActiveTab();
   }
 
@@ -230,22 +244,62 @@ export class AdminModal extends Modal {
     }
 
     for (const tab of tabs) {
-      const tabEl = this.tabContainer.createDiv({
+      const isActive = this.activeTab === tab.id;
+      const tabEl = this.tabContainer.createEl("button", {
         cls: `vaultguard-tab ${this.activeTab === tab.id ? "vaultguard-tab-active" : ""}`,
+        attr: {
+          type: "button",
+          role: "tab",
+          id: `vaultguard-admin-tab-${tab.id}`,
+          "data-tab-id": tab.id,
+          "aria-selected": String(isActive),
+          "aria-controls": "vaultguard-admin-tabpanel",
+          tabindex: isActive ? "0" : "-1",
+        },
       });
       const iconSpan = tabEl.createSpan({ cls: "vaultguard-tab-icon" });
       setIcon(iconSpan, tab.icon);
       tabEl.createSpan({ text: tab.label });
       tabEl.addEventListener("click", () => {
-        this.activeTab = tab.id;
-        this.renderTabs();
-        this.renderActiveTab();
+        this.activateTab(tab.id, true);
       });
+      tabEl.addEventListener("keydown", (event) => {
+        const index = tabs.findIndex((candidate) => candidate.id === tab.id);
+        let nextIndex: number | null = null;
+        if (event.key === "Home") nextIndex = 0;
+        if (event.key === "End") nextIndex = tabs.length - 1;
+        if (event.key === "ArrowRight") {
+          const delta = this.i18n.direction === "rtl" ? -1 : 1;
+          nextIndex = (index + delta + tabs.length) % tabs.length;
+        }
+        if (event.key === "ArrowLeft") {
+          const delta = this.i18n.direction === "rtl" ? 1 : -1;
+          nextIndex = (index + delta + tabs.length) % tabs.length;
+        }
+        if (nextIndex === null) return;
+        event.preventDefault();
+        this.activateTab(tabs[nextIndex].id, true);
+      });
+    }
+  }
+
+  private activateTab(tabId: TabId, focus: boolean): void {
+    this.activeTab = tabId;
+    this.renderTabs();
+    this.renderActiveTab();
+    if (focus) {
+      this.tabContainer
+        .querySelector<HTMLElement>(`[data-tab-id="${tabId}"]`)
+        ?.focus();
     }
   }
 
   private renderActiveTab(): void {
     this.contentContainer.replaceChildren();
+    this.contentContainer.setAttribute(
+      "aria-labelledby",
+      `vaultguard-admin-tab-${this.activeTab}`,
+    );
 
     switch (this.activeTab) {
       case "users":
@@ -269,6 +323,8 @@ export class AdminModal extends Modal {
   private renderTabError(error: unknown): void {
     this.contentContainer.replaceChildren();
     const errorEl = this.createDivElement(this.contentContainer, "vaultguard-error");
+    errorEl.setAttribute("role", "alert");
+    errorEl.setAttribute("aria-live", "assertive");
     errorEl.textContent = `Failed to render ${this.activeTab}: ${errorMessage(error)}`;
   }
 
@@ -355,6 +411,8 @@ export class AdminModal extends Modal {
   private async renderPermissionTree(container: HTMLElement): Promise<void> {
     container.empty();
     const loadingEl = container.createDiv({ cls: "vaultguard-loading" });
+    loadingEl.setAttribute("role", "status");
+    loadingEl.setAttribute("aria-live", "polite");
     loadingEl.createSpan({ text: "Loading permissions..." });
 
     try {
@@ -408,14 +466,20 @@ export class AdminModal extends Modal {
         // Edit/Delete actions
         if (!this.permissionsUserId) {
           const actionsEl = headerEl.createDiv({ cls: "vaultguard-tree-actions" });
-          const editBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn" });
+          const editBtn = actionsEl.createEl("button", {
+            cls: "vaultguard-icon-btn",
+            attr: { type: "button", title: "Edit permission", "aria-label": "Edit permission" },
+          });
           setIcon(editBtn, "pencil");
           editBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.permissionEditor.showEditRuleDialog(container, rule);
           });
 
-          const deleteBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn vaultguard-danger" });
+          const deleteBtn = actionsEl.createEl("button", {
+            cls: "vaultguard-icon-btn vaultguard-danger",
+            attr: { type: "button", title: "Delete permission", "aria-label": "Delete permission" },
+          });
           setIcon(deleteBtn, "trash");
           deleteBtn.addEventListener("click", (e) => {
             e.stopPropagation();
@@ -425,10 +489,11 @@ export class AdminModal extends Modal {
       }
     } catch (error) {
       container.empty();
-      container.createDiv({
+      const errorEl = container.createDiv({
         cls: "vaultguard-error",
         text: `Failed to load permissions: ${errorMessage(error)}`,
       });
+      errorEl.setAttribute("role", "alert");
     }
   }
 
@@ -803,6 +868,8 @@ export class AdminModal extends Modal {
       this.auditCursor = null;
       this.auditHasMore = false;
       const loadingEl = container.createDiv({ cls: "vaultguard-loading" });
+      loadingEl.setAttribute("role", "status");
+      loadingEl.setAttribute("aria-live", "polite");
       loadingEl.createSpan({ text: "Loading audit log..." });
     }
 
@@ -860,10 +927,11 @@ export class AdminModal extends Modal {
       if (!append) {
         container.empty();
       }
-      container.createDiv({
+      const errorEl = container.createDiv({
         cls: "vaultguard-error",
         text: `Failed to load audit log: ${errorMessage(error)}`,
       });
+      errorEl.setAttribute("role", "alert");
     }
   }
 
@@ -1233,7 +1301,8 @@ export class AdminModal extends Modal {
       const job = data.job;
 
       if (!job) {
-        statusEl.createEl("p", { text: "Job not found.", cls: "vaultguard-error" });
+        const errorEl = statusEl.createEl("p", { text: "Job not found.", cls: "vaultguard-error" });
+        errorEl.setAttribute("role", "alert");
         return;
       }
 
@@ -1279,10 +1348,11 @@ export class AdminModal extends Modal {
         }
       }
     } catch (error) {
-      statusEl.createEl("p", {
+      const errorEl = statusEl.createEl("p", {
         text: `Failed to fetch status: ${errorMessage(error)}`,
         cls: "vaultguard-error",
       });
+      errorEl.setAttribute("role", "alert");
     }
   }
 
@@ -1290,6 +1360,8 @@ export class AdminModal extends Modal {
     const container = this.contentContainer.createDiv({ cls: "vaultguard-settings-tab" });
 
     const loadingEl = container.createDiv({ cls: "vaultguard-loading" });
+    loadingEl.setAttribute("role", "status");
+    loadingEl.setAttribute("aria-live", "polite");
     loadingEl.createSpan({ text: "Loading settings..." });
 
     try {
@@ -1316,10 +1388,11 @@ export class AdminModal extends Modal {
         return;
       }
 
-      container.createDiv({
+      const errorEl = container.createDiv({
         cls: "vaultguard-error",
         text: `Failed to load settings: ${errorMessage(error)}`,
       });
+      errorEl.setAttribute("role", "alert");
     }
   }
 

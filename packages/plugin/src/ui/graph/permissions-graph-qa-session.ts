@@ -19,6 +19,15 @@ import {
   type PermissionsGraphModel,
 } from "./permissions-graph-model";
 import {
+  buildPermissionsGraphOverviewBuffers,
+  type PermissionsGraphOverviewBuffers,
+} from "./permissions-graph-overview-buffers";
+import {
+  buildPermissionsGraphOverviewEdges,
+  type PermissionsGraphOverviewEdgeMode,
+  type PermissionsGraphOverviewEdgeSnapshot,
+} from "./permissions-graph-overview-edges";
+import {
   createPermissionsGraphVirtualQaFixture,
   validatePermissionsGraphVirtualQaFixture,
   type PermissionsGraphVirtualQaFixture,
@@ -36,6 +45,8 @@ import { PermissionsGraphSpatialIndex } from "./permissions-graph-spatial";
 
 const ACTIVE_NODE_CAP = 900;
 const ACTIVE_EDGE_CAP = 1_600;
+export const PERMISSIONS_GRAPH_STRESS_EVIDENCE_PHASE_G_MARKER =
+  "vg-permissions-graph-stress-evidence-phase-g-v1";
 
 export type PermissionsGraphVirtualQaRunStatus = "completed" | "cancelled";
 
@@ -56,6 +67,29 @@ export interface PermissionsGraphVirtualQaEvidence {
     PermissionsGraphLayoutMemoryEstimate,
     "typedArrayBytes" | "idMetadataBytes" | "manualMetadataBytes" | "totalEstimatedBytes" | "perNodeEstimatedBytes"
   >;
+  readonly overview: {
+    readonly enabled: true;
+    readonly nodeCount: number;
+    readonly bufferBytes: number;
+    readonly edges: {
+      readonly enabled: boolean;
+      readonly mode: PermissionsGraphOverviewEdgeMode | "not-run";
+      readonly eligibleEdgeCount: number;
+      readonly representedEdgeCount: number;
+      readonly emittedSegmentCount: number;
+      readonly prioritySegmentCount: number;
+      readonly ordinarySampleSegmentCount: number;
+      readonly bundleSegmentCount: number;
+      readonly densitySegmentCount: number;
+      readonly bundledEdgeCount: number;
+      readonly omittedEdgeCount: number;
+      readonly exact: boolean;
+      readonly bufferBytes: number;
+      readonly expectedGpuMirrorBytes: number;
+      readonly bufferFingerprint: string | null;
+      readonly diagnostics: readonly string[];
+    };
+  };
   readonly planStatus: {
     readonly viewport: "ready" | "not-run";
     readonly hover: "ready" | "not-run";
@@ -76,6 +110,42 @@ export interface PermissionsGraphVirtualQaEvidence {
     readonly requested: boolean;
     readonly status: "not-cancelled" | "cancelled";
   };
+  readonly phaseG: {
+    readonly marker: typeof PERMISSIONS_GRAPH_STRESS_EVIDENCE_PHASE_G_MARKER;
+    readonly edge: {
+      readonly mode: PermissionsGraphOverviewEdgeMode | "not-run";
+      readonly eligibleEdgeCount: number;
+      readonly emittedSegmentCount: number;
+      readonly omittedEdgeCount: number;
+    };
+    readonly transition: {
+      readonly status: "completed" | "not-run";
+      readonly mode: "animated" | "immediate" | "not-run";
+      readonly progress: number;
+      readonly movedNodeCount: number;
+      readonly frameCount: number;
+      readonly droppedFrameCount: 0;
+      readonly skippedFrameCount: number;
+    };
+    readonly spatial: {
+      readonly indexedNodeCount: number;
+      readonly skippedNodeCount: number;
+      readonly rebuildCount: number;
+      readonly incrementalUpdateCount: number;
+      readonly stale: boolean;
+    };
+    readonly fallback: {
+      readonly revisionSyncRebuilt: boolean;
+    };
+    readonly lifecycle: {
+      readonly resourcesPublished: boolean;
+      readonly cancellationSafe: true;
+    };
+    readonly privacy: {
+      readonly allowlisted: true;
+      readonly forbiddenValueCount: 0;
+    };
+  };
   readonly diagnostics: readonly string[];
   readonly timingsMs: Readonly<Record<string, number>> & { readonly total: number };
   readonly safety: {
@@ -92,6 +162,8 @@ export interface PermissionsGraphVirtualQaResources {
   readonly model: PermissionsGraphModel;
   readonly index: PermissionsGraphIndex;
   readonly layout: PermissionsGraphLayoutStore;
+  readonly overviewBuffers: PermissionsGraphOverviewBuffers;
+  readonly overviewEdges: PermissionsGraphOverviewEdgeSnapshot;
   readonly spatial: PermissionsGraphSpatialIndex;
   readonly activeSlice: PermissionsGraphActiveSlice;
   readonly refinement: PermissionsGraphQaRefinementResult | null;
@@ -130,6 +202,8 @@ export async function runPermissionsGraphVirtualQaPipeline(
   const diagnostics = new Set<string>();
   let fixture: PermissionsGraphVirtualQaFixture | null = null;
   let memory: PermissionsGraphLayoutMemoryEstimate | null = null;
+  let overviewBuffers: PermissionsGraphOverviewBuffers | null = null;
+  let overviewEdges: PermissionsGraphOverviewEdgeSnapshot | null = null;
 
   try {
     checkCancellation(options.signal);
@@ -174,6 +248,11 @@ export async function runPermissionsGraphVirtualQaPipeline(
       })
     );
     memory = layout.getMemoryEstimate();
+    checkCancellation(options.signal);
+
+    overviewBuffers = await measure("overviewBuffers", timings, options, () =>
+      buildPermissionsGraphOverviewBuffers({ model, index, layout })
+    );
     checkCancellation(options.signal);
 
     const spatial = await measure("spatial", timings, options, () =>
@@ -293,6 +372,34 @@ export async function runPermissionsGraphVirtualQaPipeline(
     }
     checkCancellation(options.signal);
 
+    // Phase 6 may publish a new coordinate revision. Phase D must never pair
+    // the final active slice with pre-refinement overview/spatial coordinates.
+    await measure("interactionRevisionSync", timings, options, () => {
+      spatial.rebuildIfNeeded();
+      overviewBuffers = buildPermissionsGraphOverviewBuffers({
+        model,
+        index,
+        layout,
+        state: {
+          revision: 0,
+          materializedNodeIds: activeSlice.materializedNodeIds,
+        },
+      });
+    });
+    checkCancellation(options.signal);
+
+    overviewEdges = await measure("overviewEdges", timings, options, () =>
+      buildPermissionsGraphOverviewEdges({
+        model,
+        index,
+        layout,
+        projectedMedianSpacing: 6,
+        cameraRevision: 0,
+        signal: options.signal,
+      })
+    );
+    checkCancellation(options.signal);
+
     timings.total = round(now() - startedAt);
     const evidence = freezeEvidence({
       status: "completed",
@@ -312,12 +419,26 @@ export async function runPermissionsGraphVirtualQaPipeline(
       writeBackStatus,
       refinementEdgeCount: beforeSlice.edges.length,
       cancellationRequested: false,
+      overviewBuffers,
+      overviewEdges,
+      spatial,
+      refinementResult: refinement,
       diagnostics,
       timings,
     });
     return Object.freeze({
       evidence,
-      resources: Object.freeze({ fixture, model, index, layout, spatial, activeSlice, refinement }),
+      resources: Object.freeze({
+        fixture,
+        model,
+        index,
+        layout,
+        overviewBuffers,
+        overviewEdges,
+        spatial,
+        activeSlice,
+        refinement,
+      }),
     });
   } catch (error) {
     if (
@@ -359,6 +480,10 @@ function cancelledResult(
       writeBackStatus: "skipped",
       refinementEdgeCount: 0,
       cancellationRequested: true,
+      overviewBuffers: null,
+      overviewEdges: null,
+      spatial: null,
+      refinementResult: null,
       diagnostics,
       timings,
     }),
@@ -384,6 +509,10 @@ interface EvidenceInput {
   readonly writeBackStatus: string;
   readonly refinementEdgeCount: number;
   readonly cancellationRequested: boolean;
+  readonly overviewBuffers: PermissionsGraphOverviewBuffers | null;
+  readonly overviewEdges: PermissionsGraphOverviewEdgeSnapshot | null;
+  readonly spatial: PermissionsGraphSpatialIndex | null;
+  readonly refinementResult: PermissionsGraphQaRefinementResult | null;
   readonly diagnostics: Set<string>;
   readonly timings: Record<string, number>;
 }
@@ -421,6 +550,12 @@ function freezeEvidence(input: EvidenceInput): PermissionsGraphVirtualQaEvidence
       totalEstimatedBytes: memory.totalEstimatedBytes,
       perNodeEstimatedBytes: memory.perNodeEstimatedBytes,
     }),
+    overview: Object.freeze({
+      enabled: true,
+      nodeCount: input.overviewBuffers?.nodeCount ?? 0,
+      bufferBytes: input.overviewBuffers?.memory.totalOwnedBytes ?? 0,
+      edges: freezeOverviewEdgeEvidence(input.overviewEdges),
+    }),
     planStatus: Object.freeze({
       viewport: input.status === "completed" ? "ready" : "not-run",
       hover: input.status === "completed" ? "ready" : "not-run",
@@ -441,6 +576,7 @@ function freezeEvidence(input: EvidenceInput): PermissionsGraphVirtualQaEvidence
       requested: input.cancellationRequested,
       status: input.cancellationRequested ? "cancelled" : "not-cancelled",
     }),
+    phaseG: freezePhaseGEvidence(input),
     diagnostics: Object.freeze(Array.from(input.diagnostics).sort(compareStrings)),
     timingsMs,
     safety: Object.freeze({
@@ -450,6 +586,75 @@ function freezeEvidence(input: EvidenceInput): PermissionsGraphVirtualQaEvidence
       noCacheAccess: true,
       noPersistence: true,
     }),
+  });
+}
+
+function freezePhaseGEvidence(
+  input: EvidenceInput,
+): PermissionsGraphVirtualQaEvidence["phaseG"] {
+  const transition = input.refinementResult?.transition ?? null;
+  const frameCount = transition?.frames.length ?? 0;
+  const finalProgress = transition?.frames.at(-1)?.progress ?? (transition ? 1 : 0);
+  return Object.freeze({
+    marker: PERMISSIONS_GRAPH_STRESS_EVIDENCE_PHASE_G_MARKER,
+    edge: Object.freeze({
+      mode: input.overviewEdges?.mode ?? "not-run",
+      eligibleEdgeCount: input.overviewEdges?.eligibleEdgeCount ?? 0,
+      emittedSegmentCount: input.overviewEdges?.emittedSegmentCount ?? 0,
+      omittedEdgeCount: input.overviewEdges?.omittedEdgeCount ?? 0,
+    }),
+    transition: Object.freeze({
+      status: transition ? "completed" as const : "not-run" as const,
+      mode: transition ? transition.immediate ? "immediate" as const : "animated" as const : "not-run" as const,
+      progress: finalProgress,
+      movedNodeCount: transition?.deltas.length ?? 0,
+      frameCount,
+      droppedFrameCount: 0 as const,
+      skippedFrameCount: transition?.immediate ? Math.max(0, 1 - frameCount) : 0,
+    }),
+    spatial: Object.freeze({
+      indexedNodeCount: input.spatial?.indexedNodeCount ?? 0,
+      skippedNodeCount: input.spatial?.skippedNodeCount ?? 0,
+      rebuildCount: input.spatial?.rebuildCount ?? 0,
+      incrementalUpdateCount: input.spatial?.incrementalUpdateCount ?? 0,
+      stale: input.spatial
+        ? input.spatial.coordinateRevision !== input.overviewBuffers?.coordinateRevision
+        : false,
+    }),
+    fallback: Object.freeze({
+      revisionSyncRebuilt: (input.spatial?.rebuildCount ?? 0) > 1,
+    }),
+    lifecycle: Object.freeze({
+      resourcesPublished: input.status === "completed" && input.overviewBuffers !== null,
+      cancellationSafe: true as const,
+    }),
+    privacy: Object.freeze({
+      allowlisted: true as const,
+      forbiddenValueCount: 0 as const,
+    }),
+  });
+}
+
+function freezeOverviewEdgeEvidence(
+  snapshot: PermissionsGraphOverviewEdgeSnapshot | null,
+): PermissionsGraphVirtualQaEvidence["overview"]["edges"] {
+  return Object.freeze({
+    enabled: snapshot !== null,
+    mode: snapshot?.mode ?? "not-run",
+    eligibleEdgeCount: snapshot?.eligibleEdgeCount ?? 0,
+    representedEdgeCount: snapshot?.representedEdgeCount ?? 0,
+    emittedSegmentCount: snapshot?.emittedSegmentCount ?? 0,
+    prioritySegmentCount: snapshot?.prioritySegmentCount ?? 0,
+    ordinarySampleSegmentCount: snapshot?.ordinarySampleSegmentCount ?? 0,
+    bundleSegmentCount: snapshot?.bundleSegmentCount ?? 0,
+    densitySegmentCount: snapshot?.densitySegmentCount ?? 0,
+    bundledEdgeCount: snapshot?.bundledEdgeCount ?? 0,
+    omittedEdgeCount: snapshot?.omittedEdgeCount ?? 0,
+    exact: snapshot?.exact ?? false,
+    bufferBytes: snapshot?.memory.totalOwnedBytes ?? 0,
+    expectedGpuMirrorBytes: snapshot?.memory.expectedGpuMirrorBytes ?? 0,
+    bufferFingerprint: snapshot?.bufferFingerprint ?? null,
+    diagnostics: Object.freeze([...(snapshot?.diagnostics ?? [])]),
   });
 }
 

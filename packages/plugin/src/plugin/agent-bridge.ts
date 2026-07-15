@@ -5,6 +5,7 @@ import type { VaultGraph } from "./graph/vault-graph";
 // client). Used by the in-process `vaultguard_access` permission-query tool.
 import type {
   AuditLogEntry,
+  FileVersionRecord,
   PathAccessSummary,
   PermissionRule,
   ShareRecord,
@@ -681,7 +682,7 @@ export interface AccessQueryProvider {
   // mirrors an apiClient method and is backend-gated (history needs read on the
   // path; deleted/overview/restore are admin). Optional/null when no server
   // connection is available (the tool fails closed with a clear error).
-  getFileHistory?(path: string): Promise<{ version: string; timestamp: string; userId: string }[]>;
+  getFileHistory?(path: string): Promise<FileVersionRecord[]>;
   getDeletedFiles?(): Promise<{ path: string; deleteMarkerVersionId: string; deletedAt: string }[]>;
   restoreDeletedFile?(path: string): Promise<{ path: string; versionId: string; restoredFrom: string }>;
   getVaultOverview?(): Promise<VaultOverviewResponse>;
@@ -2020,7 +2021,7 @@ export class VaultGuardAgentBridge {
     const localProjectMemoryMode = input.localProjectMemoryMode === true;
     if (localProjectMemoryMode && (persistent || !expiresWithSession)) {
       throw new Error(
-        "Local Project Memory Mode only allows session-bound in-process chat leases."
+        "Local Project Memory Mode only allows session-bound in-app chat leases."
       );
     }
     this.assertBridgePrereqs({ allowMissingServerVault: localProjectMemoryMode });
@@ -4731,7 +4732,7 @@ export class VaultGuardAgentBridge {
 
   private async handleRpcRequest(req: NodeIncomingMessage, res: NodeServerResponse): Promise<void> {
     try {
-      const lease = this.resolveLeaseFromBearer(req);
+      const lease = this.resolveLeaseFromBearer(req, "rpc");
       if (!lease) {
         this.writeJson(res, 401, { ok: false, error: { message: "Unauthorized" } });
         return;
@@ -4780,7 +4781,7 @@ export class VaultGuardAgentBridge {
   // an optional X-VaultGuard-Lease header for clients that already wire it
   // up, but it has to match the bearer's lease.
   private async handleMcpRequest(req: NodeIncomingMessage, res: NodeServerResponse): Promise<void> {
-    const lease = this.resolveLeaseFromBearer(req);
+    const lease = this.resolveLeaseFromBearer(req, "mcp");
     if (!lease) {
       this.writeJson(res, 401, this.makeJsonRpcError(null, -32001, "Unauthorized"));
       return;
@@ -5344,7 +5345,10 @@ export class VaultGuardAgentBridge {
   // Each request is bound to a single lease via its bearer token. The
   // token-to-lease lookup is the only auth check on the wire — the lease
   // itself carries the scope, writeMode, and audit identity.
-  private resolveLeaseFromBearer(req: NodeIncomingMessage): AgentBridgeLease | null {
+  private resolveLeaseFromBearer(
+    req: NodeIncomingMessage,
+    transport: "rpc" | "mcp",
+  ): AgentBridgeLease | null {
     const header = req.headers.authorization;
     const auth = Array.isArray(header) ? header[0] : header;
     if (typeof auth !== "string" || !auth.startsWith("Bearer ")) return null;
@@ -5354,10 +5358,13 @@ export class VaultGuardAgentBridge {
     const leaseId = this.tokenIndex.get(token);
     if (!leaseId) return null;
     const lease = this.leases.get(leaseId) ?? null;
-    // Local Project Memory leases belong exclusively to the in-process chat
-    // surface. Keep them unusable over RPC/MCP even if a stale local server
-    // survives a mode transition or an internal token is exposed by a defect.
-    return lease?.localProjectMemoryMode ? null : lease;
+    // A Local Project Memory lease is minted only by the plugin's dedicated
+    // in-app chat API. It may cross this loopback MCP transport so an official
+    // local subscription client can use the same VaultGuard gates as API chat,
+    // but it remains unusable over the generic RPC transport. The HTTP server
+    // itself binds only 127.0.0.1 and still requires this unguessable bearer.
+    if (lease?.localProjectMemoryMode && transport !== "mcp") return null;
+    return lease;
   }
 
   // Wrap every tool invocation with an audit emit. Outcome is "success" if

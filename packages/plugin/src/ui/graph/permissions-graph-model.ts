@@ -123,6 +123,11 @@ export class PermissionsGraphModelBuildError extends Error {
 }
 
 const EMPTY_IDS: readonly string[] = Object.freeze([] as string[]);
+const INCIDENT_ACCESS_NONE = 1 << 0;
+const INCIDENT_ACCESS_READ = 1 << 1;
+const INCIDENT_ACCESS_WRITE = 1 << 2;
+const INCIDENT_ACCESS_ADMIN = 1 << 3;
+const INCIDENT_ACCESS_UNKNOWN = 1 << 4;
 const ZERO_DEGREE: PermissionsGraphDegree = Object.freeze({
   incoming: 0,
   outgoing: 0,
@@ -162,6 +167,7 @@ export class PermissionsGraphIndex {
   private readonly nodeIdsByPath = new Map<string, readonly string[]>();
   private readonly nodeIdsByUserId = new Map<string, readonly string[]>();
   private readonly edgeIdsByAccessLevel = new Map<GraphAccessLevel, readonly string[]>();
+  private readonly incidentPermissionAccessMasks: Uint8Array;
   private readonly aggregateNodeIds: readonly string[];
   private readonly aggregateEdgeIds: readonly string[];
 
@@ -189,6 +195,7 @@ export class PermissionsGraphIndex {
       mutableIncidentEdgeIds.set(node.id, []);
       mutableDegreeByNodeId.set(node.id, { incoming: 0, outgoing: 0 });
     }
+    this.incidentPermissionAccessMasks = new Uint8Array(model.nodeCount);
 
     for (const edge of model.edges) {
       this.edgesById.set(edge.id, edge);
@@ -208,6 +215,13 @@ export class PermissionsGraphIndex {
       if (targetDegree) targetDegree.incoming += 1;
 
       if (edge.level) appendMapValue(mutableEdgeIdsByAccessLevel, edge.level, edge.id);
+      if (edge.kind === "permission") {
+        const bit = incidentAccessBit(edge.level);
+        const sourceOrdinal = this.nodeOrdinalsById.get(edge.sourceId);
+        const targetOrdinal = this.nodeOrdinalsById.get(edge.targetId);
+        if (sourceOrdinal !== undefined) this.incidentPermissionAccessMasks[sourceOrdinal] |= bit;
+        if (targetOrdinal !== undefined) this.incidentPermissionAccessMasks[targetOrdinal] |= bit;
+      }
       if (edge.aggregate) aggregateEdgeIds.push(edge.id);
     }
 
@@ -290,6 +304,15 @@ export class PermissionsGraphIndex {
     return this.edgeIdsByAccessLevel.get(level) ?? EMPTY_IDS;
   }
 
+  /**
+   * Compact incident permission mask: none/read/write/admin use bits 0-3 and
+   * an unrecognized/null permission level uses bit 4.
+   */
+  getIncidentPermissionAccessMask(nodeId: string): number {
+    const ordinal = this.nodeOrdinalsById.get(nodeId);
+    return ordinal === undefined ? 0 : this.incidentPermissionAccessMasks[ordinal];
+  }
+
   getAggregateNodeIds(): readonly string[] {
     return this.aggregateNodeIds;
   }
@@ -306,7 +329,10 @@ export class PermissionsGraphModelBuilder {
   constructor(private readonly options: PermissionsGraphModelBuildOptions = {}) {}
 
   addElements(elements: readonly unknown[]): this {
-    this.elements.push(...elements);
+    // Avoid argument-list expansion: synthetic 100k/300k evidence batches can
+    // exceed the JavaScript engine's call-argument limit long before the
+    // model's own memory guards are reached.
+    for (const element of elements) this.elements.push(element);
     return this;
   }
 
@@ -648,6 +674,14 @@ function compareById<T extends { id: string }>(left: T, right: T): number {
 
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function incidentAccessBit(level: GraphAccessLevel | null): number {
+  if (level === "none") return INCIDENT_ACCESS_NONE;
+  if (level === "read") return INCIDENT_ACCESS_READ;
+  if (level === "write") return INCIDENT_ACCESS_WRITE;
+  if (level === "admin") return INCIDENT_ACCESS_ADMIN;
+  return INCIDENT_ACCESS_UNKNOWN;
 }
 
 function appendMapValue<K>(map: Map<K, string[]>, key: K, value: string): void {

@@ -34,6 +34,13 @@ import {
 import type VaultGuardPlugin from "../../plugin/main";
 import type { PermissionRule } from "../../api/client";
 import {
+  applyGraphStudioPresentation,
+  buildGraphStudioPresentation,
+  getGraphStudioPreset,
+  type GraphStudioPosition,
+  type GraphStudioPresetId,
+} from "./permissions-graph-customization";
+import {
   ancestorFolders,
   buildGraphElements,
   colorForUser,
@@ -62,6 +69,9 @@ import {
   normalizeGraphOptions,
   normalizeOptionalGraphPath,
   removeGraphVaultState,
+  resetGraphStudioAppearance,
+  resetGraphStudioArrangement,
+  resetGraphStudioOptions,
   upsertGraphVaultState,
   type FilteredGraphDataset,
   type GraphActualMode,
@@ -71,7 +81,8 @@ import {
   type GraphRuntimeOptions,
 } from "./permissions-graph-scale";
 
-export const VAULTGUARD_GRAPH_VIEW_TYPE = "vaultguard-permissions-graph";
+export { VAULTGUARD_GRAPH_VIEW_TYPE } from "../view-types";
+import { VAULTGUARD_GRAPH_VIEW_TYPE } from "../view-types";
 
 // ─── Data source contract (provided by the plugin; see main.ts) ───────────────
 //
@@ -111,6 +122,19 @@ const OPTIONS_SUMMARY_CLS = "vaultguard-pg-options-summary";
 const OPTIONS_GRID_CLS = "vaultguard-pg-options-grid";
 const OPTION_FIELD_CLS = "vaultguard-pg-option-field";
 const OPTION_TOGGLE_CLS = "vaultguard-pg-option-toggle";
+const STUDIO_CLS = "vaultguard-pg-studio";
+const STUDIO_INTRO_CLS = "vaultguard-pg-studio-intro";
+const STUDIO_BODY_CLS = "vaultguard-pg-studio-body";
+const STUDIO_PRESETS_CLS = "vaultguard-pg-studio-presets";
+const STUDIO_PRESET_CLS = "vaultguard-pg-studio-preset";
+const STUDIO_GROUP_CLS = "vaultguard-pg-studio-group";
+const STUDIO_GRID_CLS = "vaultguard-pg-studio-grid";
+const STUDIO_RANGE_CLS = "vaultguard-pg-studio-range";
+const STUDIO_RANGE_VALUE_CLS = "vaultguard-pg-studio-range-value";
+const STUDIO_PALETTE_CLS = "vaultguard-pg-studio-palette";
+const STUDIO_RESETS_CLS = "vaultguard-pg-studio-resets";
+const STUDIO_STATUS_CLS = "vaultguard-pg-studio-status";
+const STUDIO_CUSTOM_PALETTE_CLS = "has-studio-custom-palette";
 const LEGEND_CLS = "vaultguard-pg-legend";
 const LEGEND_CHIP_CLS = "vaultguard-pg-legend-chip";
 const LEGEND_CHIP_OFF_CLS = "is-off";
@@ -187,12 +211,20 @@ export class PermissionsGraphView extends ItemView {
   private debugEl: HTMLElement | null = null;
   private userFilterSelectEl: HTMLSelectElement | null = null;
   private optionRenderTimer: ReturnType<typeof setTimeout> | null = null;
+  private studioPersistTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeLayout: cytoscape.Layouts | null = null;
+  /** requestAnimationFrame handle for the throttled zoom -> font-size refresh. */
+  private zoomFontRaf: number | null = null;
+  private studioBodyEl: HTMLElement | null = null;
+  private studioStatusEl: HTMLElement | null = null;
+  private readonly studioPresetButtons = new Map<GraphStudioPresetId, HTMLButtonElement>();
+  private currentBaseElements: GraphElement[] = [];
 
   // Legend filter state: class → enabled.
   private readonly legendState = new Map<string, boolean>(
     LEGEND_ITEMS.map((item) => [item.key, true]),
   );
-  private graphOptions: GraphRuntimeOptions = { ...DEFAULT_GRAPH_OPTIONS };
+  private graphOptions: GraphRuntimeOptions = normalizeGraphOptions();
   private renderDecision: GraphRenderDecision | null = null;
   private lastEstimate: GraphComplexityEstimate | null = null;
   private actualMode: GraphActualMode = "detailed";
@@ -231,6 +263,12 @@ export class PermissionsGraphView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
+    this.registerEvent(
+      this.app.workspace.on("css-change", () => {
+        this.applyGraphStageAppearance();
+        this.cy?.style(this.buildStylesheet());
+      }),
+    );
     await this.render();
   }
 
@@ -295,6 +333,12 @@ export class PermissionsGraphView extends ItemView {
 
   /** Destroy the cytoscape instance and drop all cached render state. */
   private teardown(): void {
+    this.activeLayout?.stop();
+    this.activeLayout = null;
+    if (this.zoomFontRaf != null) {
+      if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.zoomFontRaf);
+      this.zoomFontRaf = null;
+    }
     if (this.cy) {
       this.cy.destroy();
       this.cy = null;
@@ -302,6 +346,11 @@ export class PermissionsGraphView extends ItemView {
     if (this.optionRenderTimer) {
       clearTimeout(this.optionRenderTimer);
       this.optionRenderTimer = null;
+    }
+    if (this.studioPersistTimer) {
+      clearTimeout(this.studioPersistTimer);
+      this.studioPersistTimer = null;
+      this.persistGraphOptions();
     }
     this.bodyEl = null;
     this.canvasEl = null;
@@ -311,6 +360,10 @@ export class PermissionsGraphView extends ItemView {
     this.noticeEl = null;
     this.debugEl = null;
     this.userFilterSelectEl = null;
+    this.studioBodyEl = null;
+    this.studioStatusEl = null;
+    this.studioPresetButtons.clear();
+    this.currentBaseElements = [];
     this.renderDecision = null;
     this.lastEstimate = null;
     this.actualMode = "detailed";
@@ -463,6 +516,7 @@ export class PermissionsGraphView extends ItemView {
 
     // Toolbar: render options, legend filters, search, and focus controls.
     const toolbar = container.createDiv({ cls: TOOLBAR_CLS });
+    this.renderGraphStudioPanel(toolbar);
     this.renderOptionsPanel(toolbar);
 
     const legend = toolbar.createDiv({ cls: LEGEND_CLS });
@@ -581,18 +635,30 @@ export class PermissionsGraphView extends ItemView {
     setIcon(refreshBtn, "refresh-cw");
     refreshBtn.addEventListener("click", () => void this.forceReload());
 
-    // Layout toggle: radial (files inside, users around the outside) ⇄ force.
+    // Compact layout cycle mirrors the Graph Studio layout control.
     const layoutBtn = depthRow.createSpan({
       cls: "clickable-icon",
       attr: { "aria-label": "Cycle layout", title: "Cycle layout" },
     });
-    const syncLayoutIcon = (): void =>
-      setIcon(layoutBtn, this.graphOptions.layoutMode === "force" ? "git-fork" : this.graphOptions.layoutMode === "grid" ? "grid-2x2" : "target");
+    const syncLayoutIcon = (): void => {
+      const layout = this.graphOptions.layoutMode;
+      setIcon(
+        layoutBtn,
+        layout === "force"
+          ? "git-fork"
+          : layout === "grid" || layout === "sections"
+            ? "grid-2x2"
+            : layout === "folder"
+              ? "folder-tree"
+              : "target",
+      );
+    };
     syncLayoutIcon();
     layoutBtn.addEventListener("click", () => {
-      const order: GraphRuntimeOptions["layoutMode"][] = ["auto", "radial", "force", "grid"];
+      const order: GraphRuntimeOptions["layoutMode"][] = ["auto", "radial", "force", "grid", "folder", "sections"];
       const idx = order.indexOf(this.graphOptions.layoutMode);
-      this.updateGraphOptions({ layoutMode: order[(idx + 1) % order.length] });
+      this.updateGraphStudioOptions({ layoutMode: order[(idx + 1) % order.length] }, true);
+      this.renderGraphStudioControls();
       syncLayoutIcon();
     });
 
@@ -608,13 +674,383 @@ export class PermissionsGraphView extends ItemView {
     this.noteEl = container.createDiv({ cls: NOTE_CLS });
     this.statusEl = container.createDiv({ cls: STATUS_CLS });
     this.debugEl = container.createDiv({ cls: DEBUG_CLS });
+    this.applyGraphStageAppearance();
+  }
+
+  private renderGraphStudioPanel(toolbar: HTMLElement): void {
+    const details = toolbar.createEl("details", { cls: `${OPTIONS_CLS} ${STUDIO_CLS}` });
+    const summary = details.createEl("summary", { cls: OPTIONS_SUMMARY_CLS });
+    setIcon(summary.createSpan(), "palette");
+    summary.createSpan({ text: "Graph Studio" });
+    summary.createSpan({ cls: STUDIO_INTRO_CLS, text: "Optional" });
+    this.studioBodyEl = details.createDiv({ cls: STUDIO_BODY_CLS });
+    this.renderGraphStudioControls();
+  }
+
+  private renderGraphStudioControls(): void {
+    const body = this.studioBodyEl;
+    if (!body) return;
+    body.empty();
+    this.studioPresetButtons.clear();
+    body.createDiv({
+      cls: STUDIO_INTRO_CLS,
+      text: "Tune structure and appearance without changing permissions, safety limits, or the familiar default.",
+    });
+
+    const presetGroup = body.createEl("fieldset", { cls: STUDIO_GROUP_CLS });
+    presetGroup.createEl("legend", { text: "Quick presets" });
+    const presetRow = presetGroup.createDiv({ cls: STUDIO_PRESETS_CLS });
+    const presets: Array<{ id: GraphStudioPresetId; label: string; title: string }> = [
+      { id: "default", label: "Default", title: "Current graph defaults" },
+      { id: "folder-map", label: "Folder map", title: "Hierarchy, folder colors, and connection sizing" },
+      { id: "access-audit", label: "Access audit", title: "Access sections, labels, and access emphasis" },
+      { id: "minimal", label: "Minimal", title: "Quiet grid with uniform nodes and no labels" },
+    ];
+    for (const preset of presets) {
+      const button = presetRow.createEl("button", {
+        cls: STUDIO_PRESET_CLS,
+        text: preset.label,
+        attr: { type: "button", title: preset.title, "aria-label": `${preset.label}: ${preset.title}` },
+      });
+      button.dataset.preset = preset.id;
+      button.addEventListener("click", () => this.applyGraphStudioPreset(preset.id));
+      this.studioPresetButtons.set(preset.id, button);
+    }
+
+    const arrangement = body.createEl("fieldset", { cls: STUDIO_GROUP_CLS });
+    arrangement.createEl("legend", { text: "Arrangement" });
+    const arrangementGrid = arrangement.createDiv({ cls: STUDIO_GRID_CLS });
+    this.addStudioSelect(
+      arrangementGrid,
+      "Layout",
+      this.graphOptions.layoutMode,
+      [
+        ["auto", "Auto"],
+        ["radial", "Radial"],
+        ["force", "Force"],
+        ["grid", "Grid"],
+        ["folder", "Folder hierarchy"],
+        ["sections", "Sections"],
+      ],
+      (value) => this.updateGraphStudioOptions({ layoutMode: value as GraphRuntimeOptions["layoutMode"] }, true),
+    );
+    this.addStudioSelect(
+      arrangementGrid,
+      "Labels",
+      this.graphOptions.labelsMode,
+      [
+        ["auto", "Auto"],
+        ["on", "On"],
+        ["off", "Off"],
+      ],
+      (value) => this.updateGraphStudioOptions({ labelsMode: value as GraphRuntimeOptions["labelsMode"] }, false),
+    );
+    this.addStudioSelect(
+      arrangementGrid,
+      "Section by",
+      this.graphOptions.arrangement.sectionBy,
+      [
+        ["folder", "Top folder"],
+        ["type", "Node type"],
+        ["access", "Access profile"],
+        ["connections", "Connectivity"],
+      ],
+      (value) =>
+        this.updateGraphStudioOptions(
+          { arrangement: { ...this.graphOptions.arrangement, sectionBy: value as GraphRuntimeOptions["arrangement"]["sectionBy"] } },
+          true,
+        ),
+    );
+    this.addStudioSelect(
+      arrangementGrid,
+      "Sort by",
+      this.graphOptions.arrangement.sortBy,
+      [
+        ["name", "Name"],
+        ["path", "Full path"],
+        ["access", "Access"],
+        ["connections", "Connections"],
+      ],
+      (value) =>
+        this.updateGraphStudioOptions(
+          { arrangement: { ...this.graphOptions.arrangement, sortBy: value as GraphRuntimeOptions["arrangement"]["sortBy"] } },
+          true,
+        ),
+    );
+    this.addStudioSelect(
+      arrangementGrid,
+      "Direction",
+      this.graphOptions.arrangement.sortDirection,
+      [
+        ["asc", "Ascending"],
+        ["desc", "Descending"],
+      ],
+      (value) =>
+        this.updateGraphStudioOptions(
+          {
+            arrangement: {
+              ...this.graphOptions.arrangement,
+              sortDirection: value as GraphRuntimeOptions["arrangement"]["sortDirection"],
+            },
+          },
+          true,
+        ),
+    );
+
+    const appearance = body.createEl("fieldset", { cls: STUDIO_GROUP_CLS });
+    appearance.createEl("legend", { text: "Appearance" });
+    const appearanceGrid = appearance.createDiv({ cls: STUDIO_GRID_CLS });
+    this.addStudioSelect(
+      appearanceGrid,
+      "Background",
+      this.graphOptions.appearance.backgroundMode,
+      [
+        ["theme", "Theme"],
+        ["solid", "Solid"],
+        ["gradient", "Gradient"],
+      ],
+      (value) =>
+        this.updateGraphStudioOptions({
+          appearance: {
+            ...this.graphOptions.appearance,
+            backgroundMode: value as GraphRuntimeOptions["appearance"]["backgroundMode"],
+          },
+        }, false),
+    );
+    this.addStudioSelect(
+      appearanceGrid,
+      "Pattern",
+      this.graphOptions.appearance.backgroundPattern,
+      [
+        ["none", "None"],
+        ["grid", "Grid"],
+        ["dots", "Dots"],
+      ],
+      (value) =>
+        this.updateGraphStudioOptions({
+          appearance: {
+            ...this.graphOptions.appearance,
+            backgroundPattern: value as GraphRuntimeOptions["appearance"]["backgroundPattern"],
+          },
+        }, false),
+    );
+    this.addStudioColor(appearanceGrid, "Background color", this.graphOptions.appearance.backgroundPrimary, (value, debounce) =>
+      this.updateGraphStudioOptions({
+        appearance: { ...this.graphOptions.appearance, backgroundPrimary: value },
+      }, false, debounce),
+    );
+    this.addStudioColor(appearanceGrid, "Gradient end", this.graphOptions.appearance.backgroundSecondary, (value, debounce) =>
+      this.updateGraphStudioOptions({
+        appearance: { ...this.graphOptions.appearance, backgroundSecondary: value },
+      }, false, debounce),
+    );
+    this.addStudioSelect(
+      appearanceGrid,
+      "Color by",
+      this.graphOptions.appearance.colorMode,
+      [
+        ["current", "Current"],
+        ["type", "Node type"],
+        ["folder", "Top folder"],
+        ["access", "Access"],
+        ["connections", "Connections"],
+      ],
+      (value) =>
+        this.updateGraphStudioOptions({
+          appearance: {
+            ...this.graphOptions.appearance,
+            colorMode: value as GraphRuntimeOptions["appearance"]["colorMode"],
+          },
+        }, false),
+    );
+    this.addStudioSelect(
+      appearanceGrid,
+      "Size by",
+      this.graphOptions.appearance.sizeMode,
+      [
+        ["standard", "Standard"],
+        ["uniform", "Uniform"],
+        ["connections", "Connections"],
+        ["access", "Access"],
+      ],
+      (value) =>
+        this.updateGraphStudioOptions({
+          appearance: {
+            ...this.graphOptions.appearance,
+            sizeMode: value as GraphRuntimeOptions["appearance"]["sizeMode"],
+          },
+        }, false),
+    );
+    this.addStudioRange(appearanceGrid, "Node scale", this.graphOptions.appearance.nodeScale, 0.75, 1.75, 0.05, (value, debounce) =>
+      this.updateGraphStudioOptions({ appearance: { ...this.graphOptions.appearance, nodeScale: value } }, false, debounce),
+    );
+    this.addStudioRange(appearanceGrid, "Edge scale", this.graphOptions.appearance.edgeScale, 0.5, 2, 0.1, (value, debounce) =>
+      this.updateGraphStudioOptions({ appearance: { ...this.graphOptions.appearance, edgeScale: value } }, false, debounce),
+    );
+    this.addStudioRange(appearanceGrid, "Text size", this.graphOptions.appearance.labelScale, 0.75, 2.5, 0.05, (value, debounce) =>
+      this.updateGraphStudioOptions({ appearance: { ...this.graphOptions.appearance, labelScale: value } }, false, debounce),
+    );
+
+    const paletteGroup = body.createEl("fieldset", { cls: `${STUDIO_GROUP_CLS} ${STUDIO_PALETTE_CLS}` });
+    paletteGroup.createEl("legend", { text: "Semantic colors" });
+    const paletteInputs: HTMLInputElement[] = [];
+    this.addStudioToggle(paletteGroup, "Use custom semantic colors", this.graphOptions.appearance.customPalette, (checked) => {
+      this.updateGraphStudioOptions({
+        appearance: { ...this.graphOptions.appearance, customPalette: checked },
+      }, false);
+      for (const input of paletteInputs) input.disabled = !checked;
+    });
+    const paletteGrid = paletteGroup.createDiv({ cls: STUDIO_GRID_CLS });
+    const paletteLabels: Array<[keyof GraphRuntimeOptions["appearance"]["palette"], string]> = [
+      ["user", "User"],
+      ["file", "File"],
+      ["folder", "Folder"],
+      ["read", "Read"],
+      ["write", "Write"],
+      ["admin", "Admin"],
+      ["low", "Low connections"],
+      ["medium", "Medium connections"],
+      ["high", "High connections"],
+    ];
+    for (const [key, label] of paletteLabels) {
+      const input = this.addStudioColor(paletteGrid, label, this.graphOptions.appearance.palette[key], (value, debounce) =>
+        this.updateGraphStudioOptions({
+          appearance: {
+            ...this.graphOptions.appearance,
+            palette: { ...this.graphOptions.appearance.palette, [key]: value },
+          },
+        }, false, debounce),
+      );
+      input.disabled = !this.graphOptions.appearance.customPalette;
+      paletteInputs.push(input);
+    }
+
+    const resets = body.createDiv({ cls: STUDIO_RESETS_CLS });
+    const resetAppearance = resets.createEl("button", { text: "Reset appearance", attr: { type: "button" } });
+    resetAppearance.addEventListener("click", () => {
+      const next = resetGraphStudioAppearance(this.graphOptions);
+      this.updateGraphStudioOptions({ appearance: next.appearance }, false);
+      this.renderGraphStudioControls();
+      this.setStudioStatus("Appearance reset. Arrangement and filters were kept.");
+    });
+    const resetArrangement = resets.createEl("button", { text: "Reset arrangement", attr: { type: "button" } });
+    resetArrangement.addEventListener("click", () => {
+      const next = resetGraphStudioArrangement(this.graphOptions);
+      this.updateGraphStudioOptions(
+        { layoutMode: next.layoutMode, labelsMode: next.labelsMode, arrangement: next.arrangement },
+        true,
+      );
+      this.renderGraphStudioControls();
+      this.setStudioStatus("Arrangement reset. Appearance and filters were kept.");
+    });
+    const resetAll = resets.createEl("button", { text: "Reset Studio", cls: "mod-cta", attr: { type: "button" } });
+    resetAll.addEventListener("click", () => {
+      const next = resetGraphStudioOptions(this.graphOptions);
+      this.updateGraphStudioOptions(
+        {
+          layoutMode: next.layoutMode,
+          labelsMode: next.labelsMode,
+          appearance: next.appearance,
+          arrangement: next.arrangement,
+        },
+        true,
+      );
+      this.renderGraphStudioControls();
+      this.setStudioStatus("Graph Studio reset. Permission data and filters were kept.");
+    });
+
+    this.studioStatusEl = body.createDiv({
+      cls: STUDIO_STATUS_CLS,
+      text: "Live preview uses only the current viewer-authorized graph.",
+      attr: { role: "status", "aria-live": "polite", "aria-atomic": "true" },
+    });
+    this.syncStudioPresetButtons();
+  }
+
+  private addStudioSelect(
+    parent: HTMLElement,
+    label: string,
+    value: string,
+    options: Array<[string, string]>,
+    onChange: (value: string) => void,
+  ): HTMLSelectElement {
+    const field = parent.createEl("label", { cls: OPTION_FIELD_CLS });
+    field.createSpan({ text: label });
+    const select = field.createEl("select", { attr: { "aria-label": label } });
+    for (const [optionValue, text] of options) select.createEl("option", { value: optionValue, text });
+    select.value = value;
+    select.addEventListener("change", () => onChange(select.value));
+    return select;
+  }
+
+  private addStudioColor(
+    parent: HTMLElement,
+    label: string,
+    value: string,
+    onChange: (value: string, debounce: boolean) => void,
+  ): HTMLInputElement {
+    const field = parent.createEl("label", { cls: OPTION_FIELD_CLS });
+    field.createSpan({ text: label });
+    const input = field.createEl("input", {
+      attr: { type: "color", value, "aria-label": label },
+    });
+    input.addEventListener("input", () => onChange(input.value, true));
+    input.addEventListener("change", () => onChange(input.value, false));
+    return input;
+  }
+
+  private addStudioRange(
+    parent: HTMLElement,
+    label: string,
+    value: number,
+    min: number,
+    max: number,
+    step: number,
+    onChange: (value: number, debounce: boolean) => void,
+  ): HTMLInputElement {
+    const field = parent.createEl("label", { cls: `${OPTION_FIELD_CLS} ${STUDIO_RANGE_CLS}` });
+    const heading = field.createSpan();
+    heading.createSpan({ text: label });
+    const output = heading.createSpan({ cls: STUDIO_RANGE_VALUE_CLS, text: String(value) });
+    const input = field.createEl("input", {
+      attr: {
+        type: "range",
+        min: String(min),
+        max: String(max),
+        step: String(step),
+        value: String(value),
+        "aria-label": label,
+      },
+    });
+    const update = (debounce: boolean): void => {
+      const next = Number(input.value);
+      output.setText(String(next));
+      onChange(next, debounce);
+    };
+    input.addEventListener("input", () => update(true));
+    input.addEventListener("change", () => update(false));
+    return input;
+  }
+
+  private addStudioToggle(
+    parent: HTMLElement,
+    label: string,
+    checked: boolean,
+    onChange: (checked: boolean) => void,
+  ): HTMLInputElement {
+    const field = parent.createEl("label", { cls: OPTION_TOGGLE_CLS });
+    const input = field.createEl("input", { attr: { type: "checkbox", "aria-label": label } });
+    input.checked = checked;
+    field.createSpan({ text: label });
+    input.addEventListener("change", () => onChange(input.checked));
+    return input;
   }
 
   private renderOptionsPanel(toolbar: HTMLElement): void {
     const details = toolbar.createEl("details", { cls: OPTIONS_CLS });
     const summary = details.createEl("summary", { cls: OPTIONS_SUMMARY_CLS });
     setIcon(summary.createSpan(), "sliders-horizontal");
-    summary.createSpan({ text: "Options" });
+    summary.createSpan({ text: "Filters & safety" });
 
     const grid = details.createDiv({ cls: OPTIONS_GRID_CLS });
     this.addSelectOption(grid, "Mode", this.graphOptions.renderMode, [
@@ -622,18 +1058,6 @@ export class PermissionsGraphView extends ItemView {
       ["aggregated", "Aggregated"],
       ["detailed", "Detailed"],
     ], (value) => this.updateGraphOptions({ renderMode: value as GraphRuntimeOptions["renderMode"] }));
-    this.addSelectOption(grid, "Layout", this.graphOptions.layoutMode, [
-      ["auto", "Auto"],
-      ["radial", "Radial"],
-      ["force", "Force"],
-      ["grid", "Grid"],
-    ], (value) => this.updateGraphOptions({ layoutMode: value as GraphRuntimeOptions["layoutMode"] }));
-    this.addSelectOption(grid, "Labels", this.graphOptions.labelsMode, [
-      ["auto", "Auto"],
-      ["on", "On"],
-      ["off", "Off"],
-    ], (value) => this.updateGraphOptions({ labelsMode: value as GraphRuntimeOptions["labelsMode"] }));
-
     this.addNumberOption(grid, "Max files", this.graphOptions.maxFiles, 1, DEFAULT_GRAPH_BUDGETS.maxInitialFiles, (value) =>
       this.updateGraphOptions({ maxFiles: value }, true),
     );
@@ -748,12 +1172,155 @@ export class PermissionsGraphView extends ItemView {
       ...patch,
       accessLevels: { ...this.graphOptions.accessLevels, ...patch.accessLevels },
       nodeTypes: { ...this.graphOptions.nodeTypes, ...patch.nodeTypes },
+      appearance: {
+        ...this.graphOptions.appearance,
+        ...patch.appearance,
+        palette: { ...this.graphOptions.appearance.palette, ...patch.appearance?.palette },
+      },
+      arrangement: { ...this.graphOptions.arrangement, ...patch.arrangement },
       selectedUsers: patch.selectedUsers ?? this.graphOptions.selectedUsers,
     };
     this.graphOptions = normalizeGraphOptions(undefined, graphOptionsToSavedState(merged), DEFAULT_GRAPH_BUDGETS);
     this.syncLegendStateFromOptions();
     this.persistGraphOptions();
     this.queueGraphRender(debounce);
+  }
+
+  private updateGraphStudioOptions(
+    patch: Partial<GraphRuntimeOptions>,
+    arrangementChanged: boolean,
+    debouncePersistence = false,
+  ): void {
+    const merged: GraphRuntimeOptions = {
+      ...this.graphOptions,
+      ...patch,
+      accessLevels: { ...this.graphOptions.accessLevels, ...patch.accessLevels },
+      nodeTypes: { ...this.graphOptions.nodeTypes, ...patch.nodeTypes },
+      appearance: {
+        ...this.graphOptions.appearance,
+        ...patch.appearance,
+        palette: { ...this.graphOptions.appearance.palette, ...patch.appearance?.palette },
+      },
+      arrangement: { ...this.graphOptions.arrangement, ...patch.arrangement },
+      selectedUsers: patch.selectedUsers ?? this.graphOptions.selectedUsers,
+    };
+    this.graphOptions = normalizeGraphOptions(undefined, graphOptionsToSavedState(merged), DEFAULT_GRAPH_BUDGETS);
+    if (this.lastEstimate) {
+      this.renderDecision = decideGraphRender(this.lastEstimate, this.graphOptions, DEFAULT_GRAPH_BUDGETS);
+    }
+    const shouldRunLayout =
+      arrangementChanged &&
+      (patch.layoutMode !== undefined ||
+        this.graphOptions.layoutMode === "folder" ||
+        this.graphOptions.layoutMode === "sections");
+    this.applyStudioPresentation(shouldRunLayout, !debouncePersistence);
+    this.queueStudioPersistence(debouncePersistence);
+    this.syncStudioPresetButtons();
+  }
+
+  private applyGraphStudioPreset(id: GraphStudioPresetId): void {
+    const preset = getGraphStudioPreset(id);
+    this.updateGraphStudioOptions(preset, true);
+    this.renderGraphStudioControls();
+    this.studioPresetButtons.get(id)?.focus();
+    this.setStudioStatus(`${this.studioPresetLabel(id)} preset applied locally.`);
+  }
+
+  private studioPresetLabel(id: GraphStudioPresetId): string {
+    if (id === "folder-map") return "Folder map";
+    if (id === "access-audit") return "Access audit";
+    if (id === "minimal") return "Minimal";
+    return "Default";
+  }
+
+  private syncStudioPresetButtons(): void {
+    for (const [id, button] of this.studioPresetButtons) {
+      const preset = getGraphStudioPreset(id);
+      const active =
+        this.graphOptions.layoutMode === preset.layoutMode &&
+        this.graphOptions.labelsMode === preset.labelsMode &&
+        JSON.stringify(this.graphOptions.appearance) === JSON.stringify(preset.appearance) &&
+        JSON.stringify(this.graphOptions.arrangement) === JSON.stringify(preset.arrangement);
+      button.setAttribute("aria-pressed", active ? "true" : "false");
+      button.toggleClass("is-active", active);
+    }
+  }
+
+  private queueStudioPersistence(debounce: boolean): void {
+    if (this.studioPersistTimer) {
+      clearTimeout(this.studioPersistTimer);
+      this.studioPersistTimer = null;
+    }
+    if (!debounce) {
+      this.persistGraphOptions();
+      return;
+    }
+    this.studioPersistTimer = setTimeout(() => {
+      this.studioPersistTimer = null;
+      this.persistGraphOptions();
+    }, 250);
+  }
+
+  private applyStudioPresentation(runArrangement: boolean, announce = true): void {
+    this.applyGraphStageAppearance();
+    if (!this.cy || this.currentBaseElements.length === 0) {
+      if (announce) this.setStudioStatus("Preview saved. It will apply when the graph can render.");
+      return;
+    }
+    const presentation = buildGraphStudioPresentation(this.currentBaseElements, this.graphOptions);
+    applyGraphStudioPresentation(this.cy, presentation);
+    this.cy.style(this.buildStylesheet());
+    // Re-apply zoom compensation after a restyle (e.g. Text size change) so the
+    // new base font is held at the readable on-screen size at the current zoom.
+    this.updateLabelFonts();
+    if (runArrangement) {
+      this.activeLayout?.stop();
+      this.activeLayout = this.cy.layout(this.buildLayout(false, presentation.positions));
+      this.activeLayout.run();
+    }
+    this.applyFilters();
+    if (this.renderDecision && this.lastEstimate) {
+      this.renderDebugReadout(
+        buildGraphDebugReadoutModel(
+          this.renderDecision,
+          this.lastEstimate,
+          this.cy.nodes().length,
+          this.cy.edges().length,
+          this.graphOptions,
+        ),
+      );
+    }
+    const sectionNote = presentation.sectionKeys.length > 0 ? ` · ${presentation.sectionKeys.length} section(s)` : "";
+    if (announce) this.setStudioStatus(`Preview updated locally${sectionNote}. No permission reload.`);
+  }
+
+  private applyGraphStageAppearance(): void {
+    const canvas = this.canvasEl;
+    if (!canvas) return;
+    const appearance = this.graphOptions.appearance;
+    for (const mode of ["theme", "solid", "gradient"]) canvas.removeClass(`is-studio-bg-${mode}`);
+    for (const pattern of ["none", "grid", "dots"]) canvas.removeClass(`is-studio-pattern-${pattern}`);
+    canvas.addClass(`is-studio-bg-${appearance.backgroundMode}`);
+    canvas.addClass(`is-studio-pattern-${appearance.backgroundPattern}`);
+    const root = canvas.closest(`.${ROOT_CLS}`) as HTMLElement | null;
+    root?.toggleClass(STUDIO_CUSTOM_PALETTE_CLS, appearance.customPalette);
+    root?.setCssProps({
+      "--vaultguard-pg-bg-primary": appearance.backgroundPrimary,
+      "--vaultguard-pg-bg-secondary": appearance.backgroundSecondary,
+      "--vaultguard-pg-studio-user": appearance.palette.user,
+      "--vaultguard-pg-studio-file": appearance.palette.file,
+      "--vaultguard-pg-studio-folder": appearance.palette.folder,
+      "--vaultguard-pg-studio-read": appearance.palette.read,
+      "--vaultguard-pg-studio-write": appearance.palette.write,
+      "--vaultguard-pg-studio-admin": appearance.palette.admin,
+      "--vaultguard-pg-studio-low": appearance.palette.low,
+      "--vaultguard-pg-studio-medium": appearance.palette.medium,
+      "--vaultguard-pg-studio-high": appearance.palette.high,
+    });
+  }
+
+  private setStudioStatus(text: string): void {
+    this.studioStatusEl?.setText(text);
   }
 
   private persistGraphOptions(): void {
@@ -990,6 +1557,9 @@ export class PermissionsGraphView extends ItemView {
     decision: GraphRenderDecision,
     estimate: GraphComplexityEstimate,
   ): void {
+    this.activeLayout?.stop();
+    this.activeLayout = null;
+    this.currentBaseElements = [];
     if (this.cy) {
       this.cy.destroy();
       this.cy = null;
@@ -1081,15 +1651,35 @@ export class PermissionsGraphView extends ItemView {
   // folders at the centre, their files in the middle ring, and users spread
   // around the outer ring (so people sit "outside the circle of files", on all
   // sides). Force = the organic cose spread.
-  private buildLayout(): cytoscape.LayoutOptions {
+  private buildLayout(
+    fit = true,
+    positions: Record<string, GraphStudioPosition> = {},
+  ): cytoscape.LayoutOptions {
     const layoutMode = this.renderDecision?.layoutModeUsed ?? "radial";
     const animate = this.renderDecision?.animationEnabled ?? true;
+    if (layoutMode === "folder" || layoutMode === "sections") {
+      return {
+        name: "preset",
+        positions,
+        animate,
+        animationDuration: animate ? 250 : 0,
+        padding: 36,
+        fit,
+      } as cytoscape.LayoutOptions;
+    }
     if (layoutMode === "grid") {
       return {
         name: "grid",
         animate: false,
         padding: 32,
-        fit: true,
+        fit,
+        // Space cells by each node's footprint so the degree-based sizes don't
+        // collide or read as uneven on the lattice.
+        avoidOverlap: true,
+        avoidOverlapPadding: 12,
+        spacingFactor: 1.15,
+        condense: false,
+        nodeDimensionsIncludeLabels: true,
       } as cytoscape.LayoutOptions;
     }
     if (layoutMode === "force") {
@@ -1100,7 +1690,7 @@ export class PermissionsGraphView extends ItemView {
         padding: 30,
         nodeDimensionsIncludeLabels: true,
         randomize: true,
-        fit: true,
+        fit,
         componentSpacing: 80,
         gravity: 0.25,
         numIter: 350,
@@ -1115,8 +1705,9 @@ export class PermissionsGraphView extends ItemView {
       animate,
       animationDuration: animate ? 250 : 0,
       padding: 36,
-      fit: true,
+      fit,
       avoidOverlap: true,
+      nodeDimensionsIncludeLabels: true, // keep labels from overlapping the rings
       minNodeSpacing: 22,
       startAngle: (3 / 2) * Math.PI, // start at top
       // Higher value = closer to the centre: folders (3) → files (2) → users (1).
@@ -1133,25 +1724,88 @@ export class PermissionsGraphView extends ItemView {
   /** Re-run the layout in place (after a mode toggle) without rebuilding cytoscape. */
   private runLayout(): void {
     if (!this.cy) return;
-    this.cy.layout(this.buildLayout()).run();
+    this.activeLayout?.stop();
+    const presentation = buildGraphStudioPresentation(this.currentBaseElements, this.graphOptions);
+    this.activeLayout = this.cy.layout(this.buildLayout(false, presentation.positions));
+    this.activeLayout.run();
+  }
+
+  /**
+   * Keep labels readable when zoomed out. Cytoscape renders font-size in graph
+   * (model) units, so on-screen label size = modelFont × zoom — a label shrinks
+   * as you zoom out. Below 1:1 we counter that by inflating the model font by
+   * 1/zoom so the label holds a ~constant on-screen size, but we CAP the
+   * inflation at CAP×. Past the cap (zoom < 1/CAP ≈ 0.4) the model font is
+   * pinned, so labels resume shrinking with further zoom-out and a large graph
+   * collapses into a clean overview instead of a constant-size wall of text —
+   * the exact failure that got the un-capped f0604ce version reverted (db3492d).
+   * At/above 1:1 we drop the override so labels still enlarge naturally on zoom-in.
+   */
+  private updateLabelFonts(): void {
+    if (!this.cy) return;
+    const cy = this.cy;
+    const scale = this.graphOptions.appearance.labelScale ?? 1;
+    const zoom = cy.zoom() || 1;
+    if (zoom >= 1) {
+      cy.batch(() => {
+        cy.nodes().removeStyle("font-size");
+        cy.edges().removeStyle("font-size");
+      });
+      return;
+    }
+    // Hold labels readable down to ~1/CAP zoom, then let the overview shrink.
+    const CAP = 2.5;
+    const inflate = Math.min(1 / Math.max(zoom, 0.05), CAP);
+    // Bases mirror the per-selector font-size in buildStylesheet() (node 13,
+    // vault 15, edge label 11); labelScale is folded in so the Text size control
+    // and the zoom compensation compose instead of fighting.
+    const fontFor = (base: number): number => Math.max(1, Math.round(base * scale * inflate));
+    cy.batch(() => {
+      cy.nodes().style("font-size", fontFor(13));
+      cy.$("node.vault").style("font-size", fontFor(15));
+      cy.$("edge[label]").style("font-size", fontFor(11));
+    });
+  }
+
+  /** Coalesce rapid zoom events into one font refresh per animation frame. */
+  private scheduleLabelFontUpdate(): void {
+    if (this.zoomFontRaf != null) return;
+    if (typeof requestAnimationFrame !== "function") {
+      this.updateLabelFonts();
+      return;
+    }
+    this.zoomFontRaf = requestAnimationFrame(() => {
+      this.zoomFontRaf = null;
+      this.updateLabelFonts();
+    });
   }
 
   private renderGraph(elements: GraphElement[]): void {
     if (!this.canvasEl) return;
+    this.activeLayout?.stop();
+    this.activeLayout = null;
     if (this.cy) {
       this.cy.destroy();
       this.cy = null;
     }
 
+    this.currentBaseElements = elements.slice();
+    const presentation = buildGraphStudioPresentation(this.currentBaseElements, this.graphOptions);
     this.cy = cytoscape({
       container: this.canvasEl,
       elements: elements as cytoscape.ElementDefinition[],
       style: this.buildStylesheet(),
-      layout: this.buildLayout(),
+      layout: this.buildLayout(true, presentation.positions),
       wheelSensitivity: 0.2,
       minZoom: 0.1,
       maxZoom: 3,
     });
+    applyGraphStudioPresentation(this.cy, presentation);
+    this.cy.style(this.buildStylesheet());
+    // Keep labels legible at any zoom: cytoscape scales font with zoom, so for
+    // zoomed-out views we inflate the model font (capped) to hold on-screen size.
+    this.cy.on("zoom", () => this.scheduleLabelFontUpdate());
+    this.updateLabelFonts();
 
     // Tap a node or edge → narrate the precedence into the explain panel and
     // focus the graph on that node.
@@ -1224,7 +1878,9 @@ export class PermissionsGraphView extends ItemView {
   private buildStylesheet(): cytoscape.StylesheetJson {
     const cssVar = (name: string, fallback: string): string => {
       try {
-        const v = getComputedStyle(document.body).getPropertyValue(name).trim();
+        const ownerDocument = this.canvasEl?.ownerDocument;
+        const target = ownerDocument?.body;
+        const v = target ? ownerDocument.defaultView?.getComputedStyle(target).getPropertyValue(name).trim() : "";
         return v || fallback;
       } catch {
         return fallback;
@@ -1244,6 +1900,10 @@ export class PermissionsGraphView extends ItemView {
     const adminColor = cssVar("--color-purple", "#a371e0");
     const denyColor = cssVar("--color-red", "#d64545");
     const labelsOn = (this.renderDecision?.labelModeUsed ?? "on") === "on";
+    // User-adjustable text size (Graph Studio → Text size). Multiplies every label
+    // font size so the graph stays readable at the default fit-to-view zoom.
+    const labelScale = this.graphOptions.appearance.labelScale ?? 1;
+    const fontPx = (base: number): number => Math.max(1, Math.round(base * labelScale));
 
     return [
       // Base node: a circular dot with its label BELOW it (native-graph style),
@@ -1252,19 +1912,21 @@ export class PermissionsGraphView extends ItemView {
         selector: "node",
         style: {
           shape: "ellipse",
-          width: 16,
-          height: 16,
+          width: 18,
+          height: 18,
           "background-color": fileColor,
           "border-width": 0,
           label: labelsOn ? "data(label)" : "",
           color: textColor,
-          "font-size": 10,
+          "font-size": fontPx(13),
           "text-valign": "bottom",
           "text-halign": "center",
           "text-margin-y": 4,
-          "text-wrap": "ellipsis",
-          "text-max-width": "110px",
-          "min-zoomed-font-size": 7,
+          // Show the FULL name — wrap long labels onto multiple lines instead of
+          // truncating with an ellipsis. Wrap width scales with the text size.
+          "text-wrap": "wrap",
+          "text-max-width": `${Math.round(200 * labelScale)}px`,
+          "min-zoomed-font-size": 6,
         },
       } as cytoscape.StylesheetStyle,
       {
@@ -1277,7 +1939,7 @@ export class PermissionsGraphView extends ItemView {
           "border-color": accent,
           "border-opacity": 0.4,
           color: textColor,
-          "font-size": 12,
+          "font-size": fontPx(15),
           "font-weight": "bold",
         },
       } as cytoscape.StylesheetStyle,
@@ -1303,8 +1965,8 @@ export class PermissionsGraphView extends ItemView {
           // the builder) so users are tellable apart at a glance. Size scales
           // with how many files they touch (degree) — busier users read bigger.
           "background-color": "data(color)",
-          width: (ele: cytoscape.NodeSingular) => 22 + Math.min(ele.degree(true), 14) * 1.6,
-          height: (ele: cytoscape.NodeSingular) => 22 + Math.min(ele.degree(true), 14) * 1.6,
+          width: (ele: cytoscape.NodeSingular) => 24 + Math.min(ele.degree(true), 14) * 1.6,
+          height: (ele: cytoscape.NodeSingular) => 24 + Math.min(ele.degree(true), 14) * 1.6,
           "font-weight": "bold",
         },
       } as unknown as cytoscape.StylesheetStyle,
@@ -1312,9 +1974,10 @@ export class PermissionsGraphView extends ItemView {
         selector: "node.file",
         style: {
           "background-color": fileColor,
-          // Size scales with how many users can reach the file.
-          width: (ele: cytoscape.NodeSingular) => 13 + Math.min(ele.degree(true), 12) * 1.2,
-          height: (ele: cytoscape.NodeSingular) => 13 + Math.min(ele.degree(true), 12) * 1.2,
+          // Size scales with how many users can reach the file. Floor kept large
+          // enough that a low-degree file is still a clearly visible, tappable dot.
+          width: (ele: cytoscape.NodeSingular) => 18 + Math.min(ele.degree(true), 12) * 1.4,
+          height: (ele: cytoscape.NodeSingular) => 18 + Math.min(ele.degree(true), 12) * 1.4,
         },
       } as unknown as cytoscape.StylesheetStyle,
       {
@@ -1336,13 +1999,13 @@ export class PermissionsGraphView extends ItemView {
         selector: "edge[label]",
         style: {
           label: labelsOn ? "data(label)" : "",
-          "font-size": 9,
+          "font-size": fontPx(11),
           color: mutedColor,
           "text-rotation": "autorotate",
           "text-background-color": bgSecondary,
           "text-background-opacity": 0.8,
           "text-background-padding": "2px",
-          "min-zoomed-font-size": 8,
+          "min-zoomed-font-size": 7,
         },
       } as cytoscape.StylesheetStyle,
       // Containment edges (folder→folder→file): faint, arrow-less hierarchy
@@ -1393,6 +2056,35 @@ export class PermissionsGraphView extends ItemView {
         selector: "edge.expiring",
         style: {
           "line-style": "dashed",
+        },
+      } as cytoscape.StylesheetStyle,
+      // Graph Studio data mappings are sparse and last in the semantic cascade.
+      // With untouched defaults these selectors match nothing, preserving the
+      // current theme-derived graph exactly.
+      {
+        selector: "node[studioColor]",
+        style: {
+          "background-color": "data(studioColor)",
+        },
+      } as cytoscape.StylesheetStyle,
+      {
+        selector: "node[studioSize]",
+        style: {
+          width: "data(studioSize)",
+          height: "data(studioSize)",
+        },
+      } as cytoscape.StylesheetStyle,
+      {
+        selector: "edge[studioColor]",
+        style: {
+          "line-color": "data(studioColor)",
+          "target-arrow-color": "data(studioColor)",
+        },
+      } as cytoscape.StylesheetStyle,
+      {
+        selector: "edge[studioWidth]",
+        style: {
+          width: "data(studioWidth)",
         },
       } as cytoscape.StylesheetStyle,
       // Hover highlight: emphasise the hovered neighborhood, fade the rest.

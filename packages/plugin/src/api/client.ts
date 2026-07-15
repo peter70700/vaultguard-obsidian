@@ -55,12 +55,115 @@ export interface FileMetadata {
   contentType?: string;
 }
 
+/** Metadata returned by the permission-filtered paginated list route. */
+export interface VaultFileListItem {
+  path: string;
+  size: number;
+  lastModified: string;
+  contentType?: string;
+  versionId?: string;
+  checksum?: string;
+}
+
+export interface VaultFileListPage {
+  files: VaultFileListItem[];
+  count: number;
+  nextContinuationToken: string | null;
+  isTruncated: boolean;
+}
+
+export interface VaultFileListOptions {
+  limit?: number;
+  continuationToken?: string;
+  prefix?: string;
+}
+
+/** Decoded plaintext returned by the independently authorized decrypt route. */
+export interface VaultFileDecryptedResponse {
+  path: string;
+  content: ArrayBuffer;
+  contentType: string;
+  size: number;
+  decrypted: true;
+  lastModified?: string;
+  versionId?: string;
+}
+
+interface VaultFileDecryptedWireResponse {
+  path: string;
+  content: string;
+  encoding: "base64";
+  decrypted: true;
+  encrypted: false;
+  contentType: string;
+  size: number;
+  lastModified?: string;
+  versionId?: string;
+}
+
 export interface PutFileOptions {
   expectedVersionId?: string;
 }
 
 export interface DeleteFileOptions {
   expectedVersionId?: string;
+}
+
+export interface DirectUploadRequest {
+  plaintextSize: number;
+  encryptedSize: number;
+  plaintextSha256: string;
+  encryptedSha256: string;
+  contentType: string;
+  activeKeyId: string;
+  expectedVersionId?: string;
+}
+
+export interface DirectUploadCapability {
+  transferId: string;
+  url: string;
+  method: "PUT";
+  headers: Record<string, string>;
+  expiresAt: string;
+}
+
+export interface DirectUploadResult extends Omit<FileMetadata, "encryptedKey"> {
+  transferId: string;
+}
+
+export interface DirectDownloadCapability {
+  transferId: string;
+  url: string;
+  method: "GET";
+  headers: Record<string, string>;
+  expiresAt: string;
+  versionId?: string;
+  encryptedSize: number;
+  encryptedSha256: string;
+  plaintextSize: number;
+  plaintextSha256: string;
+  contentType: string;
+}
+
+export interface FileVersionRecord {
+  versionId: string;
+  lastModified: string;
+  size: number;
+  isLatest: boolean;
+  isDeleteMarker: boolean;
+}
+
+export interface RecoveryPage<T> {
+  items: T[];
+  cursor: string | null;
+  hasMore: boolean;
+  partial?: boolean;
+}
+
+export interface DeletedFileRecord {
+  path: string;
+  deleteMarkerVersionId: string;
+  deletedAt: string;
 }
 
 export interface PermissionRule {
@@ -171,6 +274,8 @@ export interface VaultMemberRecord {
   role: VaultMemberRole;
   joinedAt: string;
   invitedBy: string;
+  accessKind?: "member" | "guest";
+  expiresAt?: string;
   /**
    * Server-resolved display name from Cognito. Optional because the
    * server may degrade (Cognito unreachable) and older deployments
@@ -202,6 +307,19 @@ export interface UserListEntry {
   mfaEnabled: boolean;
   deviceCount: number;
   type: "user";
+}
+
+export interface InviteUserResult {
+  message: string;
+  userId: string;
+  role: string;
+  accessKind: "member" | "guest";
+  displayName?: string;
+  expiresAt?: string;
+  vaultIds?: string[];
+  provisioningStatus?: "complete" | "partial" | "failed";
+  vaultsJoined?: number;
+  vaultProvisioningFailures?: number;
 }
 
 export interface RoleEntry {
@@ -424,6 +542,47 @@ function encodeFilePathForRoute(path: string, options: { operation?: "read" } = 
     return `deleted${operation}`;
   }
   return encodeURIComponent(path);
+}
+
+const EXPLICIT_VAULT_ID_FORBIDDEN = /[\/\u0000-\u001f\u007f]/u;
+const EXPLICIT_PATH_CONTROL = /[\u0000-\u001f\u007f]/u;
+const WINDOWS_ABSOLUTE_PATH = /^[a-z]:[\\/]/iu;
+
+function requireExplicitVaultId(value: string): string {
+  const vaultId = typeof value === "string" ? value.trim() : "";
+  if (!vaultId || vaultId.length > 256 || EXPLICIT_VAULT_ID_FORBIDDEN.test(vaultId)) {
+    throw new Error("A safe explicit vault ID is required.");
+  }
+  return vaultId;
+}
+
+function normalizeExplicitVaultPath(
+  value: string,
+  field: "path" | "prefix",
+  allowEmpty: boolean,
+): string {
+  if (typeof value !== "string" || EXPLICIT_PATH_CONTROL.test(value) || WINDOWS_ABSOLUTE_PATH.test(value)) {
+    throw new Error(`${field} must be a safe vault-relative value.`);
+  }
+  const hadTrailingSlash = /[\\/]$/u.test(value);
+  const normalized = value.replace(/\\/gu, "/").replace(/^\/+/, "").replace(/\/{2,}/gu, "/");
+  if (!normalized) {
+    if (allowEmpty) return "";
+    throw new Error(`${field} must be a non-empty vault-relative value.`);
+  }
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    throw new Error(`${field} must not contain traversal segments.`);
+  }
+  const joined = segments.join("/");
+  if (!joined || (!allowEmpty && hadTrailingSlash)) {
+    throw new Error(`${field} must be a file path.`);
+  }
+  return allowEmpty && hadTrailingSlash ? `${joined}/` : joined;
+}
+
+function explicitVaultBase(vaultId: string): string {
+  return `/vaults/${encodeURIComponent(requireExplicitVaultId(vaultId))}`;
 }
 
 // ─── Agent-bridge context helpers ──────────────────────────────────────────
@@ -698,6 +857,120 @@ export class VaultGuardApiClient {
     return response.files ?? [];
   }
 
+  /**
+   * Read one permission-filtered page from an explicitly selected vault.
+   * This method intentionally never consults or mutates the client's bound
+   * vault, so concurrent sync and permission calls cannot cross scopes.
+   */
+  async listVaultFilesPage(
+    vaultId: string,
+    options: VaultFileListOptions = {},
+  ): Promise<VaultFileListPage> {
+    const base = explicitVaultBase(vaultId);
+    const params = new URLSearchParams();
+    if (options.limit !== undefined) {
+      if (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1000) {
+        throw new Error("File-list limit must be an integer from 1 through 1000.");
+      }
+      params.set("limit", String(options.limit));
+    }
+    if (options.continuationToken !== undefined) {
+      if (
+        typeof options.continuationToken !== "string" ||
+        options.continuationToken.length < 1 ||
+        options.continuationToken.length > 8_192 ||
+        EXPLICIT_PATH_CONTROL.test(options.continuationToken)
+      ) {
+        throw new Error("Continuation token is invalid.");
+      }
+      params.set("continuationToken", options.continuationToken);
+    }
+    if (options.prefix !== undefined) {
+      const prefix = normalizeExplicitVaultPath(options.prefix, "prefix", true);
+      if (prefix) params.set("prefix", prefix);
+    }
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    const response = await this.request<Partial<VaultFileListPage>>(
+      "GET",
+      `${base}/files${suffix}`,
+    );
+    if (!Array.isArray(response.files)) {
+      throw new Error("Vault file-list response is malformed.");
+    }
+    const files = response.files.map((item) => {
+      if (
+        !item ||
+        typeof item.path !== "string" ||
+        !item.path ||
+        typeof item.size !== "number" ||
+        !Number.isFinite(item.size) ||
+        item.size < 0 ||
+        typeof item.lastModified !== "string"
+      ) {
+        throw new Error("Vault file-list item is malformed.");
+      }
+      return { ...item } as VaultFileListItem;
+    });
+    const cursor = response.nextContinuationToken;
+    if (cursor !== undefined && cursor !== null && typeof cursor !== "string") {
+      throw new Error("Vault file-list cursor is malformed.");
+    }
+    return {
+      files,
+      count:
+        typeof response.count === "number" && Number.isSafeInteger(response.count) && response.count >= 0
+          ? response.count
+          : files.length,
+      nextContinuationToken: cursor ?? null,
+      isTruncated: response.isTruncated === true,
+    };
+  }
+
+  async readVaultFileDecrypted(
+    vaultId: string,
+    path: string,
+  ): Promise<VaultFileDecryptedResponse> {
+    const base = explicitVaultBase(vaultId);
+    const normalizedPath = normalizeExplicitVaultPath(path, "path", false);
+    const response = await this.request<VaultFileDecryptedWireResponse>(
+      "GET",
+      `${base}/files-decrypted/${encodeURIComponent(normalizedPath)}`,
+    );
+    if (
+      !response ||
+      response.encoding !== "base64" ||
+      response.decrypted !== true ||
+      typeof response.content !== "string" ||
+      typeof response.path !== "string" ||
+      typeof response.contentType !== "string" ||
+      typeof response.size !== "number" ||
+      !Number.isFinite(response.size) ||
+      response.size < 0
+    ) {
+      throw new Error("Decrypted file response is malformed.");
+    }
+    let responsePath: string;
+    let content: ArrayBuffer;
+    try {
+      responsePath = normalizeExplicitVaultPath(response.path, "path", false);
+      content = base64ToArrayBuffer(response.content);
+    } catch {
+      throw new Error("Decrypted file response is malformed.");
+    }
+    if (responsePath !== normalizedPath || content.byteLength !== response.size) {
+      throw new Error("Decrypted file response is malformed.");
+    }
+    return {
+      path: response.path,
+      content,
+      contentType: response.contentType,
+      size: response.size,
+      decrypted: true,
+      lastModified: response.lastModified,
+      versionId: response.versionId,
+    };
+  }
+
   async getFile(path: string): Promise<ArrayBuffer> {
     const response = await this.request<{ content: string }>("GET", `${this.vaultBase()}/files/${encodeFilePathForRoute(path, { operation: "read" })}`);
     return base64ToArrayBuffer(response.content);
@@ -727,8 +1000,125 @@ export class VaultGuardApiClient {
     await this.request<void>("DELETE", `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}`, body);
   }
 
-  async getFileHistory(path: string): Promise<{ version: string; timestamp: string; userId: string }[]> {
-    return this.request("GET", `${this.vaultBase()}/files/${encodeURIComponent(path)}/history`);
+  async issueDirectUpload(
+    path: string,
+    request: DirectUploadRequest
+  ): Promise<DirectUploadCapability> {
+    return this.request(
+      "POST",
+      `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}/direct-upload`,
+      request
+    );
+  }
+
+  async putDirectUpload(
+    capability: DirectUploadCapability,
+    encryptedContent: ArrayBuffer
+  ): Promise<string> {
+    const response = await this.withTimeout(
+      requestUrl({
+        url: capability.url,
+        method: capability.method,
+        headers: capability.headers,
+        body: encryptedContent,
+        throw: false,
+      }),
+      Math.max(this.config.requestTimeoutMs, 120_000),
+    );
+    if (!this.isSuccessStatus(response.status)) {
+      throw new Error(`VaultGuard direct upload failed with status ${response.status}.`);
+    }
+    const etag = this.getHeaderValue(response.headers, "etag");
+    if (!etag) {
+      throw new Error("VaultGuard direct upload completed without an object ETag.");
+    }
+    return etag;
+  }
+
+  async finalizeDirectUpload(
+    path: string,
+    transferId: string,
+    stagingEtag: string,
+    expectedVersionId?: string
+  ): Promise<DirectUploadResult> {
+    return this.request(
+      "POST",
+      `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}/direct-upload/${encodeURIComponent(transferId)}/finalize`,
+      { stagingEtag, ...(expectedVersionId ? { expectedVersionId } : {}) }
+    );
+  }
+
+  async uploadLargeEncryptedFile(
+    path: string,
+    encryptedContent: ArrayBuffer,
+    request: DirectUploadRequest
+  ): Promise<DirectUploadResult> {
+    const capability = await this.issueDirectUpload(path, request);
+    const stagingEtag = await this.putDirectUpload(capability, encryptedContent);
+    return this.finalizeDirectUpload(
+      path,
+      capability.transferId,
+      stagingEtag,
+      request.expectedVersionId
+    );
+  }
+
+  async issueDirectDownload(path: string, versionId?: string): Promise<DirectDownloadCapability> {
+    return this.request(
+      "POST",
+      `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}/direct-download`,
+      versionId ? { versionId } : {}
+    );
+  }
+
+  async getDirectDownload(capability: DirectDownloadCapability): Promise<ArrayBuffer> {
+    const response = await this.withTimeout(
+      requestUrl({
+        url: capability.url,
+        method: capability.method,
+        headers: capability.headers,
+        throw: false,
+      }),
+      Math.max(this.config.requestTimeoutMs, 120_000),
+    );
+    if (!this.isSuccessStatus(response.status)) {
+      throw new Error(`VaultGuard direct download failed with status ${response.status}.`);
+    }
+    if (response.arrayBuffer.byteLength !== capability.encryptedSize) {
+      throw new Error("VaultGuard direct download size did not match the authorized object.");
+    }
+    return response.arrayBuffer;
+  }
+
+  async getFileHistoryPage(
+    path: string,
+    options: { limit?: number; cursor?: string } = {}
+  ): Promise<RecoveryPage<FileVersionRecord>> {
+    const query = new URLSearchParams();
+    if (options.limit) query.set("limit", String(options.limit));
+    if (options.cursor) query.set("cursor", options.cursor);
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    const response = await this.request<{
+      versions?: FileVersionRecord[];
+      items?: FileVersionRecord[];
+      cursor?: string | null;
+      hasMore?: boolean;
+      partial?: boolean;
+    } | FileVersionRecord[]>("GET", `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}/history${suffix}`);
+    if (Array.isArray(response)) {
+      return { items: response, cursor: null, hasMore: false };
+    }
+    return {
+      items: response.items ?? response.versions ?? [],
+      cursor: response.cursor ?? null,
+      hasMore: response.hasMore ?? false,
+      partial: response.partial,
+    };
+  }
+
+  /** Backward-compatible first-page helper used by existing agent surfaces. */
+  async getFileHistory(path: string): Promise<FileVersionRecord[]> {
+    return (await this.getFileHistoryPage(path)).items;
   }
 
   /**
@@ -736,13 +1126,34 @@ export class VaultGuardApiClient {
    * server-side, and per-row filtered to paths the caller can read. Returns
    * the delete-marker version id + deletion timestamp so a file can be restored.
    */
-  async getDeletedFiles(): Promise<
-    { path: string; deleteMarkerVersionId: string; deletedAt: string }[]
-  > {
+  async getDeletedFilesPage(
+    options: { limit?: number; cursor?: string } = {}
+  ): Promise<RecoveryPage<DeletedFileRecord>> {
+    const query = new URLSearchParams();
+    if (options.limit) query.set("limit", String(options.limit));
+    if (options.cursor) query.set("cursor", options.cursor);
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
     const response = await this.request<{
-      files: { path: string; deleteMarkerVersionId: string; deletedAt: string }[];
-    }>("GET", `${this.vaultBase()}/files/deleted`);
-    return response.files ?? [];
+      files?: DeletedFileRecord[];
+      items?: DeletedFileRecord[];
+      cursor?: string | null;
+      hasMore?: boolean;
+      partial?: boolean;
+    } | DeletedFileRecord[]>("GET", `${this.vaultBase()}/files/deleted${suffix}`);
+    if (Array.isArray(response)) {
+      return { items: response, cursor: null, hasMore: false };
+    }
+    return {
+      items: response.items ?? response.files ?? [],
+      cursor: response.cursor ?? null,
+      hasMore: response.hasMore ?? false,
+      partial: response.partial,
+    };
+  }
+
+  /** Backward-compatible first-page helper used by existing agent surfaces. */
+  async getDeletedFiles(): Promise<DeletedFileRecord[]> {
+    return (await this.getDeletedFilesPage()).items;
   }
 
   /**
@@ -755,7 +1166,22 @@ export class VaultGuardApiClient {
   ): Promise<{ path: string; versionId: string; restoredFrom: string }> {
     return this.request(
       "POST",
-      `${this.vaultBase()}/files/${encodeURIComponent(path)}/restore-delete`
+      `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}/restore-delete`
+    );
+  }
+
+  async restoreFileVersion(
+    path: string,
+    versionId: string
+  ): Promise<{
+    versionId: string;
+    restoredFrom: { versionId: string; keyId: string };
+    targetKeyId: string;
+  }> {
+    return this.request(
+      "POST",
+      `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}/restore`,
+      { versionId }
     );
   }
 
@@ -927,8 +1353,11 @@ export class VaultGuardApiClient {
     sendWelcomeEmail: boolean;
     givenName?: string;
     familyName?: string;
-  }): Promise<void> {
-    await this.request<void>("POST", "/users/invite", invite);
+    accessKind?: "member" | "guest";
+    vaultIds?: string[];
+    expiresInDays?: number;
+  }): Promise<InviteUserResult> {
+    return this.request<InviteUserResult>("POST", "/users/invite", invite);
   }
 
   async updateUserRole(userId: string, role: string): Promise<void> {
@@ -1569,7 +1998,10 @@ export class VaultGuardApiClient {
     );
   }
 
-  private async withTimeout<T>(promise: Promise<T>): Promise<T> {
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs = this.config.requestTimeoutMs,
+  ): Promise<T> {
     let timeoutId: TimeoutHandle | null = null;
 
     try {
@@ -1578,7 +2010,7 @@ export class VaultGuardApiClient {
         new Promise<T>((_, reject) => {
           timeoutId = window.setTimeout(() => {
             reject(new Error("Request timeout"));
-          }, this.config.requestTimeoutMs);
+          }, timeoutMs);
         }),
       ]);
     } finally {

@@ -572,6 +572,48 @@ describe("VaultGuardApiClient surface", () => {
     );
   });
 
+  it("sends selected-vault guest fields and returns explicit provisioning status", async () => {
+    const client = makeClient();
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(201, {
+      message: "Guest invited",
+      userId: "guest-1",
+      role: "viewer",
+      accessKind: "guest",
+      vaultIds: ["vault-abc"],
+      expiresAt: "2026-08-13T12:00:00.000Z",
+      provisioningStatus: "partial",
+      vaultsJoined: 0,
+      vaultProvisioningFailures: 1,
+    }));
+
+    const result = await client.inviteUser({
+      email: "guest@example.com",
+      role: "viewer",
+      accessKind: "guest",
+      vaultIds: ["vault-abc"],
+      expiresInDays: 30,
+      sendWelcomeEmail: true,
+    });
+
+    expect(result).toMatchObject({
+      accessKind: "guest",
+      provisioningStatus: "partial",
+      vaultProvisioningFailures: 1,
+    });
+    expect(mockRequestUrl).toHaveBeenCalledWith(expect.objectContaining({
+      method: "POST",
+      url: "https://api.vaultguard.test/users/invite",
+      body: JSON.stringify({
+        email: "guest@example.com",
+        role: "viewer",
+        accessKind: "guest",
+        vaultIds: ["vault-abc"],
+        expiresInDays: 30,
+        sendWelcomeEmail: true,
+      }),
+    }));
+  });
+
   it("retries status-0 network responses before marking the client offline", async () => {
     const client = makeClient({ maxRetries: 1 });
     const statuses: string[] = [];

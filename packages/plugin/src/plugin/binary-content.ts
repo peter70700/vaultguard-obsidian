@@ -1,19 +1,16 @@
 /**
- * binary-content.ts — shared constants and helpers for BIN-A binary attachment
- * sync (post-launch backlog item #1, `reports/post-launch-backlog-HANDOFF.md` §2).
+ * Shared constants and helpers for encrypted attachment synchronization.
  *
- * This module is the single home for the client-side size ceiling, the large-body
- * upload timeout, the outgoing-upload MIME map, and the pull-side binary
- * discriminator. Everything here is dormant in Wave 1 — later waves (push, pull,
- * queue, ingestion) import these primitives. Named exports only; 2-space indent;
- * no obsidian import (kept pure so it is trivially unit-testable).
+ * This module owns the JSON-path threshold, request timeout, outgoing MIME map,
+ * and pull-side binary discriminator. Files above the threshold use the
+ * direct-transfer path; the deployment's configured file limit is authoritative.
+ * There is no Obsidian import, so the helpers remain pure and unit-testable.
  */
 
 /**
- * Maximum PLAINTEXT byte size for a binary attachment that may ride the existing
- * JSON `/vaults/{vaultId}/files` path (BIN-A). Enforced client-side on every push
- * surface BEFORE encryption; oversize files are rejected fail-closed (OD-1) until
- * the BIN-B presigned-URL path ships.
+ * Maximum plaintext byte size that may ride the existing JSON
+ * `/vaults/{vaultId}/files` path. Larger text and binary files are routed through
+ * the encrypted direct-transfer issue/PUT/finalize path instead of being rejected.
  *
  * Ceiling math: API Gateway hard-caps the JSON request body at 10,485,760 bytes.
  * The body is `{"content": base64(N+28 ciphertext bytes), "hash": 64 hex chars,
@@ -23,22 +20,28 @@
  * (7 * 1024 * 1024 = 7,340,032) leaves ~500 KB of headroom for the JSON envelope
  * keys, the hash, and the contentType string.
  *
- * OD-3 deviation (flagged to Peter in the phase summary): the CONTEXT wording said
- * "respect org max_file_size_bytes", but NO such org setting exists anywhere in the
- * codebase (not in OrgSettingsResponse, not in any Lambda). The only server gate is
- * the `MAX_FILE_SIZE` Lambda env (10 MB, 413), never exposed to clients. So the
- * ceiling is implemented as this client-side constant. An additive org-settings
- * field is deferred to BIN-B.
+ * This is a transport-selection threshold, not the supported file-size maximum.
+ * The Lambda `MAX_FILE_SIZE` environment value is enforced when a direct upload is
+ * issued and finalized.
  */
 export const BINARY_SYNC_MAX_BYTES = 7 * 1024 * 1024;
+
+/**
+ * Largest encrypted S3 object that can still belong to the JSON transfer lane.
+ * Remote file metadata reports ciphertext bytes, so pull-side lane selection must
+ * include the fixed AES-256-GCM envelope (12-byte nonce + 16-byte tag). A direct
+ * transfer is therefore strictly larger than this value.
+ */
+export const JSON_SYNC_MAX_ENCRYPTED_BYTES = BINARY_SYNC_MAX_BYTES + 28;
 
 /**
  * Per-request timeout (ms) for binary PUT uploads, threaded through the `apiRequest`
  * `timeoutMs` override to `requestWithTimeout` (L2). The default 30 s apiRequest
  * timeout is too short for ~9.3 MB base64 bodies on slow uplinks: a timed-out PUT is
  * classified as a network error, flips the client offline, and requeues the op —
- * retrying the same oversized body forever. 120 s gives a 7 MiB attachment room to
- * land on a modest (~0.7 Mbps) uplink. Used by all binary PUT sites.
+ * retrying the same body forever. 120 s gives the largest JSON-path attachment room
+ * to land on a modest (~0.7 Mbps) uplink. Direct transfers also enforce at least
+ * this timeout in the API client.
  */
 export const BINARY_PUT_TIMEOUT_MS = 120_000;
 

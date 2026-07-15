@@ -174,6 +174,8 @@ export interface KeyLease {
   refreshToken: string;
   /** Unique identifier for this key lease (for audit trail) */
   leaseId: string;
+  /** Active vault data-key identifier used to bind direct transfers to the lease. */
+  keyId?: string;
   /** The key derivation algorithm used */
   algorithm: "AES-256-GCM";
   /** Whether this lease permits offline use */
@@ -348,12 +350,51 @@ export const ASSUMED_SERVER_FEATURES: ServerFeatures = {
 };
 
 export type PermissionsGraphRenderMode = "auto" | "aggregated" | "detailed";
-export type PermissionsGraphLayoutMode = "auto" | "radial" | "force" | "grid";
+export type PermissionsGraphLayoutMode = "auto" | "radial" | "force" | "grid" | "folder" | "sections";
 export type PermissionsGraphLabelsMode = "auto" | "on" | "off";
 export type PermissionsGraphSearchScope = "all" | "user" | "file" | "folder";
+export type PermissionsGraphBackgroundMode = "theme" | "solid" | "gradient";
+export type PermissionsGraphBackgroundPattern = "none" | "grid" | "dots";
+export type PermissionsGraphColorMode = "current" | "type" | "folder" | "access" | "connections";
+export type PermissionsGraphSizeMode = "standard" | "uniform" | "connections" | "access";
+export type PermissionsGraphSectionMode = "folder" | "type" | "access" | "connections";
+export type PermissionsGraphSortMode = "name" | "path" | "access" | "connections";
+export type PermissionsGraphSortDirection = "asc" | "desc";
+
+export interface PermissionsGraphStudioPalette {
+  user?: string;
+  file?: string;
+  folder?: string;
+  read?: string;
+  write?: string;
+  admin?: string;
+  low?: string;
+  medium?: string;
+  high?: string;
+}
+
+export interface PermissionsGraphStudioAppearance {
+  backgroundMode?: PermissionsGraphBackgroundMode;
+  backgroundPattern?: PermissionsGraphBackgroundPattern;
+  backgroundPrimary?: string;
+  backgroundSecondary?: string;
+  colorMode?: PermissionsGraphColorMode;
+  customPalette?: boolean;
+  palette?: PermissionsGraphStudioPalette;
+  sizeMode?: PermissionsGraphSizeMode;
+  nodeScale?: number;
+  edgeScale?: number;
+  labelScale?: number;
+}
+
+export interface PermissionsGraphStudioArrangement {
+  sectionBy?: PermissionsGraphSectionMode;
+  sortBy?: PermissionsGraphSortMode;
+  sortDirection?: PermissionsGraphSortDirection;
+}
 
 export interface PermissionsGraphSavedState {
-  schemaVersion?: 1;
+  schemaVersion?: 1 | 2;
   renderMode?: PermissionsGraphRenderMode;
   layoutMode?: PermissionsGraphLayoutMode;
   labelsMode?: PermissionsGraphLabelsMode;
@@ -378,8 +419,67 @@ export interface PermissionsGraphSavedState {
   maxEdges?: number;
   depth?: number;
   debugExpanded?: boolean;
+  appearance?: PermissionsGraphStudioAppearance;
+  arrangement?: PermissionsGraphStudioArrangement;
   updatedAt?: string;
 }
+
+export type PendingLargeFileReason =
+  | "offline"
+  | "manual-sync"
+  | "lease-unavailable"
+  | "upload-failed"
+  | "finalize-failed"
+  | "conflict";
+
+export type PendingLargeFileState = "pending" | "uploading" | "retryable" | "blocked";
+
+/**
+ * Metadata-only retry state for a large file that cannot use the bounded
+ * JSON/offline queue. Never add plaintext, ciphertext, presigned URLs, or key
+ * material to this record.
+ */
+export interface PendingLargeFileRecord {
+  path: string;
+  previousPath?: string;
+  size: number;
+  sha256: string;
+  contentType: string;
+  reason: PendingLargeFileReason;
+  state: PendingLargeFileState;
+  localProtection: "plaintext-pending" | "encrypted-recoverable";
+  attempts: number;
+  updatedAt: string;
+}
+
+/** Advanced modules that are opt-in for fresh installs. */
+export type OptionalModuleId =
+  | "aiChat"
+  | "permissionsGraph"
+  | "agentAccess"
+  | "secureDiscovery";
+
+/** Versioned optional-module preferences persisted in plugin data. */
+export interface OptionalModulePreferences {
+  schemaVersion: 2;
+  aiChat: boolean;
+  permissionsGraph: boolean;
+  agentAccess: boolean;
+  /** Permission-aware Bases, CLI, and secure search surfaces. Always opt-in. */
+  secureDiscovery: boolean;
+}
+
+/** Observable local semantic-index lifecycle state. */
+export type SemanticIndexState =
+  | "absent"
+  | "loading"
+  | "ready"
+  | "stale"
+  | "building"
+  | "failed";
+
+/** Provider-key storage boundary selected explicitly by the user. */
+export type ProviderKeyStorageMode = "vaultguard" | "obsidian";
 
 export interface VaultGuardSettings {
   /**
@@ -457,12 +557,30 @@ export interface VaultGuardSettings {
   /** Whether to show sync status in the status bar */
   showStatusBar: boolean;
   /**
+   * Whether the dedicated AI-chat + permissions-graph quick-access ribbon icons
+   * are shown. Defaults to true; the VaultGuard menu (shield) icon is always shown.
+   */
+  showRibbonIcons: boolean;
+  /**
    * Plaintext repo-root mode for using an Obsidian vault as local project
    * memory. Disables local at-rest encryption, sync, sharing, and org/team
    * management surfaces while leaving local navigation and agent-context
    * workflows available.
    */
   localProjectMemoryMode: boolean;
+  /**
+   * Mainstream installs start with advanced modules off. A one-time migration
+   * enables them for established installs that predate this preference.
+   */
+  optionalModules: OptionalModulePreferences;
+  /** Second consent inside Secure Discovery; never enabled by migration. */
+  semanticSearchEnabled: boolean;
+  /** Non-secret loopback embedding origin. Runtime validation remains fail-closed. */
+  semanticEmbeddingEndpoint: string;
+  /** Non-secret local embedding model identifier. */
+  semanticEmbeddingModel: string;
+  /** Default bounded result count shared by the view and CLI. */
+  discoveryResultLimit: number;
   /** Whether to use manual connection configuration instead of org slug auto-config */
   manualConfig?: boolean;
   /**
@@ -494,6 +612,11 @@ export interface VaultGuardSettings {
    * plaintext write payloads) here.
    */
   deletionTombstones?: Record<string, string>;
+  /**
+   * Metadata-only large-file retry ledger, keyed by normalized vault-relative
+   * path. Bodies stay in the vault and never enter plugin settings.
+   */
+  pendingLargeFiles?: Record<string, PendingLargeFileRecord>;
   /**
    * Local-only opt-out list. Files whose vault-relative path matches any
    * entry are kept off the sync wire entirely: never uploaded, never pulled
@@ -529,12 +652,7 @@ export interface VaultGuardSettings {
    * device. Prevents the consent modal from re-firing every sync.
    */
   pluginAllowlistIgnored?: string[];
-  /**
-   * When true, the in-plugin update checker is disabled. Default false: the
-   * plugin polls the public release repo once every 24 h and surfaces a
-   * non-blocking Notice when a newer version is published. Disabling stops
-   * all outbound calls to GitHub from this device.
-   */
+  /** @deprecated Update discovery is native/manual-only; retained for data compatibility. */
   disableUpdateChecks?: boolean;
   /**
    * Global defaults for the Permissions Graph options panel. These are UI
@@ -561,6 +679,10 @@ export interface VaultGuardSettings {
    * "ss:" = OS-keychain safeStorage, "ar:" = local AtRestCipher fallback.
    */
   encryptedAnthropicKey?: string;
+  /** Explicit storage boundary for the Anthropic provider key. */
+  anthropicKeyStorageMode?: ProviderKeyStorageMode;
+  /** Named Obsidian secret reference; never the secret value. */
+  anthropicSecretId?: string;
   /**
    * OpenAI API key for the AI Chat panel, stored as a method-tagged,
    * base64-encoded encrypted envelope (never plaintext). Written and read
@@ -568,6 +690,10 @@ export interface VaultGuardSettings {
    * "ss:" = OS-keychain safeStorage, "ar:" = local AtRestCipher fallback.
    */
   encryptedOpenAiKey?: string;
+  /** Explicit storage boundary for the OpenAI provider key. */
+  openAiKeyStorageMode?: ProviderKeyStorageMode;
+  /** Named Obsidian secret reference; never the secret value. */
+  openAiSecretId?: string;
   /** Anthropic model id for the AI Chat panel (default "claude-opus-4-8"). */
   aiChatModel: string;
   /** Adaptive-thinking effort level for AI Chat turns (default "high"). */
@@ -608,15 +734,15 @@ export interface VaultGuardSettings {
    *      subscription token). Vault access stays MCP-only via AgentBridge.
    *   "apiKey" — call the Anthropic Messages API with the user's stored key.
    *   "openai" — call the OpenAI Responses API with the user's stored key.
-   * Defaults to "subscription" the first time a logged-in CLI subscription is
-   * detected, otherwise "apiKey". The user's explicit choice is persisted.
+   *   "codex" — drive the official local Codex client with the user's ChatGPT
+   *      subscription login (desktop only; no OpenAI API key). Vault access is
+   *      limited to the dedicated VaultGuard loopback MCP chat lease.
+   * Defaults to "apiKey". The user's explicit choice is persisted.
    */
   aiChatProvider: AiChatProvider;
   /**
-   * True once the user has explicitly picked an AI provider. Until then the
-   * plugin may auto-default to "subscription" when a logged-in Claude Code
-   * subscription is detected on first open. Set when the settings dropdown is
-   * changed; never overrides an explicit choice afterward.
+   * True once the user has explicitly picked an AI provider. Provider
+   * detection is user-triggered and never silently changes this setting.
    */
   aiChatProviderExplicit?: boolean;
   /**
@@ -687,7 +813,7 @@ export interface ChatPromptTemplate {
 }
 
 /** AI Chat transport selection. */
-export type AiChatProvider = "subscription" | "apiKey" | "openai";
+export type AiChatProvider = "subscription" | "apiKey" | "openai" | "codex";
 
 /** AI Chat write-confirmation behavior. */
 export type AiChatPermissionMode = "confirm" | "skip";

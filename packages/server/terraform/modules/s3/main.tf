@@ -116,6 +116,27 @@ resource "aws_s3_bucket_lifecycle_configuration" "vault" {
       days_after_initiation = 7
     }
   }
+
+  # Direct-transfer uploads are issued to an isolated, non-vault prefix and
+  # become visible only after the files Lambda validates and promotes them.
+  # Expire abandoned bodies quickly so a crashed client cannot accumulate
+  # unbounded staging storage or version history.
+  rule {
+    id     = "expire-direct-transfer-staging"
+    status = "Enabled"
+
+    filter {
+      prefix = "_vaultguard-transfers/"
+    }
+
+    expiration {
+      days = 1
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+  }
 }
 
 resource "aws_s3_bucket_cors_configuration" "vault" {

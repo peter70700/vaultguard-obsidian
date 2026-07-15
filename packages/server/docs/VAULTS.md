@@ -46,13 +46,15 @@ URL lookups.
 `PK = vaultId, SK = userId`. GSI `userId-index` on `(userId, vaultId)` for
 "list all vaults this user belongs to".
 
-| field      | type     | notes                                              |
-| ---------- | -------- | -------------------------------------------------- |
-| `vaultId`  | string   | Hash key.                                          |
-| `userId`   | string   | Range key — Cognito `sub`.                         |
-| `role`     | enum     | `viewer` (read), `editor` (read+write), `admin`.   |
-| `joinedAt` | ISO time | When the user joined.                              |
-| `invitedBy`| string   | Admin who granted this membership.                 |
+| field         | type     | notes                                                        |
+| ------------- | -------- | ------------------------------------------------------------ |
+| `vaultId`     | string   | Hash key.                                                    |
+| `userId`      | string   | Range key — Cognito `sub`.                                   |
+| `role`        | enum     | `viewer` (read), `editor` (read+write), `admin`.             |
+| `joinedAt`    | ISO time | When the user joined.                                        |
+| `invitedBy`   | string   | Admin who granted this membership.                           |
+| `accessKind?` | enum     | `member` or `guest`; legacy permanent rows may omit it.      |
+| `expiresAt?`  | ISO time | Required for guests; expired or malformed values fail closed. |
 
 ### `Permissions` table (vault-scoped)
 
@@ -104,10 +106,13 @@ The canonical authorization gate (`infrastructure/lambda/shared/utils.ts`):
 
 1. Vault must exist and belong to the user's org (tenant check).
 2. Either:
-    - the user has a `VaultMember` row with role ≥ `requiredRole`, **or**
+    - the user has an active `VaultMember` row with role ≥ `requiredRole`, **or**
     - the user is org-`admin`/`owner` (full-org bypass).
-3. Archived vaults are read-only — writes are rejected.
-4. On success returns the resolved `VaultRecord`. On failure throws `AuthError`.
+3. A membership with an expired or malformed `expiresAt` is treated as absent.
+   The same active-membership rule filters the non-admin vault list and the
+   vault role passed into permission evaluation.
+4. Archived vaults are read-only — writes are rejected.
+5. On success returns the resolved `VaultRecord`. On failure throws `AuthError`.
 
 Every `/vaults/{vaultId}/...` route calls this before doing any work. The
 `files`, `permissions`, and `auth` lambdas all flow through it.
@@ -257,7 +262,35 @@ tokens return `410`. Full reference:
 6. Sync engine boots and starts mirroring server vault contents into the
    local Obsidian folder.
 
-### B. Self-signup (org founder)
+### B. Temporary authenticated guest
+
+1. An organization admin chooses **Temporary guest**, a 1–90 day duration, and
+   one or more active vaults in the same organization. The server validates a
+   viewer-only role, unique selected vault IDs, ownership, archive state, and
+   the duration before creating the Cognito identity.
+2. For each selected vault, the invite path conditionally creates one guest
+   membership and one deterministic `read`/`list` `/**` permission rule with
+   the exact same server-time `expiresAt`. A retry accepts only an identical
+   access boundary; permanent memberships or differently scoped guest grants
+   are preserved and reported as failures.
+3. The response and audit metadata report `complete`, `partial`, or `failed`
+   provisioning with counts. A partial result is never presented as a full
+   success, and audit metadata contains identifiers/counts rather than invite
+   tokens or credentials.
+4. Before expiry, the guest signs in normally and sees only selected active
+   vaults. Full, scoped, and refreshed offline-capable key leases are clamped to
+   the membership expiry.
+5. At or after expiry, canonical membership lookup, vault listing, permission
+   roles, share resolution, and new/renewed leases all fail closed. Removing a
+   guest deletes its default and guest permission rules and revokes outstanding
+   vault leases. A guest cannot be promoted in place; remove the guest access
+   and invite the identity as a permanent member instead.
+
+This is authenticated temporary collaboration, not anonymous public sharing.
+The guest still needs a Cognito session, an active selected-vault membership,
+and file-level permission.
+
+### C. Self-signup (org founder)
 
 1. `POST /signup` creates the org + admin Cognito user. (Pre-multi-vault no
    default vault was created.)
@@ -265,21 +298,22 @@ tokens return `410`. Full reference:
    the user is an org-admin.
 3. Default suggestion: the local Obsidian folder name. Slug is auto-derived.
 
-### C. Two local Obsidian vaults bound to the same org
+### D. Two local Obsidian vaults bound to the same org
 
 Each gets its own server vault. Their `serverVaultId` settings differ. Their
 S3 prefixes are `vault/{orgId}/{vaultIdA}/...` and `vault/{orgId}/{vaultIdB}/...`
 respectively. **`Welcome.md` in vault A is a different S3 object from
 `Welcome.md` in vault B** — collisions are impossible by construction.
 
-### D. Sharing across vaults
+### E. Sharing across vaults
 
 Cross-vault sharing is not supported as a primitive — by design. To grant
-someone read access in another vault, you add them as a member of that vault
-(viewer/editor/admin). This is the same model Notion, Drive, ClickUp, and
-GitHub use; isolation by default, explicit membership for collaboration.
+someone read access in another vault, add them either as a permanent member
+(viewer/editor/admin) or as a viewer-only authenticated guest with a bounded
+expiry. Isolation remains the default; collaboration requires explicit
+membership in each selected vault.
 
-### E. Sharing a single file inside one vault
+### F. Sharing a single file inside one vault
 
 For pointing a teammate at one specific file (without changing membership
 or rules), VaultGuard mints opaque deep-link tokens via
@@ -376,9 +410,13 @@ vault's detail page.
 
 ## 8. What's still implicit (gaps)
 
-- **Cross-vault search.** A user belonging to N vaults today gets N separate
-  views. A federated search UI would require either client-side fan-out or
-  a search service.
+- **Cross-vault search — Implemented in P2.** Secure Discovery performs bounded,
+  read-only client fan-out over explicit `/vaults/{vaultId}/...` list and
+  independently authorized decrypted-read calls. Metadata-only is the default;
+  content requires per-search consent; the bound local vault is always retained
+  inside the 25-vault cap, and the local binding is never mutated. Native UI/CLI
+  physical proof remains a separate manual lane. See
+  [Secure Discovery](SECURE-DISCOVERY.md).
 - **Cross-vault file moves.** The re-encryption Lambda has the primitives; a
   "move file from vault A to vault B" feature would wrap re-encrypt + relocate.
 - **Per-vault encryption keys.** Today's hybrid-zk model uses one key per user.

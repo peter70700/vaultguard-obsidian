@@ -29,6 +29,7 @@ import { createHash, randomBytes, randomUUID } from 'crypto';
 import { EDITION } from './edition';
 import { emitSecurityMetric } from './metrics';
 import { isOffHours } from './time';
+import { isExpiringAccessActive } from './guest-access';
 
 // ─── Environment Configuration ───────────────────────────────────────────────
 
@@ -248,6 +249,10 @@ export interface VaultMemberRecord {
   joinedAt: string;
   /** User ID of the admin who granted membership. */
   invitedBy: string;
+  /** Permanent members omit this field; guests are always viewer-only. */
+  accessKind?: 'member' | 'guest';
+  /** ISO boundary enforced by membership checks, permission rules, and leases. */
+  expiresAt?: string;
   /**
    * Optional human-readable name resolved from Cognito at read time.
    * Not persisted in DynamoDB — populated by API handlers so non-admin
@@ -884,7 +889,7 @@ export async function evaluatePermission(
     // files at vault root, etc.), grant access at the membership role's
     // baseline. Without this, anyone whose default rule wasn't created
     // gets 403 on every file in their own vault.
-    const membership = await getVaultMembership(vaultId, userId);
+    const membership = await getActiveVaultMembership(vaultId, userId);
     if (membership && vaultRoleAllowsAction(membership.role, action)) {
       return { allowed: true, matchedRule: null, evaluatedRules: liveRules };
     }
@@ -956,7 +961,11 @@ export async function authorizePermissionMutation(
   pathPattern: string,
   targetLevel: PermissionMutationTarget,
   existingRule?: PermissionRule,
-  deps: AuthorizePermissionMutationDeps = { evaluatePermission, requireVaultMember, getVaultMembership }
+  deps: AuthorizePermissionMutationDeps = {
+    evaluatePermission,
+    requireVaultMember,
+    getVaultMembership: getActiveVaultMembership,
+  }
 ): Promise<AuthorizePermissionMutationResult> {
   // 1. Vault/org admin bypass — unchanged behavior.
   try {
@@ -2402,7 +2411,7 @@ export async function getVaultBySlug(orgId: string, slug: string): Promise<Vault
  * Org admins do NOT automatically get vault memberships — instead, callers
  * should layer `isAdmin(user)` checks on top when full-org bypass is needed.
  */
-export async function getVaultMembership(
+export async function getStoredVaultMembership(
   vaultId: string,
   userId: string
 ): Promise<VaultMemberRecord | null> {
@@ -2414,6 +2423,26 @@ export async function getVaultMembership(
     })
   );
   return (result.Item as VaultMemberRecord | undefined) ?? null;
+}
+
+/** Default membership lookup for enforcement: expired rows fail closed. */
+export async function getVaultMembership(
+  vaultId: string,
+  userId: string
+): Promise<VaultMemberRecord | null> {
+  return getActiveVaultMembership(vaultId, userId);
+}
+
+/** Canonical authorization lookup: expired or malformed guest rows are absent. */
+export async function getActiveVaultMembership(
+  vaultId: string,
+  userId: string,
+  nowMs = Date.now()
+): Promise<VaultMemberRecord | null> {
+  const membership = await getStoredVaultMembership(vaultId, userId);
+  return membership && isExpiringAccessActive(membership.expiresAt, nowMs)
+    ? membership
+    : null;
 }
 
 /**
@@ -2437,7 +2466,8 @@ export async function listVaultsForUser(
       ExpressionAttributeValues: { ':userId': userId },
     })
   );
-  const rows = (memberships.Items ?? []) as VaultMemberRecord[];
+  const rows = ((memberships.Items ?? []) as VaultMemberRecord[])
+    .filter((row) => isExpiringAccessActive(row.expiresAt));
   if (rows.length === 0) return [];
 
   const vaults = await Promise.all(
@@ -2516,7 +2546,7 @@ export async function requireVaultMember(
     return vault;
   }
 
-  const membership = await getVaultMembership(vaultId, user.userId);
+  const membership = await getActiveVaultMembership(vaultId, user.userId);
   if (!membership) {
     throw new AuthError(`You are not a member of this vault: ${vaultId}`, 403);
   }
@@ -2803,9 +2833,11 @@ export async function resolveVaultEvaluationRoles(
   vaultId: string
 ): Promise<string[]> {
   if (isAdmin(user)) return user.roles;
-  const membership = await getVaultMembership(vaultId, user.userId);
-  if (membership) return [membership.role];
-  return user.roles;
+  const membership = await getStoredVaultMembership(vaultId, user.userId);
+  if (!membership) return user.roles;
+  return isExpiringAccessActive(membership.expiresAt)
+    ? [membership.role]
+    : [];
 }
 
 /**

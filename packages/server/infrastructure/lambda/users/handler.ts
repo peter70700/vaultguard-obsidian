@@ -56,6 +56,7 @@ import {
   AuthError,
   ValidationError,
   QueryCommand,
+  GetCommand,
   PutCommand,
   DeleteCommand,
   AUDIT_TABLE,
@@ -86,7 +87,15 @@ import {
   normalizeDisabledAuditActions,
   isEmailAllowedForOrg,
   invalidateOrgSettingsCache,
+  VaultRecord,
 } from '../shared/utils';
+import {
+  DEFAULT_GUEST_ACCESS_DAYS,
+  guestAccessExpiresAt,
+  isIdenticalGuestMembership,
+  isIdenticalGuestPermissionRule,
+  normalizeGuestVaultIds,
+} from '../shared/guest-access';
 import { UsersRouteContext, resolveUsersRouteContext } from '../shared/route-utils';
 import { sendEmail } from '../email/handler';
 import { syncStripeSeats } from '../billing/handler';
@@ -364,7 +373,15 @@ async function handleInviteUser(
   validateRequiredFields(body, ['email', 'role']);
 
   const email = (body.email as string).trim().toLowerCase();
-  const role = body.role as string;
+  const requestedRole = body.role as string;
+  const accessKind = body.accessKind === undefined ? 'member' : body.accessKind;
+  if (accessKind !== 'member' && accessKind !== 'guest') {
+    throw new ValidationError('accessKind must be either member or guest');
+  }
+  if (accessKind === 'guest' && requestedRole !== 'viewer') {
+    throw new ValidationError('Guests are viewer-only');
+  }
+  const role = accessKind === 'guest' ? 'viewer' : requestedRole;
   const sendWelcomeEmail = body.sendWelcomeEmail !== false;
   const givenName = normalizeOptionalProfileField(
     getOptionalStringField(body, ['givenName', 'firstName']),
@@ -390,6 +407,22 @@ async function handleInviteUser(
     throw new ValidationError('Invalid email address');
   }
 
+  let guestVaults: VaultRecord[] = [];
+  let guestExpiresAt: string | undefined;
+  if (accessKind === 'guest') {
+    try {
+      const expiresInDays = body.expiresInDays === undefined
+        ? DEFAULT_GUEST_ACCESS_DAYS
+        : body.expiresInDays;
+      if (typeof expiresInDays !== 'number') {
+        throw new RangeError('Guest access duration must be a number of whole days.');
+      }
+      guestExpiresAt = guestAccessExpiresAt(expiresInDays);
+    } catch (error) {
+      throw new ValidationError((error as Error).message);
+    }
+  }
+
   // User limit enforcement — always scoped to authenticated admin's org
   const orgCheck = await getActiveOrg(admin.orgId);
   if (!orgCheck.allowed) {
@@ -407,6 +440,25 @@ async function handleInviteUser(
         `Invitations are restricted to these domains: ${orgSettings.allowedDomains.join(', ')}`
       );
     }
+  }
+
+  if (accessKind === 'guest') {
+    let requestedVaultIds: string[];
+    try {
+      requestedVaultIds = normalizeGuestVaultIds(body.vaultIds);
+    } catch (error) {
+      throw new ValidationError((error as Error).message);
+    }
+    const activeVaults = (await listVaultsForOrg(admin.orgId))
+      .filter((vault) => !vault.archived);
+    const byId = new Map(activeVaults.map((vault) => [vault.vaultId, vault]));
+    const invalidVaultIds = requestedVaultIds.filter((vaultId) => !byId.has(vaultId));
+    if (invalidVaultIds.length > 0) {
+      throw new ValidationError(
+        `Guest vaults must be active vaults in this organization: ${invalidVaultIds.join(', ')}`
+      );
+    }
+    guestVaults = requestedVaultIds.map((vaultId) => byId.get(vaultId)!);
   }
 
   // Ensure the role group exists in Cognito
@@ -471,7 +523,43 @@ async function handleInviteUser(
   // attach them to manually. See CLAUDE.md vault-scoping rule — every rule
   // created here is per-vault, never org-wide.
   let bootstrap: { vaultsJoined: number; failures: number } | null = null;
-  if (role === 'editor' || role === 'viewer') {
+  if (accessKind === 'guest') {
+    try {
+      bootstrap = await seedGuestVaultMembershipsForInvitee(
+        admin.orgId,
+        userId,
+        guestVaults,
+        guestExpiresAt!,
+        admin.userId
+      );
+    } catch (bootstrapErr) {
+      bootstrap = { vaultsJoined: 0, failures: guestVaults.length };
+      console.error(
+        `[VaultGuard] Guest vault-membership bootstrap failed after successful invite`,
+        { orgId: admin.orgId, newUserId: userId, error: bootstrapErr }
+      );
+    }
+    if (bootstrap.failures > 0) {
+      await logAudit({
+        userId: admin.userId,
+        userEmail: admin.email,
+        orgId: admin.orgId,
+        action: 'admin.user_invite_bootstrap_partial',
+        resourcePath: `/users/${userId}`,
+        outcome: 'error',
+        ipAddress: getClientIp(event),
+        userAgent: getUserAgent(event),
+        metadata: {
+          invitedEmail: email,
+          role,
+          accessKind,
+          vaultsRequested: guestVaults.length,
+          vaultsJoined: bootstrap.vaultsJoined,
+          failures: bootstrap.failures,
+        },
+      });
+    }
+  } else if (role === 'editor' || role === 'viewer') {
     try {
       bootstrap = await seedDefaultVaultMembershipForInvitee(
         admin.orgId,
@@ -509,6 +597,14 @@ async function handleInviteUser(
     }
   }
 
+  const guestProvisioningStatus = accessKind === 'guest'
+    ? bootstrap && bootstrap.failures === 0
+      ? 'complete'
+      : bootstrap && bootstrap.vaultsJoined > 0
+        ? 'partial'
+        : 'failed'
+    : undefined;
+
   await logAudit({
     userId: admin.userId,
     userEmail: admin.email,
@@ -521,16 +617,32 @@ async function handleInviteUser(
     metadata: {
       invitedEmail: email,
       role,
+      accessKind,
       sendWelcomeEmail,
+      ...(guestExpiresAt ? { expiresAt: guestExpiresAt } : {}),
+      ...(accessKind === 'guest' ? { vaultIds: guestVaults.map((vault) => vault.vaultId) } : {}),
+      ...(guestProvisioningStatus ? { provisioningStatus: guestProvisioningStatus } : {}),
       ...(displayName ? { displayName } : {}),
       ...(bootstrap ? { vaultsJoined: bootstrap.vaultsJoined, vaultBootstrapFailures: bootstrap.failures } : {}),
     },
   });
 
   return formatSuccess(201, {
-    message: `User ${email} invited successfully`,
+    message: guestProvisioningStatus === 'partial'
+      ? `User ${email} was invited, but access to some selected vaults could not be provisioned`
+      : guestProvisioningStatus === 'failed'
+        ? `User ${email} was invited, but selected-vault access could not be provisioned`
+        : `User ${email} invited successfully`,
     userId,
     role,
+    accessKind,
+    ...(guestExpiresAt ? { expiresAt: guestExpiresAt } : {}),
+    ...(accessKind === 'guest' ? { vaultIds: guestVaults.map((vault) => vault.vaultId) } : {}),
+    ...(guestProvisioningStatus ? {
+      provisioningStatus: guestProvisioningStatus,
+      vaultsJoined: bootstrap?.vaultsJoined ?? 0,
+      vaultProvisioningFailures: bootstrap?.failures ?? guestVaults.length,
+    } : {}),
     displayName,
   }, requestId);
 }
@@ -561,6 +673,18 @@ async function handleUpdateRole(
     admin.orgId,
     'Cannot modify user from another organization'
   );
+  if (
+    newRole !== 'viewer' &&
+    await hasStoredGuestMembership([
+      target.subjectId,
+      target.username,
+      target.requestedUserId,
+    ])
+  ) {
+    throw new ValidationError(
+      'Guest users are viewer-only. Remove their guest memberships and invite them as a member instead.'
+    );
+  }
 
   // Get current groups and remove user from all role groups
   const currentGroups = await cognitoClient.send(
@@ -1693,6 +1817,7 @@ async function seedDefaultVaultMembershipForInvitee(
             vaultId: vault.vaultId,
             userId: newUserId,
             role,                        // Vault role mirrors org role for non-admin invites.
+            accessKind: 'member',
             joinedAt: nowIso,
             invitedBy: inviterUserId,
           },
@@ -1733,6 +1858,148 @@ async function seedDefaultVaultMembershipForInvitee(
         `[VaultGuard] Failed to seed vault membership during invite`,
         { orgId, newUserId, vaultId: vault.vaultId, error: err }
       );
+      failures++;
+    }
+  }
+
+  return { vaultsJoined, failures };
+}
+
+const GUEST_MEMBER_RULE_SOURCE = 'guest-invite';
+
+async function hasStoredGuestMembership(userIds: string[]): Promise<boolean> {
+  for (const userId of new Set(userIds.filter(Boolean))) {
+    const result = await docClient.send(new QueryCommand({
+      TableName: VAULT_MEMBERS_TABLE,
+      IndexName: 'userId-index',
+      KeyConditionExpression: 'userId = :userId',
+      ExpressionAttributeValues: { ':userId': userId },
+    }));
+    if ((result?.Items ?? []).some((item) => item.accessKind === 'guest')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function guestPermissionRuleId(vaultId: string, userId: string): string {
+  return `${GUEST_MEMBER_RULE_SOURCE}#${vaultId}#${userId}`;
+}
+
+/**
+ * Creates viewer-only, expiring access for exactly the selected active vaults.
+ * Conditional writes never replace a permanent member or a differently scoped
+ * guest. A retry accepts only byte-for-byte-equivalent access boundaries.
+ */
+async function seedGuestVaultMembershipsForInvitee(
+  orgId: string,
+  newUserId: string,
+  vaults: VaultRecord[],
+  expiresAt: string,
+  inviterUserId: string
+): Promise<{ vaultsJoined: number; failures: number }> {
+  let vaultsJoined = 0;
+  let failures = 0;
+  const nowIso = new Date().toISOString();
+
+  for (const vault of vaults) {
+    let membershipCreated = false;
+    const expected = { vaultId: vault.vaultId, userId: newUserId, expiresAt };
+    try {
+      try {
+        await docClient.send(new PutCommand({
+          TableName: VAULT_MEMBERS_TABLE,
+          Item: {
+            vaultId: vault.vaultId,
+            userId: newUserId,
+            role: 'viewer',
+            accessKind: 'guest',
+            joinedAt: nowIso,
+            invitedBy: inviterUserId,
+            expiresAt,
+          },
+          ConditionExpression: 'attribute_not_exists(vaultId) AND attribute_not_exists(userId)',
+        }));
+        membershipCreated = true;
+      } catch (memberErr) {
+        if ((memberErr as { name?: string }).name !== 'ConditionalCheckFailedException') {
+          throw memberErr;
+        }
+        const existingResult = await docClient.send(new GetCommand({
+          TableName: VAULT_MEMBERS_TABLE,
+          Key: { vaultId: vault.vaultId, userId: newUserId },
+        }));
+        if (!isIdenticalGuestMembership(
+          existingResult.Item as Record<string, unknown> | undefined,
+          expected
+        )) {
+          throw new Error('Existing permanent or differently expiring vault membership was preserved.');
+        }
+      }
+
+      const ruleId = guestPermissionRuleId(vault.vaultId, newUserId);
+      try {
+        await docClient.send(new PutCommand({
+          TableName: PERMISSIONS_TABLE,
+          Item: {
+            pk: ruleId,
+            sk: DEFAULT_MEMBER_RULE_SK,
+            id: ruleId,
+            orgId,
+            vaultId: vault.vaultId,
+            userId: newUserId,
+            pathPattern: '/**',
+            actions: ['read', 'list'],
+            effect: 'allow',
+            priority: DEFAULT_MEMBER_RULE_PRIORITY,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: inviterUserId,
+            source: GUEST_MEMBER_RULE_SOURCE,
+            expiresAt,
+          },
+          ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+        }));
+      } catch (ruleErr) {
+        if ((ruleErr as { name?: string }).name !== 'ConditionalCheckFailedException') {
+          throw ruleErr;
+        }
+        const existingResult = await docClient.send(new GetCommand({
+          TableName: PERMISSIONS_TABLE,
+          Key: { pk: ruleId, sk: DEFAULT_MEMBER_RULE_SK },
+        }));
+        if (!isIdenticalGuestPermissionRule(
+          existingResult.Item as Record<string, unknown> | undefined,
+          expected
+        )) {
+          throw new Error('Existing differently scoped guest permission rule was preserved.');
+        }
+      }
+
+      vaultsJoined++;
+    } catch (error) {
+      if (membershipCreated) {
+        await docClient.send(new DeleteCommand({
+          TableName: VAULT_MEMBERS_TABLE,
+          Key: { vaultId: vault.vaultId, userId: newUserId },
+          ConditionExpression: '#kind = :guest AND expiresAt = :expiresAt',
+          ExpressionAttributeNames: { '#kind': 'accessKind' },
+          ExpressionAttributeValues: { ':guest': 'guest', ':expiresAt': expiresAt },
+        })).catch((rollbackError) => {
+          console.error('[VaultGuard] Failed to roll back partial guest membership', {
+            orgId,
+            newUserId,
+            vaultId: vault.vaultId,
+            error: rollbackError,
+          });
+        });
+      }
+      console.error('[VaultGuard] Failed to seed guest vault membership during invite', {
+        orgId,
+        newUserId,
+        vaultId: vault.vaultId,
+        error,
+      });
       failures++;
     }
   }

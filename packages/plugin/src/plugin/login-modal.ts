@@ -1,4 +1,5 @@
 import { App, ButtonComponent, Modal, setIcon } from "obsidian";
+import { createI18n } from "../i18n";
 import { setButtonLoading } from "../ui/loading-button";
 import { createShieldIcon } from "../ui/icons";
 import {
@@ -26,6 +27,7 @@ export interface LoginCredentials {
 }
 
 export class LoginModal extends Modal {
+  private readonly i18n = createI18n();
   private orgSlug: string = "";
   private email: string = "";
   private password: string = "";
@@ -117,6 +119,7 @@ export class LoginModal extends Modal {
     contentEl.empty();
     this.modalEl.addClass("vaultguard-login-modal");
     contentEl.addClass("vaultguard-login-modal-content");
+    this.i18n.applyToRoot(contentEl);
 
     // Shield icon
     const iconWrap = contentEl.createDiv({ cls: "vaultguard-login-icon" });

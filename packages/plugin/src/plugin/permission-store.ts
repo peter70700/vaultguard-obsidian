@@ -262,6 +262,25 @@ export class PermissionStore extends Events {
   }
 
   /**
+   * Synchronous, cache-only permission decision for bulk/offline UI fallback.
+   * Unlike `getPermissionDecision`, this method can never call the backend,
+   * mutate the cache, or join an in-flight probe. Unknown stays explicit so a
+   * caller cannot mistake absence of evidence for an authoritative denial or
+   * grant.
+   */
+  peekPermissionDecision(path: string): PermissionDecision {
+    const normalized = this.normalizeVaultPath(path);
+    const session = this.cfg.getSession();
+    if (!session) {
+      return { kind: "verified", level: PermissionLevel.NONE };
+    }
+    if (session.role === "admin" || session.role === "owner") {
+      return { kind: "verified", level: PermissionLevel.ADMIN };
+    }
+    return this.resolvePermissionFromCache(normalized) ?? { kind: "unknown" };
+  }
+
+  /**
    * Synchronous cache probe. Used by Plan 09-02 / 09-03 fan-out handlers to
    * check "did this path just drop to NONE without firing another fetch".
    * Returns `undefined` when the path is uncached.
@@ -439,6 +458,8 @@ export class PermissionStore extends Events {
     payload?: {
       path?: string;
       serverConfirmed?: boolean;
+      /** Confirmed authorization mutation that may revoke semantic-index access. */
+      semanticAuthorityChanged?: boolean;
       storeState?: PermissionStoreState;
     }
   ): void {

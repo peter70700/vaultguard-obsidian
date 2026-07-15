@@ -644,6 +644,7 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
     id: "create-agent-bridge-lease",
     name: "Create agent bridge lease",
     checkCallback: (checking: boolean) => {
+      if (!ctx.isOptionalModuleEnabled("agentAccess")) return false;
       if (ctx.localProjectMemoryMode) return false;
       if (Platform.isMobileApp) return false;
       const ready = !!ctx.session && !!ctx.settings.serverVaultId;
@@ -656,6 +657,7 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
     id: "revoke-agent-bridge-leases",
     name: "Revoke agent bridge leases",
     checkCallback: (checking: boolean) => {
+      if (!ctx.isOptionalModuleEnabled("agentAccess")) return false;
       if (ctx.localProjectMemoryMode) return false;
       if (Platform.isMobileApp) return false;
       if (checking) return true;
@@ -670,7 +672,9 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
   ctx.addCommand({
     id: "vaultguard-agent-bridge-info",
     name: "VaultGuard: Agent bridge (desktop only)",
-    callback: () => {
+    checkCallback: (checking: boolean) => {
+      if (!ctx.isOptionalModuleEnabled("agentAccess")) return false;
+      if (checking) return true;
       if (ctx.localProjectMemoryMode) {
         new Notice("VaultGuard Sync: server bridge leases are disabled in Local Project Memory Mode.", 6000);
         return;
@@ -690,6 +694,7 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
         return;
       }
       ctx.openAgentBridgeLeaseModal();
+      return true;
     },
   });
 
@@ -705,9 +710,7 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
       const result = await ctx.updateChecker.checkNow();
       if (result.latest === null) {
         new Notice(
-          ctx.settings.disableUpdateChecks
-            ? "VaultGuard Sync: update checks are disabled in settings."
-            : "VaultGuard Sync: couldn't reach the release feed. Try again later.",
+          "VaultGuard Sync: couldn't reach the release feed. Try again later.",
           6000
         );
         return;
@@ -827,8 +830,11 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
   ctx.addCommand({
     id: "vaultguard-open-chat",
     name: "VaultGuard Chat: Open AI chat panel",
-    callback: () => {
+    checkCallback: (checking: boolean) => {
+      if (!ctx.isOptionalModuleEnabled("aiChat")) return false;
+      if (checking) return true;
       void ctx.activateVaultGuardChat();
+      return true;
     },
   });
 
@@ -836,6 +842,7 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
     id: "vaultguard-open-permissions-graph",
     name: "VaultGuard: Open permissions graph",
     checkCallback: (checking: boolean) => {
+      if (!ctx.isOptionalModuleEnabled("permissionsGraph")) return false;
       if (ctx.localProjectMemoryMode) return false;
       if (Platform.isMobileApp) return false;
       const ready = !!ctx.session && !!ctx.settings.serverVaultId;
@@ -847,16 +854,22 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
   ctx.addCommand({
     id: "vaultguard-chat-history",
     name: "VaultGuard Chat: Previous chats",
-    callback: () => {
+    checkCallback: (checking: boolean) => {
+      if (!ctx.isOptionalModuleEnabled("aiChat")) return false;
+      if (checking) return true;
       void ctx.openVaultGuardChatHistory();
+      return true;
     },
   });
 
   ctx.addCommand({
     id: "vaultguard-chat-new-tab",
     name: "VaultGuard Chat: New chat tab",
-    callback: () => {
+    checkCallback: (checking: boolean) => {
+      if (!ctx.isOptionalModuleEnabled("aiChat")) return false;
+      if (checking) return true;
       void ctx.openNewVaultGuardChatTab();
+      return true;
     },
   });
 
@@ -871,8 +884,11 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
     ctx.addCommand({
       id: "vaultguard-chat-copy-dom-debug-report",
       name: "VaultGuard (debug): Copy chat DOM report",
-      callback: () => {
+      checkCallback: (checking: boolean) => {
+        if (!ctx.isOptionalModuleEnabled("aiChat")) return false;
+        if (checking) return true;
         void ctx.copyVaultGuardChatDomDebugReport();
+        return true;
       },
     });
   }

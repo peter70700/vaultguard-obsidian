@@ -38,7 +38,11 @@ export function registerChatDebugCommand(plugin: VaultGuardPlugin): void {
     name: "VaultGuard (debug): Run headless chat debug turn",
     checkCallback: (checking: boolean) => {
       // Command only appears when debug logging is on.
-      if (!plugin.settings.debugLogging) return false;
+      if (
+        !plugin.settings.debugLogging ||
+        !plugin.isOptionalModuleEnabled("aiChat") ||
+        !plugin.isOptionalModuleEnabled("agentAccess")
+      ) return false;
       if (checking) return true;
       void runDebugTurn(plugin);
       return true;

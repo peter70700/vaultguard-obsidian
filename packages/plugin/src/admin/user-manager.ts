@@ -7,7 +7,9 @@ import {
   setIcon,
 } from "obsidian";
 import { VaultGuardApiClient } from "../api/client";
+import type { VaultMemberRecord } from "../api/client";
 import { getAccessUserNameInitials } from "../ui/access-user-utils";
+import { createI18n } from "../i18n";
 
 export type UserStatus = "active" | "suspended" | "revoked" | "pending";
 export type UserRole = "admin" | "editor" | "viewer" | "custom";
@@ -22,6 +24,8 @@ export interface VaultGuardUser {
   createdAt: string;
   mfaEnabled: boolean;
   deviceCount: number;
+  accessKind?: "member" | "guest";
+  expiresAt?: string;
 }
 
 export interface UserActivity {
@@ -34,23 +38,40 @@ export interface UserActivity {
 export class UserManager {
   private app: App;
   private apiClient: VaultGuardApiClient;
+  private currentVaultId?: string;
+  private readonly i18n = createI18n();
 
-  constructor(app: App, apiClient: VaultGuardApiClient) {
+  constructor(app: App, apiClient: VaultGuardApiClient, currentVaultId?: string) {
     this.app = app;
     this.apiClient = apiClient;
+    this.currentVaultId = currentVaultId;
   }
 
   /**
    * Renders the user list into the given container.
    */
   async renderUserList(container: HTMLElement): Promise<void> {
+    this.i18n.applyToRoot(container);
     container.empty();
+    container.setAttribute("aria-busy", "true");
     const loadingEl = container.createDiv({ cls: "vaultguard-loading" });
-    loadingEl.createSpan({ text: "Loading users..." });
+    loadingEl.setAttribute("role", "status");
+    loadingEl.setAttribute("aria-live", "polite");
+    loadingEl.createSpan({ text: this.i18n.t("common.loading") });
 
     try {
-      const users = await this.apiClient.listUsers();
+      const [users, memberships] = await Promise.all([
+        this.apiClient.listUsers(),
+        this.currentVaultId
+          ? this.apiClient.listVaultMembers(this.currentVaultId).catch(() => [])
+          : Promise.resolve([] as VaultMemberRecord[]),
+      ]);
+      const membershipByUser = new Map(memberships.map((membership) => [
+        membership.userId,
+        membership,
+      ]));
       container.empty();
+      container.setAttribute("aria-busy", "false");
 
       if (!users || users.length === 0) {
         container.createDiv({
@@ -76,14 +97,22 @@ export class UserManager {
 
       // User items
       for (const user of users as VaultGuardUser[]) {
-        this.renderUserItem(container, user);
+        const membership = membershipByUser.get(user.id);
+        this.renderUserItem(container, {
+          ...user,
+          accessKind: membership?.accessKind,
+          expiresAt: membership?.expiresAt,
+        });
       }
     } catch (error) {
       container.empty();
-      container.createDiv({
+      container.setAttribute("aria-busy", "false");
+      const errorEl = container.createDiv({
         cls: "vaultguard-error",
         text: `Failed to load users: ${(error as Error).message}`,
       });
+      errorEl.setAttribute("role", "alert");
+      errorEl.setAttribute("aria-live", "assertive");
     }
   }
 
@@ -124,6 +153,16 @@ export class UserManager {
     roleBadge.setText(user.role);
     roleBadge.addClass(`vaultguard-role-${user.role}`);
 
+    if (user.accessKind === "guest") {
+      const guestBadge = badgesEl.createSpan({
+        cls: "vaultguard-role-badge vaultguard-role-guest",
+        text: this.i18n.t("guest.badge"),
+      });
+      if (user.expiresAt && Date.parse(user.expiresAt) <= Date.now()) {
+        guestBadge.addClass("vaultguard-status-revoked");
+      }
+    }
+
     if (user.mfaEnabled) {
       const mfaBadge = badgesEl.createSpan({ cls: "vaultguard-mfa-badge" });
       const mfaIcon = mfaBadge.createSpan();
@@ -141,44 +180,55 @@ export class UserManager {
       text: `${user.deviceCount} device${user.deviceCount !== 1 ? "s" : ""}`,
       cls: "vaultguard-user-devices",
     });
+    if (user.accessKind === "guest" && user.expiresAt) {
+      const isActive = Date.parse(user.expiresAt) > Date.now();
+      metaEl.createDiv({
+        text: this.i18n.t(isActive ? "guest.expiresAt" : "guest.expiredAt", {
+          date: new Date(user.expiresAt).toLocaleString(),
+        }),
+        cls: "vaultguard-user-last-active",
+      });
+    }
 
     // Action buttons
     const actionsEl = itemEl.createDiv({ cls: "vaultguard-user-actions" });
 
     // View permissions button
-    const viewPermsBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "View permissions" } });
+    const viewPermsBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "View permissions", "aria-label": "View permissions", type: "button" } });
     setIcon(viewPermsBtn, "key");
     viewPermsBtn.addEventListener("click", () => { void this.showUserPermissions(user); });
 
     // View activity button
-    const viewActivityBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "View activity" } });
+    const viewActivityBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "View activity", "aria-label": "View activity", type: "button" } });
     setIcon(viewActivityBtn, "activity");
     viewActivityBtn.addEventListener("click", () => { void this.showUserActivity(user); });
 
     // Edit role button
-    const editRoleBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "Change role" } });
-    setIcon(editRoleBtn, "user-cog");
-    editRoleBtn.addEventListener("click", () => { void this.showRoleEditor(user, container); });
+    if (user.accessKind !== "guest") {
+      const editRoleBtn = actionsEl.createEl("button", { cls: "vaultguard-icon-btn", attr: { title: "Change role", "aria-label": "Change role", type: "button" } });
+      setIcon(editRoleBtn, "user-cog");
+      editRoleBtn.addEventListener("click", () => { void this.showRoleEditor(user, container); });
+    }
 
     // Lifecycle actions.
     if (user.status === "active") {
       const revokeBtn = actionsEl.createEl("button", {
         cls: "vaultguard-icon-btn vaultguard-danger",
-        attr: { title: "Revoke access" },
+        attr: { title: "Revoke access", "aria-label": "Revoke access", type: "button" },
       });
       setIcon(revokeBtn, "x-circle");
       revokeBtn.addEventListener("click", () => { void this.confirmRevokeAccess(user, container); });
     } else if (user.status === "pending") {
       const resendBtn = actionsEl.createEl("button", {
         cls: "vaultguard-icon-btn",
-        attr: { title: "Resend invitation" },
+        attr: { title: "Resend invitation", "aria-label": "Resend invitation", type: "button" },
       });
       setIcon(resendBtn, "send");
       resendBtn.addEventListener("click", () => { void this.resendInvitation(user); });
     } else if (user.status === "suspended" || user.status === "revoked") {
       const reactivateBtn = actionsEl.createEl("button", {
         cls: "vaultguard-icon-btn vaultguard-success",
-        attr: { title: "Reactivate user" },
+        attr: { title: "Reactivate user", "aria-label": "Reactivate user", type: "button" },
       });
       setIcon(reactivateBtn, "check-circle");
       reactivateBtn.addEventListener("click", () => { void this.reactivateUser(user, container); });
@@ -189,7 +239,7 @@ export class UserManager {
    * Shows the invite user dialog.
    */
   async showInviteDialog(parentContainer: HTMLElement): Promise<void> {
-    const modal = new InviteUserModal(this.app, this.apiClient, async () => {
+    const modal = new InviteUserModal(this.app, this.apiClient, this.currentVaultId, async () => {
       await this.renderUserList(parentContainer.querySelector(".vaultguard-user-list")!);
     });
     modal.open();
@@ -277,51 +327,170 @@ export class UserManager {
 class InviteUserModal extends Modal {
   private apiClient: VaultGuardApiClient;
   private onInvited: () => Promise<void>;
+  private currentVaultId?: string;
   private email: string = "";
   private role: UserRole = "viewer";
+  private accessKind: "member" | "guest" = "member";
+  private selectedVaultIds = new Set<string>();
+  private expiresInDays = 30;
   private sendWelcomeEmail: boolean = true;
+  private inviteButton: ButtonComponent | null = null;
+  private readonly i18n = createI18n();
 
-  constructor(app: App, apiClient: VaultGuardApiClient, onInvited: () => Promise<void>) {
+  constructor(
+    app: App,
+    apiClient: VaultGuardApiClient,
+    currentVaultId: string | undefined,
+    onInvited: () => Promise<void>,
+  ) {
     super(app);
     this.apiClient = apiClient;
+    this.currentVaultId = currentVaultId;
     this.onInvited = onInvited;
   }
 
-  onOpen(): void {
+  async onOpen(): Promise<void> {
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-dialog-modal");
     contentEl.addClass("vaultguard-dialog-content");
-    contentEl.createEl("h3", { text: "Invite user" });
+    this.i18n.applyToRoot(contentEl);
+    const title = contentEl.createEl("h3", {
+      text: this.i18n.t("guest.title"),
+      attr: { id: "vaultguard-invite-user-title" },
+    });
+    this.modalEl.setAttribute("aria-labelledby", title.id);
 
     new Setting(contentEl)
-      .setName("Email address")
-      .setDesc("An invitation will be sent via AWS Cognito")
+      .setName(this.i18n.t("guest.email.name"))
+      .setDesc(this.i18n.t("guest.email.description"))
       .addText((text) =>
         text
-          .setPlaceholder("user@company.com")
+          .setPlaceholder(this.i18n.t("guest.email.placeholder"))
           .onChange((value) => {
             this.email = value;
           })
       );
 
-    new Setting(contentEl)
-      .setName("Role")
-      .setDesc("Initial role assignment (can be changed later)")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("viewer", "Viewer (read-only)")
-          .addOption("editor", "Editor (read + write)")
-          .addOption("admin", "Admin (full access)")
-          .setValue(this.role)
-          .onChange((value) => {
-            this.role = value as UserRole;
-          })
-      );
+    const accessDetails = contentEl.createDiv({ cls: "vaultguard-invite-access-details" });
+    let renderVersion = 0;
+    const renderAccessDetails = async (): Promise<void> => {
+      const version = ++renderVersion;
+      accessDetails.empty();
+      accessDetails.setAttribute("aria-busy", "false");
+      if (this.accessKind === "member") {
+        new Setting(accessDetails)
+          .setName(this.i18n.t("guest.role.name"))
+          .setDesc(this.i18n.t("guest.role.description"))
+          .addDropdown((dropdown) =>
+            dropdown
+              .addOption("viewer", this.i18n.t("guest.viewer"))
+              .addOption("editor", this.i18n.t("guest.editor"))
+              .addOption("admin", this.i18n.t("guest.admin"))
+              .setValue(this.role)
+              .onChange((value) => {
+                this.role = value as UserRole;
+              })
+          );
+        return;
+      }
+
+      new Setting(accessDetails)
+        .setName(this.i18n.t("guest.permissions.name"))
+        .setDesc(this.i18n.t("guest.permissions.description"));
+
+      new Setting(accessDetails)
+        .setName(this.i18n.t("guest.duration.name"))
+        .setDesc(this.i18n.t("guest.duration.description"))
+        .addText((text) => {
+          text.setValue(String(this.expiresInDays));
+          text.inputEl.type = "number";
+          text.inputEl.min = "1";
+          text.inputEl.max = "90";
+          text.inputEl.step = "1";
+          text.inputEl.setAttribute("aria-label", this.i18n.t("guest.duration.name"));
+          text.onChange((value) => {
+            const parsed = Number(value);
+            if (Number.isInteger(parsed)) this.expiresInDays = parsed;
+          });
+        });
+
+      accessDetails.setAttribute("aria-busy", "true");
+      let vaults;
+      try {
+        vaults = (await this.apiClient.listVaults()).filter((vault) => !vault.archived);
+      } catch (error) {
+        if (version !== renderVersion || this.accessKind !== "guest") return;
+        const errorEl = accessDetails.createDiv({
+          cls: "vaultguard-error",
+          text: this.i18n.t("guest.vaultLoadFailed", {
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        });
+        errorEl.setAttribute("role", "alert");
+        errorEl.setAttribute("aria-live", "assertive");
+        accessDetails.setAttribute("aria-busy", "false");
+        return;
+      }
+      if (version !== renderVersion || this.accessKind !== "guest") return;
+      accessDetails.setAttribute("aria-busy", "false");
+      const validVaultIds = new Set(vaults.map((vault) => vault.vaultId));
+      for (const selectedVaultId of this.selectedVaultIds) {
+        if (!validVaultIds.has(selectedVaultId)) this.selectedVaultIds.delete(selectedVaultId);
+      }
+      if (
+        this.selectedVaultIds.size === 0 &&
+        this.currentVaultId &&
+        vaults.some((vault) => vault.vaultId === this.currentVaultId)
+      ) {
+        this.selectedVaultIds.add(this.currentVaultId);
+      }
+      if (vaults.length === 0) {
+        accessDetails.createDiv({
+          cls: "vaultguard-empty-state",
+          text: this.i18n.t("guest.noVaults"),
+        });
+        return;
+      }
+      new Setting(accessDetails).setName(this.i18n.t("guest.vaults")).setHeading();
+      for (const vault of vaults) {
+        new Setting(accessDetails)
+          .setName(vault.name)
+          .setDesc(
+            this.i18n.t(
+              vault.vaultId === this.currentVaultId ? "guest.currentVault" : "guest.viewerAccess",
+            ),
+          )
+          .addToggle((toggle) => {
+            toggle
+              .setValue(this.selectedVaultIds.has(vault.vaultId))
+              .onChange((selected) => {
+                if (selected) this.selectedVaultIds.add(vault.vaultId);
+                else this.selectedVaultIds.delete(vault.vaultId);
+              });
+          });
+      }
+    };
 
     new Setting(contentEl)
-      .setName("Send welcome email")
-      .setDesc("Send an email with setup instructions and invite link")
+      .setName(this.i18n.t("guest.accessType.name"))
+      .setDesc(this.i18n.t("guest.accessType.description"))
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("member", this.i18n.t("guest.member"))
+          .addOption("guest", this.i18n.t("guest.guest"))
+          .setValue(this.accessKind)
+          .onChange((value) => {
+            this.accessKind = value === "guest" ? "guest" : "member";
+            void renderAccessDetails();
+          })
+      );
+    contentEl.appendChild(accessDetails);
+    await renderAccessDetails();
+
+    new Setting(contentEl)
+      .setName(this.i18n.t("guest.welcome.name"))
+      .setDesc(this.i18n.t("guest.welcome.description"))
       .addToggle((toggle) =>
         toggle.setValue(this.sendWelcomeEmail).onChange((value) => {
           this.sendWelcomeEmail = value;
@@ -329,9 +498,11 @@ class InviteUserModal extends Modal {
       );
 
     const actionRow = contentEl.createDiv({ cls: "vaultguard-modal-actions" });
-    new ButtonComponent(actionRow).setButtonText("Cancel").onClick(() => this.close());
     new ButtonComponent(actionRow)
-      .setButtonText("Send invite")
+      .setButtonText(this.i18n.t("common.cancel"))
+      .onClick(() => this.close());
+    this.inviteButton = new ButtonComponent(actionRow)
+      .setButtonText(this.i18n.t("guest.send"))
       .setCta()
       .onClick(() => this.handleInvite());
   }
@@ -339,26 +510,63 @@ class InviteUserModal extends Modal {
   onClose(): void {
     this.modalEl.removeClass("vaultguard-dialog-modal");
     this.contentEl.removeClass("vaultguard-dialog-content");
+    this.inviteButton = null;
     this.contentEl.empty();
   }
 
   private async handleInvite(): Promise<void> {
     if (!this.email || !this.email.includes("@")) {
-      new Notice("Please enter a valid email address.");
+      new Notice(this.i18n.t("guest.invalidEmail"));
       return;
     }
+    if (this.accessKind === "guest") {
+      if (
+        !Number.isInteger(this.expiresInDays) ||
+        this.expiresInDays < 1 ||
+        this.expiresInDays > 90
+      ) {
+        new Notice(this.i18n.t("guest.invalidDuration"));
+        return;
+      }
+      if (this.selectedVaultIds.size === 0) {
+        new Notice(this.i18n.t("guest.selectVault"));
+        return;
+      }
+    }
 
+    this.inviteButton?.setDisabled(true).setButtonText(this.i18n.t("common.loading"));
+    this.contentEl.setAttribute("aria-busy", "true");
     try {
-      await this.apiClient.inviteUser({
+      const result = await this.apiClient.inviteUser({
         email: this.email,
-        role: this.role,
+        role: this.accessKind === "guest" ? "viewer" : this.role,
+        accessKind: this.accessKind,
+        ...(this.accessKind === "guest"
+          ? {
+              vaultIds: [...this.selectedVaultIds],
+              expiresInDays: this.expiresInDays,
+            }
+          : {}),
         sendWelcomeEmail: this.sendWelcomeEmail,
       });
-      new Notice(`Invitation sent to ${this.email}`);
+      if (result?.provisioningStatus === "partial") {
+        new Notice(this.i18n.t("guest.provisioningPartial", {
+          failures: result.vaultProvisioningFailures ?? 0,
+        }), 10_000);
+      } else if (result?.provisioningStatus === "failed") {
+        new Notice(this.i18n.t("guest.provisioningFailed"), 10_000);
+      } else {
+        new Notice(this.i18n.t("guest.sent", { email: this.email }));
+      }
       await this.onInvited();
       this.close();
     } catch (error) {
-      new Notice(`Failed to invite: ${(error as Error).message}`);
+      new Notice(this.i18n.t("guest.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      this.contentEl.setAttribute("aria-busy", "false");
+      this.inviteButton?.setDisabled(false).setButtonText(this.i18n.t("guest.send"));
     }
   }
 }

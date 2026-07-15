@@ -1,8 +1,15 @@
 import type {
+  PermissionsGraphBackgroundMode,
+  PermissionsGraphBackgroundPattern,
+  PermissionsGraphColorMode,
   PermissionsGraphLabelsMode,
   PermissionsGraphLayoutMode,
   PermissionsGraphRenderMode,
   PermissionsGraphSavedState,
+  PermissionsGraphSectionMode,
+  PermissionsGraphSizeMode,
+  PermissionsGraphSortDirection,
+  PermissionsGraphSortMode,
 } from "../../types";
 import { explainAccess, pathMatchesPattern, type ExplainRule, type ExplainVaultRole } from "./permission-explain";
 import {
@@ -40,6 +47,39 @@ export interface GraphAccessLevelOptions {
   admin: boolean;
 }
 
+export interface GraphStudioPaletteOptions {
+  user: string;
+  file: string;
+  folder: string;
+  read: string;
+  write: string;
+  admin: string;
+  low: string;
+  medium: string;
+  high: string;
+}
+
+export interface GraphStudioAppearanceOptions {
+  backgroundMode: PermissionsGraphBackgroundMode;
+  backgroundPattern: PermissionsGraphBackgroundPattern;
+  backgroundPrimary: string;
+  backgroundSecondary: string;
+  colorMode: PermissionsGraphColorMode;
+  customPalette: boolean;
+  palette: GraphStudioPaletteOptions;
+  sizeMode: PermissionsGraphSizeMode;
+  nodeScale: number;
+  edgeScale: number;
+  /** Multiplier for all label font sizes in the graph (Graph Studio → Text size). */
+  labelScale: number;
+}
+
+export interface GraphStudioArrangementOptions {
+  sectionBy: PermissionsGraphSectionMode;
+  sortBy: PermissionsGraphSortMode;
+  sortDirection: PermissionsGraphSortDirection;
+}
+
 export interface GraphRuntimeOptions {
   renderMode: PermissionsGraphRenderMode;
   layoutMode: PermissionsGraphLayoutMode;
@@ -57,6 +97,8 @@ export interface GraphRuntimeOptions {
   maxEdges: number;
   depth: number;
   debugExpanded: boolean;
+  appearance: GraphStudioAppearanceOptions;
+  arrangement: GraphStudioArrangementOptions;
 }
 
 export interface GraphDatasetForScale {
@@ -94,7 +136,7 @@ export interface GraphRenderDecision {
   exceeded: string[];
   disabled: string[];
   labelModeUsed: "on" | "off";
-  layoutModeUsed: "radial" | "force" | "grid";
+  layoutModeUsed: "radial" | "force" | "grid" | "folder" | "sections";
   hoverEnabled: boolean;
   animationEnabled: boolean;
 }
@@ -133,6 +175,38 @@ export const DEFAULT_GRAPH_BUDGETS: GraphComplexityBudgets = {
   largeGraphThreshold: 1200,
 };
 
+export const DEFAULT_GRAPH_STUDIO_PALETTE: GraphStudioPaletteOptions = {
+  user: "#7c3aed",
+  file: "#14b8a6",
+  folder: "#f59e0b",
+  read: "#22c55e",
+  write: "#f59e0b",
+  admin: "#ef4444",
+  low: "#94a3b8",
+  medium: "#3b82f6",
+  high: "#a855f7",
+};
+
+export const DEFAULT_GRAPH_STUDIO_APPEARANCE: GraphStudioAppearanceOptions = {
+  backgroundMode: "theme",
+  backgroundPattern: "none",
+  backgroundPrimary: "#1e1e1e",
+  backgroundSecondary: "#252a34",
+  colorMode: "current",
+  customPalette: false,
+  palette: { ...DEFAULT_GRAPH_STUDIO_PALETTE },
+  sizeMode: "standard",
+  nodeScale: 1,
+  edgeScale: 1,
+  labelScale: 1,
+};
+
+export const DEFAULT_GRAPH_STUDIO_ARRANGEMENT: GraphStudioArrangementOptions = {
+  sectionBy: "folder",
+  sortBy: "name",
+  sortDirection: "asc",
+};
+
 export const DEFAULT_GRAPH_OPTIONS: GraphRuntimeOptions = {
   renderMode: "auto",
   layoutMode: "auto",
@@ -150,11 +224,33 @@ export const DEFAULT_GRAPH_OPTIONS: GraphRuntimeOptions = {
   maxEdges: DEFAULT_GRAPH_BUDGETS.maxRenderedEdges,
   depth: 2,
   debugExpanded: false,
+  appearance: {
+    ...DEFAULT_GRAPH_STUDIO_APPEARANCE,
+    palette: { ...DEFAULT_GRAPH_STUDIO_APPEARANCE.palette },
+  },
+  arrangement: { ...DEFAULT_GRAPH_STUDIO_ARRANGEMENT },
 };
 
 const MAX_SAVED_VAULT_STATES = 50;
 const MAX_SELECTED_USERS = 32;
 const MAX_TEXT_FILTER_LENGTH = 240;
+const GRAPH_STUDIO_PALETTE_KEYS = [
+  "user",
+  "file",
+  "folder",
+  "read",
+  "write",
+  "admin",
+  "low",
+  "medium",
+  "high",
+] as const;
+
+export function normalizeGraphStudioColor(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(normalized) ? normalized : undefined;
+}
 
 export function normalizeGraphPath(path: string): string {
   const trimmed = path.trim();
@@ -191,13 +287,28 @@ export function normalizeGraphOptions(
       ...base.nodeTypes,
       ...state.nodeTypes,
     },
+    appearance: {
+      ...DEFAULT_GRAPH_OPTIONS.appearance,
+      ...base.appearance,
+      ...state.appearance,
+      palette: {
+        ...DEFAULT_GRAPH_OPTIONS.appearance.palette,
+        ...base.appearance?.palette,
+        ...state.appearance?.palette,
+      },
+    },
+    arrangement: {
+      ...DEFAULT_GRAPH_OPTIONS.arrangement,
+      ...base.arrangement,
+      ...state.arrangement,
+    },
     selectedUsers: state.selectedUsers ?? base.selectedUsers ?? [],
   };
 }
 
 export function graphOptionsToSavedState(options: GraphRuntimeOptions): PermissionsGraphSavedState {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     renderMode: options.renderMode,
     layoutMode: options.layoutMode,
     labelsMode: options.labelsMode,
@@ -214,8 +325,36 @@ export function graphOptionsToSavedState(options: GraphRuntimeOptions): Permissi
     maxEdges: options.maxEdges,
     depth: options.depth,
     debugExpanded: options.debugExpanded || undefined,
+    appearance: {
+      ...options.appearance,
+      palette: { ...options.appearance.palette },
+    },
+    arrangement: { ...options.arrangement },
     updatedAt: new Date().toISOString(),
   };
+}
+
+export function resetGraphStudioAppearance(options: GraphRuntimeOptions): GraphRuntimeOptions {
+  return {
+    ...options,
+    appearance: {
+      ...DEFAULT_GRAPH_STUDIO_APPEARANCE,
+      palette: { ...DEFAULT_GRAPH_STUDIO_APPEARANCE.palette },
+    },
+  };
+}
+
+export function resetGraphStudioArrangement(options: GraphRuntimeOptions): GraphRuntimeOptions {
+  return {
+    ...options,
+    layoutMode: DEFAULT_GRAPH_OPTIONS.layoutMode,
+    labelsMode: DEFAULT_GRAPH_OPTIONS.labelsMode,
+    arrangement: { ...DEFAULT_GRAPH_STUDIO_ARRANGEMENT },
+  };
+}
+
+export function resetGraphStudioOptions(options: GraphRuntimeOptions): GraphRuntimeOptions {
+  return resetGraphStudioArrangement(resetGraphStudioAppearance(options));
 }
 
 export function upsertGraphVaultState(
@@ -455,13 +594,26 @@ export function decideGraphRender(
 
   const forceUnsafe = estimate.edgeCount > budgets.maxForceLayoutEdges;
   let layoutModeUsed: GraphRenderDecision["layoutModeUsed"];
-  if (options.layoutMode === "grid") layoutModeUsed = "grid";
+  if (options.layoutMode === "folder") layoutModeUsed = "folder";
+  else if (options.layoutMode === "sections") layoutModeUsed = "sections";
+  else if (options.layoutMode === "grid") layoutModeUsed = "grid";
   else if (options.layoutMode === "force" && !forceUnsafe) layoutModeUsed = "force";
   else if (options.layoutMode === "force" && forceUnsafe) {
-    layoutModeUsed = "grid";
+    // Force needs a cheaper fallback once the edge count is past the sim budget.
+    // Radial (concentric) is a deterministic O(n) placement and reads far better
+    // than a rigid grid, so fall back to it rather than dropping to the lattice.
+    layoutModeUsed = "radial";
     disabled.push("force layout");
-  } else if (options.layoutMode === "radial") layoutModeUsed = "radial";
-  else layoutModeUsed = forceUnsafe || exceeded.length > 0 ? "grid" : "radial";
+  } else {
+    // Auto and Radial both use the concentric "rings" layout. It is cheap and
+    // deterministic (no force simulation), so neither a heavy edge count
+    // (forceUnsafe) nor a label-budget overflow is a reason to fall back to the
+    // rigid grid — doing so was what silently turned the circle into a static
+    // square. Genuinely oversized graphs never reach a detailed render at all;
+    // they become "aggregated" or "refused" upstream (see `unsafe`/`actualMode`
+    // below), so concentric is always legible by the time we get here.
+    layoutModeUsed = "radial";
+  }
 
   const unsafe = exceeded.some((budget) => budget !== "maxRenderedLabels" || options.labelsMode === "on");
   const actualMode: GraphActualMode =
@@ -473,7 +625,11 @@ export function decideGraphRender(
           ? "aggregated"
           : "detailed";
 
-  const large = actualMode !== "detailed" || exceeded.length > 0;
+  // A label-budget overflow only means "hide labels" (already handled by
+  // labelModeUsed); it does not make the graph structurally large, so it must
+  // not switch off animation/hover for an otherwise-legible detailed graph.
+  const structurallyLarge = exceeded.some((budget) => budget !== "maxRenderedLabels");
+  const large = actualMode !== "detailed" || structurallyLarge;
   const hoverEnabled = !large && estimate.edgeCount <= budgets.maxForceLayoutEdges;
   if (!hoverEnabled) disabled.push("hover highlighting");
   const animationEnabled = !large && layoutModeUsed !== "grid";
@@ -722,18 +878,34 @@ interface AggregateFolderStats {
   userLevels: Map<string, Exclude<GraphAccessLevel, "none">>;
 }
 
+type GraphStudioAppearancePatch = Omit<Partial<GraphStudioAppearanceOptions>, "palette"> & {
+  palette?: Partial<GraphStudioPaletteOptions>;
+};
+
+type PartialGraphRuntimeOptions = Omit<Partial<GraphRuntimeOptions>, "appearance" | "arrangement"> & {
+  appearance?: GraphStudioAppearancePatch;
+  arrangement?: Partial<GraphStudioArrangementOptions>;
+};
+
 function parsePartialGraphOptions(
   raw: unknown,
   budgets: GraphComplexityBudgets,
-): Partial<GraphRuntimeOptions> {
+): PartialGraphRuntimeOptions {
   if (!raw || typeof raw !== "object") return {};
   const value = raw as Partial<PermissionsGraphSavedState>;
-  const parsed: Partial<GraphRuntimeOptions> = {};
+  const parsed: PartialGraphRuntimeOptions = {};
 
   if (value.renderMode === "auto" || value.renderMode === "aggregated" || value.renderMode === "detailed") {
     parsed.renderMode = value.renderMode;
   }
-  if (value.layoutMode === "auto" || value.layoutMode === "radial" || value.layoutMode === "force" || value.layoutMode === "grid") {
+  if (
+    value.layoutMode === "auto" ||
+    value.layoutMode === "radial" ||
+    value.layoutMode === "force" ||
+    value.layoutMode === "grid" ||
+    value.layoutMode === "folder" ||
+    value.layoutMode === "sections"
+  ) {
     parsed.layoutMode = value.layoutMode;
   }
   if (value.labelsMode === "auto" || value.labelsMode === "on" || value.labelsMode === "off") {
@@ -773,6 +945,88 @@ function parsePartialGraphOptions(
   if (typeof value.maxEdges === "number") parsed.maxEdges = clampInt(value.maxEdges, 0, budgets.maxRenderedEdges);
   if (typeof value.depth === "number") parsed.depth = clampInt(value.depth, 1, 8);
   if (typeof value.debugExpanded === "boolean") parsed.debugExpanded = value.debugExpanded;
+  if (value.appearance && typeof value.appearance === "object") {
+    const appearance: GraphStudioAppearancePatch = {};
+    if (
+      value.appearance.backgroundMode === "theme" ||
+      value.appearance.backgroundMode === "solid" ||
+      value.appearance.backgroundMode === "gradient"
+    ) {
+      appearance.backgroundMode = value.appearance.backgroundMode;
+    }
+    if (
+      value.appearance.backgroundPattern === "none" ||
+      value.appearance.backgroundPattern === "grid" ||
+      value.appearance.backgroundPattern === "dots"
+    ) {
+      appearance.backgroundPattern = value.appearance.backgroundPattern;
+    }
+    const backgroundPrimary = normalizeGraphStudioColor(value.appearance.backgroundPrimary);
+    if (backgroundPrimary) appearance.backgroundPrimary = backgroundPrimary;
+    const backgroundSecondary = normalizeGraphStudioColor(value.appearance.backgroundSecondary);
+    if (backgroundSecondary) appearance.backgroundSecondary = backgroundSecondary;
+    if (
+      value.appearance.colorMode === "current" ||
+      value.appearance.colorMode === "type" ||
+      value.appearance.colorMode === "folder" ||
+      value.appearance.colorMode === "access" ||
+      value.appearance.colorMode === "connections"
+    ) {
+      appearance.colorMode = value.appearance.colorMode;
+    }
+    if (typeof value.appearance.customPalette === "boolean") {
+      appearance.customPalette = value.appearance.customPalette;
+    }
+    if (
+      value.appearance.sizeMode === "standard" ||
+      value.appearance.sizeMode === "uniform" ||
+      value.appearance.sizeMode === "connections" ||
+      value.appearance.sizeMode === "access"
+    ) {
+      appearance.sizeMode = value.appearance.sizeMode;
+    }
+    if (typeof value.appearance.nodeScale === "number" && Number.isFinite(value.appearance.nodeScale)) {
+      appearance.nodeScale = clampNumber(value.appearance.nodeScale, 0.75, 1.75);
+    }
+    if (typeof value.appearance.edgeScale === "number" && Number.isFinite(value.appearance.edgeScale)) {
+      appearance.edgeScale = clampNumber(value.appearance.edgeScale, 0.5, 2);
+    }
+    if (typeof value.appearance.labelScale === "number" && Number.isFinite(value.appearance.labelScale)) {
+      appearance.labelScale = clampNumber(value.appearance.labelScale, 0.75, 2.5);
+    }
+    if (value.appearance.palette && typeof value.appearance.palette === "object") {
+      const palette: Partial<GraphStudioPaletteOptions> = {};
+      for (const key of GRAPH_STUDIO_PALETTE_KEYS) {
+        const color = normalizeGraphStudioColor(value.appearance.palette[key]);
+        if (color) palette[key] = color;
+      }
+      if (Object.keys(palette).length > 0) appearance.palette = palette;
+    }
+    parsed.appearance = appearance;
+  }
+  if (value.arrangement && typeof value.arrangement === "object") {
+    const arrangement: Partial<GraphStudioArrangementOptions> = {};
+    if (
+      value.arrangement.sectionBy === "folder" ||
+      value.arrangement.sectionBy === "type" ||
+      value.arrangement.sectionBy === "access" ||
+      value.arrangement.sectionBy === "connections"
+    ) {
+      arrangement.sectionBy = value.arrangement.sectionBy;
+    }
+    if (
+      value.arrangement.sortBy === "name" ||
+      value.arrangement.sortBy === "path" ||
+      value.arrangement.sortBy === "access" ||
+      value.arrangement.sortBy === "connections"
+    ) {
+      arrangement.sortBy = value.arrangement.sortBy;
+    }
+    if (value.arrangement.sortDirection === "asc" || value.arrangement.sortDirection === "desc") {
+      arrangement.sortDirection = value.arrangement.sortDirection;
+    }
+    parsed.arrangement = arrangement;
+  }
 
   return parsed;
 }
@@ -931,4 +1185,8 @@ function userNodeId(uid: string): string {
 function clampInt(value: number, min: number, max: number = Number.MAX_SAFE_INTEGER): number {
   if (!Number.isFinite(value)) return min;
   return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }

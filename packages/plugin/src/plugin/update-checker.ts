@@ -1,11 +1,6 @@
 /**
- * Polls the public release repo for newer plugin versions and surfaces a
- * non-blocking Notice when one appears. Pure read-only HTTP — no telemetry,
- * no auto-install. The user still downloads + installs manually (or via BRAT).
- *
- * Self-throttles to one check per 24 h across reloads via persisted state.
- * Suppresses repeat notifications for the same version so an unread notice
- * doesn't re-fire on every plugin load.
+ * User-invoked release diagnostic. Obsidian owns background community-plugin
+ * update discovery; VaultGuard contacts GitHub only after the manual command.
  */
 
 import { Notice, requestUrl } from "obsidian";
@@ -20,8 +15,6 @@ const RELEASES_API_URL =
 const RELEASES_PAGE_URL =
   "https://github.com/peter70700/vaultguard-obsidian/releases";
 
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const STARTUP_DELAY_MS = 30_000;
 const NOTICE_DURATION_MS = 15_000;
 
 export interface UpdateCheckState {
@@ -32,32 +25,16 @@ export interface UpdateCheckState {
 }
 
 export class UpdateChecker {
-  private startupTimer: number | null = null;
-  private intervalTimer: number | null = null;
-
   constructor(private readonly plugin: VaultGuardPlugin) {}
 
+  /** @deprecated Background checks are intentionally disabled. */
   start(): void {
-    if (this.startupTimer !== null || this.intervalTimer !== null) return;
-
-    this.startupTimer = window.setTimeout(() => {
-      this.startupTimer = null;
-      void this.runCheck();
-      this.intervalTimer = window.setInterval(() => {
-        void this.runCheck();
-      }, CHECK_INTERVAL_MS);
-    }, STARTUP_DELAY_MS);
+    // No-op: Obsidian 1.11+ checks community-plugin updates natively, and
+    // older supported versions retain the explicit `checkNow()` command.
   }
 
   stop(): void {
-    if (this.startupTimer !== null) {
-      window.clearTimeout(this.startupTimer);
-      this.startupTimer = null;
-    }
-    if (this.intervalTimer !== null) {
-      window.clearInterval(this.intervalTimer);
-      this.intervalTimer = null;
-    }
+    // No timers are created.
   }
 
   /** Manually trigger a check (e.g. from a command). Bypasses the 24h throttle. */
@@ -69,16 +46,8 @@ export class UpdateChecker {
     latest: string | null;
     isNewer: boolean;
   }> {
-    if (this.plugin.settings.disableUpdateChecks) {
-      return { latest: null, isNewer: false };
-    }
-
     const state: UpdateCheckState =
       this.plugin.settings.updateCheckState ?? { lastCheckedAt: 0, lastSeenVersion: "" };
-
-    if (!opts.force && Date.now() - state.lastCheckedAt < CHECK_INTERVAL_MS) {
-      return { latest: null, isNewer: false };
-    }
 
     let latest: string | null = null;
     let isNewer = false;

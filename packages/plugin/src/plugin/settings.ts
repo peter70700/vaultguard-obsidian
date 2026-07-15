@@ -4,7 +4,17 @@
  * encrypted cloud sync system.
  */
 
-import { App, ButtonComponent, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
+import {
+  App,
+  ButtonComponent,
+  Notice,
+  Platform,
+  PluginSettingTab,
+  SecretComponent,
+  Setting,
+  SettingGroup,
+  requireApiVersion,
+} from "obsidian";
 import {
   AtRestPasswordConfirmModal,
   AtRestRecoveryCodeModal,
@@ -40,6 +50,10 @@ import {
   getClaudeAuthStatus,
   type ClaudeAuthStatus,
 } from "../ui/chat/claude-cli/claude-detector";
+import {
+  getCodexAuthStatus,
+  type CodexAuthStatus,
+} from "../ui/chat/codex-cli/codex-detector";
 import { LOCAL_PROJECT_MEMORY_MODE_NOTICE } from "./local-project-memory-mode";
 import type {
   UserListEntry,
@@ -67,6 +81,7 @@ import type { CodexSkillInstallStatus } from "./agent-bridge-codex-skill/install
 import { SAAS_DEFAULTS } from "../config/saas-defaults";
 import { SetPinModal, ChangePinModal, DisablePinModal } from "../ui/lock/pin-modals";
 import { biometricAvailable } from "../crypto/biometric-probe";
+import { createI18n } from "../i18n";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default Settings
@@ -102,7 +117,21 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   debugLogging: false,
   maxRetryAttempts: 3,
   showStatusBar: true,
+  showRibbonIcons: true,
   localProjectMemoryMode: false,
+  optionalModules: {
+    schemaVersion: 2,
+    // AI chat + permissions graph ship enabled by default (each still has its own
+    // ribbon icon and can be turned off per-vault in Settings → VaultGuard).
+    aiChat: true,
+    permissionsGraph: true,
+    agentAccess: false,
+    secureDiscovery: false,
+  },
+  semanticSearchEnabled: false,
+  semanticEmbeddingEndpoint: "http://127.0.0.1:11434",
+  semanticEmbeddingModel: "embeddinggemma",
+  discoveryResultLimit: 50,
   excludedPaths: [...DEFAULT_EXCLUDED_PATHS],
   aiChatModel: "claude-opus-4-8",
   aiChatEffort: "high",
@@ -113,13 +142,15 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   // On by default for live token-by-token feedback. Desktop-only; mobile always
   // falls back to the Tier-1 requestUrl path (see chat-view streamingEnabled()).
   aiChatStreaming: true,
+  anthropicKeyStorageMode: "vaultguard",
+  openAiKeyStorageMode: "vaultguard",
   // On by default: a key entered on desktop auto-provisions on mobile without
   // re-entry. Stored server-side ONLY as a DEK-wrapped envelope (zero-knowledge).
   aiChatKeySyncEnabled: true,
   aiChatPermissionMode: "confirm",
   aiChatProvider: "apiKey",
   permissionsGraphDefaults: {
-    schemaVersion: 1,
+    schemaVersion: 2,
     renderMode: "auto",
     layoutMode: "auto",
     labelsMode: "auto",
@@ -129,9 +160,37 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
     maxFiles: 1000,
     maxEdges: 1600,
     depth: 2,
+    appearance: {
+      backgroundMode: "theme",
+      backgroundPattern: "none",
+      backgroundPrimary: "#1e1e1e",
+      backgroundSecondary: "#252a34",
+      colorMode: "current",
+      customPalette: false,
+      palette: {
+        user: "#7c3aed",
+        file: "#14b8a6",
+        folder: "#f59e0b",
+        read: "#22c55e",
+        write: "#f59e0b",
+        admin: "#ef4444",
+        low: "#94a3b8",
+        medium: "#3b82f6",
+        high: "#a855f7",
+      },
+      sizeMode: "standard",
+      nodeScale: 1,
+      edgeScale: 1,
+    },
+    arrangement: {
+      sectionBy: "folder",
+      sortBy: "name",
+      sortDirection: "asc",
+    },
   },
   permissionsGraphVaultStates: {},
   deletionTombstones: {},
+  pendingLargeFiles: {},
   // Persisted once-ever guard for the onboarding "Set a PIN" prompt (quick
   // 260708-el6). A persisted `true` overrides this default via the reload merge
   // (Object.assign({}, DEFAULT_SETTINGS, data)), so the prompt shows at most once.
@@ -193,16 +252,134 @@ interface ChatGptConnectorReveal {
  */
 export class VaultGuardSettingTab extends PluginSettingTab {
   private plugin: VaultGuardPlugin;
+  private readonly i18n = createI18n();
   private latestAgentBridgeReveal: AgentBridgeConnectionReveal | null = null;
   private latestChatGptConnectorReveal: ChatGptConnectorReveal | null = null;
-  private aiChatKeyStore: AnthropicKeyStore;
-  private openAiKeyStore: OpenAiKeyStore;
+  private aiChatKeyStore: AnthropicKeyStore | null = null;
+  private openAiKeyStore: OpenAiKeyStore | null = null;
+  private codexStatusAbort: AbortController | null = null;
 
   constructor(app: App, plugin: VaultGuardPlugin) {
     super(app, plugin);
     this.plugin = plugin;
-    this.aiChatKeyStore = new AnthropicKeyStore(plugin);
-    this.openAiKeyStore = new OpenAiKeyStore(plugin);
+  }
+
+  private getAnthropicKeyStore(): AnthropicKeyStore {
+    this.aiChatKeyStore ??= new AnthropicKeyStore(this.plugin);
+    return this.aiChatKeyStore;
+  }
+
+  private getOpenAiKeyStore(): OpenAiKeyStore {
+    this.openAiKeyStore ??= new OpenAiKeyStore(this.plugin);
+    return this.openAiKeyStore;
+  }
+
+  private renderProviderKeyStorageSetting(
+    containerEl: HTMLElement,
+    provider: "anthropic" | "openai",
+    keyStore: AnthropicKeyStore | OpenAiKeyStore,
+  ): void {
+    const field = provider === "anthropic"
+      ? "anthropicKeyStorageMode"
+      : "openAiKeyStorageMode";
+    const current = this.plugin.settings[field] ?? "vaultguard";
+    const nativeAvailable = keyStore.isObsidianSecretStorageAvailable() &&
+      typeof SecretComponent === "function";
+
+    new Setting(containerEl)
+      .setName("API key storage")
+      .setDesc(
+        current === "obsidian"
+          ? nativeAvailable
+            ? "Use Obsidian's global encrypted secret store. VaultGuard persists only the selected secret ID."
+            : "Native storage remains selected, but it needs Obsidian 1.11.5 or newer. VaultGuard will not fall back to another key source."
+          : "Keep the key vault-local in VaultGuard's encrypted key envelope. This is compatible with older Obsidian versions.",
+      )
+      .addDropdown((dropdown) => {
+        dropdown.addOption("vaultguard", "VaultGuard (this vault)");
+        if (nativeAvailable || current === "obsidian") {
+          dropdown.addOption(
+            "obsidian",
+            nativeAvailable
+              ? "Obsidian secrets (global)"
+              : "Obsidian secrets (requires 1.11.5)",
+          );
+        }
+        dropdown
+          .setValue(current)
+          .onChange(async (value) => {
+            if (value !== "vaultguard" && value !== "obsidian") return;
+            this.plugin.settings[field] = value;
+            if (provider === "anthropic" && value === "obsidian") {
+              this.plugin.settings.aiChatKeySyncEnabled = false;
+            }
+            await this.plugin.saveSettings();
+            providerModelCatalog.invalidate(provider);
+            if (provider === "anthropic" && value === "obsidian") {
+              // Remove an old VaultGuard roaming copy; the global Obsidian
+              // secret remains exclusively owned by Obsidian.
+              void this.plugin.aiKeySync.deleteRemote();
+            }
+            this.display();
+          });
+      });
+  }
+
+  private renderNativeProviderSecretSetting(
+    containerEl: HTMLElement,
+    providerLabel: "Anthropic" | "OpenAI",
+    keyStore: AnthropicKeyStore | OpenAiKeyStore,
+  ): void {
+    const available = keyStore.isObsidianSecretStorageAvailable() &&
+      typeof SecretComponent === "function";
+    const hasKey = keyStore.hasKey();
+    const setting = new Setting(containerEl)
+      .setName(`${providerLabel} secret`)
+      .setDesc(
+        available
+          ? hasKey
+            ? "The selected native secret is available. Its value never enters VaultGuard settings."
+            : "Choose or create a native secret. VaultGuard stores only its ID and never displays its value."
+          : "Unavailable on this Obsidian version. Upgrade to 1.11.5 or newer, or switch back to VaultGuard storage.",
+      );
+
+    if (!available) return;
+
+    new SecretComponent(this.app, setting.controlEl)
+      .setValue(keyStore.getSecretId())
+      .onChange(async (secretId) => {
+        try {
+          await keyStore.setSecretId(secretId);
+          providerModelCatalog.invalidate(providerLabel.toLowerCase() as "anthropic" | "openai");
+          this.showStatus(containerEl, `${providerLabel} secret reference saved.`, false);
+          this.display();
+        } catch (error) {
+          this.showStatus(
+            containerEl,
+            `Failed to save secret reference: ${(error as Error).message}`,
+            true,
+          );
+        }
+      });
+
+    if (keyStore.getSecretId()) {
+      setting.addButton((button) => {
+        button
+          .setButtonText("Clear reference")
+          .setTooltip("Forget this reference without deleting the global Obsidian secret")
+          .onClick(async () => {
+            await keyStore.clearKey();
+            providerModelCatalog.invalidate(providerLabel.toLowerCase() as "anthropic" | "openai");
+            this.display();
+          });
+      });
+    }
+  }
+
+  hide(): void {
+    this.codexStatusAbort?.abort();
+    this.codexStatusAbort = null;
+    super.hide();
   }
 
   /**
@@ -289,8 +466,291 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     if (existing) existing.remove();
     const el = containerEl.createDiv({ cls: 'vaultguard-status-msg' });
     el.addClass(isError ? 'is-error' : 'is-success');
+    el.setAttribute("role", isError ? "alert" : "status");
+    el.setAttribute("aria-live", isError ? "assertive" : "polite");
+    el.setAttribute("aria-atomic", "true");
     el.setText(message);
     window.setTimeout(() => el.remove(), 6000);
+  }
+
+  private renderOptionalModulesSection(containerEl: HTMLElement): void {
+    const modules = [
+      {
+        id: "aiChat" as const,
+        nameKey: "settings.modules.ai.name" as const,
+        descriptionKey: "settings.modules.ai.description" as const,
+      },
+      {
+        id: "permissionsGraph" as const,
+        nameKey: "settings.modules.graph.name" as const,
+        descriptionKey: "settings.modules.graph.description" as const,
+      },
+      {
+        id: "agentAccess" as const,
+        nameKey: "settings.modules.agent.name" as const,
+        descriptionKey: "settings.modules.agent.description" as const,
+      },
+      {
+        id: "secureDiscovery" as const,
+        nameKey: "settings.modules.discovery.name" as const,
+        descriptionKey: "settings.modules.discovery.description" as const,
+      },
+    ];
+
+    const configure = (
+      setting: Setting,
+      module: (typeof modules)[number],
+    ): void => {
+      const moduleName = this.i18n.t(module.nameKey);
+      setting
+        .setName(moduleName)
+        .setDesc(this.i18n.t(module.descriptionKey))
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.isOptionalModuleEnabled(module.id))
+            .setDisabled(module.id === "agentAccess" && Platform.isMobileApp)
+            .onChange(async (enabled) => {
+              toggle.setDisabled(true);
+              try {
+                await this.plugin.setOptionalModuleEnabled(module.id, enabled);
+                this.showStatus(
+                  containerEl,
+                  this.i18n.t(
+                    enabled ? "settings.module.enabled" : "settings.module.disabled",
+                    { name: moduleName },
+                  ),
+                  false,
+                );
+                this.display();
+              } catch (error) {
+                this.showStatus(
+                  containerEl,
+                  this.i18n.t("settings.module.failed", {
+                    name: moduleName,
+                    message: error instanceof Error ? error.message : String(error),
+                  }),
+                  true,
+                );
+                toggle.setValue(this.plugin.isOptionalModuleEnabled(module.id));
+                toggle.setDisabled(false);
+              }
+            }),
+        );
+    };
+
+    if (
+      typeof requireApiVersion === "function" &&
+      requireApiVersion("1.11.0") &&
+      typeof SettingGroup === "function"
+    ) {
+      const group = new SettingGroup(containerEl).setHeading(
+        this.i18n.t("settings.modules.heading"),
+      );
+      for (const module of modules) {
+        group.addSetting((setting) => configure(setting, module));
+      }
+      return;
+    }
+
+    new Setting(containerEl)
+      .setName(this.i18n.t("settings.modules.heading"))
+      .setHeading();
+    for (const module of modules) {
+      configure(new Setting(containerEl), module);
+    }
+  }
+
+  private renderSemanticDiscoverySection(containerEl: HTMLElement): void {
+    if (!this.plugin.isOptionalModuleEnabled("secureDiscovery")) return;
+
+    new Setting(containerEl)
+      .setName(this.i18n.t("discovery.semantic.heading"))
+      .setDesc(this.i18n.t("discovery.semantic.trust"))
+      .setHeading();
+
+    if (Platform.isDesktopApp !== true) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description vaultguard-semantic-settings-status",
+        text: this.i18n.t("discovery.semantic.desktopOnly"),
+      });
+      return;
+    }
+
+    new Setting(containerEl)
+      .setName(this.i18n.t("discovery.semantic.consent"))
+      .setDesc(this.i18n.t("discovery.semantic.consentDetail"))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.semanticSearchEnabled === true)
+          .onChange(async (enabled) => {
+            toggle.setDisabled(true);
+            try {
+              await this.plugin.setSemanticSearchEnabled(enabled);
+              this.showStatus(
+                containerEl,
+                this.i18n.t(enabled ? "discovery.semantic.enabled" : "discovery.semantic.disabled"),
+                false,
+              );
+              this.display();
+            } catch (error) {
+              toggle.setValue(this.plugin.settings.semanticSearchEnabled === true);
+              toggle.setDisabled(false);
+              this.showStatus(
+                containerEl,
+                this.i18n.t("discovery.semantic.error", {
+                  message: error instanceof Error ? error.message : String(error),
+                }),
+                true,
+              );
+            }
+          }),
+      );
+
+    let pendingOrigin = this.plugin.settings.semanticEmbeddingEndpoint;
+    let pendingModel = this.plugin.settings.semanticEmbeddingModel;
+    new Setting(containerEl)
+      .setName(this.i18n.t("discovery.semantic.origin"))
+      .setDesc(this.i18n.t("discovery.semantic.originDetail"))
+      .addText((text) =>
+        text
+          .setPlaceholder("http://127.0.0.1:11434")
+          .setValue(pendingOrigin)
+          .onChange((value) => {
+            pendingOrigin = value;
+          }),
+      );
+    new Setting(containerEl)
+      .setName(this.i18n.t("discovery.semantic.model"))
+      .setDesc(this.i18n.t("discovery.semantic.modelDetail"))
+      .addText((text) =>
+        text
+          .setPlaceholder("embeddinggemma")
+          .setValue(pendingModel)
+          .onChange((value) => {
+            pendingModel = value;
+          }),
+      );
+    new Setting(containerEl)
+      .setName(this.i18n.t("discovery.semantic.providerActions"))
+      .setDesc(this.i18n.t("discovery.semantic.providerActionsDetail"))
+      .addButton((button) =>
+        button
+          .setButtonText(this.i18n.t("discovery.semantic.save"))
+          .onClick(async () => {
+            button.setDisabled(true);
+            try {
+              await this.plugin.updateSemanticProviderPreferences(pendingOrigin, pendingModel);
+              this.showStatus(containerEl, this.i18n.t("discovery.semantic.saved"), false);
+              this.display();
+            } catch (error) {
+              this.showStatus(
+                containerEl,
+                this.i18n.t("discovery.semantic.error", {
+                  message: error instanceof Error ? error.message : String(error),
+                }),
+                true,
+              );
+              button.setDisabled(false);
+            }
+          }),
+      )
+      .addButton((button) =>
+        button
+          .setButtonText(this.i18n.t("discovery.semantic.test"))
+          .setDisabled(this.plugin.settings.semanticSearchEnabled !== true)
+          .onClick(async () => {
+            button.setDisabled(true);
+            try {
+              const dimensions = await this.plugin.testSemanticProvider();
+              this.showStatus(
+                containerEl,
+                this.i18n.t("discovery.semantic.testPassed", { dimensions }),
+                false,
+              );
+            } catch (error) {
+              this.showStatus(
+                containerEl,
+                this.i18n.t("discovery.semantic.error", {
+                  message: error instanceof Error ? error.message : String(error),
+                }),
+                true,
+              );
+            } finally {
+              button.setDisabled(this.plugin.settings.semanticSearchEnabled !== true);
+            }
+          }),
+      );
+
+    const status = this.plugin.getSemanticSearchStatus();
+    let statusDescription = this.i18n.t(`discovery.semantic.status.${status.state}`, {
+      files: status.indexedFiles,
+      chunks: status.indexedChunks,
+    });
+    if (status.totalFiles !== undefined) {
+      statusDescription += ` ${this.i18n.t("discovery.semantic.status.coverage", {
+        processed: status.processedFiles ?? 0,
+        total: status.totalFiles,
+        skipped: status.skippedFiles ?? 0,
+        failed: status.failedFiles ?? 0,
+        limited: status.limitedFiles ?? 0,
+      })}`;
+    }
+    new Setting(containerEl)
+      .setName(this.i18n.t("discovery.semantic.indexActions"))
+      .setDesc(statusDescription)
+      .addButton((button) =>
+        button
+          .setButtonText(this.i18n.t("discovery.semantic.build"))
+          .setCta()
+          .setDisabled(this.plugin.settings.semanticSearchEnabled !== true)
+          .onClick(async () => {
+            button.setDisabled(true);
+            this.showStatus(containerEl, this.i18n.t("discovery.semantic.building"), false);
+            try {
+              await this.plugin.buildSemanticIndex();
+              this.display();
+            } catch (error) {
+              this.showStatus(
+                containerEl,
+                this.i18n.t("discovery.semantic.error", {
+                  message: error instanceof Error ? error.message : String(error),
+                }),
+                true,
+              );
+              button.setDisabled(false);
+            }
+          }),
+      )
+      .addButton((button) =>
+        button
+          .setButtonText(this.i18n.t("discovery.semantic.cancel"))
+          .onClick(() => {
+            this.plugin.cancelSemanticIndexWork();
+            this.showStatus(containerEl, this.i18n.t("discovery.semantic.cancelling"), false);
+          }),
+      )
+      .addButton((button) =>
+        button
+          .setButtonText(this.i18n.t("discovery.semantic.purge"))
+          .setWarning()
+          .onClick(async () => {
+            button.setDisabled(true);
+            try {
+              await this.plugin.purgeSemanticIndex();
+              this.showStatus(containerEl, this.i18n.t("discovery.semantic.purged"), false);
+              this.display();
+            } catch (error) {
+              this.showStatus(
+                containerEl,
+                this.i18n.t("discovery.semantic.error", {
+                  message: error instanceof Error ? error.message : String(error),
+                }),
+                true,
+              );
+              button.setDisabled(false);
+            }
+          }),
+      );
   }
 
   private renderLocalProjectMemoryModeSection(containerEl: HTMLElement): void {
@@ -351,7 +811,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * yet, so we cannot gate this with `plugin.featureEnabled("aiChat")`. When a
    * server feature flag lands (AI-CHAT-PANEL.md §11), wrap this section in that
    * check. For now AI Chat is a settings-level capability and makes no model
-   * call until the user stores a key or uses a logged-in Claude Code subscription.
+ * call until the user stores a key or selects a verified subscription login.
    */
   private renderAiChatSection(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("AI chat").setHeading();
@@ -360,8 +820,16 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     if (this.plugin.settings.aiChatProvider === "openai") {
       this.renderOpenAiChatProviderSettings(containerEl);
+    } else if (this.plugin.settings.aiChatProvider === "codex") {
+      this.renderCodexSubscriptionProviderSettings(containerEl);
     } else {
-    const hasKey = this.aiChatKeyStore.hasKey();
+    const keyStore = this.getAnthropicKeyStore();
+    this.renderProviderKeyStorageSetting(containerEl, "anthropic", keyStore);
+    const hasKey = keyStore.hasKey();
+
+    if (keyStore.usesObsidianSecretStorage()) {
+      this.renderNativeProviderSecretSetting(containerEl, "Anthropic", keyStore);
+    } else {
 
     // ── API key (masked, write-only) ────────────────────────────────────────
     new Setting(containerEl)
@@ -400,7 +868,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           saveBtn.disabled = true;
           saveBtn.textContent = "Saving...";
           try {
-            await this.aiChatKeyStore.setKey(newKey);
+            await this.getAnthropicKeyStore().setKey(newKey);
             providerModelCatalog.invalidate("anthropic");
             // Wipe the plaintext from the field immediately after storing.
             inputEl.value = "";
@@ -429,7 +897,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           clearBtn.addEventListener("click", async () => {
             clearBtn.disabled = true;
             try {
-              await this.aiChatKeyStore.clearKey();
+              await this.getAnthropicKeyStore().clearKey();
               providerModelCatalog.invalidate("anthropic");
               // Best-effort: remove the roaming copy from Cloud too.
               void this.plugin.aiKeySync.deleteRemote();
@@ -447,30 +915,40 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           });
         }
       });
+    }
 
     // ── Sync API key across devices ─────────────────────────────────────────
-    new Setting(containerEl)
-      .setName("Sync API key to your other devices")
-      .setDesc(
-        "Stores an ENCRYPTED copy of your Anthropic key — wrapped with your vault's key — in " +
-          "VaultGuard Cloud, so mobile works without re-entering it. VaultGuard never sees the " +
-          "plaintext key.",
-      )
-      .addToggle((toggle) => {
-        toggle
-          .setValue(this.plugin.settings.aiChatKeySyncEnabled)
-          .onChange(async (value) => {
-            this.plugin.settings.aiChatKeySyncEnabled = value;
-            await this.plugin.saveSettings();
-            if (value) {
-              // Turned ON: push the current local key (if any) right away.
-              void this.plugin.aiKeySync.uploadIfEnabled({ userInitiated: true });
-            } else {
-              // Turned OFF: best-effort remove the roaming copy from Cloud.
-              void this.plugin.aiKeySync.deleteRemote();
-            }
-          });
-      });
+    if (!keyStore.usesObsidianSecretStorage()) {
+      new Setting(containerEl)
+        .setName("Sync API key to your other devices")
+        .setDesc(
+          "Stores an ENCRYPTED copy of your Anthropic key — wrapped with your vault's key — in " +
+            "VaultGuard Cloud, so mobile works without re-entering it. VaultGuard never sees the " +
+            "plaintext key.",
+        )
+        .addToggle((toggle) => {
+          toggle
+            .setValue(this.plugin.settings.aiChatKeySyncEnabled)
+            .onChange(async (value) => {
+              this.plugin.settings.aiChatKeySyncEnabled = value;
+              await this.plugin.saveSettings();
+              if (value) {
+                // Turned ON: push the current local key (if any) right away.
+                void this.plugin.aiKeySync.uploadIfEnabled({ userInitiated: true });
+              } else {
+                // Turned OFF: best-effort remove the roaming copy from Cloud.
+                void this.plugin.aiKeySync.deleteRemote();
+              }
+            });
+        });
+    } else {
+      new Setting(containerEl)
+        .setName("Key availability across devices")
+        .setDesc(
+          "Obsidian owns this secret. VaultGuard does not copy it into plugin data or VaultGuard Cloud. " +
+            "Choose the same native secret on each device where you want to use AI chat.",
+        );
+    }
 
     // ── Model ───────────────────────────────────────────────────────────────
     const anthropicModelSetting = new Setting(containerEl)
@@ -556,8 +1034,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .setName("Custom instructions")
       .setDesc(
         "Optional instructions appended to the assistant's system prompt (e.g. tone, formatting, " +
-          "project conventions). They never override the built-in security and permission rules. " +
-          "Applies in API-key mode.",
+        "project conventions). They never override the built-in security and permission rules.",
       )
       .addTextArea((ta) => {
         ta.setPlaceholder("e.g. Answer concisely. Prefer bullet points. Use British spelling.");
@@ -575,7 +1052,13 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private renderOpenAiChatProviderSettings(containerEl: HTMLElement): void {
-    const hasKey = this.openAiKeyStore.hasKey();
+    const keyStore = this.getOpenAiKeyStore();
+    this.renderProviderKeyStorageSetting(containerEl, "openai", keyStore);
+    const hasKey = keyStore.hasKey();
+
+    if (keyStore.usesObsidianSecretStorage()) {
+      this.renderNativeProviderSecretSetting(containerEl, "OpenAI", keyStore);
+    } else {
 
     new Setting(containerEl)
       .setName("OpenAI API key")
@@ -609,7 +1092,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           saveBtn.disabled = true;
           saveBtn.textContent = "Saving...";
           try {
-            await this.openAiKeyStore.setKey(newKey);
+            await this.getOpenAiKeyStore().setKey(newKey);
             providerModelCatalog.invalidate("openai");
             inputEl.value = "";
             this.showStatus(containerEl, "OpenAI API key saved.", false);
@@ -634,7 +1117,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           clearBtn.addEventListener("click", async () => {
             clearBtn.disabled = true;
             try {
-              await this.openAiKeyStore.clearKey();
+              await this.getOpenAiKeyStore().clearKey();
               providerModelCatalog.invalidate("openai");
               this.showStatus(containerEl, "OpenAI API key removed.", false);
               this.display();
@@ -650,6 +1133,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           });
         }
       });
+    }
 
     const openAiModelSetting = new Setting(containerEl)
       .setName("Model")
@@ -712,6 +1196,50 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
   }
 
+  private renderCodexSubscriptionProviderSettings(containerEl: HTMLElement): void {
+    new Setting(containerEl)
+      .setName("ChatGPT subscription transport")
+      .setDesc(
+        "Uses your official Codex client login. VaultGuard does not request or store an OpenAI API key, " +
+          "and the Codex thread is ephemeral with VaultGuard as its only MCP tool surface.",
+      );
+
+    new Setting(containerEl)
+      .setName("Model")
+      .setDesc(
+        "Requested Codex model. Availability follows your ChatGPT plan and workspace policy.",
+      )
+      .addDropdown((dropdown) => {
+        this.populateModelSelect(
+          dropdown.selectEl,
+          OPENAI_CHAT_MODELS,
+          this.plugin.settings.openAiModel,
+        );
+        dropdown
+          .setValue(this.plugin.settings.openAiModel)
+          .onChange(async (value) => {
+            this.plugin.settings.openAiModel = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Reasoning effort")
+      .setDesc("How much reasoning effort Codex requests for each subscription turn.")
+      .addDropdown((dropdown) => {
+        for (const effort of OPENAI_REASONING_EFFORTS) {
+          dropdown.addOption(effort.id, effort.label);
+        }
+        dropdown
+          .setValue(this.plugin.settings.openAiReasoningEffort)
+          .onChange(async (value) => {
+            this.plugin.settings.openAiReasoningEffort =
+              value === "low" || value === "high" ? value : "medium";
+            await this.plugin.saveSettings();
+          });
+      });
+  }
+
   private populateModelSelect(
     selectEl: HTMLSelectElement,
     options: ReadonlyArray<{ id: string; label: string }>,
@@ -736,7 +1264,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     statusEl: HTMLElement,
   ): Promise<void> {
     if (!selectEl) return;
-    const keyStore = provider === "openai" ? this.openAiKeyStore : this.aiChatKeyStore;
+    const keyStore = provider === "openai"
+      ? this.getOpenAiKeyStore()
+      : this.getAnthropicKeyStore();
     const selectedModel =
       provider === "openai"
         ? this.plugin.settings.openAiModel
@@ -853,12 +1383,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .addDropdown((dropdown) => {
         if (!onMobile) {
           dropdown.addOption("subscription", "Claude subscription (Claude Code CLI)");
+          dropdown.addOption("codex", "ChatGPT subscription (Codex CLI)");
         }
         dropdown.addOption("apiKey", "Anthropic API key");
-        dropdown.addOption("openai", "OpenAI / GPT");
+        dropdown.addOption("openai", "OpenAI API key / GPT");
         dropdown
           .setValue(
-            onMobile && this.plugin.settings.aiChatProvider === "subscription"
+            onMobile &&
+              (this.plugin.settings.aiChatProvider === "subscription" ||
+                this.plugin.settings.aiChatProvider === "codex")
               ? "apiKey"
               : this.plugin.settings.aiChatProvider,
           )
@@ -866,15 +1399,33 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             this.plugin.settings.aiChatProvider =
               value === "subscription" && !onMobile
                 ? "subscription"
+                : value === "codex" && !onMobile
+                  ? "codex"
                 : value === "openai"
                   ? "openai"
                   : "apiKey";
             this.plugin.settings.aiChatProviderExplicit = true;
             await this.plugin.saveSettings();
+            this.plugin.notifyAiChatProviderChanged();
             // Re-render so the status line / API-key field reflect the choice.
             this.display();
           });
       });
+
+    if (this.plugin.settings.aiChatProvider === "codex") {
+      const statusSetting = new Setting(containerEl)
+        .setName("Codex status")
+        .setDesc("Checking…");
+      if (onMobile) {
+        statusSetting.setDesc(
+          "ChatGPT subscription mode launches the official Codex client and is desktop-only. " +
+            "Use an API-key provider on mobile.",
+        );
+        return;
+      }
+      void this.refreshCodexStatus(statusSetting);
+      return;
+    }
 
     if (this.plugin.settings.aiChatProvider !== "subscription") return;
 
@@ -979,6 +1530,78 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
     // Re-check after the login subprocess finishes.
     await this.refreshClaudeStatus(statusSetting);
+  }
+
+  private async refreshCodexStatus(statusSetting: Setting): Promise<void> {
+    this.codexStatusAbort?.abort();
+    const controller = new AbortController();
+    this.codexStatusAbort = controller;
+    let status: CodexAuthStatus;
+    try {
+      status = await getCodexAuthStatus(undefined, controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      statusSetting.setDesc(`Could not check Codex: ${(error as Error).message}`);
+      return;
+    } finally {
+      if (this.codexStatusAbort === controller) this.codexStatusAbort = null;
+    }
+
+    statusSetting.clear();
+    statusSetting.setName("Codex status");
+    switch (status.classification) {
+      case "logged-in-chatgpt":
+        statusSetting.setDesc(
+          `Signed in with ChatGPT${status.version ? ` (Codex ${status.version})` : ""}. ` +
+            "Subscription chat uses this login; no OpenAI API key is required.",
+        );
+        break;
+      case "logged-in-other":
+        statusSetting.setDesc(
+          "Codex is authenticated with an API key or access token, not a ChatGPT login. " +
+            "This provider refuses that mode to avoid silently using metered API billing.",
+        );
+        statusSetting.addButton((button) =>
+          button
+            .setButtonText("Sign in with ChatGPT")
+            .onClick(() => void this.runCodexLogin(statusSetting)),
+        );
+        break;
+      case "not-logged-in":
+        statusSetting.setDesc(
+          "Codex is installed but signed out. Sign in through the official client to use your ChatGPT subscription.",
+        );
+        statusSetting.addButton((button) =>
+          button
+            .setButtonText("Sign in")
+            .setCta()
+            .onClick(() => void this.runCodexLogin(statusSetting)),
+        );
+        break;
+      case "not-installed":
+        statusSetting.setDesc(
+          "Official Codex client not found. Install it from OpenAI, then reopen settings.",
+        );
+        break;
+      case "unsupported":
+        statusSetting.setDesc(status.error ?? "Codex subscription chat is unavailable here.");
+        break;
+      case "error":
+      default:
+        statusSetting.setDesc(status.error ?? "Could not determine Codex readiness.");
+        break;
+    }
+  }
+
+  private async runCodexLogin(statusSetting: Setting): Promise<void> {
+    statusSetting.setDesc("Opening the official Codex sign-in flow…");
+    try {
+      await this.plugin.startCodexCliLogin();
+    } catch (error) {
+      statusSetting.setDesc(`Could not start Codex sign-in: ${(error as Error).message}`);
+      return;
+    }
+    await this.refreshCodexStatus(statusSetting);
   }
 
   /**
@@ -2185,9 +2808,12 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   display(): void {
+    this.codexStatusAbort?.abort();
+    this.codexStatusAbort = null;
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("vaultguard-settings-tab");
+    this.i18n.applyToRoot(containerEl);
 
     // ── Header ──────────────────────────────────────────────────────────────
     // No top-level heading here: Obsidian already renders the plugin name as
@@ -2196,11 +2822,13 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // "settings"/"options"/"general" in setHeading labels). Lead with the
     // description paragraph instead.
     containerEl.createEl("p", {
-      text: "Enterprise-grade vault security with permission-aware encrypted cloud sync.",
+      text: this.i18n.t("settings.intro"),
       cls: "setting-item-description",
     });
 
     this.renderLocalProjectMemoryModeSection(containerEl);
+    this.renderOptionalModulesSection(containerEl);
+    this.renderSemanticDiscoverySection(containerEl);
 
     // `session` / `isManualMode` are computed once and read by both the
     // Connection and Account blocks below.
@@ -2795,6 +3423,21 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Show quick-access ribbon icons")
+      .setDesc(
+        "Show dedicated left-ribbon icons for AI chat and the permissions graph. The VaultGuard menu icon is always shown. When turned back on, reload Obsidian to bring them back."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.showRibbonIcons !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.showRibbonIcons = value;
+            await this.plugin.saveSettings();
+            this.plugin.applyRibbonIconLayout();
+          })
+      );
+
     // ── Advanced (collapsed) ─────────────────────────────────────────────────
     // Security + Reliability + at-rest maintenance live behind one disclosure.
     this.renderCollapsibleSection(containerEl, "Advanced", (body) => {
@@ -2885,20 +3528,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             })
         );
 
-      new Setting(body)
-        .setName("Disable update checks")
-        .setDesc(
-          "When enabled, the plugin won't poll GitHub for new releases. Default off: the plugin checks once every 24 h and shows a notification when a newer version is available. No telemetry is sent — only an outbound HTTPS request to api.github.com."
-        )
-        .addToggle((toggle) =>
-          toggle
-            .setValue(this.plugin.settings.disableUpdateChecks ?? false)
-            .onChange(async (value) => {
-              this.plugin.settings.disableUpdateChecks = value;
-              await this.plugin.saveSettings();
-            })
-        );
-
       // ── Local at-rest encryption ─────────────────────────────────────────
       this.renderAtRestSection(body);
     });
@@ -2906,12 +3535,21 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // ── AI & automation (collapsed) ──────────────────────────────────────────
     // Agent bridge + AI chat live behind one disclosure. Both helpers keep
     // their own desktop gating and setHeading() labels.
-    this.renderCollapsibleSection(containerEl, "AI & automation", (body) => {
-      this.renderVaultOrientationSection(body);
-      this.renderAgentBridgeSection(body);
-      this.renderChatGptConnectorSection(body);
-      this.renderAiChatSection(body);
-    });
+    if (
+      this.plugin.isOptionalModuleEnabled("aiChat") ||
+      this.plugin.isOptionalModuleEnabled("agentAccess")
+    ) {
+      this.renderCollapsibleSection(containerEl, "AI & automation", (body) => {
+        if (this.plugin.isOptionalModuleEnabled("agentAccess")) {
+          this.renderVaultOrientationSection(body);
+          this.renderAgentBridgeSection(body);
+          this.renderChatGptConnectorSection(body);
+        }
+        if (this.plugin.isOptionalModuleEnabled("aiChat")) {
+          this.renderAiChatSection(body);
+        }
+      });
+    }
 
     // ── Danger Zone ─────────────────────────────────────────────────────────
     new Setting(containerEl).setName("Danger zone").setHeading();

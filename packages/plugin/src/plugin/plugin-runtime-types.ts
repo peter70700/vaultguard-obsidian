@@ -28,6 +28,8 @@ import type {
   SyncState,
   UserSession,
   VaultGuardSettings,
+  PendingLargeFileRecord,
+  OptionalModuleId,
 } from "../types";
 import type { FileExplorerDecorations } from "../ui/file-explorer-decorations";
 import type { FilePermissionHeader } from "../ui/file-permission-header";
@@ -141,6 +143,8 @@ export interface VaultGuardCommandContext {
   /** Live per-vault membership role (null = no explicit membership row; org role governs). */
   readonly vaultMemberRole: VaultMemberRole | null;
 
+  isOptionalModuleEnabled(moduleId: OptionalModuleId): boolean;
+
   handleLogin(): void;
   forceLogout(noticeMessage?: string): Promise<void>;
   isSessionTokenExpiring(): boolean;
@@ -230,6 +234,8 @@ export interface VaultGuardViewRegistrationContext {
 
 export interface VaultGuardSidebarActivationContext {
   app: App;
+  isOptionalModuleEnabled(moduleId: OptionalModuleId): boolean;
+  ensureOptionalViewRegistered(moduleId: OptionalModuleId): Promise<boolean>;
   createSidebarViewConfig(): VaultGuardSidebarViewConfig | null;
   getSidebarViewConfig(): VaultGuardSidebarViewConfig | null;
   setSidebarViewConfig(config: VaultGuardSidebarViewConfig | null): void;
@@ -520,6 +526,14 @@ export interface AtRestAdapterRuntimeContext {
   encryptContentBytes(content: ArrayBuffer): Promise<string>;
   decryptContentBytes(encryptedContent: string): Promise<ArrayBuffer>;
   computeHashBytes(content: ArrayBuffer): Promise<string>;
+  uploadLargeEncryptedFile?(
+    path: string,
+    plaintext: ArrayBuffer,
+    contentType: string,
+    expectedVersionId?: string,
+  ): Promise<LargeFileUploadResult>;
+  upsertPendingLargeFile?(record: PendingLargeFileRecord): Promise<void>;
+  clearPendingLargeFile?(path: string): Promise<void>;
   apiRequest<T>(
     method: string,
     endpoint: string,
@@ -559,6 +573,23 @@ export interface SyncRuntimeSnapshot {
   connectionLostNoticeTimerAlive: boolean;
   applyingRemoteWrite: boolean;
   folderLifecycleListenersRegistered: boolean;
+}
+
+export interface LargeFileUploadResult {
+  path: string;
+  hash: string;
+  size: number;
+  lastModified: string;
+  versionId?: string;
+  transferId: string;
+}
+
+export interface LargeFileDownloadResult {
+  bytes: ArrayBuffer;
+  plaintextSize: number;
+  plaintextSha256: string;
+  contentType: string;
+  versionId?: string;
 }
 
 export interface SyncRuntimeContext {
@@ -635,7 +666,7 @@ export interface SyncRuntimeContext {
   ): Promise<"uploaded" | "skipped-no-lease" | "skipped-no-permission">;
   /** Re-encrypts an externally-added plaintext text file in place (no-op for
    * VG1/binary/excluded paths). Fire-and-forget hygiene after catch-up uploads. */
-  ensureAtRestEncryptedInPlace(path: string): Promise<boolean>;
+  ensureAtRestEncryptedInPlace(path: string, remoteDurable?: boolean): Promise<boolean>;
   /** Current permission-store state — used to refuse deleting local-only files
    * on an unconfirmed (cold/warming/fetch-failed) permission baseline (SY2). */
   getPermissionStoreState(): PermissionStoreState;
@@ -708,6 +739,18 @@ export interface SyncRuntimeContext {
   encryptContentBytes(content: ArrayBuffer): Promise<string>;
   decryptContentBytes(encryptedContent: string): Promise<ArrayBuffer>;
   computeHashBytes(content: ArrayBuffer): Promise<string>;
+  uploadLargeEncryptedFile(
+    path: string,
+    plaintext: ArrayBuffer,
+    contentType: string,
+    expectedVersionId?: string,
+  ): Promise<LargeFileUploadResult>;
+  downloadLargeEncryptedFile(
+    path: string,
+    versionId?: string,
+  ): Promise<LargeFileDownloadResult>;
+  upsertPendingLargeFile(record: PendingLargeFileRecord): Promise<void>;
+  clearPendingLargeFile(path: string): Promise<void>;
   bytesToBase64(bytes: Uint8Array): string;
   notifyCloudDecryptFallback(path: string): void;
   getEffectivePermission(path: string): Promise<PermissionLevel>;
@@ -741,7 +784,11 @@ export interface SyncRuntimeContext {
   renewKeyLease(): Promise<void>;
   forceLogout(noticeMessage?: string): Promise<void>;
   invalidatePermissionStore(): void;
-  emitPermissionChanged(payload?: { path?: string; serverConfirmed?: boolean }): void;
+  emitPermissionChanged(payload?: {
+    path?: string;
+    serverConfirmed?: boolean;
+    semanticAuthorityChanged?: boolean;
+  }): void;
   clearPlaceholderPaths(): void;
   log(message: string): void;
   logError(message: string, error: unknown): void;

@@ -742,6 +742,10 @@ resource "aws_api_gateway_integration" "files_path_delete" {
 # POST /vaults/{vaultId}/files/{filePath+} — multipurpose POST on the greedy file-path resource.
 # Currently dispatched server-side by the Lambda based on `event.path` suffix:
 #   - ends with `/restore-delete` → un-delete a soft-deleted file (Phase 5 / UND-01)
+#   - ends with `/restore` → restore a historical version
+#   - ends with `/direct-upload` → issue an isolated encrypted upload capability
+#   - ends with `/direct-upload/{transferId}/finalize` → validate and promote it
+#   - ends with `/direct-download` → issue an authorized encrypted download
 # API Gateway does NOT allow child resources under a greedy `{filePath+}` path variable,
 # so we add the static suffix matching in the Lambda dispatcher (mirroring how `/history`
 # is handled via `isHistoryResource = isFilePathResource && path.endsWith('/history')`).
@@ -1806,12 +1810,13 @@ resource "aws_wafv2_web_acl" "api_regional" {
 
         # SizeRestrictions_BODY blocks any request body over 8 KB, but file
         # sync PUTs (`PUT /vaults/{id}/files/{path}`) carry base64 ciphertext
-        # in the JSON body by design, up to max_file_size_bytes (10 MB) — with
+        # in the JSON body up to the API Gateway request ceiling — with
         # this rule in block mode every note larger than ~6 KB fails to
         # upload. Count instead of block: payload size stays bounded by API
-        # Gateway's 10 MB cap plus the files Lambda's own max_file_size_bytes
-        # check, and the body is E2E ciphertext, so there is nothing for the
-        # deeper body inspections to miss beyond WAF's 8 KB inspection window.
+        # Gateway's 10 MB cap plus the files Lambda's own JSON-path checks.
+        # Larger configured files use presigned direct S3 transfer and do not
+        # cross this WAF body path. The JSON body is client ciphertext, so there
+        # is no plaintext content for inspection beyond WAF's 8 KB window.
         rule_action_override {
           name = "SizeRestrictions_BODY"
           action_to_use {

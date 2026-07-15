@@ -10,6 +10,7 @@ import {
   ConflictResolutionStrategy,
   type ServerEdition,
   type ServerFeatures,
+  type OptionalModulePreferences,
   type UserSession,
   type VaultGuardSettings,
 } from "../types";
@@ -24,6 +25,145 @@ import type { PluginSettingsRuntimeContext } from "./plugin-runtime-types";
 type VaultGuardPluginData = Partial<VaultGuardSettings> & {
   storedSessions?: Record<string, unknown>;
 };
+
+export type SettingsLoadMode = "startup" | "external";
+
+const RECOGNIZED_LEGACY_SETTINGS_KEYS = new Set<keyof VaultGuardSettings>([
+  "orgSlug",
+  "serverVaultId",
+  "apiEndpoint",
+  "organizationId",
+  "cognitoUserPoolId",
+  "cognitoClientId",
+  "syncInterval",
+  "cacheEncryptionStrength",
+  "localProjectMemoryMode",
+  "showStatusBar",
+  "excludedPaths",
+  "lastSyncTimestamp",
+  "encryptedAnthropicKey",
+  "encryptedOpenAiKey",
+  "aiChatModel",
+  "aiChatProvider",
+  "permissionsGraphDefaults",
+  "permissionsGraphVaultStates",
+  "pinLock",
+  "pinOnboardingPromptShown",
+]);
+
+function isBoolean(value: unknown): value is boolean {
+  return typeof value === "boolean";
+}
+
+/**
+ * AI chat and the permissions graph default ON for every install (fresh included);
+ * each still has its own ribbon icon and a per-vault Settings toggle. Agent access
+ * keeps the former "established pre-P1 installs only" migration default; secure
+ * discovery stays off. Explicit saved booleans always win, and unknown host
+ * housekeeping keys never turn agent access on.
+ */
+export function normalizeOptionalModules(
+  rawData: Record<string, unknown>,
+): OptionalModulePreferences {
+  const raw = rawData.optionalModules;
+  const establishedInstall = Object.keys(rawData).some((key) =>
+    RECOGNIZED_LEGACY_SETTINGS_KEYS.has(key as keyof VaultGuardSettings),
+  );
+  const migrationDefault = establishedInstall;
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      schemaVersion: 2,
+      aiChat: true,
+      permissionsGraph: true,
+      agentAccess: migrationDefault,
+      secureDiscovery: false,
+    };
+  }
+
+  const modules = raw as Record<string, unknown>;
+  return {
+    schemaVersion: 2,
+    aiChat: isBoolean(modules.aiChat) ? modules.aiChat : true,
+    permissionsGraph: isBoolean(modules.permissionsGraph)
+      ? modules.permissionsGraph
+      : true,
+    agentAccess: isBoolean(modules.agentAccess) ? modules.agentAccess : migrationDefault,
+    // Secure Discovery did not exist before schema v2. It must never inherit
+    // P1's established-install migration default.
+    secureDiscovery: isBoolean(modules.secureDiscovery)
+      ? modules.secureDiscovery
+      : false,
+  };
+}
+
+export interface DiscoveryPreferences {
+  semanticSearchEnabled: boolean;
+  semanticEmbeddingEndpoint: string;
+  semanticEmbeddingModel: string;
+  discoveryResultLimit: number;
+}
+
+const DEFAULT_SEMANTIC_ENDPOINT = "http://127.0.0.1:11434";
+const DEFAULT_SEMANTIC_MODEL = "embeddinggemma";
+const DEFAULT_DISCOVERY_RESULT_LIMIT = 50;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * Normalize the non-secret P2 preferences without ever widening a malformed
+ * endpoint to a network destination. Runtime provider validation repeats this
+ * check immediately before every explicit request.
+ */
+export function normalizeDiscoveryPreferences(
+  rawData: Record<string, unknown>,
+): DiscoveryPreferences {
+  const rawEndpoint =
+    typeof rawData.semanticEmbeddingEndpoint === "string"
+      ? rawData.semanticEmbeddingEndpoint.trim()
+      : "";
+  let semanticEmbeddingEndpoint = DEFAULT_SEMANTIC_ENDPOINT;
+  if (rawEndpoint) {
+    try {
+      const parsed = new URL(rawEndpoint);
+      const cleanPath = parsed.pathname === "" || parsed.pathname === "/";
+      if (
+        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+        LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase()) &&
+        !parsed.username &&
+        !parsed.password &&
+        !parsed.search &&
+        !parsed.hash &&
+        cleanPath
+      ) {
+        semanticEmbeddingEndpoint = parsed.origin;
+      }
+    } catch {
+      // Keep the loopback-only default.
+    }
+  }
+
+  const rawModel =
+    typeof rawData.semanticEmbeddingModel === "string"
+      ? rawData.semanticEmbeddingModel.trim()
+      : "";
+  const semanticEmbeddingModel =
+    rawModel.length >= 1 && rawModel.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(rawModel)
+      ? rawModel
+      : DEFAULT_SEMANTIC_MODEL;
+
+  const rawLimit = rawData.discoveryResultLimit;
+  const discoveryResultLimit =
+    typeof rawLimit === "number" && Number.isFinite(rawLimit)
+      ? Math.max(1, Math.min(100, Math.trunc(rawLimit)))
+      : DEFAULT_DISCOVERY_RESULT_LIMIT;
+
+  return {
+    semanticSearchEnabled: rawData.semanticSearchEnabled === true,
+    semanticEmbeddingEndpoint,
+    semanticEmbeddingModel,
+    discoveryResultLimit,
+  };
+}
 
 interface ProtectedSessionEnvelope {
   v: 1;
@@ -70,11 +210,18 @@ export class PluginSettingsRuntime {
     );
   }
 
-  async loadSettings(): Promise<void> {
+  async loadSettings(mode: SettingsLoadMode = "startup"): Promise<void> {
     const data = ((await this.ctx.loadData()) ?? {}) as VaultGuardPluginData;
-    this.ctx.setPersistedSessions(this.normalizePersistedSessions(data.storedSessions));
+    if (mode === "startup") {
+      this.ctx.setPersistedSessions(this.normalizePersistedSessions(data.storedSessions));
+    }
     delete data.storedSessions;
     this.ctx.setSettings(Object.assign({}, DEFAULT_SETTINGS, data));
+    this.settings.optionalModules = normalizeOptionalModules(data as Record<string, unknown>);
+    Object.assign(
+      this.settings,
+      normalizeDiscoveryPreferences(data as Record<string, unknown>),
+    );
 
     // Migrate the legacy single "show permission indicators" toggle into the
     // three granular display toggles. Object.assign above already seeded the

@@ -31,6 +31,7 @@ import {
   getVault,
   getVaultBySlug,
   getVaultMembership,
+  getStoredVaultMembership,
   listVaultsForUser,
   listVaultsForOrg,
   listVaultMembers,
@@ -533,7 +534,7 @@ async function handleAddMember(
     ? (body.role as VaultMemberRole)
     : vault.defaultRole;
 
-  const existing = await getVaultMembership(vaultId, targetUserId);
+  const existing = await getStoredVaultMembership(vaultId, targetUserId);
   if (existing) {
     return formatError(409, `User ${targetUserId} is already a member of this vault.`, requestId);
   }
@@ -542,6 +543,7 @@ async function handleAddMember(
     vaultId,
     userId: targetUserId,
     role,
+    accessKind: 'member',
     joinedAt: new Date().toISOString(),
     invitedBy: user.userId,
   };
@@ -593,9 +595,16 @@ async function handleUpdateMember(
   }
   const role = body.role as VaultMemberRole;
 
-  const existing = await getVaultMembership(vaultId, targetUserId);
+  const existing = await getStoredVaultMembership(vaultId, targetUserId);
   if (!existing) {
     return formatError(404, `User ${targetUserId} is not a member of this vault.`, requestId);
+  }
+  if (existing.accessKind === 'guest') {
+    return formatError(
+      409,
+      'Guest access cannot be promoted in place. Remove it and invite the user as a member.',
+      requestId
+    );
   }
 
   await docClient.send(
@@ -666,7 +675,7 @@ async function handleRemoveMember(
   const targetUserId = event.pathParameters?.userId || '';
   const vault = await requireVaultMember(user, vaultId, 'admin');
 
-  const existing = await getVaultMembership(vaultId, targetUserId);
+  const existing = await getStoredVaultMembership(vaultId, targetUserId);
   if (!existing) {
     return formatError(404, `User ${targetUserId} is not a member of this vault.`, requestId);
   }
@@ -692,7 +701,7 @@ async function handleRemoveMember(
     })
   );
 
-  await deleteDefaultMemberPermission(vaultId, targetUserId);
+  await deleteMemberPermissions(vaultId, targetUserId, existing.accessKind);
 
   // Cut the cryptographic-key plane in the same step as the data plane.
   // Without this, the removed user's outstanding leases stay active and they
@@ -958,14 +967,19 @@ function sanitizePluginAllowlist(
   return out;
 }
 
-async function deleteDefaultMemberPermission(vaultId: string, userId: string): Promise<void> {
-  await docClient.send(
+async function deleteMemberPermissions(
+  vaultId: string,
+  userId: string,
+  accessKind?: 'member' | 'guest'
+): Promise<void> {
+  const ruleIds = [defaultMemberPermissionRuleId(vaultId, userId)];
+  if (accessKind === 'guest') {
+    ruleIds.push(`guest-invite#${vaultId}#${userId}`);
+  }
+  await Promise.all(ruleIds.map((ruleId) => docClient.send(
     new DeleteCommand({
       TableName: PERMISSIONS_TABLE,
-      Key: {
-        pk: defaultMemberPermissionRuleId(vaultId, userId),
-        sk: DEFAULT_MEMBER_RULE_SK,
-      },
+      Key: { pk: ruleId, sk: DEFAULT_MEMBER_RULE_SK },
     })
-  );
+  )));
 }

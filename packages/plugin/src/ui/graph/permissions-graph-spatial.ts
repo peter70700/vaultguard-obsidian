@@ -11,6 +11,38 @@ import type {
 } from "./permissions-graph-layout";
 
 export const DEFAULT_PERMISSIONS_GRAPH_SPATIAL_CELL_SIZE = 256;
+export const MAX_PERMISSIONS_GRAPH_INCREMENTAL_SPATIAL_NODES = 4_096;
+
+export type PermissionsGraphSpatialUpdateErrorCode =
+  | "GENERATION_MISMATCH"
+  | "INVALID_COORDINATE"
+  | "INVALID_ORDINAL"
+  | "INVALID_REVISION"
+  | "TOPOLOGY_MISMATCH";
+
+export class PermissionsGraphSpatialUpdateError extends Error {
+  constructor(readonly code: PermissionsGraphSpatialUpdateErrorCode, message: string) {
+    super(message);
+    this.name = "PermissionsGraphSpatialUpdateError";
+  }
+}
+
+export interface PermissionsGraphSpatialMovedNodeUpdateInput {
+  readonly topologyFingerprint: string;
+  readonly layoutGeneration: number;
+  readonly previousCoordinateRevision: number;
+  readonly movedOrdinals: readonly number[] | Uint32Array;
+  readonly maxIncrementalNodes?: number;
+}
+
+export interface PermissionsGraphSpatialMovedNodeUpdateResult {
+  readonly mode: "incremental" | "full-rebuild" | "unchanged";
+  readonly reason: "batch-limit" | "revision-mismatch" | null;
+  readonly movedNodeCount: number;
+  readonly touchedCellKeys: readonly string[];
+  readonly previousCoordinateRevision: number;
+  readonly coordinateRevision: number;
+}
 
 export interface PermissionsGraphSpatialBounds {
   readonly x1: number;
@@ -68,6 +100,7 @@ export class PermissionsGraphSpatialIndex {
 
   private readonly configurationDiagnostics: PermissionsGraphSpatialDiagnostic[];
   private cells = new Map<string, readonly PermissionsGraphSpatialEntry[]>();
+  private entriesByOrdinal = new Map<number, PermissionsGraphSpatialEntry>();
   private diagnostics: readonly PermissionsGraphSpatialDiagnostic[] = Object.freeze(
     [] as PermissionsGraphSpatialDiagnostic[],
   );
@@ -76,6 +109,7 @@ export class PermissionsGraphSpatialIndex {
   private _indexedNodeCount = 0;
   private _skippedNodeCount = 0;
   private _rebuildCount = 0;
+  private _incrementalUpdateCount = 0;
 
   constructor(
     readonly layout: PermissionsGraphLayoutStore,
@@ -115,6 +149,10 @@ export class PermissionsGraphSpatialIndex {
     return this._rebuildCount;
   }
 
+  get incrementalUpdateCount(): number {
+    return this._incrementalUpdateCount;
+  }
+
   get isStale(): boolean {
     return this._layoutGeneration !== this.layout.layoutGeneration ||
       this._coordinateRevision !== this.layout.coordinateRevision;
@@ -134,6 +172,7 @@ export class PermissionsGraphSpatialIndex {
   /** Rebuild completely; invalid externally-mutated coordinates are skipped. */
   rebuild(): void {
     const mutableCells = new Map<string, MutableSpatialEntry[]>();
+    const entriesByOrdinal = new Map<number, PermissionsGraphSpatialEntry>();
     const rebuildDiagnostics = [...this.configurationDiagnostics];
     let indexedNodeCount = 0;
     let skippedNodeCount = 0;
@@ -156,6 +195,7 @@ export class PermissionsGraphSpatialIndex {
       const cellX = Math.floor(x / this.cellSize);
       const cellY = Math.floor(y / this.cellSize);
       const entry = Object.freeze({ nodeId, ordinal, x, y, cellX, cellY });
+      entriesByOrdinal.set(ordinal, entry);
       const key = cellKey(cellX, cellY);
       const entries = mutableCells.get(key);
       if (entries) entries.push(entry);
@@ -172,12 +212,153 @@ export class PermissionsGraphSpatialIndex {
     }
 
     this.cells = nextCells;
+    this.entriesByOrdinal = entriesByOrdinal;
     this._layoutGeneration = this.layout.layoutGeneration;
     this._coordinateRevision = this.layout.coordinateRevision;
     this._indexedNodeCount = indexedNodeCount;
     this._skippedNodeCount = skippedNodeCount;
     this._rebuildCount += 1;
     this.diagnostics = Object.freeze(rebuildDiagnostics);
+  }
+
+  /**
+   * Move one bounded ordinal batch from the immediately previous coordinate
+   * revision. Any stale identity or oversized batch takes the deterministic
+   * full-rebuild path; invalid caller data is rejected before index mutation.
+   */
+  updateMovedNodes(
+    input: PermissionsGraphSpatialMovedNodeUpdateInput,
+  ): PermissionsGraphSpatialMovedNodeUpdateResult {
+    if (input.topologyFingerprint !== this.layout.topologyFingerprint) {
+      throw new PermissionsGraphSpatialUpdateError(
+        "TOPOLOGY_MISMATCH",
+        "Moved-node spatial update topology does not match the layout.",
+      );
+    }
+    if (!Number.isInteger(input.layoutGeneration) || input.layoutGeneration < 0 ||
+      input.layoutGeneration !== this.layout.layoutGeneration) {
+      throw new PermissionsGraphSpatialUpdateError(
+        "GENERATION_MISMATCH",
+        "Moved-node spatial update generation does not match the committed layout.",
+      );
+    }
+    if (!isUint32(input.previousCoordinateRevision)) {
+      throw new PermissionsGraphSpatialUpdateError(
+        "INVALID_REVISION",
+        "Moved-node spatial update previous coordinate revision must be Uint32.",
+      );
+    }
+
+    const movedOrdinals = Array.from(new Set(Array.from(input.movedOrdinals))).sort((a, b) => a - b);
+    for (const ordinal of movedOrdinals) {
+      if (!Number.isInteger(ordinal) || ordinal < 0 || ordinal >= this.layout.coordinateCount) {
+        throw new PermissionsGraphSpatialUpdateError(
+          "INVALID_ORDINAL",
+          `Moved-node spatial update ordinal ${ordinal} is outside the layout.`,
+        );
+      }
+      const x = this.layout.x[ordinal];
+      const y = this.layout.y[ordinal];
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        throw new PermissionsGraphSpatialUpdateError(
+          "INVALID_COORDINATE",
+          `Moved-node spatial update coordinate at ordinal ${ordinal} must be finite.`,
+        );
+      }
+    }
+
+    const maxIncrementalNodes = normalizeIncrementalLimit(input.maxIncrementalNodes);
+    const revisionsMatch =
+      this._layoutGeneration === input.layoutGeneration &&
+      this._coordinateRevision === input.previousCoordinateRevision &&
+      this.layout.coordinateRevision === incrementUint32(input.previousCoordinateRevision);
+    if (!revisionsMatch || movedOrdinals.length > maxIncrementalNodes) {
+      const reason = revisionsMatch ? "batch-limit" as const : "revision-mismatch" as const;
+      this.rebuild();
+      return Object.freeze({
+        mode: "full-rebuild" as const,
+        reason,
+        movedNodeCount: movedOrdinals.length,
+        touchedCellKeys: Object.freeze([] as string[]),
+        previousCoordinateRevision: input.previousCoordinateRevision,
+        coordinateRevision: this._coordinateRevision,
+      });
+    }
+    if (movedOrdinals.length === 0) {
+      return Object.freeze({
+        mode: "unchanged" as const,
+        reason: null,
+        movedNodeCount: 0,
+        touchedCellKeys: Object.freeze([] as string[]),
+        previousCoordinateRevision: input.previousCoordinateRevision,
+        coordinateRevision: this._coordinateRevision,
+      });
+    }
+
+    const nextCells = new Map(this.cells);
+    const mutableTouched = new Map<string, MutableSpatialEntry[]>();
+    const nextEntriesByOrdinal = new Map(this.entriesByOrdinal);
+    const touched = new Set<string>();
+    const mutableCell = (key: string): MutableSpatialEntry[] => {
+      const existing = mutableTouched.get(key);
+      if (existing) return existing;
+      const created = [...(nextCells.get(key) ?? [])];
+      mutableTouched.set(key, created);
+      return created;
+    };
+    let indexedNodeCount = this._indexedNodeCount;
+    let skippedNodeCount = this._skippedNodeCount;
+
+    for (const ordinal of movedOrdinals) {
+      const previous = nextEntriesByOrdinal.get(ordinal);
+      if (previous) {
+        const previousKey = cellKey(previous.cellX, previous.cellY);
+        const previousCell = mutableCell(previousKey);
+        const previousIndex = previousCell.findIndex((entry) => entry.ordinal === ordinal);
+        if (previousIndex >= 0) previousCell.splice(previousIndex, 1);
+        touched.add(previousKey);
+      } else {
+        indexedNodeCount += 1;
+        skippedNodeCount = Math.max(0, skippedNodeCount - 1);
+      }
+
+      const x = this.layout.x[ordinal] as number;
+      const y = this.layout.y[ordinal] as number;
+      const cellX = Math.floor(x / this.cellSize);
+      const cellY = Math.floor(y / this.cellSize);
+      const nodeId = this.layout.nodeIds[ordinal] ?? `ordinal:${ordinal}`;
+      const entry = Object.freeze({ nodeId, ordinal, x, y, cellX, cellY });
+      const nextKey = cellKey(cellX, cellY);
+      mutableCell(nextKey).push(entry);
+      nextEntriesByOrdinal.set(ordinal, entry);
+      touched.add(nextKey);
+    }
+
+    for (const [key, entries] of mutableTouched) {
+      entries.sort(compareEntries);
+      if (entries.length === 0) nextCells.delete(key);
+      else nextCells.set(key, Object.freeze(entries));
+    }
+
+    const movedSet = new Set(movedOrdinals);
+    this.cells = new Map(Array.from(nextCells.entries()).sort((left, right) => compareStrings(left[0], right[0])));
+    this.entriesByOrdinal = nextEntriesByOrdinal;
+    this._layoutGeneration = this.layout.layoutGeneration;
+    this._coordinateRevision = this.layout.coordinateRevision;
+    this._indexedNodeCount = indexedNodeCount;
+    this._skippedNodeCount = skippedNodeCount;
+    this._incrementalUpdateCount += 1;
+    this.diagnostics = Object.freeze(this.diagnostics.filter((diagnostic) =>
+      diagnostic.ordinal === undefined || !movedSet.has(diagnostic.ordinal)
+    ));
+    return Object.freeze({
+      mode: "incremental" as const,
+      reason: null,
+      movedNodeCount: movedOrdinals.length,
+      touchedCellKeys: Object.freeze(Array.from(touched).sort(compareStrings)),
+      previousCoordinateRevision: input.previousCoordinateRevision,
+      coordinateRevision: this._coordinateRevision,
+    });
   }
 
   query(
@@ -326,4 +507,18 @@ function compareEntries(
 
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function normalizeIncrementalLimit(value: number | undefined): number {
+  if (value === undefined) return MAX_PERMISSIONS_GRAPH_INCREMENTAL_SPATIAL_NODES;
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(MAX_PERMISSIONS_GRAPH_INCREMENTAL_SPATIAL_NODES, Math.floor(value)));
+}
+
+function isUint32(value: number): boolean {
+  return Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff;
+}
+
+function incrementUint32(value: number): number {
+  return value === 0xffff_ffff ? 0 : value + 1;
 }

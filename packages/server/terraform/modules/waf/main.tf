@@ -32,14 +32,14 @@ resource "aws_wafv2_web_acl" "vaultguard" {
         name        = "AWSManagedRulesCommonRuleSet"
 
         # This ACL fronts the legacy *.cloudfront.net distribution whose
-        # origin is the API Gateway, so file-sync PUT bodies — base64
-        # ciphertext up to max_file_size_bytes (10 MB) — flow through here.
+        # origin is the API Gateway, so JSON-path file-sync PUT bodies — base64
+        # ciphertext up to API Gateway's request ceiling — flow through here.
         # SizeRestrictions_BODY in block mode 403s every body over 8 KB,
         # silently breaking uploads of any note larger than ~6 KB for clients
         # still on the legacy endpoint. Count instead of block, same as the
-        # REGIONAL ACL on the primary API: size stays bounded by API
-        # Gateway's 10 MB cap and the files Lambda's max_file_size_bytes
-        # check.
+        # REGIONAL ACL on the primary API: size stays bounded by API Gateway's
+        # 10 MB cap and Lambda validation. Larger configured files transfer
+        # directly to isolated S3 staging objects and bypass this request body.
         rule_action_override {
           name = "SizeRestrictions_BODY"
           action_to_use {

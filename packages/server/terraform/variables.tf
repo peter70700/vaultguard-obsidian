@@ -82,7 +82,7 @@ variable "session_duration_seconds" {
 variable "max_file_size_bytes" {
   description = "Maximum file upload size in bytes"
   type        = number
-  default     = 10485760 # 10MB
+  default     = 26214400 # 25 MiB
 }
 
 variable "sender_email" {

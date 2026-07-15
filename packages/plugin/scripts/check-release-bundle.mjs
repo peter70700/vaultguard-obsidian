@@ -22,6 +22,18 @@ const forbiddenStrings = [
   "VaultGuard (debug): Open virtual permissions graph QA",
   "Virtual permissions graph synthetic QA",
   "Use a disposable vault for synthetic QA only.",
+  "vg-permissions-overview-phase-c-v1",
+  "VG_PG_OVERVIEW_PHASE_C_VERTEX_V1",
+  "VG_PG_OVERVIEW_PHASE_C_FRAGMENT_V1",
+  "vg-permissions-virtual-interaction-phase-d-v1",
+  "vg-permissions-graph-overview-edges-phase-e-v1",
+  "vg-permissions-graph-transition-phase-f-v1",
+  "vg-permissions-graph-stress-evidence-phase-g-v1",
+  "/synthetic/component-",
+  "single-run-performance-now",
+  "million-opt-in-required",
+  "engine-memory-guard",
+  "vg-permissions-graph-activation-evidence-phase-h-v1",
 ];
 
 const hits = [];

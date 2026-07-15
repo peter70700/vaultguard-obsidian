@@ -745,7 +745,7 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(new Uint8Array(Buffer.from(writeOp.data, 'base64'))).toEqual(bytes);
     });
 
-    it('rejects an oversize binary fail-closed: throw + throttled Notice + zero disk + zero queue (OD-1)', async () => {
+    it('preserves an oversize binary locally with metadata-only pending state when direct upload is unavailable', async () => {
       plugin.session = makeSession('editor');
       plugin.keyLease = makeKeyLease();
       plugin.connectionState.status = 'online';
@@ -758,21 +758,20 @@ describe('File Protection: Vault Adapter Interception', () => {
       huge[1] = 0xfe;
 
       await expect(plugin.interceptedWriteBinary('img/huge.bin', huge.buffer))
-        .rejects.toThrow(/attachment sync limit/);
+        .resolves.toBeUndefined();
 
-      // OD-1: nothing lands on disk, nothing queues, no PUT ever fires.
+      // BIN-B: exact plaintext bytes land locally, never in the bounded offline
+      // queue; settings retain metadata only for retry.
       expect(plugin.apiRequest).not.toHaveBeenCalled();
-      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledWith('img/huge.bin', huge.buffer);
       expect(plugin.offlineQueue).toHaveLength(0);
+      expect(plugin.settings.pendingLargeFiles['img/huge.bin']).toMatchObject({
+        path: 'img/huge.bin',
+        size: huge.byteLength,
+        localProtection: 'plaintext-pending',
+      });
       expect(mockNotice).toHaveBeenCalledTimes(1);
-      expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining('7 MB'), 10000);
-
-      // Throttled: a second oversize drop of the same path throws again but
-      // does not stack a second Notice.
-      mockNotice.mockClear();
-      await expect(plugin.interceptedWriteBinary('img/huge.bin', huge.buffer))
-        .rejects.toThrow(/attachment sync limit/);
-      expect(mockNotice).not.toHaveBeenCalled();
+      expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining('pending'), 10000);
     });
 
     it('AC-API1: a permanent 4xx (413) throws and queues nothing (no local VG1 orphan)', async () => {
@@ -969,7 +968,7 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(new Uint8Array(Buffer.from(writeOp.data, 'base64'))).toEqual(bytes);
     });
 
-    it('skips ALL server ops for an oversize binary rename and Notices once (throttled)', async () => {
+    it('keeps the old server path and records a pending oversize binary rename', async () => {
       plugin.session = makeSession('editor');
       plugin.keyLease = makeKeyLease();
       plugin.connectionState.status = 'online';
@@ -989,15 +988,12 @@ describe('File Protection: Vault Adapter Interception', () => {
       // No PUT, no queued write, and NO delete of the old server path.
       expect(plugin.apiRequest).not.toHaveBeenCalled();
       expect(plugin.offlineQueue).toHaveLength(0);
+      expect(plugin.settings.pendingLargeFiles['img/huge.bin']).toMatchObject({
+        previousPath: 'img/old.bin',
+        localProtection: 'plaintext-pending',
+      });
       expect(mockNotice).toHaveBeenCalledTimes(1);
-      expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining('7 MB'), 10000);
-
-      // Second rename onto the SAME new path within 60 s: throttle suppresses it.
-      mockNotice.mockClear();
-      await plugin.interceptedRename('img/old2.bin', 'img/huge.bin');
-      expect(mockNotice).not.toHaveBeenCalled();
-      expect(plugin.apiRequest).not.toHaveBeenCalled();
-      expect(plugin.offlineQueue).toHaveLength(0);
+      expect(mockNotice).toHaveBeenCalledWith(expect.stringContaining('old server copy was preserved'), 10000);
     });
 
     it('keeps the legacy string rename path when the adapter lacks readBinary (D-10)', async () => {

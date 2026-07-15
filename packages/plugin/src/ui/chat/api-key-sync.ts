@@ -43,6 +43,7 @@ export class ApiKeySync {
    */
   async uploadIfEnabled(opts?: { userInitiated?: boolean }): Promise<void> {
     if (!this.plugin.settings.aiChatKeySyncEnabled) return;
+    if ((this.plugin.settings.anthropicKeyStorageMode ?? "vaultguard") === "obsidian") return;
     const ctx = this.context();
     if (!ctx) return;
 
@@ -74,6 +75,7 @@ export class ApiKeySync {
    */
   async provisionIfMissing(): Promise<string | null> {
     if (!this.plugin.settings.aiChatKeySyncEnabled) return null;
+    if ((this.plugin.settings.anthropicKeyStorageMode ?? "vaultguard") === "obsidian") return null;
     const ctx = this.context();
     if (!ctx) return null;
 
@@ -115,6 +117,7 @@ export class ApiKeySync {
    */
   async healIfStale(): Promise<void> {
     if (!this.plugin.settings.aiChatKeySyncEnabled) return;
+    if ((this.plugin.settings.anthropicKeyStorageMode ?? "vaultguard") === "obsidian") return;
     const ctx = this.context();
     if (!ctx) return;
 

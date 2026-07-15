@@ -8,6 +8,7 @@ import {
   PermissionLevel,
   type ApiResponse,
   type ConnectionStatus,
+  type PendingLargeFileRecord,
 } from "../types";
 import type {
   AtRestAdapterRuntimeContext,
@@ -529,6 +530,43 @@ export class AtRestAdapterRuntime {
 
   private computeHashBytes(bytes: ArrayBuffer): Promise<string> {
     return this.ctx.computeHashBytes(bytes);
+  }
+
+  private async markLargeFilePending(
+    path: string,
+    bytes: ArrayBuffer,
+    contentType: string,
+    reason: PendingLargeFileRecord["reason"],
+    previousPath?: string,
+  ): Promise<void> {
+    if (!this.ctx.upsertPendingLargeFile) return;
+    const normalized = this.normalizeVaultPath(path);
+    const existing = this.settings.pendingLargeFiles?.[normalized];
+    await this.ctx.upsertPendingLargeFile({
+      path: normalized,
+      ...(previousPath ? { previousPath: this.normalizeVaultPath(previousPath) } : {}),
+      size: bytes.byteLength,
+      sha256: await this.computeHashBytes(bytes),
+      contentType,
+      reason,
+      state: reason === "conflict" ? "blocked" : "retryable",
+      localProtection: "plaintext-pending",
+      attempts: (existing?.attempts ?? 0) + 1,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  private recordDirectWrite(
+    path: string,
+    hash: string,
+    result: { versionId?: string; lastModified: string; size: number },
+  ): void {
+    this.recordRemoteFilePresent(path, {
+      versionId: result.versionId,
+      baseHash: hash,
+      lastModified: result.lastModified,
+      size: result.size,
+    });
   }
 
   private apiRequest<T>(
@@ -2205,6 +2243,71 @@ export class AtRestAdapterRuntime {
       );
     }
 
+    const textBytesView = new TextEncoder().encode(data);
+    const textBytes = textBytesView.buffer.slice(
+      textBytesView.byteOffset,
+      textBytesView.byteOffset + textBytesView.byteLength,
+    ) as ArrayBuffer;
+    if (textBytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+      const hash = await this.computeHashBytes(textBytes);
+      const baseVersionId = this.getExpectedVersionId(path);
+      const canUploadNow =
+        this.shouldUploadChangesImmediately() &&
+        this.isOnline() &&
+        Boolean(this.keyLease) &&
+        Boolean(this.ctx.uploadLargeEncryptedFile);
+      if (canUploadNow) {
+        try {
+          const result = await this.ctx.uploadLargeEncryptedFile!(
+            path,
+            textBytes,
+            "text/markdown",
+            baseVersionId,
+          );
+          this.recordDirectWrite(path, hash, result);
+          await this.hostWritePlainToDisk(path, data);
+          await this.ctx.clearPendingLargeFile?.(path);
+          await this.emitAuditEvent("file.write", path, {
+            directTransfer: true,
+            bytes: textBytes.byteLength,
+          });
+          this.syncState.pendingChanges++;
+          this.updateStatusBar();
+          return;
+        } catch (error) {
+          if (this.isNetworkError(error)) this.setConnectionStatus("offline");
+          await this.originalAdapterMethods.write?.(path, data);
+          await this.markLargeFilePending(
+            path,
+            textBytes,
+            "text/markdown",
+            /conflict|409/i.test(String(error)) ? "conflict" : "upload-failed",
+          );
+          new Notice(
+            `VaultGuard Sync: Saved "${path}" locally. Its large encrypted upload is pending and can be retried from the VaultGuard sidebar.`,
+            10000,
+          );
+          this.updateStatusBar();
+          return;
+        }
+      }
+
+      await this.originalAdapterMethods.write?.(path, data);
+      const reason: PendingLargeFileRecord["reason"] = !this.isOnline()
+        ? "offline"
+        : !this.keyLease
+          ? "lease-unavailable"
+          : "manual-sync";
+      await this.markLargeFilePending(path, textBytes, "text/markdown", reason);
+      new Notice(
+        `VaultGuard Sync: Saved "${path}" locally. Its large encrypted upload is pending.`,
+        8000,
+      );
+      this.syncState.pendingChanges++;
+      this.updateStatusBar();
+      return;
+    }
+
     const hash = await this.computeHash(data);
     const baseVersionId = this.getExpectedVersionId(path);
 
@@ -2665,21 +2768,17 @@ export class AtRestAdapterRuntime {
    * them); this exists for files that bypass Obsidian entirely: Finder drops,
    * git checkouts, external tools.
    *
-   * BIN-A contract (replaces the old binary-skip policy): text files AND
-   * binaries up to BINARY_SYNC_MAX_BYTES are encrypted in place. Both now have
-   * a server copy path — text via normal sync, in-size binaries via the BIN-A
-   * byte push (catch-up upload + reconciliation, 11-03) — so the LAK envelope
-   * is never the single copy. OVERSIZE binaries (> BINARY_SYNC_MAX_BYTES) are
-   * deliberately LEFT PLAINTEXT until the BIN-B presigned-URL path exists:
-   * at-rest-encrypting content that has no server copy would recreate the
-   * CR-1 data-loss class (envelope/keychain loss = permanent loss — L10).
+   * Files at or below BINARY_SYNC_MAX_BYTES use the JSON sync path. Larger text
+   * and binary files use direct transfer. A large externally-added file remains
+   * plaintext until the caller proves its encrypted remote copy is durable;
+   * otherwise LAK-envelope loss could make the only copy unrecoverable.
    *
    * `isEncrypted` is checked FIRST so a file already carrying the VG1 magic
    * (e.g. one written through the now-unblocked interceptedWriteBinary) is a
    * no-op — no double-encryption hazard. Never throws — background hygiene
    * must not break its callers. Returns true when the file was re-encrypted.
    */
-  async ensureAtRestEncryptedInPlace(path: string): Promise<boolean> {
+  async ensureAtRestEncryptedInPlace(path: string, remoteDurable = false): Promise<boolean> {
     const readBin = this.originalAdapterMethods.readBinary;
     if (this.isLocalProjectMemoryModeEnabled()) return false;
     if (!readBin || !this.atRestCipher?.isReady()) return false;
@@ -2690,19 +2789,12 @@ export class AtRestAdapterRuntime {
       const bytes = await readBin(path);
       // isEncrypted FIRST (research §5): an already-VG1 file is a no-op.
       if (this.atRestCipher.isEncrypted(bytes)) return false;
-      // Content-based classify via a strict UTF-8 probe (never extension-based).
-      let isText = true;
-      try {
-        new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-      } catch {
-        isText = false;
-      }
-      // BIN-A / L10 / CR-1: an oversize binary cannot reach the server until
-      // BIN-B, so LAK-encrypting it in place would recreate the CR-1 data-loss
-      // class. Leave it readable plaintext on disk.
-      if (!isText && bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+      // Direct-transfer / CR-1: do not LAK-encrypt a large external file until
+      // its direct transfer has been finalized. The sync caller passes
+      // remoteDurable=true only after successful promotion.
+      if (bytes.byteLength > BINARY_SYNC_MAX_BYTES && !remoteDurable) {
         this.log(
-          `At-rest: leaving oversize binary "${path}" plaintext (${bytes.byteLength} bytes > ${BINARY_SYNC_MAX_BYTES} — no server copy until BIN-B).`
+          `At-rest: leaving large file "${path}" plaintext until its server copy is durable.`
         );
         return false;
       }
@@ -2830,15 +2922,13 @@ export class AtRestAdapterRuntime {
   }
 
   /**
-   * Permission-checked at-rest encrypted binary write (BIN-A / D-08).
+   * Permission-checked at-rest encrypted binary write.
    *
-   * Mirrors `interceptedWrite` for binary content: permission check → E2E PUT
-   * (or offline queue with encoding:"base64") → VG1 at-rest write to disk. This
-   * is the drag-drop / paste ingestion path. Oversize (> BINARY_SYNC_MAX_BYTES)
-   * drops are rejected fail-closed (OD-1) — never written, never queued —
-   * because a LAK-only binary with no server copy is unrecoverable if the
-   * envelope is lost (the CR-1 data-loss class this phase's ordering prevents).
-   * Legacy adapters without writeBinary keep today's silent return (D-10).
+   * This is the drag-drop/paste ingestion path. JSON-size content follows the
+   * existing encrypted request path. Larger content uses direct transfer; if it
+   * cannot become durable remotely, exact plaintext bytes stay on disk with a
+   * metadata-only pending record. Legacy adapters without writeBinary retain
+   * the existing silent return.
    */
   async interceptedWriteBinary(path: string, data: ArrayBuffer): Promise<void> {
     if (!this.originalAdapterMethods.writeBinary) return;
@@ -2875,33 +2965,73 @@ export class AtRestAdapterRuntime {
         `VaultGuard Sync: Access denied. You do not have write permission for "${path}".`
       );
     }
-    // OD-1 / L10 (BIN-A): an oversize binary cannot ride the JSON path until
-    // BIN-B, so reject fail-closed BEFORE any disk or queue mutation. Never
-    // write it (a LAK-only local copy with no server path is the CR-1 data-loss
-    // class) and never queue it (every catch-up pass would trip over a
-    // landed-but-unsyncable file). The throw is swallowed by Obsidian's drop
-    // handler exactly as the retired block's throw was; the throttled Notice
-    // (reusing the binaryWriteNoticeAt per-path map) is what the user sees.
+    // Files over the JSON ceiling use a direct encrypted transfer. The
+    // canonical server copy is finalized before local VG1 encryption. If that
+    // cannot happen yet, preserve the exact plaintext bytes locally and persist
+    // metadata-only retry state instead of dropping the user's attachment.
     if (data.byteLength > BINARY_SYNC_MAX_BYTES) {
-      await this.emitAuditEvent("file.write", path, {
-        outcome: "denied",
-        reason: "binary-too-large",
-      });
+      const contentType = contentTypeForPath(path);
+      const hash = await this.computeHashBytes(data);
+      const baseVersionId = this.getExpectedVersionId(path);
+      const canUploadNow =
+        this.shouldUploadChangesImmediately() &&
+        this.isOnline() &&
+        Boolean(this.keyLease) &&
+        Boolean(this.ctx.uploadLargeEncryptedFile);
+      if (canUploadNow) {
+        try {
+          const result = await this.ctx.uploadLargeEncryptedFile!(
+            path,
+            data,
+            contentType,
+            baseVersionId,
+          );
+          this.recordDirectWrite(path, hash, result);
+          await this.hostWritePlainBinaryToDisk(path, data);
+          await this.ctx.clearPendingLargeFile?.(path);
+          await this.emitAuditEvent("file.write", path, {
+            directTransfer: true,
+            bytes: data.byteLength,
+          });
+          this.syncState.pendingChanges++;
+          this.updateStatusBar();
+          return;
+        } catch (error) {
+          if (this.isNetworkError(error)) this.setConnectionStatus("offline");
+          await this.originalAdapterMethods.writeBinary(path, data);
+          await this.markLargeFilePending(
+            path,
+            data,
+            contentType,
+            /conflict|409/i.test(String(error)) ? "conflict" : "upload-failed",
+          );
+          new Notice(
+            `VaultGuard Sync: Saved "${path}" locally. Its large encrypted upload is pending and can be retried from the VaultGuard sidebar.`,
+            10000,
+          );
+          this.updateStatusBar();
+          return;
+        }
+      }
+
+      await this.originalAdapterMethods.writeBinary(path, data);
+      const reason: PendingLargeFileRecord["reason"] = !this.isOnline()
+        ? "offline"
+        : !this.keyLease
+          ? "lease-unavailable"
+          : "manual-sync";
+      await this.markLargeFilePending(path, data, contentType, reason);
       const now = Date.now();
       if (now - (this.binaryWriteNoticeAt.get(path) ?? 0) >= 60_000) {
         this.binaryWriteNoticeAt.set(path, now);
         new Notice(
-          `VaultGuard Sync: "${path}" is larger than the ${Math.round(
-            BINARY_SYNC_MAX_BYTES / (1024 * 1024)
-          )} MB attachment sync limit — it was not added. Large-file support arrives with BIN-B.`,
+          `VaultGuard Sync: Saved "${path}" locally. Its large encrypted upload is pending.`,
           10000
         );
       }
-      throw new Error(
-        `VaultGuard Sync: "${path}" exceeds the ${Math.round(
-          BINARY_SYNC_MAX_BYTES / (1024 * 1024)
-        )} MB attachment sync limit and was not written.`
-      );
+      this.syncState.pendingChanges++;
+      this.updateStatusBar();
+      return;
     }
 
     // BIN-A / D-08: in-size binary ingestion mirrors interceptedWrite exactly,
@@ -3305,15 +3435,32 @@ export class AtRestAdapterRuntime {
     newPath: string,
     readContent: () => Promise<string>,
   ): Promise<void> {
+    let content: string;
+    try {
+      content = await readContent();
+    } catch (err) {
+      this.logError(`Rename: failed to read "${newPath}" for server sync`, err);
+      this.permissionStore.emit("changed", { path: oldNormalized });
+      return;
+    }
+    const view = new TextEncoder().encode(content);
+    const bytes = view.buffer.slice(
+      view.byteOffset,
+      view.byteOffset + view.byteLength,
+    ) as ArrayBuffer;
+    if (bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+      await this.pushRenamedLargeFileToServer(
+        oldNormalized,
+        newNormalized,
+        newPath,
+        bytes,
+        "text/markdown",
+      );
+      return;
+    }
+
     if (!this.shouldUploadChangesImmediately() || !this.isOnline() || !this.keyLease) {
-      // Queue both halves: read content from the just-renamed local file so the
-      // queued write carries the right bytes when connectivity returns.
-      try {
-        const content = await readContent();
-        this.queueOfflineOperation("write", newNormalized, content);
-      } catch (err) {
-        this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
-      }
+      this.queueOfflineOperation("write", newNormalized, content);
       this.queueOfflineOperation("delete", oldNormalized);
       // Pitfall 5: rename emits OLD path.
       this.permissionStore.emit("changed", { path: oldNormalized });
@@ -3321,7 +3468,6 @@ export class AtRestAdapterRuntime {
     }
 
     try {
-      const content = await readContent();
       const encrypted = await this.encryptContent(content);
       const hash = await this.computeHash(content);
       const baseVersionId = this.getExpectedVersionId(newNormalized);
@@ -3369,12 +3515,7 @@ export class AtRestAdapterRuntime {
     } catch (error) {
       if (this.isNetworkError(error)) {
         this.setConnectionStatus("offline");
-        try {
-          const content = await readContent();
-          this.queueOfflineOperation("write", newNormalized, content);
-        } catch (err) {
-          this.logError(`Rename: failed to queue offline write for "${newPath}"`, err);
-        }
+        this.queueOfflineOperation("write", newNormalized, content);
         this.queueOfflineOperation("delete", oldNormalized);
         // Pitfall 5: rename emits OLD path.
         this.permissionStore.emit("changed", { path: oldNormalized });
@@ -3384,9 +3525,86 @@ export class AtRestAdapterRuntime {
     }
   }
 
+  private async pushRenamedLargeFileToServer(
+    oldNormalized: string,
+    newNormalized: string,
+    newPath: string,
+    bytes: ArrayBuffer,
+    contentType: string,
+  ): Promise<void> {
+    const canUploadNow =
+      this.shouldUploadChangesImmediately() &&
+      this.isOnline() &&
+      Boolean(this.keyLease) &&
+      Boolean(this.ctx.uploadLargeEncryptedFile);
+    if (!canUploadNow) {
+      const reason: PendingLargeFileRecord["reason"] = !this.isOnline()
+        ? "offline"
+        : !this.keyLease
+          ? "lease-unavailable"
+          : "manual-sync";
+      await this.markLargeFilePending(
+        newNormalized,
+        bytes,
+        contentType,
+        reason,
+        oldNormalized,
+      );
+      new Notice(
+        `VaultGuard Sync: Kept the local rename to "${newPath}". The large server rename is pending; the old server copy was preserved.`,
+        10000,
+      );
+      this.permissionStore.emit("changed", { path: oldNormalized });
+      return;
+    }
+
+    const hash = await this.computeHashBytes(bytes);
+    try {
+      const result = await this.ctx.uploadLargeEncryptedFile!(
+        newNormalized,
+        bytes,
+        contentType,
+        this.getExpectedVersionId(newNormalized),
+      );
+      this.recordDirectWrite(newNormalized, hash, result);
+      const delResp = await this.apiRequest(
+        "DELETE",
+        this.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`),
+        this.buildDeleteBody(oldNormalized),
+      );
+      if (!delResp.success && delResp.error?.statusCode !== 404) {
+        this.queueOfflineOperation("delete", oldNormalized);
+      } else {
+        this.recordRemoteFileAbsent(oldNormalized);
+      }
+      await this.ctx.clearPendingLargeFile?.(newNormalized);
+      await this.ensureAtRestEncryptedInPlace(newNormalized, true);
+      await this.emitAuditEvent("file.rename", oldNormalized, {
+        newPath: newNormalized,
+        directTransfer: true,
+      });
+    } catch (error) {
+      if (this.isNetworkError(error)) this.setConnectionStatus("offline");
+      await this.markLargeFilePending(
+        newNormalized,
+        bytes,
+        contentType,
+        /conflict|409/i.test(String(error)) ? "conflict" : "upload-failed",
+        oldNormalized,
+      );
+      new Notice(
+        `VaultGuard Sync: Kept the local rename to "${newPath}". The replacement upload is pending; the old server copy was preserved.`,
+        10000,
+      );
+    } finally {
+      this.permissionStore.emit("changed", { path: oldNormalized });
+      this.updateStatusBar();
+    }
+  }
+
   /**
-   * BIN-A / L1: byte-safe rename push for binary content. Mirrors the string flow
-   * but (a) size-gates against the JSON-path ceiling, (b) encrypts/hashes RAW
+   * Byte-safe rename push for binary content. Mirrors the string flow but (a)
+   * dispatches above-threshold bytes to direct transfer, (b) encrypts/hashes RAW
    * bytes (no lossy UTF-8 decode — the L1 corruption fix), (c) sends a real
    * contentType + the large-body timeout, and (d) queues base64 with
    * encoding:"base64" when offline.
@@ -3398,28 +3616,17 @@ export class AtRestAdapterRuntime {
     newPath: string,
     bytes: ArrayBuffer,
   ): Promise<void> {
-    // Size gate (L10 / OD-1): an oversize binary can't ride the JSON path until
-    // BIN-B. Skip ALL server ops — no PUT, no queued write, and crucially do NOT
-    // delete/queue-delete the old server path (never remove a server copy without
-    // a replacement). The local rename already happened; leave it. Throttled
-    // Notice reuses the binaryWriteNoticeAt per-path map.
+    // Above-threshold bytes cannot ride the JSON path. Direct-transfer the
+    // replacement first; its helper preserves the old remote path and records
+    // metadata-only pending state if promotion cannot complete.
     if (bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
-      const now = Date.now();
-      if (now - (this.binaryWriteNoticeAt.get(newNormalized) ?? 0) >= 60_000) {
-        this.binaryWriteNoticeAt.set(newNormalized, now);
-        new Notice(
-          `VaultGuard Sync: "${newPath}" is larger than the ${Math.round(
-            BINARY_SYNC_MAX_BYTES / (1024 * 1024)
-          )} MB attachment sync limit — the local rename is kept, but the server copy was not moved. Large-file support arrives with BIN-B.`,
-          10000
-        );
-      }
-      this.logError(
-        `Rename: skipping server sync for oversize binary "${newNormalized}" (${bytes.byteLength} bytes > ${BINARY_SYNC_MAX_BYTES})`,
-        new Error("binary exceeds BINARY_SYNC_MAX_BYTES")
+      await this.pushRenamedLargeFileToServer(
+        oldNormalized,
+        newNormalized,
+        newPath,
+        bytes,
+        contentTypeForPath(newNormalized),
       );
-      // Pitfall 5: rename emits OLD path.
-      this.permissionStore.emit("changed", { path: oldNormalized });
       return;
     }
 

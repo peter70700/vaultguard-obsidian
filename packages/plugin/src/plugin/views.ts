@@ -1,9 +1,8 @@
 import { Notice, Platform, addIcon } from "obsidian";
-import { VaultGuardChatView, VAULTGUARD_CHAT_VIEW_TYPE } from "../ui/chat/chat-view";
 import {
-  PermissionsGraphView,
+  VAULTGUARD_CHAT_VIEW_TYPE,
   VAULTGUARD_GRAPH_VIEW_TYPE,
-} from "../ui/graph/permissions-graph-view";
+} from "../ui/view-types";
 import { VaultGuardSidebarView, VAULTGUARD_VIEW_TYPE } from "../ui/vaultguard-sidebar-view";
 import {
   VAULTGUARD_CHAT_ICON_ID,
@@ -13,9 +12,6 @@ import {
   type VaultGuardSidebarActivationContext,
   type VaultGuardViewRegistrationContext,
 } from "./plugin-runtime-types";
-
-type ChatPluginHost = ConstructorParameters<typeof VaultGuardChatView>[1];
-type GraphPluginHost = ConstructorParameters<typeof PermissionsGraphView>[1];
 
 export function registerVaultGuardRibbons(
   ctx: VaultGuardRibbonContext,
@@ -28,6 +24,13 @@ export function registerVaultGuardRibbons(
   ctx.setVaultGuardRibbonEl(vaultGuardRibbonEl);
   ctx.updateRibbonAuthIndicator();
 
+  // Dedicated quick-access ribbon icons for AI chat and the permissions graph
+  // (both modules default on). Registered UNCONDITIONALLY: ribbons must be created
+  // synchronously before onload's first `await`, at which point settings are not
+  // loaded yet — so we cannot (and must not) gate this on the module flag here.
+  // The permissions graph is desktop-only. If a module is later turned off, its
+  // view/command still guards the action, so the icon just opens the
+  // "enable it in settings" prompt rather than doing nothing.
   const vaultGuardChatRibbonEl =
     ctx.addRibbonIcon(VAULTGUARD_CHAT_ICON_ID, "VaultGuard Chat", () => {
       void ctx.activateVaultGuardChat();
@@ -75,44 +78,43 @@ export function registerVaultGuardViews(ctx: VaultGuardViewRegistrationContext):
     return view;
   });
 
-  ctx.registerView(
-    VAULTGUARD_CHAT_VIEW_TYPE,
-    (leaf) => new VaultGuardChatView(leaf, ctx.pluginForViews as ChatPluginHost),
-  );
-
-  ctx.registerView(
-    VAULTGUARD_GRAPH_VIEW_TYPE,
-    (leaf) => new PermissionsGraphView(leaf, ctx.pluginForViews as GraphPluginHost),
-  );
 }
 
 export async function activateVaultGuardChat(ctx: VaultGuardSidebarActivationContext): Promise<void> {
+  if (!(await ctx.ensureOptionalViewRegistered("aiChat"))) {
+    new Notice("VaultGuard Chat is off. Enable it in VaultGuard settings first.");
+    return;
+  }
   const existing = ctx.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
   if (existing.length > 0) {
-    ctx.app.workspace.revealLeaf(existing[0]);
+    await ctx.app.workspace.revealLeaf(existing[0]);
     return;
   }
 
   const leaf = ctx.app.workspace.getRightLeaf(false);
   if (leaf) {
     await leaf.setViewState({ type: VAULTGUARD_CHAT_VIEW_TYPE, active: true });
-    ctx.app.workspace.revealLeaf(leaf);
+    await ctx.app.workspace.revealLeaf(leaf);
   }
 }
 
 export async function activatePermissionsGraph(
   ctx: VaultGuardSidebarActivationContext,
 ): Promise<void> {
+  if (!(await ctx.ensureOptionalViewRegistered("permissionsGraph"))) {
+    new Notice("Permissions Graph is off. Enable it in VaultGuard settings first.");
+    return;
+  }
   const existing = ctx.app.workspace.getLeavesOfType(VAULTGUARD_GRAPH_VIEW_TYPE);
   if (existing.length > 0) {
-    ctx.app.workspace.revealLeaf(existing[0]);
+    await ctx.app.workspace.revealLeaf(existing[0]);
     return;
   }
 
   const leaf = ctx.app.workspace.getLeaf("tab");
   if (leaf) {
     await leaf.setViewState({ type: VAULTGUARD_GRAPH_VIEW_TYPE, active: true });
-    ctx.app.workspace.revealLeaf(leaf);
+    await ctx.app.workspace.revealLeaf(leaf);
   }
 }
 
@@ -120,8 +122,10 @@ export async function openNewVaultGuardChatTab(
   ctx: VaultGuardSidebarActivationContext,
 ): Promise<void> {
   await activateVaultGuardChat(ctx);
+  if (!ctx.isOptionalModuleEnabled("aiChat")) return;
   const leaves = ctx.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
   const view = leaves[0]?.view;
+  const { VaultGuardChatView } = await import("../ui/chat/chat-view");
   if (view instanceof VaultGuardChatView) {
     view.openFreshChatTab();
   }
@@ -131,8 +135,10 @@ export async function openVaultGuardChatHistory(
   ctx: VaultGuardSidebarActivationContext,
 ): Promise<void> {
   await activateVaultGuardChat(ctx);
+  if (!ctx.isOptionalModuleEnabled("aiChat")) return;
   const leaves = ctx.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
   const view = leaves[0]?.view;
+  const { VaultGuardChatView } = await import("../ui/chat/chat-view");
   if (view instanceof VaultGuardChatView) {
     view.showHistoryPicker();
   }
@@ -142,8 +148,10 @@ export async function copyVaultGuardChatDomDebugReport(
   ctx: VaultGuardSidebarActivationContext,
 ): Promise<void> {
   await activateVaultGuardChat(ctx);
+  if (!ctx.isOptionalModuleEnabled("aiChat")) return;
   const leaves = ctx.app.workspace.getLeavesOfType(VAULTGUARD_CHAT_VIEW_TYPE);
   const view = leaves[0]?.view;
+  const { VaultGuardChatView } = await import("../ui/chat/chat-view");
   if (view instanceof VaultGuardChatView) {
     await view.copyDomDebugReport();
     return;
@@ -156,15 +164,9 @@ export function reloadVaultGuardSidebar(ctx: VaultGuardSidebarActivationContext)
   const sidebarViewConfig = ctx.getSidebarViewConfig();
   const leaves = ctx.app.workspace.getLeavesOfType(VAULTGUARD_VIEW_TYPE);
   for (const leaf of leaves) {
-    const view = leaf.view as
-      | (VaultGuardSidebarView & {
-          configure?: (cfg: typeof sidebarViewConfig) => void;
-        })
-      | undefined;
-    if (view?.configure) {
+    const view = leaf.view;
+    if (view instanceof VaultGuardSidebarView) {
       view.configure(sidebarViewConfig);
-    }
-    if (view?.reload) {
       void view.reload();
     }
   }
@@ -196,12 +198,12 @@ export async function activateVaultGuardSidebar(
 
   const existing = ctx.app.workspace.getLeavesOfType(VAULTGUARD_VIEW_TYPE);
   if (existing.length > 0) {
-    ctx.app.workspace.revealLeaf(existing[0]);
-    const view = existing[0].view as VaultGuardSidebarView;
-    if (sidebarViewConfig) {
+    await ctx.app.workspace.revealLeaf(existing[0]);
+    const view = existing[0].view;
+    if (view instanceof VaultGuardSidebarView && sidebarViewConfig) {
       view.configure(sidebarViewConfig);
+      await view.reload();
     }
-    await view.reload();
     return;
   }
 
@@ -211,10 +213,10 @@ export async function activateVaultGuardSidebar(
       type: VAULTGUARD_VIEW_TYPE,
       active: true,
     });
-    ctx.app.workspace.revealLeaf(leaf);
+    await ctx.app.workspace.revealLeaf(leaf);
 
-    const view = leaf.view as VaultGuardSidebarView;
-    if (view?.configure && sidebarViewConfig) {
+    const view = leaf.view;
+    if (view instanceof VaultGuardSidebarView && sidebarViewConfig) {
       view.configure(sidebarViewConfig);
       await view.reload();
     }

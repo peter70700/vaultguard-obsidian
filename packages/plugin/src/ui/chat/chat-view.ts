@@ -43,6 +43,11 @@ import {
   getClaudeAuthStatus,
   type ClaudeAuthStatus,
 } from "./claude-cli/claude-detector";
+import { CodexAppServerClient } from "./codex-cli/codex-app-server-client";
+import {
+  getCodexAuthStatus,
+  type CodexAuthStatus,
+} from "./codex-cli/codex-detector";
 import { VaultToolRuntime } from "./vault-tool-runtime";
 import { buildSystemPrompt } from "./system-prompt";
 import { OpenAiResponsesClient } from "./openai-client";
@@ -122,8 +127,10 @@ import {
   parseImportArg,
 } from "./import-prompt";
 import { buildFormatVaultPrompt } from "./format-vault-prompt";
+import { IN_APP_CHAT_CAPABILITY } from "./in-app-chat-capability";
 
-export const VAULTGUARD_CHAT_VIEW_TYPE = "vaultguard-chat-view";
+export { VAULTGUARD_CHAT_VIEW_TYPE } from "../view-types";
+import { VAULTGUARD_CHAT_VIEW_TYPE } from "../view-types";
 
 const ROOT_CLS = "vaultguard-chat";
 const LIST_CLS = "vaultguard-chat-list";
@@ -168,11 +175,13 @@ export class VaultGuardChatView extends ItemView {
   private model: string;
   private abortController: AbortController | null = null;
 
-  // Subscription provider (Claude Code CLI). Lazily built on the first
-  // subscription-mode turn; rebuilt when the provider/model changes. Null in
-  // API-key mode. The client itself never touches a token — `claude`
-  // authenticates from its own keychain.
-  private cliClient: ClaudeCliClient | null = null;
+  // Official CLI subscription transport (Claude Code or Codex). Lazily built
+  // on the first subscription turn and rebuilt when provider/model changes.
+  // Neither client reads a provider token; the official binary authenticates.
+  private cliClient: ClaudeCliClient | CodexAppServerClient | null = null;
+  private cliTransport: "claude" | "codex" | null = null;
+  private leaseProvider: AiChatProvider | null = null;
+  private bridgeCleanup: Promise<void> = Promise.resolve();
   private cliSessionToolName: string | null = null;
 
   // Persistence (AI-CHAT-PANEL.md §10). `convo` is the in-memory mirror of the
@@ -236,7 +245,7 @@ export class VaultGuardChatView extends ItemView {
   constructor(leaf: WorkspaceLeaf, private readonly plugin: VaultGuardPlugin) {
     super(leaf);
     this.model =
-      plugin.settings.aiChatProvider === "openai"
+      plugin.settings.aiChatProvider === "openai" || plugin.settings.aiChatProvider === "codex"
         ? plugin.settings.openAiModel
         : plugin.settings.aiChatModel;
   }
@@ -390,7 +399,7 @@ export class VaultGuardChatView extends ItemView {
     // open. Auto-detection silently spawned `claude` — a binary resolved from the
     // user's unrestricted PATH — with no user action, i.e. a drive-by child
     // process on every panel open. Detection is now strictly user-triggered: the
-    // user opts in by choosing "Claude subscription" in Settings → AI provider,
+    // user opts in by choosing a CLI subscription in Settings → AI provider,
     // which is what runs the detector (settings.ts, gated on that choice). This
     // removes the exploitation trigger (passive PATH-resolved spawn) and is a
     // privacy win — a fresh install launches no child process until the user
@@ -432,10 +441,8 @@ export class VaultGuardChatView extends ItemView {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    this.runtime = null;
-    this.cliClient?.reset();
-    this.cliClient = null;
-    this.leaseId = null;
+    this.disposeProviderSession();
+    await this.bridgeCleanup;
     this.pendingToolCards = [];
     this.activeAssistantBubble = null;
     this.cancelActiveUserQuestion("VaultGuard Chat closed before the question was answered.");
@@ -485,6 +492,7 @@ export class VaultGuardChatView extends ItemView {
     // Defensive connectedness re-check so this is safe to call from any site.
     const connected =
       this.plugin.settings.aiChatProvider === "subscription" ||
+      this.plugin.settings.aiChatProvider === "codex" ||
       this.hasCurrentProviderKey();
     if (!connected) return;
 
@@ -533,17 +541,19 @@ export class VaultGuardChatView extends ItemView {
   }
 
   private currentApiKeyProvider(): ApiKeyProvider {
-    return this.currentProvider() === "openai" ? "openai" : "anthropic";
+    return this.currentProvider() === "openai" || this.currentProvider() === "codex"
+      ? "openai"
+      : "anthropic";
   }
 
   private currentEffort(): AiChatEffort {
-    return this.currentProvider() === "openai"
+    return this.currentProvider() === "openai" || this.currentProvider() === "codex"
       ? this.plugin.settings.openAiReasoningEffort
       : this.plugin.settings.aiChatEffort;
   }
 
   private currentModelSetting(): string {
-    return this.currentProvider() === "openai"
+    return this.currentProvider() === "openai" || this.currentProvider() === "codex"
       ? this.plugin.settings.openAiModel
       : this.plugin.settings.aiChatModel;
   }
@@ -554,10 +564,7 @@ export class VaultGuardChatView extends ItemView {
     this.model = next;
     this.statusPanel?.setModel(next);
     this.statusPanel?.setEffort(this.currentEffort());
-    this.runtime = null;
-    this.runtimeProvider = null;
-    this.cliClient?.reset();
-    this.cliClient = null;
+    this.disposeProviderSession();
   }
 
   private hasCurrentProviderKey(): boolean {
@@ -598,7 +605,10 @@ export class VaultGuardChatView extends ItemView {
    */
   private async renderInitialEmptyState(): Promise<void> {
     try {
-      if (this.plugin.settings.aiChatProvider === "subscription") return;
+      if (
+        this.plugin.settings.aiChatProvider === "subscription" ||
+        this.plugin.settings.aiChatProvider === "codex"
+      ) return;
       // A locally-stored key means the conversation-restore path renders the
       // welcome/messages — nothing to do here (preserves prior behavior).
       if (this.hasCurrentProviderKey()) return;
@@ -627,7 +637,10 @@ export class VaultGuardChatView extends ItemView {
   private canSubmit(text: string, images?: ImageAttachment[]): boolean {
     if (this.inputController?.isBusy()) return false;
 
-    if (this.plugin.settings.aiChatProvider === "subscription") {
+    if (
+      this.plugin.settings.aiChatProvider === "subscription" ||
+      this.plugin.settings.aiChatProvider === "codex"
+    ) {
       if (images && images.length) {
         new Notice("VaultGuard Chat: image attachments need the API-key provider.");
         // A stale image-only submit after switching providers should not spawn
@@ -667,6 +680,9 @@ export class VaultGuardChatView extends ItemView {
     // silently drop after the first turn (or on reload/resume), and the agent
     // would report a phantom "expired" session on its next source read.
     await this.ensureImportSessionArmed();
+    if (this.leaseProvider && this.leaseProvider !== this.currentProvider()) {
+      this.disposeProviderSession();
+    }
     this.syncModelFromSettings();
 
     if (this.plugin.settings.aiChatProvider === "subscription") {
@@ -674,7 +690,13 @@ export class VaultGuardChatView extends ItemView {
       if (images && images.length) {
         if (!text.trim()) return;
       }
-      await this.handleSubmitSubscription(text);
+      await this.handleSubmitSubscription(text, "claude");
+      return;
+    }
+
+    if (this.plugin.settings.aiChatProvider === "codex") {
+      if (images && images.length && !text.trim()) return;
+      await this.handleSubmitSubscription(text, "codex");
       return;
     }
 
@@ -721,7 +743,7 @@ export class VaultGuardChatView extends ItemView {
     const streaming = this.streamingEnabled();
     // Rebuild the runtime if the streaming preference changed since it was built.
     if (this.runtime && this.runtimeStreaming !== streaming) {
-      this.runtime = null;
+      this.disposeProviderSession();
     }
 
     // Lazily build the runtime + lease for the session.
@@ -829,7 +851,10 @@ export class VaultGuardChatView extends ItemView {
     if (!this.listEl || !this.inputController || !this.statusPanel) return;
     if (this.inputController.isBusy()) return;
 
-    if (this.plugin.settings.aiChatProvider === "subscription") {
+    if (
+      this.plugin.settings.aiChatProvider === "subscription" ||
+      this.plugin.settings.aiChatProvider === "codex"
+    ) {
       new Notice("VaultGuard Chat: regenerate isn't available in subscription mode.");
       return;
     }
@@ -870,14 +895,17 @@ export class VaultGuardChatView extends ItemView {
     await this.executeTurn(apiKey, streaming, (signal) => runtime.regenerateLast(signal), apiProvider);
   }
 
-  // ─── Subscription provider (Claude Code CLI) ───────────────────────────────
+  // ─── Official CLI subscription providers ──────────────────────────────────
   //
   // Drives the official `claude` binary with the user's own subscription login.
   // Vault access happens ONLY through the AgentBridge MCP server we point the
   // CLI at (lease-scoped, permission-checked, writeMode-gated). The
   // plugin never touches the subscription token. §11: zero subprocess is spawned
   // until the user has selected subscription AND `claude` is logged in.
-  private async handleSubmitSubscription(text: string): Promise<void> {
+  private async handleSubmitSubscription(
+    text: string,
+    transport: "claude" | "codex",
+  ): Promise<void> {
     if (!this.listEl || !this.inputController || !this.statusPanel) return;
 
     if (Platform.isMobileApp) {
@@ -891,16 +919,38 @@ export class VaultGuardChatView extends ItemView {
     // §11 gate: confirm the CLI is installed + logged in BEFORE any subprocess
     // that could reach the vault. A not-ready state renders the connect banner
     // and spawns nothing further.
-    let status: ClaudeAuthStatus;
-    try {
-      status = await getClaudeAuthStatus();
-    } catch (e) {
-      this.renderError(`Could not check Claude Code: ${(e as Error).message}`);
-      return;
-    }
-    if (!status.loggedIn || !status.isSubscription) {
-      this.renderSubscriptionConnectState(status);
-      return;
+    let binaryPath: string;
+    if (transport === "codex") {
+      const readinessController = new AbortController();
+      this.abortController = readinessController;
+      let status: CodexAuthStatus;
+      try {
+        status = await getCodexAuthStatus(undefined, readinessController.signal);
+      } catch (error) {
+        if (readinessController.signal.aborted) return;
+        this.renderError(`Could not check Codex: ${(error as Error).message}`);
+        return;
+      } finally {
+        if (this.abortController === readinessController) this.abortController = null;
+      }
+      if (!status.loggedIn || !status.isChatGptSubscription || !status.binaryPath) {
+        this.renderCodexConnectState(status);
+        return;
+      }
+      binaryPath = status.binaryPath;
+    } else {
+      let status: ClaudeAuthStatus;
+      try {
+        status = await getClaudeAuthStatus();
+      } catch (error) {
+        this.renderError(`Could not check Claude Code: ${(error as Error).message}`);
+        return;
+      }
+      if (!status.loggedIn || !status.isSubscription || !status.binaryPath) {
+        this.renderSubscriptionConnectState(status);
+        return;
+      }
+      binaryPath = status.binaryPath;
     }
 
     this.listEl.querySelector(`.${EMPTY_CLS}`)?.remove();
@@ -925,11 +975,17 @@ export class VaultGuardChatView extends ItemView {
       else assistantBlocks.push({ type: "text", text: t });
     };
 
-    let client: ClaudeCliClient;
+    let client: ClaudeCliClient | CodexAppServerClient;
     try {
-      client = await this.ensureCliClient(status.binaryPath as string);
+      client = await this.ensureCliClient(binaryPath, transport);
     } catch (e) {
-      this.renderError((e as Error).message || "Could not start the Claude Code session.");
+      this.disposeProviderSession();
+      this.renderError(
+        (e as Error).message ||
+          (transport === "codex"
+            ? "Could not start the Codex subscription session."
+            : "Could not start the Claude Code session."),
+      );
       return;
     }
 
@@ -1003,7 +1059,15 @@ export class VaultGuardChatView extends ItemView {
     } catch (e) {
       // A user-initiated Stop aborts the CLI turn — not an error to surface.
       if (!controller.signal.aborted) {
-        this.renderError((e as Error).message || "The Claude Code request failed.");
+        // A failed CLI/app-server process cannot safely be reused. Revoke the
+        // vault lease now so retry starts from a fresh, bounded session.
+        this.disposeProviderSession();
+        this.renderError(
+          (e as Error).message ||
+            (transport === "codex"
+              ? "The Codex subscription request failed."
+              : "The Claude Code request failed."),
+        );
       }
     } finally {
       // Settle the final streamed text block into its markdown render (the last
@@ -1032,54 +1096,56 @@ export class VaultGuardChatView extends ItemView {
     }
   }
 
-  // Lazily start the AgentBridge HTTP/MCP server, mint a lease using the active
-  // AI Chat permission mode, and build the ClaudeCliClient pointed at the
-  // lease-scoped MCP endpoint.
-  private async ensureCliClient(binaryPath: string): Promise<ClaudeCliClient> {
-    if (this.cliClient) return this.cliClient;
+  // Lazily start the AgentBridge HTTP/MCP server, mint a trusted in-app lease,
+  // and point the selected official CLI at that lease-scoped MCP endpoint.
+  private async ensureCliClient(
+    binaryPath: string,
+    transport: "claude" | "codex",
+  ): Promise<ClaudeCliClient | CodexAppServerClient> {
+    if (this.cliClient && this.cliTransport === transport) return this.cliClient;
+    if (this.cliClient || this.leaseId) this.disposeProviderSession();
+    await this.bridgeCleanup;
 
-    const server = await this.plugin.startAgentBridgeServer();
-    const lease = await this.plugin.createAgentBridgeLease({
-      agentName: "VaultGuard Chat (subscription)",
-      scope: "/**",
-      expiresWithSession: true,
-      allowRead: true,
-      writeMode: chatPermissionWriteMode(this.plugin.settings.aiChatPermissionMode),
-      // In-app chat lease: enable the vaultguard_access permission-query tool.
-      allowAccessQueries: true,
-      // In-app chat lease: enable the gated /import-knowledge source-read tools.
-      // They stay inert until the user runs /import-knowledge (which arms an
-      // import session); minting the capability here just lets that flow work.
-      allowImportRead: true,
-      // In-app chat lease: enable Claude to ask follow-up questions through an
-      // inline chat card instead of ending the turn and waiting manually.
-      allowUserInteraction: true,
-      // In-app chat lease: enable the vaultguard_set_permission tool. Every change
-      // is still user-confirmed and re-authorized server-side (admin/file-admin).
-      allowPermissionWrites: true,
-      // In-app chat lease: enable the read-only vaultguard_audit tool. The backend
-      // still gates the audit log to vault admins.
-      allowAuditQueries: true,
-      // In-app chat lease: enable the vaultguard_files tool (history/overview/
-      // deleted/restore). The backend gates each op; restore is user-confirmed.
-      allowFileHistory: true,
-      // In-app chat lease: enable the vaultguard_share tool (list/create/revoke).
-      // create/revoke are user-confirmed; the backend re-authorizes each.
-      allowShareManagement: true,
-      // In-app chat lease: enable the vaultguard_membership tool (add/remove/
-      // set_role). Every op is user-confirmed and re-authorized as vault-admin.
-      allowMembershipWrites: true,
-    });
-    this.leaseId = lease.leaseId;
+    let bridgeStarted = false;
+    try {
+      const server = await this.plugin.startInAppChatAgentBridgeServer(IN_APP_CHAT_CAPABILITY);
+      bridgeStarted = true;
+      const lease = await this.createChatLease(
+        transport === "codex"
+          ? "VaultGuard Chat (Codex subscription)"
+          : "VaultGuard Chat (Claude subscription)",
+      );
+      this.leaseId = lease.leaseId;
+      this.leaseProvider = this.currentProvider();
+      this.cliTransport = transport;
 
-    this.cliClient = new ClaudeCliClient({
-      binaryPath,
-      mcpUrl: server.mcpEndpoint,
-      leaseToken: lease.token,
-      model: this.model,
-      permissionMode: this.plugin.settings.aiChatPermissionMode,
-    });
-    return this.cliClient;
+      this.cliClient =
+        transport === "codex"
+          ? new CodexAppServerClient({
+              binaryPath,
+              mcpUrl: server.mcpEndpoint,
+              leaseToken: lease.token,
+              model: this.model,
+              reasoningEffort: this.plugin.settings.openAiReasoningEffort,
+              permissionMode: this.plugin.settings.aiChatPermissionMode,
+              customInstructions: this.plugin.settings.aiChatSystemPrompt,
+            })
+          : new ClaudeCliClient({
+              binaryPath,
+              mcpUrl: server.mcpEndpoint,
+              leaseToken: lease.token,
+              model: this.model,
+              permissionMode: this.plugin.settings.aiChatPermissionMode,
+            });
+      return this.cliClient;
+    } catch (error) {
+      this.disposeProviderSession();
+      if (bridgeStarted && this.plugin.isLocalProjectMemoryModeEnabled()) {
+        this.queueLocalBridgeStop();
+        await this.bridgeCleanup;
+      }
+      throw error;
+    }
   }
 
   private captureAndSaveSubscription(): void {
@@ -1119,10 +1185,19 @@ export class VaultGuardChatView extends ItemView {
 
   private handleCancel(): void {
     this.cancelActiveUserQuestion("Question cancelled.");
+    const hadCliSession = this.cliClient !== null;
     if (this.abortController) {
       this.abortController.abort();
       this.abortController = null;
     }
+    if (hadCliSession) this.disposeProviderSession();
+  }
+
+  /** Settings-provider changes are an immediate cancellation/revocation boundary. */
+  handleProviderConfigurationChanged(): void {
+    this.handleCancel();
+    this.disposeProviderSession();
+    this.syncModelFromSettings();
   }
 
   private handleSlash(cmd: SlashCommand): void {
@@ -1153,6 +1228,32 @@ export class VaultGuardChatView extends ItemView {
     }
     if (cmd.kind === "model") {
       void this.handleModelCommand(cmd.model);
+    }
+  }
+
+  private renderCodexConnectState(status: CodexAuthStatus): void {
+    if (!this.listEl) return;
+    this.listEl.querySelector(`.${EMPTY_CLS}`)?.remove();
+    const empty = this.listEl.createDiv({ cls: EMPTY_CLS });
+    const icon = empty.createDiv({ cls: "vaultguard-chat-empty-icon" });
+    setIcon(icon, "message-square");
+
+    if (status.classification === "not-installed") {
+      empty.createEl("p", { text: "Install the official Codex client to use ChatGPT subscription chat." });
+    } else if (status.classification === "logged-in-other") {
+      empty.createEl("p", { text: "Codex is not signed in with ChatGPT." });
+      empty.createEl("p", {
+        cls: "vaultguard-chat-empty-hint",
+        text:
+          "Its current API-key/access-token mode is intentionally rejected to avoid metered API billing. " +
+          "Open VaultGuard settings → AI Chat and choose Sign in with ChatGPT.",
+      });
+    } else {
+      empty.createEl("p", { text: "Sign in to Codex with ChatGPT to use your subscription." });
+      empty.createEl("p", {
+        cls: "vaultguard-chat-empty-hint",
+        text: status.error ?? "Open VaultGuard settings → AI Chat and click Sign in.",
+      });
     }
   }
 
@@ -1342,11 +1443,7 @@ export class VaultGuardChatView extends ItemView {
     // A new/cleared conversation ends any armed import session — the gated
     // source-read tools must not survive into an unrelated conversation.
     this.endImportSessionIfActive();
-    this.runtime?.reset();
-    this.runtime = null;
-    // Drop the CLI session so /clear starts a fresh Claude Code context too.
-    this.cliClient?.reset();
-    this.cliClient = null;
+    this.disposeProviderSession();
     if (this.listEl) this.listEl.empty();
     this.pendingToolCards = [];
     this.activeAssistantBubble = null;
@@ -1376,6 +1473,7 @@ export class VaultGuardChatView extends ItemView {
     this.persistLeafState();
     if (
       this.plugin.settings.aiChatProvider !== "subscription" &&
+      this.plugin.settings.aiChatProvider !== "codex" &&
       !this.hasCurrentProviderKey()
     ) {
       this.renderConnectState();
@@ -1940,10 +2038,7 @@ export class VaultGuardChatView extends ItemView {
     }
     this.selectConversationTab(convo.id, convo.title);
     this.handleCancel();
-    this.runtime?.reset();
-    this.runtime = null; // rebuild on next turn; rehydrate via pendingRestore
-    this.cliClient?.reset();
-    this.cliClient = null;
+    this.disposeProviderSession(); // rebuild on next turn; rehydrate via pendingRestore
     if (this.listEl) this.listEl.empty();
     this.pendingToolCards = [];
     this.activeAssistantBubble = null;
@@ -1959,46 +2054,67 @@ export class VaultGuardChatView extends ItemView {
 
   // ─── Runtime construction ──────────────────────────────────────────────────
 
+  private createChatLease(agentName: string) {
+    return this.plugin.createInAppChatAgentBridgeLease(IN_APP_CHAT_CAPABILITY, {
+      agentName,
+      scope: "/**",
+      allowRead: true,
+      writeMode: chatPermissionWriteMode(this.plugin.settings.aiChatPermissionMode),
+      allowAccessQueries: true,
+      allowImportRead: true,
+      allowUserInteraction: true,
+      allowPermissionWrites: true,
+      allowAuditQueries: true,
+      allowFileHistory: true,
+      allowShareManagement: true,
+      allowMembershipWrites: true,
+    });
+  }
+
+  private disposeProviderSession(): void {
+    const hadCliTransport = this.cliClient !== null;
+    this.runtime = null;
+    this.runtimeProvider = null;
+    this.cliClient?.reset();
+    this.cliClient = null;
+    this.cliTransport = null;
+    const leaseId = this.leaseId;
+    this.leaseId = null;
+    this.leaseProvider = null;
+    if (leaseId) {
+      try {
+        this.plugin.revokeAgentBridgeLease(leaseId);
+      } catch (error) {
+        console.warn("[VaultGuard Chat] Could not revoke the chat lease", error);
+      }
+    }
+    if (hadCliTransport && this.plugin.isLocalProjectMemoryModeEnabled()) {
+      this.queueLocalBridgeStop();
+    }
+  }
+
+  private queueLocalBridgeStop(): void {
+    this.bridgeCleanup = this.bridgeCleanup
+      .catch(() => undefined)
+      .then(() => this.plugin.stopAgentBridgeServer())
+      .catch((error) =>
+        console.warn("[VaultGuard Chat] Could not stop the Local Mode chat bridge", error),
+      );
+  }
+
   private async ensureRuntime(apiKey: string, streaming: boolean): Promise<void> {
     if (this.runtime && this.runtimeProvider === "anthropic") return;
-    this.runtime = null;
+    if (this.leaseId) this.disposeProviderSession();
+    await this.bridgeCleanup;
     this.runtimeProvider = "anthropic";
     this.runtimeStreaming = streaming;
 
     // Mint a vault-wide lease for the session. The selected AI Chat permission
     // mode decides whether writes ask first or use the ephemeral skip-confirm
     // write mode; server-side file permissions still apply either way.
-    const lease = await this.plugin.createAgentBridgeLease({
-      agentName: "VaultGuard Chat",
-      scope: "/**",
-      expiresWithSession: true,
-      allowRead: true,
-      writeMode: chatPermissionWriteMode(this.plugin.settings.aiChatPermissionMode),
-      // In-app chat lease: enable the vaultguard_access permission-query tool.
-      allowAccessQueries: true,
-      // In-app chat lease: enable the gated /import-knowledge source-read tools.
-      // They stay inert until the user runs /import-knowledge (which arms an
-      // import session); minting the capability here just lets that flow work.
-      allowImportRead: true,
-      // In-app chat lease: enable the interactive ask-user tool.
-      allowUserInteraction: true,
-      // In-app chat lease: enable the vaultguard_set_permission tool. Every change
-      // is still user-confirmed and re-authorized server-side (admin/file-admin).
-      allowPermissionWrites: true,
-      // In-app chat lease: enable the read-only vaultguard_audit tool. The backend
-      // still gates the audit log to vault admins.
-      allowAuditQueries: true,
-      // In-app chat lease: enable the vaultguard_files tool (history/overview/
-      // deleted/restore). The backend gates each op; restore is user-confirmed.
-      allowFileHistory: true,
-      // In-app chat lease: enable the vaultguard_share tool (list/create/revoke).
-      // create/revoke are user-confirmed; the backend re-authorizes each.
-      allowShareManagement: true,
-      // In-app chat lease: enable the vaultguard_membership tool (add/remove/
-      // set_role). Every op is user-confirmed and re-authorized as vault-admin.
-      allowMembershipWrites: true,
-    });
+    const lease = await this.createChatLease("VaultGuard Chat (Anthropic API)");
     this.leaseId = lease.leaseId;
+    this.leaseProvider = this.currentProvider();
 
     const surface = this.plugin.getAgentBridge();
     const toolRuntime = new VaultToolRuntime(surface, lease.leaseId);
@@ -2045,26 +2161,14 @@ export class VaultGuardChatView extends ItemView {
 
   private async ensureOpenAiRuntime(apiKey: string): Promise<void> {
     if (this.runtime && this.runtimeProvider === "openai") return;
-    this.runtime = null;
+    if (this.leaseId) this.disposeProviderSession();
+    await this.bridgeCleanup;
     this.runtimeProvider = "openai";
     this.runtimeStreaming = false;
 
-    const lease = await this.plugin.createAgentBridgeLease({
-      agentName: "VaultGuard Chat (OpenAI)",
-      scope: "/**",
-      expiresWithSession: true,
-      allowRead: true,
-      writeMode: chatPermissionWriteMode(this.plugin.settings.aiChatPermissionMode),
-      allowAccessQueries: true,
-      allowImportRead: true,
-      allowUserInteraction: true,
-      allowPermissionWrites: true,
-      allowAuditQueries: true,
-      allowFileHistory: true,
-      allowShareManagement: true,
-      allowMembershipWrites: true,
-    });
+    const lease = await this.createChatLease("VaultGuard Chat (OpenAI API)");
     this.leaseId = lease.leaseId;
+    this.leaseProvider = this.currentProvider();
 
     const surface = this.plugin.getAgentBridge();
     const toolRuntime = new VaultToolRuntime(surface, lease.leaseId);
@@ -2452,7 +2556,7 @@ export class VaultGuardChatView extends ItemView {
   private async resolveCurrentModelCatalog() {
     const provider = this.currentApiKeyProvider();
     const apiKey =
-      this.currentProvider() === "subscription"
+      this.currentProvider() === "subscription" || this.currentProvider() === "codex"
         ? null
         : provider === "openai"
           ? await new OpenAiKeyStore(this.plugin).getKey()
@@ -2468,7 +2572,9 @@ export class VaultGuardChatView extends ItemView {
     const menu = new Menu();
     const currentEffort = this.currentEffort();
     const efforts =
-      this.currentProvider() === "openai" ? OPENAI_REASONING_EFFORTS : AI_CHAT_EFFORTS;
+      this.currentProvider() === "openai" || this.currentProvider() === "codex"
+        ? OPENAI_REASONING_EFFORTS
+        : AI_CHAT_EFFORTS;
     for (const e of efforts) {
       menu.addItem((item) =>
         item
@@ -2497,7 +2603,7 @@ export class VaultGuardChatView extends ItemView {
   }
 
   private async setEffort(effort: AiChatEffort): Promise<void> {
-    if (this.currentProvider() === "openai") {
+    if (this.currentProvider() === "openai" || this.currentProvider() === "codex") {
       if (effort !== "low" && effort !== "medium" && effort !== "high") return;
       if (this.plugin.settings.openAiReasoningEffort === effort) return;
       this.plugin.settings.openAiReasoningEffort = effort;
@@ -2508,10 +2614,7 @@ export class VaultGuardChatView extends ItemView {
     await this.plugin.saveSettings();
     this.statusPanel?.setEffort(effort);
     // Rebuild so the next turn's client carries the new effort.
-    this.runtime = null;
-    this.runtimeProvider = null;
-    this.cliClient?.reset();
-    this.cliClient = null;
+    this.disposeProviderSession();
     new Notice(`VaultGuard Chat: thinking effort → ${effort}`);
   }
 
@@ -2521,10 +2624,7 @@ export class VaultGuardChatView extends ItemView {
     await this.plugin.saveSettings();
     this.statusPanel?.setPermissionMode(mode);
     // Rebuild so the next turn mints a lease with the new write mode.
-    this.runtime = null;
-    this.runtimeProvider = null;
-    this.cliClient?.reset();
-    this.cliClient = null;
+    this.disposeProviderSession();
     new Notice(`VaultGuard Chat: permissions → ${permissionModeLabel(mode)}`);
   }
 
@@ -2533,17 +2633,14 @@ export class VaultGuardChatView extends ItemView {
     this.statusPanel?.setModel(model);
     // Persist so the choice survives a panel reopen / new chat (mirrors
     // setEffort) and stays in sync with the settings dropdown.
-    if (this.currentProvider() === "openai") {
+    if (this.currentProvider() === "openai" || this.currentProvider() === "codex") {
       this.plugin.settings.openAiModel = model;
     } else {
       this.plugin.settings.aiChatModel = model;
     }
     void this.plugin.saveSettings();
     // Rebuild the runtime / CLI client on next turn so the new model applies.
-    this.runtime = null;
-    this.runtimeProvider = null;
-    this.cliClient?.reset();
-    this.cliClient = null;
+    this.disposeProviderSession();
   }
 
   async copyDomDebugReport(): Promise<void> {
@@ -2824,10 +2921,13 @@ export class VaultGuardChatView extends ItemView {
     return c;
   }
 
-  // Edit/delete need a replayable message array; the subscription (CLI) provider
-  // keeps its own context, so the actions are API-key-only.
+  // Edit/delete need a replayable message array; CLI subscription providers
+  // keep their own context, so the actions are API-key-only.
   private userMessageActions(turnIndex: number) {
-    if (this.plugin.settings.aiChatProvider === "subscription") return undefined;
+    if (
+      this.plugin.settings.aiChatProvider === "subscription" ||
+      this.plugin.settings.aiChatProvider === "codex"
+    ) return undefined;
     return {
       onEdit: () => this.editUserTurn(turnIndex),
       onDelete: () => this.deleteUserTurn(turnIndex),

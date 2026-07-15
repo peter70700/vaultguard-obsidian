@@ -8,30 +8,47 @@ VaultGuard Sync is the Obsidian plugin for permission-aware encrypted sync, part
 of the VaultGuard product family. This public plugin repository contains only
 the Obsidian client.
 
-- **Try Pro free for 14 days (no card):** https://admin.vaultguard.cloud/#/signup
+Fresh installs start with one shield and the protection/sync core. AI Chat,
+Permissions Graph, and external Agent Access are optional modules that remain
+off until enabled in settings; established installs preserve their previous
+availability during migration.
+
+- **Try Pro free for 14 days (payment method required):** https://admin.vaultguard.cloud/#/signup
 - **Learn more / managed hosting:** https://vaultguard.cloud
 - **Compare editions:** https://vaultguard.cloud/#/compare
 
 ## Features
 
-- **End-to-end encrypted sync** — every file is AES-256-GCM encrypted before it
-  leaves the device; the server stores ciphertext only. Decryption needs a
-  short-lived, server-issued key lease that is revoked instantly on offboarding.
-- **Local at-rest encryption** — every file in your vault folder is also
-  encrypted in place on disk under a per-device key wrapped by the OS keychain,
-  so Finder, Spotlight, and backup tools only ever see ciphertext.
+- **Client-side encrypted sync** — supported file bodies are AES-256-GCM
+  encrypted before upload. The current service uses KMS-backed server-managed
+  keys, so the backend is inside the trust boundary; this is not zero knowledge.
+- **Local at-rest encryption** — supported vault adapter paths are encrypted in
+  place under a per-device key wrapped by available device storage. Documented
+  exclusions, Obsidian caches, filenames/metadata, and large files pending a
+  safe first upload can remain plaintext.
+- **Large attachment sync** — text and binary files above the normal JSON
+  request limit use a vault-scoped encrypted direct-transfer path up to the
+  deployment's configured maximum. Failed or offline large uploads preserve the
+  local file and appear as pending for retry.
+- **Human recovery** — one Recovery Center exposes bounded file history,
+  deleted files, confirmed restore, and non-destructive conflict inspection.
 - **Per-file permissions** — vault, folder, and file-level grants with role
   inheritance, enforced server-side. Default deny; explicit grants only.
-- **Permission-aware AI chat** — a native Claude chat panel inside Obsidian
-  (the **VaultGuard Chat** ribbon icon). Ask about your notes, or have Claude
+- **Expiring authenticated guests** — invite a viewer to selected active vaults
+  for 1–90 days. Membership, permission rules, and renewable key leases share
+  the same expiry boundary; this is not anonymous public access.
+- **Permission-aware AI chat (optional)** — a native Claude/GPT chat panel inside Obsidian
+  (open it with the command palette or control center). Ask about your notes, or have Claude
   draft and edit them. Every file it reads or writes runs through the *same*
   at-rest decryption, per-file permission checks, and audit logging as a human
   user; the model never touches the on-disk ciphertext. Connect with your own
-  Anthropic API key or by driving an existing Claude subscription — until you
+  Anthropic/OpenAI API key or by driving a supported subscription — until you
   connect, the panel makes zero outbound calls. Works on desktop and mobile
-  (token-by-token streaming is desktop-only).
-- **Visual permissions graph** — the **VaultGuard Permissions** ribbon icon (or
-  the "VaultGuard: Open permissions graph" command) opens an interactive map of
+  (token-by-token streaming is desktop-only). VaultGuard encrypted key storage
+  is the default; Obsidian 1.11.5+ users can explicitly select a named native
+  secret without placing the secret value in plugin settings.
+- **Visual permissions graph (optional)** — the "VaultGuard: Open permissions graph"
+  command opens an interactive map of
   who can reach what: users, files, and folders as nodes, with edges colored by
   access level (read / write / admin) and dashed for time-bound grants. Click any
   node or edge to see exactly which rule grants that access and why. The graph
@@ -39,15 +56,16 @@ the Obsidian client.
 - **Audit logging** — every access and permission change is recorded to a
   server-side audit log (advanced dashboards, alerts, and CSV export are a Pro
   feature).
-- **Re-encryption on offboarding** — revoking a user rotates the keys for the
-  files they could reach, so their cached copies become permanently unreadable.
+- **Managed access revocation** — revoking a user stops new authorised server
+  access and renewable leases. Devices enforce the change when they reconnect
+  or current leases expire; exported copies outside VaultGuard cannot be erased.
 - **Built-in vault tools** — both the AI chat and any external agent work
   through one curated, permission-gated tool surface instead of raw file access:
   `list` and `search` the files you can see, `read` decrypted content,
   `apply_patch` edits, and `create` new notes. Every call is permission-checked
   and audit-logged, and the tools refuse hidden/excluded paths (`.obsidian`,
   `.trash`, `.git`, …).
-- **MCP server for external agents** — VaultGuard runs a built-in **MCP (Model
+- **MCP server for external agents (optional)** — VaultGuard runs a built-in **MCP (Model
   Context Protocol)** server over Streamable HTTP, so you can wire your own AI
   tools — Claude Code, Cursor, Claudian, anything that speaks MCP — into the
   vault. They surface as `mcp__vaultguard__list` / `search` / `read` /
@@ -56,7 +74,7 @@ the Obsidian client.
   connections**. Agents never get raw filesystem access or your keys — only
   decrypted content they're allowed to read. Desktop-only.
 
-The AI chat, permissions graph, built-in tools, and MCP server are plugin
+The optional AI chat, permissions graph, built-in tools, and MCP server are plugin
 features and work on **every edition** (Community, Pro, Enterprise) — the
 security primitives are never paywalled. See the [security plane](#security-plane)
 table below for the full per-edition breakdown.
@@ -75,9 +93,9 @@ the operational layer most teams want once they scale past a few users,
 | **Price** | Free, self-hosted | €12 / user / month | Custom |
 | **Edition (code)** | `community` | `pro` | `pro` |
 | **License** | Sustainable Use License | Cloud ToS | Commercial contract |
-| **User cap** | Unlimited (you provision) | Up to 100 | Unlimited |
-| **Storage** | Limited by your AWS | 100 GB included | Unlimited |
-| **Trial** | Clone + deploy | 14 days, no card | Sales call |
+| **User cap** | Your deployment limit | Up to 100 | By agreement |
+| **Storage** | Your AWS configuration | 100 GB included | By agreement |
+| **Trial** | Clone + deploy | 14 days; payment method required | Sales call |
 
 ### Security plane
 
@@ -85,9 +103,9 @@ Identical in every tier — security primitives are never paywalled.
 
 | Capability | CE | Pro | Enterprise |
 | --- | :---: | :---: | :---: |
-| End-to-end encryption (AES-256-GCM + AWS KMS) | ✓ | ✓ | ✓ |
+| Client-side content encryption (AES-256-GCM + managed KMS keys) | ✓ | ✓ | ✓ |
 | Per-file permissions with role inheritance | ✓ | ✓ | ✓ |
-| Re-encryption on user offboarding | ✓ | ✓ | ✓ |
+| Session, permission, and renewable-lease revocation | ✓ | ✓ | ✓ |
 | Time-bound key leases (1h default, configurable) | ✓ | ✓ | ✓ |
 | Multi-vault support per organization | ✓ | ✓ | ✓ |
 | Plugin allowlist enforcement | ✓ | ✓ | ✓ |
@@ -145,7 +163,7 @@ What you do vs. what we do.
 - Working AWS Cognito + API Gateway + Lambda + DynamoDB + S3 + KMS + SES stack via Terraform
 - Plugin connects with no code changes — capability discovery hides Pro-only UI surfaces
 - Single-tenant by default — public signup refuses after the first org exists
-- Unlimited users, unlimited vaults, every security guarantee
+- User, vault, storage, and file-size limits follow your AWS configuration
 - Cost: AWS resources only. Idle deployment ~$5–15/month on low traffic.
 
 ### What CE doesn't deliver (and why Pro is worth paying for)
@@ -164,7 +182,7 @@ outsiders, or has a compliance team asking for audit evidence. Enterprise adds
 SSO, dedicated infra, and compliance attestations on top of Pro.
 
 > **Want managed hosting?** [Start a 14-day Pro trial](https://admin.vaultguard.cloud/#/signup)
-> — no card required. Or [contact Enterprise sales](mailto:support@vaultguard.cloud?subject=VaultGuard%20Enterprise%20Inquiry)
+> — a payment method is required at trial start. Or [contact Enterprise sales](mailto:support@vaultguard.cloud?subject=VaultGuard%20Enterprise%20Inquiry)
 > for SSO and compliance.
 
 ## Self-Hosting (Community Edition)
@@ -248,13 +266,13 @@ installs default to `https://api.vaultguard.cloud`, but the plugin does not make
 redeem an invite, connect an organization, or restore an existing session. Manual
 configuration bypasses the bundled Cloud fallback.
 
-Two network paths are independent of Cloud sign-in and are listed here for full
-disclosure:
+Two user-triggered network paths are independent of Cloud sign-in and are
+listed here for full disclosure:
 
-- **Update check (on load).** Shortly after the plugin loads it queries the
-  GitHub Releases API (`api.github.com` / `github.com`) to check for a newer
-  VaultGuard version. This sends no vault data or account information — only a
-  standard version request — and simply no-ops when you are offline.
+- **Manual update check.** Only the explicit **Check for plugin updates** command
+  queries the GitHub Releases API (`api.github.com` / `github.com`). Plugin load
+  does not start an update timer or GitHub request. The manual check sends no
+  vault data or account information — only a standard version request.
 - **AI chat (opt-in).** If you use the built-in AI chat and supply your own
   Anthropic or OpenAI API key, chat requests go directly to `api.anthropic.com`
   or `api.openai.com`. No AI calls are made until you enable chat and provide a
@@ -277,6 +295,11 @@ contents, permission checks, audit events, and authentication tokens to the
 configured backend as part of sync and access control. It does not include
 client-side telemetry, ads, or analytics. Billing and subscription management
 are handled outside the public plugin.
+
+Sync runs while Obsidian is active: local changes are observed and remote
+changes are checked on a configurable interval. It is not live collaborative
+editing or a background service after the app is suspended. File support is
+bounded by the backend's configured size limit and device resources.
 
 VaultGuard Sync stores plugin settings, vault binding data, and auth session
 data in Obsidian's plugin data store and browser storage so it can restore your

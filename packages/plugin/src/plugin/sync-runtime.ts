@@ -20,6 +20,7 @@ import {
 import {
   BINARY_PUT_TIMEOUT_MS,
   BINARY_SYNC_MAX_BYTES,
+  JSON_SYNC_MAX_ENCRYPTED_BYTES,
   contentTypeForPath,
   isBinaryContentType,
   isKnownBinaryExtensionPath,
@@ -51,23 +52,19 @@ export type UploadReconciledOutcome =
   | "skipped-no-permission";
 
 /**
- * BIN-A / D-07: byte-upload outcome. Every text outcome (SY2) plus
- * `skipped-too-large` — the client-side `BINARY_SYNC_MAX_BYTES` ceiling (OD-3),
- * enforced BEFORE any encrypt/network work and permanent until the BIN-B
- * presigned-URL path ships. Like `skipped-no-lease`, `skipped-too-large` is
- * fail-closed: a caller must NEVER delete or overwrite the local file on it —
- * the on-disk bytes are the only copy of an attachment that could not be pushed
- * (SY2 extended). Only `skipped-no-permission` (on a warmed store) may lead to
- * local removal.
+ * Byte-upload outcome. Every text outcome (SY2) plus `pending-large`, returned
+ * when an above-JSON-threshold direct transfer could not complete. A caller must
+ * never delete or overwrite the local file on this outcome; only
+ * `skipped-no-permission` (on a warmed store) may lead to local removal.
  *
  * This is a superset SIBLING of UploadReconciledOutcome rather than a widening
  * of it, so the string uploadReconciledFile contract (and its ctx forwarding)
- * stays narrow — the text path can never return `skipped-too-large`, so no
+ * stays narrow — the text path can never return `pending-large`, so no
  * text-path caller has to guard a case it cannot produce.
  */
 export type UploadReconciledBinaryOutcome =
   | UploadReconciledOutcome
-  | "skipped-too-large";
+  | "pending-large";
 
 /**
  * Sentinel filename uploaded into every server-side folder so the empty-folder
@@ -86,10 +83,8 @@ const DELETION_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MIN_SYNC_INTERVAL = 10;
 
 /**
- * BIN-A: per-path throttle window for the "binary too large" Notice, so a
- * repeated oversize file does not re-notify on every push pass.
+ * Per-path throttle window for a pending large-file Notice.
  */
-const BINARY_TOO_LARGE_NOTICE_THROTTLE_MS = 60_000;
 
 /** Grace period before key expiry to trigger renewal (5 minutes). */
 const KEY_RENEWAL_GRACE_MS = 5 * 60 * 1000;
@@ -130,14 +125,6 @@ export class SyncRuntime {
   private currentSyncOperation: LongOperationHandle | null = null;
 
   constructor(private readonly ctx: SyncRuntimeContext) {}
-
-  /**
-   * BIN-A / L10/L12: per-path throttle for the "binary too large" Notice. This
-   * is presentation state only (not sync state) — it prevents a repeated
-   * oversize file from re-notifying on every push pass. Mirrors the
-   * `binaryWriteNoticeAt` throttle interceptedRename established in 11-02.
-   */
-  private readonly binaryTooLargeNoticeAt = new Map<string, number>();
 
   private isLocalProjectMemoryMode(): boolean {
     return this.ctx.getSettings().localProjectMemoryMode === true;
@@ -182,6 +169,44 @@ export class SyncRuntime {
       checksum: response.data?.checksum,
       lastModified: response.data?.lastModified,
       size: response.data?.size,
+    });
+  }
+
+  private recordDirectWrite(
+    path: string,
+    hash: string,
+    result: { versionId?: string; lastModified: string; size: number },
+  ): void {
+    this.ctx.recordRemoteFilePresent(path, {
+      versionId: result.versionId,
+      baseHash: hash,
+      lastModified: result.lastModified,
+      size: result.size,
+    });
+  }
+
+  private async markPendingLargeFile(
+    path: string,
+    bytes: ArrayBuffer,
+    contentType: string,
+    reason: import("../types").PendingLargeFileRecord["reason"],
+    previousPath?: string,
+  ): Promise<void> {
+    const normalized = this.ctx.normalizeVaultPath(path);
+    const existing = this.ctx.getSettings().pendingLargeFiles?.[normalized];
+    await this.ctx.upsertPendingLargeFile({
+      path: normalized,
+      ...(previousPath
+        ? { previousPath: this.ctx.normalizeVaultPath(previousPath) }
+        : {}),
+      size: bytes.byteLength,
+      sha256: await this.ctx.computeHashBytes(bytes),
+      contentType,
+      reason,
+      state: reason === "conflict" ? "blocked" : "retryable",
+      localProtection: "plaintext-pending",
+      attempts: (existing?.attempts ?? 0) + 1,
+      updatedAt: new Date().toISOString(),
     });
   }
 
@@ -540,7 +565,13 @@ export class SyncRuntime {
           `Sync: ${offlineQueueSizeBefore} queued operation(s) kept pending because no encryption key lease is available.`
         );
       }
-      const flushedSomething = canUploadEncryptedContent && offlineQueueSizeBefore > 0;
+      const retriedLargeFiles = canUploadEncryptedContent
+        ? await this.retryPendingLargeFiles(userInitiated)
+        : 0;
+      totalFilesUploaded += retriedLargeFiles;
+      const flushedSomething =
+        canUploadEncryptedContent &&
+        (offlineQueueSizeBefore > 0 || retriedLargeFiles > 0);
 
       // Phase 1b: Catch up local-only files + folders.
       let catchupChanges = 0;
@@ -634,7 +665,10 @@ export class SyncRuntime {
 
       if (response.data.permissionsChanged) {
         this.ctx.log("Sync: permission rules changed on the server — emitting bus event.");
-        this.ctx.emitPermissionChanged({ serverConfirmed: true });
+        this.ctx.emitPermissionChanged({
+          serverConfirmed: true,
+          semanticAuthorityChanged: true,
+        });
       }
 
       deltaCount = response.data.deltas.length;
@@ -973,6 +1007,44 @@ export class SyncRuntime {
       this.ctx.log(`Sync: skipping key-lease-denied path "${normalizedPath}".`);
       return;
     }
+    if (this.ctx.getSettings().pendingLargeFiles?.[normalizedPath]) {
+      this.ctx.log(
+        `Sync: skipping remote apply for "${normalizedPath}" — a local large-file transfer is pending.`,
+      );
+      return;
+    }
+
+    // S3 metadata is ciphertext size. The JSON lane may be exactly
+    // BINARY_SYNC_MAX_BYTES of plaintext plus the fixed 28-byte GCM envelope.
+    if (metadata.size > JSON_SYNC_MAX_ENCRYPTED_BYTES) {
+      if (!this.ctx.hasOriginalAdapterWrite()) return;
+      try {
+        const direct = await this.ctx.downloadLargeEncryptedFile(normalizedPath);
+        if (isBinaryContentType(direct.contentType)) {
+          await this.writeLocalBinaryFileFromRemote(normalizedPath, direct.bytes);
+        } else {
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(direct.bytes);
+          await this.ctx.writeLocalFileFromRemote(normalizedPath, text);
+        }
+        this.ctx.recordRemoteFilePresent(normalizedPath, {
+          versionId: direct.versionId,
+          baseHash: direct.plaintextSha256,
+          size: direct.plaintextSize,
+        });
+        this.ctx.getSyncState().bytesDownloaded += direct.plaintextSize;
+        this.ctx.recordSyncDiagnostic("applyRemoteChange.direct-pull", {
+          path: normalizedPath,
+          bytes: direct.plaintextSize,
+        });
+      } catch (error) {
+        this.ctx.logError(
+          `Sync: direct download of "${normalizedPath}" failed integrity or authorization checks; local copy preserved.`,
+          error,
+        );
+        this.ctx.notifyCloudDecryptFallback(normalizedPath);
+      }
+      return;
+    }
 
     const response = await this.ctx.fetchRemoteFileContent(normalizedPath);
     if (!response.success || !response.data) {
@@ -1176,10 +1248,17 @@ export class SyncRuntime {
         if (result.kind === "binary") {
           // BIN-A / L1/L10: a binary rename queues through the byte path
           // (base64 of the PLAIN bytes, encoding "base64"), mirroring the
-          // interceptedRename fix (11-02). Oversize → skip BOTH halves: never
-          // remove a server copy without a replacement.
+          // interceptedRename fix (11-02). Above-threshold content becomes a
+          // metadata-only pending rename; never remove the old server copy
+          // without a durable replacement.
           if (result.bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
-            this.notifyBinaryTooLarge(newPath);
+            await this.markPendingLargeFile(
+              newNormalized,
+              result.bytes,
+              contentTypeForPath(newNormalized),
+              !this.ctx.isOnline() ? "offline" : "lease-unavailable",
+              oldNormalized,
+            );
             return;
           }
           const base64 = uint8ToBase64Chunked(new Uint8Array(result.bytes));
@@ -1188,6 +1267,21 @@ export class SyncRuntime {
             contentType: contentTypeForPath(newNormalized),
           });
         } else {
+          const view = new TextEncoder().encode(result.text);
+          const bytes = view.buffer.slice(
+            view.byteOffset,
+            view.byteOffset + view.byteLength,
+          ) as ArrayBuffer;
+          if (bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+            await this.markPendingLargeFile(
+              newNormalized,
+              bytes,
+              "text/markdown",
+              !this.ctx.isOnline() ? "offline" : "lease-unavailable",
+              oldNormalized,
+            );
+            return;
+          }
           this.queueOfflineOperation("write", newNormalized, result.text);
         }
       } catch (err) {
@@ -1201,18 +1295,13 @@ export class SyncRuntime {
       return;
     }
 
-    // BIN-A / L1: probe once, then dispatch. Exactly one of content/binaryBytes
-    // is set. Oversize binaries fail closed: skip the PUT AND the old-path
-    // DELETE (never orphan-delete a server copy we can't replace — L10).
+    // Probe once, then dispatch. Exactly one of content/binaryBytes is set.
+    // Above-threshold files use replacement-first direct transfer.
     let content: string | null = null;
     let binaryBytes: ArrayBuffer | null = null;
     try {
       const result = await this.readForSync(newPath);
       if (result.kind === "binary") {
-        if (result.bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
-          this.notifyBinaryTooLarge(newPath);
-          return;
-        }
         binaryBytes = result.bytes;
       } else {
         content = result.text;
@@ -1221,6 +1310,56 @@ export class SyncRuntime {
       this.ctx.log(
         `Rename sync: cannot read "${newPath}" (${err}); skipping server move.`
       );
+      return;
+    }
+
+    const largeBytes = binaryBytes !== null
+      ? binaryBytes
+      : (() => {
+          const view = new TextEncoder().encode(content as string);
+          return view.buffer.slice(
+            view.byteOffset,
+            view.byteOffset + view.byteLength,
+          ) as ArrayBuffer;
+        })();
+    if (largeBytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+      const contentType = binaryBytes !== null
+        ? contentTypeForPath(newNormalized)
+        : "text/markdown";
+      const hash = await this.ctx.computeHashBytes(largeBytes);
+      try {
+        const result = await this.ctx.uploadLargeEncryptedFile(
+          newNormalized,
+          largeBytes,
+          contentType,
+          this.ctx.getExpectedVersionId(newNormalized),
+        );
+        this.recordDirectWrite(newNormalized, hash, result);
+        const delResp = await this.ctx.apiRequest(
+          "DELETE",
+          this.ctx.vaultPath(`/files/${encodeURIComponent(oldNormalized)}`),
+          this.buildDeleteBody(oldNormalized),
+        );
+        if (!delResp.success && delResp.error?.statusCode !== 404) {
+          this.queueOfflineOperation("delete", oldNormalized);
+        } else {
+          this.ctx.recordRemoteFileAbsent(oldNormalized);
+        }
+        await this.ctx.clearPendingLargeFile(newNormalized);
+        await this.ctx.ensureAtRestEncryptedInPlace(newNormalized, true);
+      } catch (error) {
+        await this.markPendingLargeFile(
+          newNormalized,
+          largeBytes,
+          contentType,
+          /conflict|409/i.test(String(error)) ? "conflict" : "upload-failed",
+          oldNormalized,
+        );
+        this.ctx.logError(
+          `Rename sync: direct replacement for "${newNormalized}" is pending; old server path preserved`,
+          error,
+        );
+      }
       return;
     }
 
@@ -1385,16 +1524,10 @@ export class SyncRuntime {
     const unreadable = new Set<string>();
     // D-10 (byte-identical legacy safety net): the pre-BIN-A exclusion set for
     // binaries that must never ride the string pipeline. On CAPABLE adapters the
-    // readForSync content-probe now routes in-size binaries to first-class
-    // manifest entries (D-05) and oversize ones to `oversizeBinaryLocal`, so this
-    // set stays empty in practice — but the mechanism + its Notice are preserved
+    // readForSync content-probe now routes binaries to first-class manifest
+    // entries, so this
     // so any legacy/no-readBinary detection path continues to fail safe.
     const binaryLocal = new Set<string>();
-    // L10: an oversize binary can't reach the server until BIN-B, so it is
-    // excluded from the manifest exactly like binaryLocal (the serverOnly pass
-    // skips both) — never uploaded, never downloaded, never overwritten. The
-    // local plaintext copy is the only copy and must stay untouched (CR-1).
-    const oversizeBinaryLocal = new Set<string>();
     let localFileIndex = 0;
     operation.update({
       phase: "Reading local files",
@@ -1415,17 +1548,6 @@ export class SyncRuntime {
           // compare + byte conflict strategies below). Legacy adapters never
           // reach this branch — readForSync string-reads on them (D-10), so
           // mobile keeps today's behavior end-to-end.
-          if (result.bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
-            // L10: oversize → keep it OUT of the manifest (never uploaded, never
-            // serverOnly, never overwritten). Throttled size Notice naming the
-            // limit + BIN-B, plus a diagnostics breadcrumb. Local copy untouched.
-            oversizeBinaryLocal.add(`/${normalized}`);
-            this.notifyBinaryTooLarge(file.path);
-            this.ctx.recordSyncDiagnostic("reconciliation.binary-oversize-skip", {
-              path: normalized,
-            });
-            continue;
-          }
           const hash = await this.ctx.computeHashBytes(result.bytes);
           localManifest.set(`/${normalized}`, {
             kind: "binary",
@@ -1554,9 +1676,8 @@ export class SyncRuntime {
         if (unreadable.has(path)) continue;
         // D-10: legacy safety-net exclusion (see binaryLocal above).
         if (binaryLocal.has(path)) continue;
-        // L10: oversize local binary — never overwrite the intact (only) local
-        // copy of an attachment that can't yet sync to the server.
-        if (oversizeBinaryLocal.has(path)) continue;
+        // A locally present binary or pending large file is never classified as
+        // server-only; preserve the intact local copy during reconciliation.
         serverOnly.push(path);
       } finally {
         classifyIndex += 1;
@@ -1708,8 +1829,10 @@ export class SyncRuntime {
     let compareIndex = 0;
     for (const item of localManifestBoth) {
       try {
-        const remoteContent = await this.ctx.readRemotePlaintext(item.path);
-        const remoteHash = await this.ctx.computeHash(remoteContent);
+        const localView = new TextEncoder().encode(item.localContent);
+        const remoteHash = localView.byteLength > BINARY_SYNC_MAX_BYTES
+          ? (await this.ctx.downloadLargeEncryptedFile(item.path)).plaintextSha256
+          : await this.ctx.computeHash(await this.ctx.readRemotePlaintext(item.path));
         if (remoteHash === item.localHash) {
           sameContent.add(item.path);
         } else {
@@ -1740,6 +1863,19 @@ export class SyncRuntime {
     const healBinary: Array<{ path: string; bytes: ArrayBuffer }> = [];
     for (const item of binaryBoth) {
       try {
+        if (item.bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+          const direct = await this.ctx.downloadLargeEncryptedFile(item.path);
+          if (!isBinaryContentType(direct.contentType)) {
+            healBinary.push({ path: item.path, bytes: item.bytes });
+            continue;
+          }
+          if (direct.plaintextSha256 === item.hash) {
+            sameContent.add(item.path);
+          } else {
+            conflicts.push(item.path);
+          }
+          continue;
+        }
         const response = await this.ctx.fetchRemoteFileContent(item.path);
         if (!response.success || !response.data) {
           // OD-2: couldn't read the server side → skip (neither same, conflict,
@@ -2083,6 +2219,38 @@ export class SyncRuntime {
       );
       return "skipped-no-permission";
     }
+    const textView = new TextEncoder().encode(content);
+    const textBytes = textView.buffer.slice(
+      textView.byteOffset,
+      textView.byteOffset + textView.byteLength,
+    ) as ArrayBuffer;
+    if (textBytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+      const hash = await this.ctx.computeHashBytes(textBytes);
+      try {
+        const result = await this.ctx.uploadLargeEncryptedFile(
+          path,
+          textBytes,
+          "text/markdown",
+          this.ctx.getExpectedVersionId(path),
+        );
+        this.recordDirectWrite(path, hash, result);
+        await this.ctx.clearPendingLargeFile(path);
+        await this.ctx.emitAuditEvent("file.write", path, {
+          reconciliation: true,
+          directTransfer: true,
+          bytes: textBytes.byteLength,
+        });
+        return "uploaded";
+      } catch (error) {
+        await this.markPendingLargeFile(
+          path,
+          textBytes,
+          "text/markdown",
+          /conflict|409/i.test(String(error)) ? "conflict" : "upload-failed",
+        );
+        throw error;
+      }
+    }
     const encrypted = await this.ctx.encryptContent(content);
     const hash = await this.ctx.computeHash(content);
     const response = await this.ctx.apiRequest<RemoteFileWriteResponse>(
@@ -2099,16 +2267,10 @@ export class SyncRuntime {
   }
 
   /**
-   * BIN-A / D-07: byte sibling of uploadReconciledFile. Pushes PLAIN bytes as
-   * encryptContentBytes ciphertext with a computeHashBytes hash, the real MIME
-   * contentType, and the large-body timeout (L2) — reusing the vault-scoped
-   * JSON /files path (D-03; the dormant client.ts putFile/getFile stay dormant,
-   * PATTERNS §8 option (a)). Mirrors the string sibling's outcome discipline
-   * (SY2) with ONE addition and ONE ordering rule:
-   *   - a `skipped-too-large` outcome for files over the client ceiling, and
-   *   - the size gate runs FIRST — before the lease/permission/network work —
-   *     so an unsendable attachment never triggers a misleading "no lease"
-   *     Notice and never encrypts megabytes for nothing (L10/L12).
+   * Byte sibling of uploadReconciledFile. JSON-size content uses the encrypted
+   * vault-scoped `/files` path; larger content uses direct transfer. It mirrors
+   * the string sibling's outcome discipline with a `pending-large` outcome so
+   * failed direct transfers preserve the local file and retry metadata.
    * Private: only the catch-up and rename push sites call it, and its extended
    * outcome (UploadReconciledBinaryOutcome) never needs to thread through the
    * narrow ctx uploadReconciledFile declaration.
@@ -2118,14 +2280,6 @@ export class SyncRuntime {
     bytes: ArrayBuffer,
     options: { noWriteNotice?: string } = {}
   ): Promise<UploadReconciledBinaryOutcome> {
-    // Size gate FIRST (cheapest, and must precede the lease gate — L10/L12).
-    if (bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
-      this.notifyBinaryTooLarge(path);
-      // Fail-closed like skipped-no-lease: callers must NEVER delete or
-      // overwrite the local file on this outcome (SY2 extended).
-      return "skipped-too-large";
-    }
-
     if (!this.hasValidKeyLease()) {
       this.ctx.log(`Reconciliation: skipping "${path}" — no encryption key lease available.`);
       new Notice(
@@ -2145,6 +2299,42 @@ export class SyncRuntime {
       return "skipped-no-permission";
     }
 
+    if (bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+      const hash = await this.ctx.computeHashBytes(bytes);
+      try {
+        const result = await this.ctx.uploadLargeEncryptedFile(
+          path,
+          bytes,
+          contentTypeForPath(path),
+          this.ctx.getExpectedVersionId(path),
+        );
+        this.recordDirectWrite(path, hash, result);
+        await this.ctx.clearPendingLargeFile(path);
+        await this.ctx.emitAuditEvent("file.write", path, {
+          reconciliation: true,
+          directTransfer: true,
+          bytes: bytes.byteLength,
+        });
+        this.ctx.recordSyncDiagnostic("upload.binary-direct", {
+          path,
+          bytes: bytes.byteLength,
+        });
+        return "uploaded";
+      } catch (error) {
+        await this.markPendingLargeFile(
+          path,
+          bytes,
+          contentTypeForPath(path),
+          /conflict|409/i.test(String(error)) ? "conflict" : "upload-failed",
+        );
+        new Notice(
+          `VaultGuard Sync: Large encrypted upload for "${path}" is pending; the local file was preserved.`,
+          8000,
+        );
+        return "pending-large";
+      }
+    }
+
     const encrypted = await this.ctx.encryptContentBytes(bytes);
     const response = await this.ctx.apiRequest(
       "PUT",
@@ -2161,8 +2351,8 @@ export class SyncRuntime {
       throw new Error(response.error?.message ?? `Upload of "${path}" failed.`);
     }
     await this.ctx.emitAuditEvent("file.write", path, { reconciliation: true });
-    // BIN-A / D-11: complete the binary breadcrumb family (pull, oversize-skip,
-    // and size-gate-skip already record) with the push-SUCCESS event. Dev-only —
+    // Complete the binary breadcrumb family with the JSON-path push success
+    // event. Dev-only —
     // recordSyncDiagnostic is a NODE_ENV-gated ring buffer, DCE-stripped from
     // production builds. Path + byte count only (metadata, no content).
     this.ctx.recordSyncDiagnostic("upload.binary-push", {
@@ -2172,24 +2362,88 @@ export class SyncRuntime {
     return "uploaded";
   }
 
-  /**
-   * BIN-A (OD-1/OD-3): per-path-throttled Notice that a binary exceeds the
-   * ~7 MiB JSON-path ceiling and cannot sync until BIN-B. Fired on every push
-   * surface that trips the size gate (catch-up upload, both rename paths).
-   * Never deletes or LAK-encrypts the file — it stays local plaintext (CR-1).
-   */
-  private notifyBinaryTooLarge(path: string): void {
-    const now = Date.now();
-    const last = this.binaryTooLargeNoticeAt.get(path) ?? 0;
-    if (now - last < BINARY_TOO_LARGE_NOTICE_THROTTLE_MS) return;
-    this.binaryTooLargeNoticeAt.set(path, now);
-    this.ctx.log(
-      `Sync: "${path}" exceeds the ~7 MiB binary sync limit; skipping upload (large-file support arrives with BIN-B).`
-    );
-    new Notice(
-      `VaultGuard Sync: "${path}" is larger than 7 MiB and can't be synced yet. Large-file support arrives with BIN-B; the file stays in this folder but is not uploaded.`,
-      8000
-    );
+  private async retryPendingLargeFiles(userInitiated: boolean): Promise<number> {
+    const pending = Object.values(this.ctx.getSettings().pendingLargeFiles ?? {})
+      .filter((record) => record.state !== "blocked")
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+      .slice(0, 5);
+    let uploaded = 0;
+    for (const record of pending) {
+      const ageMs = Date.now() - Date.parse(record.updatedAt);
+      const backoffMs = Math.min(5 * 60_000, 1_000 * 2 ** Math.min(record.attempts, 8));
+      if (!userInitiated && Number.isFinite(ageMs) && ageMs < backoffMs) continue;
+      try {
+        const item = this.ctx.app.vault.getAbstractFileByPath(record.path);
+        if (!(item instanceof TFile)) {
+          await this.ctx.clearPendingLargeFile(record.path);
+          continue;
+        }
+        const local = await this.readForSync(record.path);
+        let bytes: ArrayBuffer;
+        let contentType: string;
+        if (local.kind === "binary") {
+          bytes = local.bytes;
+          contentType = contentTypeForPath(record.path);
+        } else {
+          const view = new TextEncoder().encode(local.text);
+          bytes = view.buffer.slice(
+            view.byteOffset,
+            view.byteOffset + view.byteLength,
+          ) as ArrayBuffer;
+          contentType = "text/markdown";
+        }
+        if (bytes.byteLength <= BINARY_SYNC_MAX_BYTES) {
+          await this.ctx.clearPendingLargeFile(record.path);
+          continue;
+        }
+        await this.ctx.upsertPendingLargeFile({
+          ...record,
+          size: bytes.byteLength,
+          sha256: await this.ctx.computeHashBytes(bytes),
+          contentType,
+          state: "uploading",
+          attempts: record.attempts + 1,
+          updatedAt: new Date().toISOString(),
+        });
+        const hash = await this.ctx.computeHashBytes(bytes);
+        const result = await this.ctx.uploadLargeEncryptedFile(
+          record.path,
+          bytes,
+          contentType,
+          this.ctx.getExpectedVersionId(record.path),
+        );
+        this.recordDirectWrite(record.path, hash, result);
+        if (record.previousPath) {
+          const delResp = await this.ctx.apiRequest(
+            "DELETE",
+            this.ctx.vaultPath(`/files/${encodeURIComponent(record.previousPath)}`),
+            this.buildDeleteBody(record.previousPath),
+          );
+          if (!delResp.success && delResp.error?.statusCode !== 404) {
+            this.queueOfflineOperation("delete", record.previousPath);
+          } else {
+            this.ctx.recordRemoteFileAbsent(record.previousPath);
+          }
+        }
+        await this.ctx.ensureAtRestEncryptedInPlace(record.path, true);
+        await this.ctx.clearPendingLargeFile(record.path);
+        uploaded += 1;
+      } catch (error) {
+        await this.ctx.upsertPendingLargeFile({
+          ...record,
+          reason: /conflict|409/i.test(String(error)) ? "conflict" : "upload-failed",
+          state: /conflict|409/i.test(String(error)) ? "blocked" : "retryable",
+          attempts: record.attempts + 1,
+          updatedAt: new Date().toISOString(),
+        });
+        this.ctx.logError(
+          `Sync: pending large-file retry failed for "${record.path}"`,
+          error,
+        );
+      }
+      await yieldToEventLoop();
+    }
+    return uploaded;
   }
 
   async removeUnsyncedLocalFile(path: string): Promise<boolean> {
@@ -2277,10 +2531,9 @@ export class SyncRuntime {
 
         const result = await this.readForSync(file.path);
         if (result.kind === "binary") {
-          // BIN-A / D-07: binaries now ride the byte upload path instead of the
-          // AR1 skip. In-size files upload and count as uploads (D-11
-          // truthfulness); oversize files fail closed (L10). Legacy adapters
-          // never reach here — readForSync returns text for them (D-10).
+          // Binaries ride the byte path. JSON-size files use the original API;
+          // larger files use direct transfer and remain pending on failure.
+          // Legacy adapters never reach here; readForSync returns text for them.
           const outcome = await this.uploadReconciledBinaryFile(normalized, result.bytes, {
             noWriteNotice:
               `VaultGuard Sync: Removed local-only "${normalized}" because this server vault ` +
@@ -2288,17 +2541,17 @@ export class SyncRuntime {
           });
           if (outcome === "uploaded") {
             uploaded += 1;
-            // CR-1/D-01: the post-upload at-rest hygiene call fires ONLY after
-            // "uploaded", exactly as for text. It is a harmless no-op for
-            // binaries until the wave-6 ingestion flip (server-copy-first —
-            // never LAK-encrypt a binary that has no server copy).
-            void this.ctx.ensureAtRestEncryptedInPlace(normalized);
-          } else if (outcome === "skipped-too-large") {
-            // The size-gate Notice already fired inside the byte sibling — do
-            // NOT double-Notice, and NEVER LAK-encrypt an unsendable file
-            // (CR-1/L10: no post-upload hygiene call here).
+            // Post-upload at-rest hygiene runs only after remote durability.
+            if (result.bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
+              void this.ctx.ensureAtRestEncryptedInPlace(normalized, true);
+            } else {
+              void this.ctx.ensureAtRestEncryptedInPlace(normalized);
+            }
+          } else if (outcome === "pending-large") {
+            // The direct-transfer Notice already fired inside the byte sibling.
+            // Do not double-notify or LAK-encrypt before remote durability.
             skipped += 1;
-            this.ctx.recordSyncDiagnostic("catchup.binary-skip-too-large", {
+            this.ctx.recordSyncDiagnostic("catchup.binary-pending-large", {
               path: normalized,
             });
           } else if (outcome === "skipped-no-lease") {
@@ -2311,7 +2564,7 @@ export class SyncRuntime {
             break;
           } else {
             // skipped-no-permission: IDENTICAL removal rule to the text path —
-            // remove ONLY on a warmed store, never on skipped-too-large /
+            // remove ONLY on a warmed store, never on pending-large /
             // skipped-no-lease (SY2 extended).
             skipped += 1;
             const storeState = this.ctx.getPermissionStoreState();
@@ -2340,7 +2593,11 @@ export class SyncRuntime {
           // so its on-disk form is still plaintext. Now that the server has
           // the content, flip the local copy to at-rest ciphertext.
           // Fire-and-forget: hygiene must never fail the catch-up loop.
-          void this.ctx.ensureAtRestEncryptedInPlace(normalized);
+          if (new TextEncoder().encode(content).byteLength > BINARY_SYNC_MAX_BYTES) {
+            void this.ctx.ensureAtRestEncryptedInPlace(normalized, true);
+          } else {
+            void this.ctx.ensureAtRestEncryptedInPlace(normalized);
+          }
         } else if (outcome === "skipped-no-lease") {
           // SY2: the key lease expired/disappeared mid-loop. This is transient
           // and applies to EVERY remaining file — continuing would return

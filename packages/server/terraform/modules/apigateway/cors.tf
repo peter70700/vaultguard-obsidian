@@ -37,9 +37,8 @@ locals {
     files                      = aws_api_gateway_resource.files.id
     files_sync                 = aws_api_gateway_resource.files_sync.id
     files_path                 = aws_api_gateway_resource.files_path.id
-    # Note: /files/{filePath+}/restore-delete is served via the files_path resource
-    # itself (suffix dispatch in the Lambda), so its OPTIONS preflight is covered by
-    # the files_path CORS entry above. Greedy {filePath+} can't have child resources.
+    # Restore and direct-transfer action suffixes are served via files_path itself,
+    # so this OPTIONS entry covers them. Greedy {filePath+} cannot have children.
     files_deleted            = aws_api_gateway_resource.files_deleted.id
     files_decrypted          = aws_api_gateway_resource.files_decrypted.id
     files_decrypted_path     = aws_api_gateway_resource.files_decrypted_path.id

@@ -18,6 +18,7 @@ import {
 } from "../api/client";
 import { PermissionLevel } from "../types";
 import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
+import { createI18n } from "../i18n";
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
@@ -60,6 +61,13 @@ export interface VaultGuardSidebarViewConfig {
   onNavigateToFile?: (path: string) => void;
   onOpenMenu?: (evt?: MouseEvent) => void;
   onOpenSettings?: () => void;
+  onOpenRecoveryCenter?: () => void;
+  getPendingLargeFileSummary?: () => {
+    count: number;
+    retryable: number;
+    blocked: number;
+  };
+  onRetryPendingLargeFiles?: () => void;
 }
 
 export interface VaultGuardSidebarAuthState {
@@ -101,6 +109,7 @@ export interface VaultGuardSidebarViewOptions {
 // ─── View Class ────────────────────────────────────────────────────────────
 
 export class VaultGuardSidebarView extends ItemView {
+  private readonly i18n = createI18n();
   private config: VaultGuardSidebarViewConfig | null = null;
   private options: VaultGuardSidebarViewOptions;
   private ruleCache: Map<string, ViewCacheEntry> = new Map();
@@ -158,7 +167,7 @@ export class VaultGuardSidebarView extends ItemView {
   }
 
   getDisplayText(): string {
-    return "VaultGuard Files";
+    return this.i18n.t("sidebar.title");
   }
 
   getIcon(): string {
@@ -169,6 +178,7 @@ export class VaultGuardSidebarView extends ItemView {
     const container = this.containerEl.children[1] as HTMLElement;
     container.empty();
     container.addClass("vaultguard-sidebar");
+    this.i18n.applyToRoot(container);
 
     this.contentEl_ = container;
 
@@ -186,6 +196,7 @@ export class VaultGuardSidebarView extends ItemView {
 
     this.renderShell(container);
     this.refreshAtRestBanner();
+    this.refreshPendingLargeFileBanner();
     await this.loadEntries();
   }
 
@@ -345,7 +356,18 @@ export class VaultGuardSidebarView extends ItemView {
     const titleRow = header.createDiv({ cls: "vaultguard-sb-title-row" });
     const titleIcon = titleRow.createSpan({ cls: "vaultguard-sb-title-icon" });
     setIcon(titleIcon, "vaultguard-shield");
-    titleRow.createSpan({ cls: "vaultguard-sb-title-text", text: "VaultGuard Files" });
+    titleRow.createSpan({ cls: "vaultguard-sb-title-text", text: this.i18n.t("sidebar.title") });
+
+    const recoveryBtn = titleRow.createEl("button", {
+      cls: "vaultguard-sb-recovery-btn clickable-icon",
+      attr: {
+        "aria-label": this.i18n.t("sidebar.recovery"),
+        title: this.i18n.t("sidebar.recovery"),
+        type: "button",
+      },
+    });
+    setIcon(recoveryBtn, "history");
+    recoveryBtn.addEventListener("click", () => this.config?.onOpenRecoveryCenter?.());
 
     const emptyState = container.createDiv({
       cls: isLoggedOut
@@ -368,13 +390,13 @@ export class VaultGuardSidebarView extends ItemView {
       if (this.options.onLogin) {
         const loginBtn = emptyState.createEl("button", {
           cls: "vaultguard-sb-empty-action vaultguard-sb-empty-action-primary",
-          text: authState.actionLabel ?? "Log in",
+          text: authState.actionLabel ?? this.i18n.t("sidebar.login"),
         });
         loginBtn.addEventListener("click", () => this.options.onLogin?.());
       } else if (this.options.onOpenSettings) {
         const settingsBtn = emptyState.createEl("button", {
           cls: "vaultguard-sb-empty-action vaultguard-sb-empty-action-primary",
-          text: "Open settings",
+          text: this.i18n.t("sidebar.openSettings"),
         });
         settingsBtn.addEventListener("click", () => this.options.onOpenSettings?.());
       }
@@ -382,10 +404,10 @@ export class VaultGuardSidebarView extends ItemView {
     }
 
     emptyState.createEl("p", {
-      text: "Log in to VaultGuard to see file permissions and sharing status.",
+      text: this.i18n.t("sidebar.loginPrompt"),
     });
     emptyState.createEl("p", {
-      text: "Use the shield icon in the ribbon or run \"VaultGuard: Login\" from the command palette.",
+      text: this.i18n.t("sidebar.loginHint"),
       cls: "vaultguard-sb-empty-hint",
     });
   }
@@ -491,13 +513,14 @@ export class VaultGuardSidebarView extends ItemView {
 
     const titleIcon = titleRow.createSpan({ cls: "vaultguard-sb-title-icon" });
     setIcon(titleIcon, "vaultguard-shield");
-    titleRow.createSpan({ cls: "vaultguard-sb-title-text", text: "VaultGuard Files" });
+    titleRow.createSpan({ cls: "vaultguard-sb-title-text", text: this.i18n.t("sidebar.title") });
 
     const menuBtn = titleRow.createEl("button", {
       cls: "vaultguard-sb-menu-btn clickable-icon",
       attr: {
-        "aria-label": "VaultGuard menu",
-        title: "VaultGuard menu",
+        "aria-label": this.i18n.t("sidebar.menu"),
+        title: this.i18n.t("sidebar.menu"),
+        type: "button",
       },
     });
     setIcon(menuBtn, "more-horizontal");
@@ -513,7 +536,11 @@ export class VaultGuardSidebarView extends ItemView {
 
     const refreshBtn = titleRow.createEl("button", {
       cls: "vaultguard-sb-refresh-btn clickable-icon",
-      attr: { "aria-label": "Refresh" },
+      attr: {
+        "aria-label": this.i18n.t("sidebar.refresh"),
+        title: this.i18n.t("sidebar.refresh"),
+        type: "button",
+      },
     });
     setIcon(refreshBtn, "refresh-cw");
     refreshBtn.addEventListener("click", () => this.reload());
@@ -526,13 +553,22 @@ export class VaultGuardSidebarView extends ItemView {
 
     const searchInput = searchWrap.createEl("input", {
       cls: "vaultguard-sb-search",
-      attr: { placeholder: "Filter files...", type: "text", spellcheck: "false" },
+      attr: {
+        placeholder: this.i18n.t("sidebar.filter"),
+        "aria-label": this.i18n.t("sidebar.filter"),
+        type: "text",
+        spellcheck: "false",
+      },
     });
     this.searchInputEl = searchInput;
 
     const searchClear = searchWrap.createEl("button", {
       cls: "vaultguard-sb-search-clear",
-      attr: { "aria-label": "Clear search", type: "button", title: "Clear search" },
+      attr: {
+        "aria-label": this.i18n.t("sidebar.clearSearch"),
+        type: "button",
+        title: this.i18n.t("sidebar.clearSearch"),
+      },
     });
     setIcon(searchClear, "x");
     searchClear.hide();
@@ -646,8 +682,40 @@ export class VaultGuardSidebarView extends ItemView {
     // Active filter chips row (populated dynamically in renderEntries)
     header.createDiv({ cls: "vaultguard-sb-chips" });
 
+    container.createDiv({ cls: "vaultguard-sb-large-pending" });
+    this.refreshPendingLargeFileBanner();
+
     // Entry list container
     container.createDiv({ cls: "vaultguard-sb-list" });
+  }
+
+  private refreshPendingLargeFileBanner(): void {
+    const host = this.contentEl_?.querySelector<HTMLElement>(
+      ".vaultguard-sb-large-pending",
+    );
+    if (!host) return;
+    host.empty();
+    const summary = this.config?.getPendingLargeFileSummary?.();
+    if (!summary || summary.count === 0) {
+      host.hide();
+      return;
+    }
+    host.show();
+    const icon = host.createSpan({ cls: "vaultguard-sb-large-pending-icon" });
+    setIcon(icon, summary.blocked > 0 ? "alert-triangle" : "cloud-upload");
+    const detail = host.createDiv({ cls: "vaultguard-sb-large-pending-detail" });
+    detail.createEl("strong", {
+      text: `${summary.count} large file${summary.count === 1 ? "" : "s"} pending`,
+    });
+    detail.createEl("span", {
+      text: summary.blocked > 0
+        ? `${summary.blocked} need conflict review; local copies are preserved.`
+        : "Waiting for a safe encrypted upload; local copies are preserved.",
+    });
+    if (summary.retryable > 0) {
+      const retry = host.createEl("button", { text: "Retry now" });
+      retry.addEventListener("click", () => this.config?.onRetryPendingLargeFiles?.());
+    }
   }
 
   private clearSearch(): void {
@@ -1174,9 +1242,12 @@ export class VaultGuardSidebarView extends ItemView {
 
     if (this.isLoading) {
       const loadingEl = listEl.createDiv({ cls: "vaultguard-sb-loading" });
+      loadingEl.setAttribute("role", "status");
+      loadingEl.setAttribute("aria-live", "polite");
+      loadingEl.setAttribute("aria-atomic", "true");
       const spinner = loadingEl.createSpan({ cls: "vaultguard-sb-spinner" });
       setIcon(spinner, "loader");
-      loadingEl.createSpan({ text: "Loading permissions..." });
+      loadingEl.createSpan({ text: this.i18n.t("sidebar.loadingPermissions") });
       return;
     }
 

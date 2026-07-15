@@ -223,28 +223,25 @@ A file that does not start with the `VG1\0` magic is treated as legacy
 plaintext and decoded directly. This enables:
 
 - **Lazy migration**: legacy vaults still read; first write encrypts.
-- **External adds are auto-encrypted (text and in-size binaries — BIN-A)**:
+- **External adds are auto-encrypted after remote durability is established**:
   when a plaintext file lands in the vault folder from outside Obsidian
   (Finder drop, git checkout), the plugin re-encrypts the identical bytes in
   place — via `vault.on("create")` (with a stat-stability guard against
   mid-copy clobbering) while Obsidian is running, or via the local-only
   catch-up hook after the file's first upload when it was added while
-  Obsidian was closed. This now covers **binaries up to `BINARY_SYNC_MAX_BYTES`
-  (~7 MiB — the JSON-path transport ceiling: API Gateway's 10 MB body cap
-  minus base64 inflation)**, because BIN-A gives in-size binaries a server
-  copy path (byte push + reconciliation), so the LAK envelope is no longer
-  their only copy. **Oversize binaries (> `BINARY_SYNC_MAX_BYTES`) are
-  deliberately left plaintext on disk until the BIN-B presigned-URL path
-  ships**: at-rest-encrypting content that has no server copy would make the
-  LAK envelope a single point of failure — envelope/keychain loss = permanent
-  loss (the CR-1 data-loss class). First save through Obsidian still encrypts
-  anything the hooks missed (legacy lazy migration).
-- **Drag-dropped binaries are ingested end-to-end (BIN-A)**: a binary pasted
-  or dropped into a protected vault flows through `interceptedWriteBinary` —
-  permission check → E2E-encrypted upload (or an offline queue entry encoded
-  base64) → VG1 at-rest write to disk — the same shape as `interceptedWrite`
-  for text. Oversize drops are rejected fail-closed with a Notice naming the
-  ~7 MiB limit (OD-1); nothing lands on disk or in the offline queue.
+  Obsidian was closed. Files up to `BINARY_SYNC_MAX_BYTES` use the bounded JSON
+  path. Larger text and binary files use the vault-scoped direct-transfer path
+  up to the deployment's configured maximum. The plugin writes the local VG1
+  form only after the encrypted remote object is durable. If a large upload is
+  unavailable or fails, the exact local plaintext is preserved and a
+  metadata-only pending record is shown for retry; the file is not copied into
+  the offline queue or made dependent on the local access key alone.
+- **Drag-dropped binaries are ingested end-to-end**: a binary pasted or
+  dropped into a protected vault flows through `interceptedWriteBinary` —
+  permission check → encrypted JSON or direct upload → VG1 at-rest write after
+  remote durability. Offline or failed large uploads remain local plaintext
+  with visible pending state. The configured server file-size limit remains
+  authoritative.
 - **Forward compatibility**: the version byte gives one bump for
   changing scheme without breaking existing vaults.
 
@@ -262,6 +259,31 @@ The plugin never at-rest-encrypts:
 
 The check is `isAtRestExcluded()` in `main.ts`, a superset of the
 sync-level `isPathExcluded()`.
+
+### Protected plugin-cache envelopes
+
+The normal vault-file interception above does not automatically make every
+file under `.obsidian/plugins/` safe to persist. Protected plugin caches must
+use the saved raw adapter boundary plus `AtRestCipher.encryptBinary()` /
+`decryptBinary()` so they are authenticated once and do not pass through a
+double-encryption loop.
+
+P2 uses this pattern for the semantic index at
+`.obsidian/plugins/{manifestId}/semantic/index.v1.envelope`. Only validated
+vectors, bounded headings/offsets, and source fingerprints are serialized;
+note bodies and snippets are not persisted. The binary envelope is bound to
+the current user, local vault, server vault, provider origin, model, chunker,
+schema, and vector dimension. `SemanticIndexStore` writes encrypted temporary
+bytes, reads/decrypts/validates them through the saved raw adapter, atomically
+replaces the prior generation with rollback protection, and deletes final,
+temporary, and backup files on purge. Encoded and decrypted intermediate index
+buffers are zeroed in `finally` paths, including encryption and validation
+failures. See
+[Secure Discovery](SECURE-DISCOVERY.md) and the
+[semantic-index contract](../specs/006-p2-secure-expansion/contracts/semantic-index.md).
+
+This envelope does not encrypt or replace Obsidian's own metadata or search
+indexes.
 
 ---
 
@@ -572,7 +594,8 @@ people. They are complementary, not redundant.
 ## Code map
 
 - `src/crypto/at-rest-cipher.ts` — owns the LAK, file format, recovery
-  code export/import, safeStorage probe, fallback logic.
+  code export/import, safeStorage probe, fallback logic, and authenticated
+  binary helpers for approved protected-cache callers.
 - `src/plugin/at-rest-adapter-runtime.ts` — `interceptVaultAdapter()`
   (wires the read/write/readBinary/writeBinary/rename/**getResourcePath**
   hooks), the `interceptedRead/Write/…` methods, `readPlainFromDisk()` /
@@ -594,7 +617,9 @@ people. They are complementary, not redundant.
 ## What this implementation deliberately does NOT do
 
 - **Filename encryption**: see [§ Threat model](#what-at-rest-encryption-does-not-protect-against).
-- **Search-index encryption**: ditto.
+- **Obsidian search/metadata-index encryption**: the Secure Discovery semantic
+  envelope is a separate VaultGuard-owned cache and is not an encryption layer
+  for Obsidian's indexes.
 - **Memory hygiene**: decrypted content is held in JS strings while
   Obsidian renders it. We don't try to scrub heap memory.
 - **Tamper detection beyond GCM**: AES-GCM authenticates each file,

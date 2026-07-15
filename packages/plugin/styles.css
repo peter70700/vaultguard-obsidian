@@ -185,7 +185,9 @@
   max-width: calc(100vw - 32px);
   max-height: calc(100vh - 48px);
   border: 1px solid var(--background-modifier-border);
-  background: var(--background-primary);
+  background:
+    linear-gradient(180deg, rgba(20, 184, 166, 0.1), transparent 160px),
+    var(--background-primary);
 }
 
 .modal.vaultguard-long-operation-modal .modal-content {
@@ -199,9 +201,7 @@
   gap: 16px;
   padding: 22px 24px 20px;
   color: var(--text-normal);
-  background:
-    linear-gradient(180deg, rgba(20, 184, 166, 0.1), transparent 160px),
-    var(--background-primary);
+  background: transparent;
 }
 
 .vaultguard-long-op-header {
@@ -384,14 +384,14 @@
 /* ─── Ribbon Auth Indicator ──────────────────────────────────────────────── */
 
 .vaultguard-ribbon-auth-logged-in {
-  color: var(--vaultguard-ribbon-online, #8b5cf6);
+  color: var(--vaultguard-ribbon-online, var(--interactive-accent));
   opacity: 1;
 }
 
 body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-files-view"] .workspace-tab-header-inner-icon,
 body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-chat-view"] .workspace-tab-header-inner-icon,
 body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permissions-graph"] .workspace-tab-header-inner-icon {
-  color: var(--vaultguard-ribbon-online, #8b5cf6);
+  color: var(--vaultguard-ribbon-online, var(--interactive-accent));
 }
 
 body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-files-view"] .workspace-tab-header-inner-icon svg,
@@ -442,13 +442,17 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   gap: 6px;
   padding: 8px 14px;
   cursor: pointer;
+  border: 0;
   border-bottom: 2px solid transparent;
+  background: transparent;
+  box-shadow: none;
   color: var(--text-muted);
   font-size: 0.88em;
   font-weight: 500;
   transition: color 0.15s, border-color 0.15s, background-color 0.15s;
   border-radius: 4px 4px 0 0;
   user-select: none;
+  font-family: inherit;
 }
 
 .vaultguard-tab:hover {
@@ -477,7 +481,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   overflow-x: hidden;
   flex: 1;
   min-height: 0;
-  padding-right: 4px;
+  padding-inline-end: 4px;
 }
 
 /* Scrollbar styling for tab content */
@@ -536,7 +540,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   padding: 10px 12px;
   border-radius: 6px;
   background-color: var(--background-secondary);
-  border-left: 3px solid var(--interactive-accent);
+  border-inline-start: 3px solid var(--interactive-accent);
   color: var(--text-muted);
   font-size: 0.86em;
   line-height: 1.5;
@@ -552,7 +556,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   color: var(--text-normal);
   background-color: rgba(255, 50, 50, 0.1);
   border-radius: 6px;
-  border-left: 3px solid var(--color-red, #e03e3e);
+  border-inline-start: 3px solid var(--color-red, #e03e3e);
   font-size: 0.9em;
   line-height: 1.4;
 }
@@ -657,7 +661,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 .vaultguard-user-meta {
   font-size: 0.78em;
   color: var(--text-muted);
-  text-align: right;
+  text-align: end;
   flex-shrink: 0;
   line-height: 1.5;
 }
@@ -4424,7 +4428,7 @@ body.is-phone .vaultguard-fh-popover-inner {
   display: flex;
   align-items: center;
   color: var(--text-faint);
-  padding-left: 8px;
+  padding-inline-start: 8px;
   flex-shrink: 0;
   pointer-events: none;
 }
@@ -4462,7 +4466,7 @@ body.is-phone .vaultguard-fh-popover-inner {
   justify-content: center;
   width: 22px;
   height: 22px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   padding: 0;
   background: transparent;
   border: none;
@@ -4590,7 +4594,7 @@ body.is-phone .vaultguard-fh-popover-inner {
 
 .vaultguard-sb-chip-clear-all {
   align-self: center;
-  margin-left: auto;
+  margin-inline-start: auto;
   padding: 2px 8px;
   background: transparent;
   border: none;
@@ -4700,7 +4704,7 @@ body.is-phone .vaultguard-fh-popover-inner {
 .vaultguard-btn-spinner {
   display: inline-flex;
   align-items: center;
-  margin-right: 6px;
+  margin-inline-end: 6px;
   vertical-align: middle;
 }
 
@@ -4710,7 +4714,7 @@ body.is-phone .vaultguard-fh-popover-inner {
 }
 
 button .vaultguard-btn-spinner:only-child {
-  margin-right: 0;
+  margin-inline-end: 0;
 }
 
 @keyframes vaultguard-spin {
@@ -4899,7 +4903,7 @@ button .vaultguard-btn-spinner:only-child {
   font-size: 8px;
   font-weight: 700;
   color: var(--text-on-accent);
-  margin-left: -5px;
+  margin-inline-start: -5px;
   border: 2px solid var(--background-primary);
   flex-shrink: 0;
   line-height: 1;
@@ -4907,7 +4911,7 @@ button .vaultguard-btn-spinner:only-child {
 }
 
 .vaultguard-sb-avatar:last-child {
-  margin-left: 0;
+  margin-inline-start: 0;
 }
 
 .vaultguard-sb-avatar svg {
@@ -4934,7 +4938,7 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-sb-avatar-overflow {
   font-size: 9px;
   color: var(--text-muted);
-  margin-left: 3px;
+  margin-inline-start: 3px;
   white-space: nowrap;
 }
 
@@ -6823,6 +6827,8 @@ button .vaultguard-btn-spinner:only-child {
   height: 100%;
   min-height: 0;
   padding: 0;
+  container-name: vaultguard-pg;
+  container-type: inline-size;
 }
 
 .vaultguard-pg-header {
@@ -6871,6 +6877,127 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-pg-options-summary:hover {
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
+}
+
+/* --- Optional Graph Studio ----------------------------------------------- */
+.vaultguard-pg-studio[open] {
+  flex: 1 0 100%;
+  min-width: 0;
+}
+
+.vaultguard-pg-options-summary .vaultguard-pg-studio-intro {
+  padding: 1px 5px;
+  border-radius: 999px;
+  background-color: var(--background-modifier-hover);
+  color: var(--text-faint);
+  font-size: var(--font-ui-smallest);
+  font-weight: var(--font-medium);
+}
+
+.vaultguard-pg-studio-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  max-height: min(64vh, 640px);
+  margin-top: 8px;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-primary);
+}
+
+.vaultguard-pg-studio-body > .vaultguard-pg-studio-intro,
+.vaultguard-pg-studio-presets,
+.vaultguard-pg-studio-resets,
+.vaultguard-pg-studio-status {
+  grid-column: 1 / -1;
+}
+
+.vaultguard-pg-studio-body > .vaultguard-pg-studio-intro {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+}
+
+.vaultguard-pg-studio-group {
+  min-width: 0;
+  margin: 0;
+  padding: 9px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+}
+
+.vaultguard-pg-studio-group > legend {
+  padding: 0 5px;
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+}
+
+.vaultguard-pg-studio-presets,
+.vaultguard-pg-studio-resets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.vaultguard-pg-studio-preset {
+  min-width: 88px;
+  border-color: var(--background-modifier-border);
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+}
+
+.vaultguard-pg-studio-preset:hover,
+.vaultguard-pg-studio-preset.is-active,
+.vaultguard-pg-studio-preset[aria-pressed="true"] {
+  border-color: var(--interactive-accent);
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.vaultguard-pg-studio-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.vaultguard-pg-studio-range > span:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vaultguard-pg-studio-range-value {
+  color: var(--text-normal);
+  font-variant-numeric: tabular-nums;
+}
+
+.vaultguard-pg-studio-palette {
+  grid-column: 1 / -1;
+}
+
+.vaultguard-pg-studio-palette input:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.vaultguard-pg-studio-status {
+  min-height: 1.4em;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smallest);
+}
+
+.vaultguard-pg-studio button:focus-visible,
+.vaultguard-pg-studio input:focus-visible,
+.vaultguard-pg-studio select:focus-visible,
+.vaultguard-pg-options-summary:focus-visible,
+.vaultguard-pg-legend-chip:focus-visible,
+.vaultguard-pg-explain-row:focus-visible,
+.vaultguard-pg-explain-back:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 
 .vaultguard-pg-options-grid {
@@ -6986,6 +7113,30 @@ button .vaultguard-btn-spinner:only-child {
   background-color: var(--color-purple, #a371e0); /* admin */
   height: 4px;
   border-radius: 2px;
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-legend-swatch.is-user {
+  background-color: var(--vaultguard-pg-studio-user);
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-legend-swatch.is-file {
+  background-color: var(--vaultguard-pg-studio-file);
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-legend-swatch.is-folder {
+  background-color: var(--vaultguard-pg-studio-folder);
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-legend-swatch.is-read {
+  background-color: var(--vaultguard-pg-studio-read);
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-legend-swatch.is-write {
+  background-color: var(--vaultguard-pg-studio-write);
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-legend-swatch.is-admin {
+  background-color: var(--vaultguard-pg-studio-admin);
 }
 
 .vaultguard-pg-large-notice {
@@ -7108,10 +7259,44 @@ button .vaultguard-btn-spinner:only-child {
 }
 
 .vaultguard-pg-canvas {
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
   min-height: 240px;
   background-color: var(--background-primary);
+  isolation: isolate;
+}
+
+.vaultguard-pg-canvas.is-studio-bg-solid {
+  background-color: var(--vaultguard-pg-bg-primary);
+}
+
+.vaultguard-pg-canvas.is-studio-bg-gradient {
+  background-color: var(--vaultguard-pg-bg-primary);
+  background-image: linear-gradient(135deg, var(--vaultguard-pg-bg-primary), var(--vaultguard-pg-bg-secondary));
+}
+
+.vaultguard-pg-canvas::before {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  content: "";
+  pointer-events: none;
+  opacity: 0;
+}
+
+.vaultguard-pg-canvas.is-studio-pattern-grid::before {
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--text-muted) 16%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--text-muted) 16%, transparent) 1px, transparent 1px);
+  background-size: 28px 28px;
+  opacity: 0.55;
+}
+
+.vaultguard-pg-canvas.is-studio-pattern-dots::before {
+  background-image: radial-gradient(circle, color-mix(in srgb, var(--text-muted) 28%, transparent) 1px, transparent 1.5px);
+  background-size: 24px 24px;
+  opacity: 0.6;
 }
 
 .vaultguard-pg-explain {
@@ -7187,6 +7372,18 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-pg-explain-badge.is-level-none {
   background-color: var(--background-modifier-border);
   color: var(--text-muted);
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-explain-badge.is-level-read {
+  background-color: var(--vaultguard-pg-studio-read);
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-explain-badge.is-level-write {
+  background-color: var(--vaultguard-pg-studio-write);
+}
+
+.vaultguard-permissions-graph.has-studio-custom-palette .vaultguard-pg-explain-badge.is-level-admin {
+  background-color: var(--vaultguard-pg-studio-admin);
 }
 
 /* Subtitle (full path under a title) + section header. */
@@ -7605,6 +7802,44 @@ button .vaultguard-btn-spinner:only-child {
   cursor: not-allowed;
 }
 
+@container vaultguard-pg (max-width: 720px) {
+  .vaultguard-pg-options-grid {
+    grid-template-columns: repeat(2, minmax(110px, 1fr));
+  }
+
+  .vaultguard-pg-studio-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .vaultguard-pg-body {
+    flex-direction: column;
+  }
+
+  .vaultguard-pg-explain {
+    width: auto;
+    flex-basis: 190px;
+    border-left: none;
+    border-top: 1px solid var(--background-modifier-border);
+  }
+}
+
+@container vaultguard-pg (max-width: 480px) {
+  .vaultguard-pg-options-grid,
+  .vaultguard-pg-studio-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .vaultguard-pg-studio-body {
+    max-height: 58vh;
+    padding: 8px;
+  }
+
+  .vaultguard-pg-studio-presets,
+  .vaultguard-pg-studio-resets {
+    align-items: stretch;
+  }
+}
+
 @media (max-width: 720px) {
   .vaultguard-pg-options-grid {
     grid-template-columns: repeat(2, minmax(110px, 1fr));
@@ -7624,14 +7859,612 @@ button .vaultguard-btn-spinner:only-child {
 
 /* Dev-only synthetic permissions-graph QA modal (dev-gated import). */
 .vaultguard-permissions-graph-qa-canvas {
+  position: relative;
   height: 420px;
   min-height: 280px;
   margin-top: 12px;
   border: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
+  overflow: hidden;
+}
+.vaultguard-permissions-graph-qa-canvas:focus-visible {
+  outline: 3px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+.vaultguard-permissions-graph-qa-overview,
+.vaultguard-permissions-graph-qa-detail {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.vaultguard-permissions-graph-qa-overview {
+  z-index: 0;
+  pointer-events: none;
+}
+.vaultguard-permissions-graph-qa-detail {
+  z-index: 1;
+  background: transparent;
 }
 .vaultguard-permissions-graph-qa-evidence {
   max-height: 260px;
   overflow: auto;
   white-space: pre-wrap;
+}
+.vaultguard-permissions-graph-qa-selected-summary {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+}
+.vaultguard-permissions-graph-qa-edge-status {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-small);
+}
+@media (forced-colors: active) {
+  .vaultguard-permissions-graph-qa-canvas,
+  .vaultguard-permissions-graph-qa-selected-summary {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  .vaultguard-permissions-graph-qa-canvas:focus-visible {
+    outline-color: Highlight;
+  }
+
+  .vaultguard-permissions-graph-qa-edge-status {
+    color: CanvasText;
+  }
+}
+/* P0 Recovery Center and large-file retry status */
+.vaultguard-recovery-center-modal {
+  width: min(760px, calc(100vw - 32px));
+  max-width: 760px;
+}
+
+.vaultguard-recovery-center {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: min(560px, 75vh);
+}
+
+.vaultguard-recovery-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.vaultguard-recovery-header h2,
+.vaultguard-recovery-header p {
+  margin: 0;
+}
+
+.vaultguard-recovery-header p,
+.vaultguard-recovery-row-detail span,
+.vaultguard-recovery-confirm-note {
+  color: var(--text-muted);
+}
+
+.vaultguard-recovery-title-icon {
+  display: inline-flex;
+  color: var(--interactive-accent);
+  margin-top: 4px;
+}
+
+.vaultguard-recovery-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.vaultguard-recovery-tabs button {
+  min-height: 38px;
+}
+
+.vaultguard-recovery-tabs button.is-active {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+}
+
+.vaultguard-recovery-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.vaultguard-recovery-path-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.vaultguard-recovery-path-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.vaultguard-recovery-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vaultguard-recovery-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+
+.vaultguard-recovery-row-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.vaultguard-recovery-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.vaultguard-recovery-loading,
+.vaultguard-recovery-empty,
+.vaultguard-recovery-warning,
+.vaultguard-recovery-error {
+  padding: 12px;
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+
+.vaultguard-recovery-warning,
+.vaultguard-recovery-error {
+  border-left: 3px solid var(--color-orange);
+}
+
+.vaultguard-recovery-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.vaultguard-sb-large-pending {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin: 8px;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+
+.vaultguard-sb-large-pending-icon {
+  display: inline-flex;
+  color: var(--color-orange);
+}
+
+.vaultguard-sb-large-pending-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.vaultguard-sb-large-pending-detail span {
+  color: var(--text-muted);
+  font-size: var(--font-smallest);
+}
+
+@media (max-width: 500px) {
+  .vaultguard-recovery-center-modal {
+    width: calc(100vw - 16px);
+  }
+
+  .vaultguard-recovery-tabs,
+  .vaultguard-recovery-path-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .vaultguard-recovery-row,
+  .vaultguard-sb-large-pending {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+    flex-direction: column;
+  }
+
+  .vaultguard-recovery-row button,
+  .vaultguard-recovery-load-more,
+  .vaultguard-sb-large-pending button {
+    width: 100%;
+    min-height: 44px;
+  }
+}
+
+/* ─── P2 Secure Discovery: lexical and local-semantic search ───────── */
+
+.vaultguard-secure-search {
+  min-inline-size: 0;
+  padding: var(--size-4-4);
+  overflow: auto;
+}
+
+.vaultguard-secure-search__header,
+.vaultguard-secure-search__form,
+.vaultguard-secure-search__semantic,
+.vaultguard-secure-search__results {
+  max-inline-size: 760px;
+  margin-inline: auto;
+}
+
+.vaultguard-secure-search__header h2 {
+  margin-block: 0 var(--size-2-2);
+}
+
+.vaultguard-secure-search__intro,
+.vaultguard-secure-search__consent,
+.vaultguard-secure-search__semantic-trust,
+.vaultguard-secure-search__semantics,
+.vaultguard-secure-search__vault {
+  color: var(--text-muted);
+}
+
+.vaultguard-secure-search__form {
+  display: grid;
+  gap: var(--size-4-2);
+  margin-block: var(--size-4-4);
+  padding: var(--size-4-4);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+
+.vaultguard-secure-search__query,
+.vaultguard-secure-search__field select {
+  inline-size: 100%;
+}
+
+.vaultguard-secure-search__options {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.6fr) minmax(240px, 1fr);
+  gap: var(--size-4-3);
+  align-items: end;
+}
+
+.vaultguard-secure-search__field,
+.vaultguard-secure-search__check {
+  display: grid;
+  gap: var(--size-2-1);
+}
+
+.vaultguard-secure-search__check {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+
+.vaultguard-secure-search__consent {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: var(--font-small);
+}
+
+.vaultguard-secure-search__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+}
+
+.vaultguard-secure-search__semantic {
+  display: grid;
+  gap: var(--size-4-3);
+  margin-block: 0 var(--size-4-4);
+  padding: var(--size-4-4);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-primary-alt);
+}
+
+.vaultguard-secure-search__semantic h3,
+.vaultguard-secure-search__semantic-trust {
+  margin: 0;
+}
+
+.vaultguard-secure-search__semantic-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--size-4-3);
+}
+
+.vaultguard-secure-search__semantic-fields label {
+  display: grid;
+  gap: var(--size-2-1);
+  min-inline-size: 0;
+}
+
+.vaultguard-secure-search__semantic-fields input {
+  inline-size: 100%;
+}
+
+.vaultguard-secure-search__semantic-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+}
+
+.vaultguard-secure-search__semantic-status,
+.vaultguard-semantic-settings-status {
+  padding: var(--size-2-3) var(--size-4-2);
+  border-inline-start: 3px solid var(--interactive-accent);
+  color: var(--text-muted);
+  background: var(--background-secondary-alt);
+}
+
+.vaultguard-secure-search__semantic-status.is-error {
+  border-inline-start-color: var(--text-error);
+  color: var(--text-error);
+}
+
+.vaultguard-secure-search__status {
+  max-inline-size: 760px;
+  margin: 0 auto var(--size-4-3);
+  padding: var(--size-2-3) var(--size-4-2);
+  border-inline-start: 3px solid var(--interactive-accent);
+  color: var(--text-muted);
+  background: var(--background-secondary-alt);
+}
+
+.vaultguard-secure-search__status.is-error {
+  border-inline-start-color: var(--text-error);
+  color: var(--text-error);
+}
+
+.vaultguard-secure-search__list {
+  display: grid;
+  gap: var(--size-4-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vaultguard-secure-search__result {
+  min-inline-size: 0;
+  padding: var(--size-4-3);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary-alt);
+}
+
+.vaultguard-secure-search__result-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2-3) var(--size-4-2);
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.vaultguard-secure-search__path {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-normal);
+  font-weight: var(--font-semibold);
+  text-align: start;
+}
+
+button.vaultguard-secure-search__path {
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+  color: var(--text-accent);
+  background: transparent;
+}
+
+button.vaultguard-secure-search__path:hover {
+  color: var(--text-accent-hover);
+  text-decoration: underline;
+}
+
+.vaultguard-secure-search__path:focus-visible,
+.vaultguard-secure-search button:focus-visible,
+.vaultguard-secure-search input:focus-visible,
+.vaultguard-secure-search select:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.vaultguard-secure-search__semantics,
+.vaultguard-secure-search__snippet,
+.vaultguard-secure-search__empty {
+  margin-block: var(--size-2-2) 0;
+}
+
+.vaultguard-secure-search__snippet {
+  padding: var(--size-2-3) var(--size-4-2);
+  border-inline-start: 2px solid var(--background-modifier-border-hover);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 500px) {
+  .vaultguard-secure-search {
+    padding: var(--size-4-2);
+  }
+
+  .vaultguard-secure-search__options {
+    grid-template-columns: 1fr;
+  }
+
+  .vaultguard-secure-search__semantic-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .vaultguard-secure-search__consent {
+    grid-column: 1;
+  }
+
+  .vaultguard-secure-search__actions > button {
+    flex: 1 1 140px;
+  }
+
+  .vaultguard-secure-search__semantic-actions > button {
+    flex: 1 1 160px;
+  }
+}
+
+
+/* ─── P1 localization and accessibility ────────────────────────────────── */
+
+.vaultguard-settings-tab[dir="rtl"],
+.vaultguard-admin-modal-content[dir="rtl"],
+.vaultguard-sidebar[dir="rtl"] {
+  text-align: start;
+}
+
+.vaultguard-tab:focus-visible,
+.vaultguard-icon-btn:focus-visible,
+.vaultguard-sb-menu-btn:focus-visible,
+.vaultguard-sb-refresh-btn:focus-visible,
+.vaultguard-sb-recovery-btn:focus-visible,
+.vaultguard-sb-search-clear:focus-visible,
+.vaultguard-sb-chip-clear:focus-visible,
+.vaultguard-sb-chip-clear-all:focus-visible,
+.vaultguard-sb-empty-action:focus-visible,
+.vaultguard-sidebar input:focus-visible,
+.vaultguard-sidebar select:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.vaultguard-user-item,
+.vaultguard-user-info,
+.vaultguard-user-badges,
+.vaultguard-user-actions,
+.vaultguard-sb-title-row,
+.vaultguard-sb-filter-row,
+.vaultguard-sb-entry {
+  min-inline-size: 0;
+}
+
+.vaultguard-invite-access-details[aria-busy="true"],
+.vaultguard-user-list[aria-busy="true"] {
+  cursor: progress;
+}
+
+@media (max-width: 700px) {
+  .vaultguard-user-item {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .vaultguard-user-meta,
+  .vaultguard-user-actions {
+    inline-size: 100%;
+  }
+
+  .vaultguard-user-actions {
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vaultguard-tab,
+  .vaultguard-user-item,
+  .vaultguard-sb-search-wrap,
+  .vaultguard-sb-entry {
+    transition: none;
+  }
+
+  .vaultguard-sb-spinner svg,
+  .vaultguard-btn-spinner svg {
+    animation: none;
+  }
+}
+
+/* ─── P2 Secure Discovery: permission-aware Bases layout ─────────────── */
+
+.vaultguard-bases-access {
+  min-inline-size: 0;
+  padding: var(--size-4-3);
+}
+
+.vaultguard-discovery-status {
+  margin: 0 0 var(--size-4-3);
+  color: var(--text-muted);
+  font-size: var(--font-small);
+}
+
+.vaultguard-bases-access-list {
+  display: grid;
+  gap: var(--size-2-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vaultguard-bases-access-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--size-4-2);
+  min-inline-size: 0;
+  padding: var(--size-2-3) var(--size-4-2);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary-alt);
+}
+
+.vaultguard-bases-access-row > a {
+  min-inline-size: 0;
+  overflow: hidden;
+  color: var(--text-normal);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vaultguard-bases-access-row > a:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.vaultguard-bases-access-badge,
+.vaultguard-bases-access-provenance {
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: var(--background-secondary);
+  font-size: var(--font-smallest);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.vaultguard-bases-access-badge.is-write,
+.vaultguard-bases-access-badge.is-admin {
+  color: var(--text-accent);
+}
+
+@media (max-width: 500px) {
+  .vaultguard-bases-access-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .vaultguard-bases-access-provenance {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
 }

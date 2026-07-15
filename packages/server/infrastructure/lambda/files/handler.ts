@@ -21,6 +21,7 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import {
   S3Client,
+  CopyObjectCommand,
   GetObjectCommand,
   PutObjectCommand,
   ListObjectsV2Command,
@@ -28,6 +29,8 @@ import {
   ListObjectVersionsCommand,
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { createHash } from 'node:crypto';
 import { KMSClient, DecryptCommand } from '@aws-sdk/client-kms';
 import { emitSecurityMetric } from '../shared/metrics';
 import {
@@ -75,7 +78,11 @@ import {
 const S3_BUCKET = process.env.VAULT_BUCKET || process.env.VAULT_S3_BUCKET!;
 const S3_PREFIX_BASE = process.env.VAULT_S3_PREFIX || 'vault/';
 const REGION = process.env.AWS_REGION || 'eu-west-1';
-const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || '10485760', 10); // 10MB default
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || '26214400', 10); // 25 MiB default
+const DIRECT_TRANSFER_TTL_SECONDS = 5 * 60;
+const DIRECT_TRANSFER_STAGING_PREFIX = '_vaultguard-transfers/';
+const AES_GCM_ENVELOPE_OVERHEAD_BYTES = 28; // 12-byte nonce + 16-byte tag
+const DIRECT_TRANSFER_MAX_ENCRYPTED_SIZE = MAX_FILE_SIZE + AES_GCM_ENVELOPE_OVERHEAD_BYTES;
 const DEFAULT_OVERVIEW_LIMIT = 5000;
 const MAX_OVERVIEW_LIMIT = 10000;
 
@@ -295,6 +302,138 @@ function vaultS3Prefix(orgId: string, vaultId: string): string {
   return `${S3_PREFIX_BASE}${orgId}/${vaultId}/`;
 }
 
+interface DirectUploadMetadata {
+  transferId: string;
+  ownerUserId: string;
+  orgId: string;
+  vaultId: string;
+  pathSha256: string;
+  plaintextSize: number;
+  encryptedSize: number;
+  plaintextSha256: string;
+  encryptedSha256: string;
+  contentType: string;
+  activeKeyId: string;
+  issuedVersionId: string;
+  issuedEtag: string;
+  expiresAtMs: number;
+}
+
+function directTransferStagingKey(
+  orgId: string,
+  vaultId: string,
+  userId: string,
+  transferId: string
+): string {
+  return `${DIRECT_TRANSFER_STAGING_PREFIX}${orgId}/${vaultId}/${userId}/${transferId}`;
+}
+
+function sha256Hex(value: string | Buffer | Uint8Array): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function checksumBase64FromHex(value: string): string {
+  return Buffer.from(value, 'hex').toString('base64');
+}
+
+function isSha256Hex(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function parseBoundedInteger(value: unknown, field: string, maximum: number): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > maximum) {
+    throw new AuthError(`${field} must be an integer between 0 and ${maximum}`, 400);
+  }
+  return value;
+}
+
+function sanitizeDirectContentType(value: unknown): string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 160 || /[^\x20-\x7e]/.test(value)) {
+    throw new AuthError('contentType is invalid', 400);
+  }
+  return value;
+}
+
+function encodeOpaqueCursor(value: Record<string, string | undefined>): string {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+}
+
+function decodeOpaqueCursor(raw: string | undefined): Record<string, string | undefined> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('shape');
+    const out: Record<string, string | undefined> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (value !== undefined && typeof value !== 'string') throw new Error('value');
+      out[key] = value;
+    }
+    return out;
+  } catch {
+    throw new AuthError('Invalid pagination cursor', 400);
+  }
+}
+
+function parseRecoveryLimit(raw: string | undefined): number {
+  if (!raw) return 50;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) throw new AuthError('limit must be at least 1', 400);
+  return Math.min(parsed, 100);
+}
+
+function directUploadS3Metadata(input: DirectUploadMetadata): Record<string, string> {
+  return {
+    'transfer-id': input.transferId,
+    'owner-user-id': input.ownerUserId,
+    'org-id': input.orgId,
+    'vault-id': input.vaultId,
+    'path-sha256': input.pathSha256,
+    operation: 'upload',
+    'plaintext-size': String(input.plaintextSize),
+    'encrypted-size': String(input.encryptedSize),
+    'plaintext-sha256': input.plaintextSha256,
+    'encrypted-sha256': input.encryptedSha256,
+    'content-type': input.contentType,
+    'active-key-id': input.activeKeyId,
+    'issued-version-id': input.issuedVersionId,
+    'issued-etag': input.issuedEtag,
+    'expires-at-ms': String(input.expiresAtMs),
+  };
+}
+
+function readDirectUploadMetadata(metadata: Record<string, string> | undefined): DirectUploadMetadata | null {
+  if (!metadata) return null;
+  const plaintextSize = Number(metadata['plaintext-size']);
+  const encryptedSize = Number(metadata['encrypted-size']);
+  const expiresAtMs = Number(metadata['expires-at-ms']);
+  if (
+    metadata.operation !== 'upload' ||
+    !Number.isSafeInteger(plaintextSize) ||
+    !Number.isSafeInteger(encryptedSize) ||
+    !Number.isSafeInteger(expiresAtMs) ||
+    !isSha256Hex(metadata['plaintext-sha256']) ||
+    !isSha256Hex(metadata['encrypted-sha256'])
+  ) {
+    return null;
+  }
+  return {
+    transferId: metadata['transfer-id'] || '',
+    ownerUserId: metadata['owner-user-id'] || '',
+    orgId: metadata['org-id'] || '',
+    vaultId: metadata['vault-id'] || '',
+    pathSha256: metadata['path-sha256'] || '',
+    plaintextSize,
+    encryptedSize,
+    plaintextSha256: metadata['plaintext-sha256'],
+    encryptedSha256: metadata['encrypted-sha256'],
+    contentType: metadata['content-type'] || 'application/octet-stream',
+    activeKeyId: metadata['active-key-id'] || '',
+    issuedVersionId: metadata['issued-version-id'] || 'none',
+    issuedEtag: metadata['issued-etag'] || 'none',
+    expiresAtMs,
+  };
+}
+
 const s3Client = new S3Client({ region: REGION });
 
 // Phase 7 (Plan 07-01): KMS client for cross-DEK restore. The restore endpoint
@@ -414,7 +553,7 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       resource === '/vaults/{vaultId}/files/{path+}' ||
       resource === '/vaults/{vaultId}/files/{filePath+}';
     const actualPath = event.path || '';
-    // LF6: action suffixes (history/restore/restore-delete) ride the greedy
+    // Action suffixes (history/restore/restore-delete/direct transfer) ride the greedy
     // {path+} resource — API Gateway cannot define child resources under a
     // greedy segment — so they must be recognized from the path. But a bare
     // `endsWith` over the whole path shadows FILES whose name is an action
@@ -437,6 +576,19 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       ? eventWithFilePathParameter(event, 'deleted')
       : event;
     const isHistoryResource = isFilePathResource && rawActionSegment === 'history';
+    const isDirectUploadIssueResource =
+      isFilePathResource &&
+      rawFileSegments.length >= 2 &&
+      rawActionSegment === 'direct-upload';
+    const isDirectUploadFinalizeResource =
+      isFilePathResource &&
+      rawFileSegments.length >= 4 &&
+      rawFileSegments[rawFileSegments.length - 3] === 'direct-upload' &&
+      rawActionSegment === 'finalize';
+    const isDirectDownloadIssueResource =
+      isFilePathResource &&
+      rawFileSegments.length >= 2 &&
+      rawActionSegment === 'direct-download';
     // The dispatch order below ensures the restore arms win over the generic
     // read/write/delete arms for the same resource string, and restore-delete
     // is matched by exact segment so it can never fall into the `restore` arm.
@@ -478,6 +630,15 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       case method === 'POST' && isRestoreVersionResource:
         return await handleRestoreVersion(event, user, vault, requestId);
+
+      case method === 'POST' && isDirectUploadFinalizeResource:
+        return await handleFinalizeDirectUpload(event, user, vault, requestId);
+
+      case method === 'POST' && isDirectUploadIssueResource:
+        return await handleIssueDirectUpload(event, user, vault, requestId);
+
+      case method === 'POST' && isDirectDownloadIssueResource:
+        return await handleIssueDirectDownload(event, user, vault, requestId);
 
       case method === 'GET' && isHistoryResource:
         return await handleGetHistory(event, user, vault, requestId);
@@ -697,6 +858,19 @@ function parseOverviewLimit(rawLimit: string | undefined): number {
   return Math.min(parsed, MAX_OVERVIEW_LIMIT);
 }
 
+function parseFileListLimit(rawLimit: string | undefined): number {
+  if (rawLimit === undefined || rawLimit === '') return 100;
+  const normalized = rawLimit.trim();
+  if (!/^\d+$/u.test(normalized)) return 100;
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed)) return 100;
+  return Math.max(1, Math.min(parsed, 1000));
+}
+
+function normalizeFileListPrefix(rawPrefix: string | undefined): string {
+  return (rawPrefix ?? '').replace(/^\/+/, '');
+}
+
 function createOverviewFolder(name: string, path: string): MutableVaultOverviewFolder {
   return {
     type: 'folder',
@@ -837,16 +1011,24 @@ async function handleListFiles(
   vault: VaultRecord,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  const prefix = event.queryStringParameters?.prefix || '';
-  const limit = Math.min(parseInt(event.queryStringParameters?.limit || '100', 10), 1000);
+  const prefix = normalizeFileListPrefix(event.queryStringParameters?.prefix);
+  const limit = parseFileListLimit(event.queryStringParameters?.limit);
   const continuationToken = event.queryStringParameters?.continuationToken;
 
-  // List objects from S3
+  // Resolve request-scoped authorization inputs once. Rebuilding membership
+  // roles and org policy for every S3 row is both wasteful and risks applying
+  // a different policy snapshot within one page.
+  const permRoles = await resolveFileOpRoles(user, vault);
+  const permissionOptions = await fileOpPermissionOptions(user, vault);
+
+  // One API cursor always maps to one complete S3 page. Asking S3 for more
+  // than `limit` and breaking after enough authorized rows skips the
+  // unprocessed tail because NextContinuationToken points past that tail.
   const s3Response = await s3Client.send(
     new ListObjectsV2Command({
       Bucket: S3_BUCKET,
       Prefix: vaultS3Prefix(user.orgId, vault.vaultId) + prefix,
-      MaxKeys: limit * 2, // Fetch extra since we'll filter by permissions
+      MaxKeys: limit,
       ContinuationToken: continuationToken || undefined,
     })
   );
@@ -862,8 +1044,15 @@ async function handleListFiles(
     if (isClientLocalOnlyPath(relativePath)) continue;
 
     // Check if user has 'list' or 'read' permission for this path
-    const permRoles = await resolveFileOpRoles(user, vault);
-    const permResult = await evaluatePermission(user.userId, permRoles, 'list', '/' + relativePath, user.orgId, vault.vaultId, await fileOpPermissionOptions(user, vault));
+    const permResult = await evaluatePermission(
+      user.userId,
+      permRoles,
+      'list',
+      '/' + relativePath,
+      user.orgId,
+      vault.vaultId,
+      permissionOptions
+    );
 
     if (permResult.allowed) {
       files.push({
@@ -875,8 +1064,6 @@ async function handleListFiles(
         checksum: obj.ETag || '',
       });
     }
-
-    if (files.length >= limit) break;
   }
 
   await logAudit({
@@ -1136,6 +1323,519 @@ async function handleReadDecrypted(
     },
     requestId
   );
+}
+
+// ─── Direct encrypted transfer ───────────────────────────────────────────────
+
+function isS3MissingError(error: unknown): boolean {
+  const name = error && typeof error === 'object' && 'name' in error
+    ? String((error as { name: unknown }).name)
+    : '';
+  return name === 'NotFound' || name === 'NoSuchKey' || name === 'NoSuchVersion';
+}
+
+async function headObjectOrNull(input: {
+  Key: string;
+  VersionId?: string;
+  includeChecksum?: boolean;
+}) {
+  try {
+    return await s3Client.send(
+      new HeadObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: input.Key,
+        ...(input.VersionId ? { VersionId: input.VersionId } : {}),
+        ...(input.includeChecksum ? { ChecksumMode: 'ENABLED' as const } : {}),
+      })
+    );
+  } catch (error) {
+    if (isS3MissingError(error)) return null;
+    throw error;
+  }
+}
+
+function directActionPath(event: APIGatewayProxyEvent, suffix: string): string {
+  const raw = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
+  if (!raw.endsWith(suffix)) throw new AuthError('Invalid direct-transfer route', 404);
+  const filePath = sanitizeFilePath(raw.slice(0, -suffix.length));
+  if (!filePath) throw new AuthError('Missing file path', 400);
+  if (isClientLocalOnlyPath(filePath) || isFolderMarkerPath(filePath)) {
+    throw new AuthError(`File not found: ${filePath}`, 404);
+  }
+  return filePath;
+}
+
+function directFinalizeRoute(event: APIGatewayProxyEvent): { filePath: string; transferId: string } {
+  const raw = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
+  const match = raw.match(/^(.*)\/direct-upload\/([A-Za-z0-9_-]{8,128})\/finalize$/);
+  if (!match) throw new AuthError('Invalid direct-upload finalization route', 404);
+  const filePath = sanitizeFilePath(match[1]);
+  if (!filePath || isClientLocalOnlyPath(filePath) || isFolderMarkerPath(filePath)) {
+    throw new AuthError(`File not found: ${filePath || 'unknown'}`, 404);
+  }
+  return { filePath, transferId: match[2] };
+}
+
+async function requireDirectPermission(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  filePath: string,
+  action: 'read' | 'write',
+  auditAction: string,
+  requestId: string
+): Promise<APIGatewayProxyResult | null> {
+  const roles = await resolveFileOpRoles(user, vault);
+  const permission = await evaluatePermission(
+    user.userId,
+    roles,
+    action,
+    '/' + filePath,
+    user.orgId,
+    vault.vaultId,
+    await fileOpPermissionOptions(user, vault)
+  );
+  if (permission.allowed) return null;
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: auditAction,
+    resourcePath: '/' + filePath,
+    outcome: 'denied',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: { matchedRule: permission.matchedRule?.id },
+  }, event);
+  return formatError(403, `Access denied: insufficient permissions to ${action} this file`, requestId);
+}
+
+/** Issues a short-lived, single-object PUT capability for encrypted bytes. */
+async function handleIssueDirectUpload(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  assertVaultWritable(vault);
+  const filePath = directActionPath(event, '/direct-upload');
+  const denied = await requireDirectPermission(
+    event,
+    user,
+    vault,
+    filePath,
+    'write',
+    'files.directUpload.issue.denied',
+    requestId
+  );
+  if (denied) return denied;
+
+  const body = parseBody(event);
+  validateRequiredFields(body, [
+    'plaintextSize',
+    'encryptedSize',
+    'plaintextSha256',
+    'encryptedSha256',
+    'contentType',
+    'activeKeyId',
+  ]);
+  const plaintextSize = parseBoundedInteger(body.plaintextSize, 'plaintextSize', MAX_FILE_SIZE);
+  const encryptedSize = parseBoundedInteger(
+    body.encryptedSize,
+    'encryptedSize',
+    DIRECT_TRANSFER_MAX_ENCRYPTED_SIZE
+  );
+  if (encryptedSize !== plaintextSize + AES_GCM_ENVELOPE_OVERHEAD_BYTES) {
+    return formatError(400, 'encryptedSize does not match the AES-GCM envelope size', requestId);
+  }
+  if (!isSha256Hex(body.plaintextSha256) || !isSha256Hex(body.encryptedSha256)) {
+    return formatError(400, 'SHA-256 commitments must be 64 lowercase hexadecimal characters', requestId);
+  }
+  const contentType = sanitizeDirectContentType(body.contentType);
+  const requestedKeyId = typeof body.activeKeyId === 'string' ? body.activeKeyId : '';
+  if (!requestedKeyId || requestedKeyId.length > 256 || /[\r\n]/.test(requestedKeyId)) {
+    return formatError(400, 'activeKeyId is invalid', requestId);
+  }
+
+  const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
+  if (!activeKeyId || activeKeyId !== requestedKeyId) {
+    return formatError(409, 'The active encryption key changed; renew the key lease and retry', requestId);
+  }
+
+  const expectedVersionId = typeof body.expectedVersionId === 'string'
+    ? body.expectedVersionId
+    : undefined;
+  if (expectedVersionId && (expectedVersionId.length > 1024 || /[\r\n]/.test(expectedVersionId))) {
+    return formatError(400, 'expectedVersionId is invalid', requestId);
+  }
+  const canonicalKey = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+  const current = await headObjectOrNull({ Key: canonicalKey });
+  if (expectedVersionId && current?.VersionId !== expectedVersionId) {
+    return formatError(409, 'Conflict: the remote file changed before direct upload issuance', requestId);
+  }
+  if (expectedVersionId && !current) {
+    return formatError(409, 'Conflict: the expected remote file no longer exists', requestId);
+  }
+
+  const orgResult = await getActiveOrg(user.orgId);
+  if (orgResult.org) {
+    const additionalBytes = Math.max(0, encryptedSize - (current?.ContentLength || 0));
+    const quota = checkStorageLimit(orgResult.org, additionalBytes);
+    if (!quota.allowed) return formatError(402, quota.reason || 'Storage limit exceeded', requestId);
+  }
+
+  const transferId = generateId();
+  const expiresAtMs = Date.now() + DIRECT_TRANSFER_TTL_SECONDS * 1000;
+  const transfer: DirectUploadMetadata = {
+    transferId,
+    ownerUserId: user.userId,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    pathSha256: sha256Hex(filePath),
+    plaintextSize,
+    encryptedSize,
+    plaintextSha256: body.plaintextSha256,
+    encryptedSha256: body.encryptedSha256,
+    contentType,
+    activeKeyId,
+    issuedVersionId: current?.VersionId || 'none',
+    issuedEtag: current?.ETag || 'none',
+    expiresAtMs,
+  };
+  const metadata = directUploadS3Metadata(transfer);
+  const checksum = checksumBase64FromHex(transfer.encryptedSha256);
+  const stagingKey = directTransferStagingKey(user.orgId, vault.vaultId, user.userId, transferId);
+  const command = new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: stagingKey,
+    ContentType: 'application/octet-stream',
+    ChecksumSHA256: checksum,
+    Metadata: metadata,
+  });
+  const url = await getSignedUrl(s3Client, command, { expiresIn: DIRECT_TRANSFER_TTL_SECONDS });
+  const headers: Record<string, string> = {
+    'content-type': 'application/octet-stream',
+    'x-amz-checksum-sha256': checksum,
+  };
+  for (const [key, value] of Object.entries(metadata)) {
+    headers[`x-amz-meta-${key}`] = value;
+  }
+
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'files.directUpload.issue',
+    resourcePath: '/' + filePath,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: { transferId, plaintextSize, encryptedSize, contentType, expiresAtMs },
+  }, event);
+
+  return formatSuccess(200, {
+    transferId,
+    url,
+    method: 'PUT',
+    headers,
+    expiresAt: new Date(expiresAtMs).toISOString(),
+  }, requestId);
+}
+
+function directUploadResult(
+  filePath: string,
+  transferId: string,
+  versionId: string | undefined,
+  checksum: string | undefined,
+  encryptedSize: number,
+  plaintextSha256: string,
+  contentType: string,
+  lastModified = new Date().toISOString()
+) {
+  return {
+    path: '/' + filePath,
+    hash: plaintextSha256,
+    size: encryptedSize,
+    versionId,
+    checksum,
+    contentType,
+    lastModified,
+    transferId,
+  };
+}
+
+/** Validates and atomically promotes one isolated encrypted upload. */
+async function handleFinalizeDirectUpload(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  assertVaultWritable(vault);
+  const { filePath, transferId } = directFinalizeRoute(event);
+  const denied = await requireDirectPermission(
+    event,
+    user,
+    vault,
+    filePath,
+    'write',
+    'files.directUpload.finalize.denied',
+    requestId
+  );
+  if (denied) return denied;
+
+  const body = parseBody(event);
+  const stagingEtag = typeof body.stagingEtag === 'string' ? body.stagingEtag : '';
+  if (!stagingEtag || stagingEtag.length > 256 || /[\r\n]/.test(stagingEtag)) {
+    return formatError(400, 'stagingEtag is required', requestId);
+  }
+
+  const canonicalKey = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+  const stagingKey = directTransferStagingKey(user.orgId, vault.vaultId, user.userId, transferId);
+  // S3 returns the stored object checksum only when checksum mode is enabled.
+  let staged = await headObjectOrNull({ Key: stagingKey, includeChecksum: true });
+
+  // Idempotent retry after copy/delete: the final object carries transfer-id.
+  if (!staged) {
+    const finalHead = await headObjectOrNull({ Key: canonicalKey });
+    if (
+      finalHead?.Metadata?.['vaultguard-transfer-id'] === transferId &&
+      finalHead.Metadata['modified-by'] === user.userId
+    ) {
+      return formatSuccess(200, directUploadResult(
+        filePath,
+        transferId,
+        finalHead.VersionId,
+        finalHead.ETag,
+        finalHead.ContentLength || 0,
+        finalHead.Metadata['vaultguard-plaintext-sha256'] || '',
+        finalHead.ContentType || 'application/octet-stream',
+        finalHead.LastModified?.toISOString()
+      ), requestId);
+    }
+    return formatError(410, 'Direct upload is missing or expired', requestId);
+  }
+
+  const transfer = readDirectUploadMetadata(staged.Metadata);
+  if (!transfer) return formatError(409, 'Direct upload metadata is incomplete', requestId);
+  if (
+    transfer.transferId !== transferId ||
+    transfer.ownerUserId !== user.userId ||
+    transfer.orgId !== user.orgId ||
+    transfer.vaultId !== vault.vaultId ||
+    transfer.pathSha256 !== sha256Hex(filePath)
+  ) {
+    return formatError(403, 'Direct upload does not belong to this operation', requestId);
+  }
+  if (Date.now() > transfer.expiresAtMs) {
+    return formatError(410, 'Direct upload capability expired before finalization', requestId);
+  }
+  if (
+    staged.ContentLength !== transfer.encryptedSize ||
+    staged.ETag !== stagingEtag ||
+    staged.ChecksumSHA256 !== checksumBase64FromHex(transfer.encryptedSha256)
+  ) {
+    return formatError(409, 'Direct upload body failed size or checksum validation', requestId);
+  }
+  const expectedVersionId = typeof body.expectedVersionId === 'string'
+    ? body.expectedVersionId
+    : undefined;
+  if (expectedVersionId && expectedVersionId !== transfer.issuedVersionId) {
+    return formatError(409, 'Direct upload expected-version binding changed', requestId);
+  }
+  const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
+  if (!activeKeyId || activeKeyId !== transfer.activeKeyId) {
+    return formatError(409, 'The active encryption key changed before finalization', requestId);
+  }
+
+  const current = await headObjectOrNull({ Key: canonicalKey });
+  if (current?.Metadata?.['vaultguard-transfer-id'] === transferId) {
+    try {
+      await s3Client.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: stagingKey }));
+    } catch {
+      // Lifecycle expiry is the fallback; never fail an already-durable copy.
+    }
+    return formatSuccess(200, directUploadResult(
+      filePath,
+      transferId,
+      current.VersionId,
+      current.ETag,
+      current.ContentLength || transfer.encryptedSize,
+      transfer.plaintextSha256,
+      transfer.contentType,
+      current.LastModified?.toISOString()
+    ), requestId);
+  }
+  if (
+    (transfer.issuedVersionId === 'none' && current) ||
+    (transfer.issuedVersionId !== 'none' &&
+      (!current || current.VersionId !== transfer.issuedVersionId || current.ETag !== transfer.issuedEtag))
+  ) {
+    return formatError(409, 'Conflict: the remote file changed before finalization', requestId);
+  }
+
+  const orgResult = await getActiveOrg(user.orgId);
+  const storageDelta = transfer.encryptedSize - (current?.ContentLength || 0);
+  if (orgResult.org) {
+    const quota = checkStorageLimit(orgResult.org, Math.max(0, storageDelta));
+    if (!quota.allowed) return formatError(402, quota.reason || 'Storage limit exceeded', requestId);
+  }
+
+  let copied;
+  try {
+    copied = await s3Client.send(new CopyObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: canonicalKey,
+      CopySource: encodeURIComponent(`${S3_BUCKET}/${stagingKey}`),
+      CopySourceIfMatch: staged.ETag,
+      MetadataDirective: 'REPLACE',
+      ContentType: transfer.contentType,
+      Metadata: {
+        'modified-by': user.userId,
+        'modified-at': new Date().toISOString(),
+        'vaultguard-key-id': transfer.activeKeyId,
+        'vaultguard-transfer-id': transferId,
+        'vaultguard-plaintext-sha256': transfer.plaintextSha256,
+        'vaultguard-plaintext-size': String(transfer.plaintextSize),
+        'vaultguard-encrypted-sha256': transfer.encryptedSha256,
+      },
+      ...(current?.ETag ? { IfMatch: current.ETag } : { IfNoneMatch: '*' }),
+    }));
+  } catch (error: unknown) {
+    const name = error && typeof error === 'object' && 'name' in error
+      ? String((error as { name: unknown }).name)
+      : '';
+    if (
+      name === 'PreconditionFailed' ||
+      name === 'ConditionalRequestConflict' ||
+      name === 'NotFound'
+    ) {
+      return formatError(409, 'Conflict: direct upload promotion lost a concurrent update', requestId);
+    }
+    throw error;
+  }
+
+  if (orgResult.org && storageDelta !== 0) {
+    await updateOrgStorageUsage(orgResult.org.slug, storageDelta);
+  }
+  await recordVaultActivity({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: current ? 'modified' : 'created',
+    path: '/' + filePath,
+    actorUserId: user.userId,
+  });
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'files.directUpload.finalize',
+    resourcePath: '/' + filePath,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: {
+      transferId,
+      plaintextSize: transfer.plaintextSize,
+      encryptedSize: transfer.encryptedSize,
+      contentType: transfer.contentType,
+      versionId: copied.VersionId,
+      keyId: transfer.activeKeyId,
+    },
+  }, event);
+
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: stagingKey }));
+  } catch {
+    // The canonical copy is durable; lifecycle expiration handles abandoned staging.
+  }
+  staged = null;
+
+  return formatSuccess(200, directUploadResult(
+    filePath,
+    transferId,
+    copied.VersionId,
+    copied.CopyObjectResult?.ETag,
+    transfer.encryptedSize,
+    transfer.plaintextSha256,
+    transfer.contentType,
+    copied.CopyObjectResult?.LastModified?.toISOString()
+  ), requestId);
+}
+
+/** Issues a short-lived GET capability after current read authorization. */
+async function handleIssueDirectDownload(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  requestId: string
+): Promise<APIGatewayProxyResult> {
+  const filePath = directActionPath(event, '/direct-download');
+  const denied = await requireDirectPermission(
+    event,
+    user,
+    vault,
+    filePath,
+    'read',
+    'files.directDownload.issue.denied',
+    requestId
+  );
+  if (denied) return denied;
+  const body = parseBody(event);
+  const versionId = typeof body.versionId === 'string' && body.versionId.length > 0
+    ? body.versionId
+    : undefined;
+  if (versionId && (versionId.length > 1024 || /[\r\n]/.test(versionId))) {
+    return formatError(400, 'versionId is invalid', requestId);
+  }
+  const key = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+  const head = await headObjectOrNull({ Key: key, VersionId: versionId });
+  if (!head) return formatError(404, 'File not found', requestId);
+  const plaintextSha256 = head.Metadata?.['vaultguard-plaintext-sha256'];
+  const encryptedSha256 = head.Metadata?.['vaultguard-encrypted-sha256'];
+  const plaintextSize = Number(head.Metadata?.['vaultguard-plaintext-size']);
+  if (!isSha256Hex(plaintextSha256) || !isSha256Hex(encryptedSha256) || !Number.isSafeInteger(plaintextSize) || plaintextSize < 0) {
+    return formatError(
+      409,
+      'This version predates direct-transfer integrity metadata; use the normal download path',
+      requestId
+    );
+  }
+  const transferId = generateId();
+  const expiresAtMs = Date.now() + DIRECT_TRANSFER_TTL_SECONDS * 1000;
+  const url = await getSignedUrl(
+    s3Client,
+    new GetObjectCommand({ Bucket: S3_BUCKET, Key: key, ...(versionId ? { VersionId: versionId } : {}) }),
+    { expiresIn: DIRECT_TRANSFER_TTL_SECONDS }
+  );
+  await logAudit({
+    userId: user.userId,
+    userEmail: user.email,
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'files.directDownload.issue',
+    resourcePath: '/' + filePath,
+    outcome: 'success',
+    ipAddress: getClientIp(event),
+    userAgent: getUserAgent(event),
+    metadata: { transferId, versionId: head.VersionId, encryptedSize: head.ContentLength || 0, expiresAtMs },
+  }, event);
+  return formatSuccess(200, {
+    transferId,
+    url,
+    method: 'GET',
+    headers: {},
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    versionId: head.VersionId,
+    encryptedSize: head.ContentLength || 0,
+    encryptedSha256,
+    plaintextSize,
+    plaintextSha256,
+    contentType: head.ContentType || 'application/octet-stream',
+  }, requestId);
 }
 
 // ─── PUT /vaults/{vaultId}/files/{path} ─────────────────────────────────────
@@ -1563,12 +2263,24 @@ async function handleGetHistory(
     return formatError(403, 'Access denied: insufficient permissions', requestId);
   }
 
-  // Fetch version history from S3
+  const limit = parseRecoveryLimit(event.queryStringParameters?.limit);
+  const cursor = decodeOpaqueCursor(event.queryStringParameters?.cursor);
+  const pathDigest = sha256Hex(filePath);
+  if (
+    Object.keys(cursor).length > 0 &&
+    (cursor.kind !== 'history' || cursor.path !== pathDigest)
+  ) {
+    return formatError(400, 'Pagination cursor does not belong to this file history', requestId);
+  }
+
+  // Fetch one bounded version-history page from S3.
   const versionsResponse = await s3Client.send(
     new ListObjectVersionsCommand({
       Bucket: S3_BUCKET,
       Prefix: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
-      MaxKeys: 50,
+      MaxKeys: limit,
+      KeyMarker: cursor.keyMarker,
+      VersionIdMarker: cursor.versionIdMarker,
     })
   );
 
@@ -1613,15 +2325,29 @@ async function handleGetHistory(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { versionCount: versions.length },
+    metadata: { versionCount: versions.length, hasMore: versionsResponse.IsTruncated === true },
   });
+
+  const nextCursor =
+    versionsResponse.IsTruncated && versionsResponse.NextKeyMarker
+      ? encodeOpaqueCursor({
+          kind: 'history',
+          path: pathDigest,
+          keyMarker: versionsResponse.NextKeyMarker,
+          versionIdMarker: versionsResponse.NextVersionIdMarker,
+        })
+      : null;
 
   return formatSuccess(
     200,
     {
       path: '/' + filePath,
       versions,
+      items: versions,
       count: versions.length,
+      cursor: nextCursor,
+      hasMore: nextCursor !== null,
+      partial: false,
     },
     requestId
   );
@@ -2097,6 +2823,8 @@ async function handleRestoreVersion(
   // STEP 7 — AES-decrypt the historical ciphertext.
   const ciphertextBody = await getResp.Body!.transformToByteArray();
   const plaintext = aesDecrypt(Buffer.from(ciphertextBody), oldDek);
+  const plaintextSize = plaintext.byteLength;
+  const plaintextSha256 = sha256Hex(plaintext);
 
   // STEP 8 — fetch the current ACTIVE DEK for the vault.
   const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
@@ -2107,6 +2835,7 @@ async function handleRestoreVersion(
 
   // STEP 9 — AES-encrypt with the current DEK.
   const newCiphertext = aesEncrypt(plaintext, currentDek);
+  const encryptedSha256 = sha256Hex(newCiphertext);
 
   // STEP 10 — best-effort plaintext wipe. Matches `reEncryptFile`'s pattern.
   plaintext.fill(0);
@@ -2117,11 +2846,15 @@ async function handleRestoreVersion(
       Bucket: bucket,
       Key: key,
       Body: newCiphertext,
+      ChecksumSHA256: checksumBase64FromHex(encryptedSha256),
       ContentType: getResp.ContentType || 'application/octet-stream',
       Metadata: {
         'modified-by': user.userId,
         'modified-at': new Date().toISOString(),
         'vaultguard-key-id': currentKeyId,
+        'vaultguard-plaintext-sha256': plaintextSha256,
+        'vaultguard-plaintext-size': String(plaintextSize),
+        'vaultguard-encrypted-sha256': encryptedSha256,
         'restored-from-version': sourceVersionId,
       },
     })
@@ -2198,67 +2931,77 @@ async function handleListDeleted(
     deletedAt: string;
   }
 
+  const limit = parseRecoveryLimit(event.queryStringParameters?.limit);
+  const cursor = decodeOpaqueCursor(event.queryStringParameters?.cursor);
+  const vaultDigest = sha256Hex(`${user.orgId}:${vault.vaultId}`);
+  if (
+    Object.keys(cursor).length > 0 &&
+    (cursor.kind !== 'deleted' || cursor.vault !== vaultDigest)
+  ) {
+    return formatError(400, 'Pagination cursor does not belong to this vault', requestId);
+  }
+  const res = await s3Client.send(
+    new ListObjectVersionsCommand({
+      Bucket: S3_BUCKET,
+      Prefix: prefix,
+      MaxKeys: limit,
+      KeyMarker: cursor.keyMarker,
+      VersionIdMarker: cursor.versionIdMarker,
+    })
+  );
   const files: DeletedFileEntry[] = [];
-  let keyMarker: string | undefined;
-  let versionIdMarker: string | undefined;
-  let safetyIterations = 0;
+  const permissionOptions = await fileOpPermissionOptions(user, vault);
 
-  do {
-    const res = await s3Client.send(
-      new ListObjectVersionsCommand({
-        Bucket: S3_BUCKET,
-        Prefix: prefix,
-        MaxKeys: 1000,
-        KeyMarker: keyMarker,
-        VersionIdMarker: versionIdMarker,
-      })
+  for (const marker of res.DeleteMarkers ?? []) {
+    if (marker.IsLatest !== true || !marker.Key || !marker.VersionId || !marker.LastModified) continue;
+    const relPath = marker.Key.slice(prefix.length);
+    if (!relPath) continue;
+    if (isClientLocalOnlyPath(relPath)) continue;
+    if (isFolderMarkerPath(relPath)) continue;
+
+    // Per-row permission filter — only include paths the caller can read.
+    const perm = await evaluatePermission(
+      user.userId,
+      permRoles,
+      'read',
+      '/' + relPath,
+      user.orgId,
+      vault.vaultId,
+      permissionOptions
     );
+    if (!perm.allowed) continue;
 
-    for (const marker of res.DeleteMarkers ?? []) {
-      if (marker.IsLatest !== true || !marker.Key || !marker.VersionId || !marker.LastModified) continue;
-      const relPath = marker.Key.slice(prefix.length);
-      if (!relPath) continue;
-      if (isClientLocalOnlyPath(relPath)) continue;
-      if (isFolderMarkerPath(relPath)) continue;
+    const deletedAt =
+      marker.LastModified instanceof Date
+        ? marker.LastModified.toISOString()
+        : String(marker.LastModified);
 
-      // Per-row permission filter — only include paths the caller can read.
-      const perm = await evaluatePermission(
-        user.userId,
-        permRoles,
-        'read',
-        '/' + relPath,
-        user.orgId,
-        vault.vaultId,
-        await fileOpPermissionOptions(user, vault)
-      );
-      if (!perm.allowed) continue;
+    files.push({
+      path: relPath,
+      deleteMarkerVersionId: marker.VersionId,
+      deletedAt,
+    });
+  }
 
-      const deletedAt =
-        marker.LastModified instanceof Date
-          ? marker.LastModified.toISOString()
-          : String(marker.LastModified);
-
-      files.push({
-        path: relPath,
-        deleteMarkerVersionId: marker.VersionId,
-        deletedAt,
-      });
-    }
-
-    keyMarker = res.IsTruncated ? res.NextKeyMarker : undefined;
-    versionIdMarker = res.IsTruncated ? res.NextVersionIdMarker : undefined;
-
-    safetyIterations += 1;
-    if (safetyIterations > 100) {
-      // Defensive — a vault with > 100,000 versions returned per call is
-      // pathological; bail out rather than spin indefinitely.
-      break;
-    }
-  } while (keyMarker);
+  const nextCursor =
+    res.IsTruncated && res.NextKeyMarker
+      ? encodeOpaqueCursor({
+          kind: 'deleted',
+          vault: vaultDigest,
+          keyMarker: res.NextKeyMarker,
+          versionIdMarker: res.NextVersionIdMarker,
+        })
+      : null;
 
   return formatSuccess(
     200,
-    { files },
+    {
+      files,
+      items: files,
+      cursor: nextCursor,
+      hasMore: nextCursor !== null,
+      partial: false,
+    },
     requestId
   );
 }

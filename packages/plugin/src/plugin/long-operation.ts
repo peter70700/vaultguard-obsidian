@@ -237,14 +237,31 @@ export function evaluateWorkloadGuard(
   return { ok: true, warnings, error: null };
 }
 
-export class MovingAverageEstimator {
-  private lastItems: number | null = null;
-  private lastBytes: number | null = null;
-  private lastAt: number | null = null;
-  private itemsPerSecond: number | null = null;
-  private bytesPerSecond: number | null = null;
+interface TimeWeightedRateState {
+  baselineAt: number | null;
+  baselineValue: number | null;
+  lastObservedAt: number | null;
+  lastSampleAt: number | null;
+  lastValue: number | null;
+  progressSamples: number;
+  ratePerSecond: number | null;
+}
 
-  constructor(private readonly alpha = 0.35) {}
+function createTimeWeightedRateState(): TimeWeightedRateState {
+  return {
+    baselineAt: null,
+    baselineValue: null,
+    lastObservedAt: null,
+    lastSampleAt: null,
+    lastValue: null,
+    progressSamples: 0,
+    ratePerSecond: null,
+  };
+}
+
+export class MovingAverageEstimator {
+  private readonly itemRate = createTimeWeightedRateState();
+  private readonly byteRate = createTimeWeightedRateState();
 
   record(input: {
     atMs: number;
@@ -254,36 +271,12 @@ export class MovingAverageEstimator {
     totalBytes?: number | null;
     approximate?: boolean;
   }): { eta: EtaSnapshot; throughput: ThroughputSnapshot } {
-    if (this.lastAt !== null) {
-      const elapsedSeconds = (input.atMs - this.lastAt) / 1000;
-      if (elapsedSeconds > 0) {
-        const itemDelta = input.processedItems - (this.lastItems ?? 0);
-        if (itemDelta > 0) {
-          const rate = itemDelta / elapsedSeconds;
-          this.itemsPerSecond =
-            this.itemsPerSecond === null
-              ? rate
-              : this.itemsPerSecond * (1 - this.alpha) + rate * this.alpha;
-        }
-
-        const byteDelta = input.processedBytes - (this.lastBytes ?? 0);
-        if (byteDelta > 0) {
-          const rate = byteDelta / elapsedSeconds;
-          this.bytesPerSecond =
-            this.bytesPerSecond === null
-              ? rate
-              : this.bytesPerSecond * (1 - this.alpha) + rate * this.alpha;
-        }
-      }
-    }
-
-    this.lastAt = input.atMs;
-    this.lastItems = input.processedItems;
-    this.lastBytes = input.processedBytes;
+    this.recordRate(this.itemRate, input.atMs, input.processedItems);
+    this.recordRate(this.byteRate, input.atMs, input.processedBytes);
 
     const throughput = {
-      itemsPerSecond: this.itemsPerSecond,
-      bytesPerSecond: this.bytesPerSecond,
+      itemsPerSecond: this.itemRate.ratePerSecond,
+      bytesPerSecond: this.byteRate.ratePerSecond,
     };
 
     return {
@@ -303,11 +296,14 @@ export class MovingAverageEstimator {
       input.totalBytes !== null &&
       input.totalBytes !== undefined &&
       input.totalBytes > 0 &&
-      this.bytesPerSecond !== null &&
-      this.bytesPerSecond > 0
+      this.byteRate.ratePerSecond !== null &&
+      this.byteRate.ratePerSecond > 0
     ) {
       return {
-        remainingMs: Math.max(0, ((input.totalBytes - input.processedBytes) / this.bytesPerSecond) * 1000),
+        remainingMs: Math.max(
+          0,
+          ((input.totalBytes - input.processedBytes) / this.byteRate.ratePerSecond) * 1000
+        ),
         approximate: Boolean(input.approximate),
         basis: "bytes",
         confidence: "estimated",
@@ -318,11 +314,14 @@ export class MovingAverageEstimator {
       input.totalItems !== null &&
       input.totalItems !== undefined &&
       input.totalItems > 0 &&
-      this.itemsPerSecond !== null &&
-      this.itemsPerSecond > 0
+      this.itemRate.ratePerSecond !== null &&
+      this.itemRate.ratePerSecond > 0
     ) {
       return {
-        remainingMs: Math.max(0, ((input.totalItems - input.processedItems) / this.itemsPerSecond) * 1000),
+        remainingMs: Math.max(
+          0,
+          ((input.totalItems - input.processedItems) / this.itemRate.ratePerSecond) * 1000
+        ),
         approximate: Boolean(input.approximate),
         basis: "items",
         confidence: "estimated",
@@ -335,6 +334,51 @@ export class MovingAverageEstimator {
       basis: input.approximate ? "phase" : "unknown",
       confidence: "warming",
     };
+  }
+
+  private recordRate(state: TimeWeightedRateState, atMs: number, value: number): void {
+    if (
+      state.baselineAt === null ||
+      state.baselineValue === null ||
+      state.lastObservedAt === null ||
+      state.lastSampleAt === null ||
+      state.lastValue === null ||
+      atMs < state.lastObservedAt ||
+      value < state.lastValue
+    ) {
+      this.resetRate(state, atMs, value);
+      return;
+    }
+
+    state.lastObservedAt = atMs;
+    if (value <= state.lastValue) return;
+
+    state.lastValue = value;
+    if (atMs <= state.lastSampleAt) return;
+
+    state.lastSampleAt = atMs;
+    state.progressSamples += 1;
+    const elapsedSeconds = (atMs - state.baselineAt) / 1000;
+    const processedSinceBaseline = value - state.baselineValue;
+    if (state.progressSamples < 2 || elapsedSeconds <= 0 || processedSinceBaseline <= 0) {
+      state.ratePerSecond = null;
+      return;
+    }
+
+    // Weight progress by the wall time for the whole counter series. This
+    // prevents a single tiny or huge file from dominating ETA merely because
+    // it was the most recent progress tick.
+    state.ratePerSecond = processedSinceBaseline / elapsedSeconds;
+  }
+
+  private resetRate(state: TimeWeightedRateState, atMs: number, value: number): void {
+    state.baselineAt = atMs;
+    state.baselineValue = value;
+    state.lastObservedAt = atMs;
+    state.lastSampleAt = atMs;
+    state.lastValue = value;
+    state.progressSamples = 0;
+    state.ratePerSecond = null;
   }
 }
 

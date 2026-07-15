@@ -407,14 +407,16 @@ export function connectorContextForProvider(
   permissionMode: AiChatPermissionMode,
 ): AgentConnectorContext {
   const connector =
-    provider === "openai"
+    provider === "codex"
+      ? "codex-mcp"
+      : provider === "openai"
       ? "internal-openai-chat"
       : provider === "subscription" || provider === "apiKey"
         ? "internal-claude-chat"
         : "unknown";
   return {
     connector,
-    transport: "inproc",
+    transport: provider === "codex" ? "mcp" : "inproc",
     profile: "internal-chat",
     writeMode: permissionMode === "skip" ? "allowed" : "confirm",
   };
