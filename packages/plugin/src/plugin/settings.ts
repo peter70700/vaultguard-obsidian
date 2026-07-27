@@ -91,6 +91,22 @@ import { createI18n } from "../i18n";
 export { SAAS_DEFAULTS };
 
 /**
+ * Human-readable label for the bundled API host, e.g. "api.example.com".
+ * Derived from SAAS_DEFAULTS so UI copy can never state a host the build does
+ * not actually use — the public export scrubs the domain everywhere except
+ * saas-defaults.ts, so a hardcoded literal would ship as a false claim.
+ */
+export function saasDefaultsHostLabel(): string {
+  const endpoint = SAAS_DEFAULTS.apiEndpoint.trim();
+  if (!endpoint) return "cloud";
+  try {
+    return new URL(endpoint).host || "cloud";
+  } catch {
+    return endpoint.replace(/^https?:\/\//, "").replace(/\/.*$/, "") || "cloud";
+  }
+}
+
+/**
  * Default plugin settings applied on first installation or when
  * individual settings are missing from persisted data.
  */
@@ -3066,7 +3082,13 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     if (!isManualMode) {
       new Setting(containerEl)
         .setName("VaultGuard Cloud")
-        .setDesc("Uses the bundled api.example.com and Cognito configuration. Sign in from the Account section above.")
+        // Derived, not hardcoded: the public export scrubs example.com
+        // outside saas-defaults, so a literal domain here would ship claiming
+        // the build uses api.example.com while it actually uses the bundled
+        // default. Reading the value means the sentence cannot contradict it.
+        .setDesc(
+          `Uses the bundled ${saasDefaultsHostLabel()} and Cognito configuration. Sign in from the Account section above.`
+        )
         .addButton((button) =>
           button
             .setButtonText("Reset")

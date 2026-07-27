@@ -1,4 +1,5 @@
 import { App, ButtonComponent, Modal, setIcon } from "obsidian";
+import { SAAS_DEFAULTS } from "../config/saas-defaults";
 import { createI18n } from "../i18n";
 import { setButtonLoading } from "../ui/loading-button";
 import { createShieldIcon } from "../ui/icons";
@@ -323,16 +324,23 @@ export class LoginModal extends Modal {
       .onClick(() => this.handleSubmit());
 
     // Setup-guide docs link — opens the verified landing route in the browser.
-    const footer = contentEl.createDiv({ cls: "vaultguard-login-footer" });
-    const docsLink = footer.createEl("a", {
-      text: "Setup guide",
-      cls: "vaultguard-login-docs-link",
-      href: "#",
-    });
-    docsLink.addEventListener("click", (e) => {
-      e.preventDefault();
-      window.open("https://example.com/#/docs/setup", "_blank", "noopener,noreferrer");
-    });
+    // The URL comes from saas-defaults because the public export scrubs
+    // example.com everywhere else; a literal here ships as a dead
+    // example.com link. Empty means this build has no hosted docs, so render
+    // no link at all rather than a broken one.
+    const docsSetupUrl = SAAS_DEFAULTS.docsSetupUrl.trim();
+    if (docsSetupUrl) {
+      const footer = contentEl.createDiv({ cls: "vaultguard-login-footer" });
+      const docsLink = footer.createEl("a", {
+        text: "Setup guide",
+        cls: "vaultguard-login-docs-link",
+        href: "#",
+      });
+      docsLink.addEventListener("click", (e) => {
+        e.preventDefault();
+        window.open(docsSetupUrl, "_blank", "noopener,noreferrer");
+      });
+    }
 
     // Focus first visible input on open
     this.scheduleWhileOpen(() => {

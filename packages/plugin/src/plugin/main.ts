@@ -10121,7 +10121,10 @@ export default class VaultGuardPlugin extends Plugin {
         message:
           "The VaultGuard API endpoint rejected the request before it reached VaultGuard. " +
           "Check the API endpoint in plugin settings; it should point to the VaultGuard REST API " +
-          "(for example https://api.example.com, your API Gateway URL, or your API CloudFront base URL). " +
+          // Derived, not hardcoded: the public export scrubs example.com
+          // outside saas-defaults, so a literal example here ships pointing at
+          // api.example.com.
+          `(for example ${SAAS_DEFAULTS.apiEndpoint || "your VaultGuard endpoint"}, your API Gateway URL, or your API CloudFront base URL). ` +
           "If the endpoint is correct, the deployed API authorizer may need to be refreshed.",
         details: null,
         statusCode: response.status,
@@ -11013,10 +11016,16 @@ export default class VaultGuardPlugin extends Plugin {
         .catch((error) => this.logError("Could not load the upgrade dialog", error));
       return;
     }
+    // The base URL comes from saas-defaults because the public export scrubs
+    // example.com everywhere else — a literal here ships as a dead
+    // admin.example.com link.
+    const base = SAAS_DEFAULTS.adminBaseUrl.trim().replace(/\/+$/, "");
+    if (!base) {
+      new Notice("VaultGuard Sync: no hosted admin panel is configured for this build.");
+      return;
+    }
     const slug = this.settings.orgSlug?.trim() || "";
-    const url = slug
-      ? `https://admin.example.com/${encodeURIComponent(slug)}`
-      : "https://admin.example.com";
+    const url = slug ? `${base}/${encodeURIComponent(slug)}` : base;
     window.open(url, "_blank", "noopener,noreferrer");
   }
 
