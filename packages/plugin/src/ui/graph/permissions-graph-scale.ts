@@ -29,6 +29,7 @@ export interface GraphComplexityBudgets {
   maxRenderedNodes: number;
   maxRenderedEdges: number;
   maxRenderedLabels: number;
+  maxRenderedEdgeLabels: number;
   maxExplainRows: number;
   maxForceLayoutEdges: number;
   maxInitialFiles: number;
@@ -121,7 +122,12 @@ export interface FilteredGraphDataset extends GraphDatasetForScale {
 export interface GraphComplexityEstimate {
   nodeCount: number;
   edgeCount: number;
+  /** Combined node + permission-edge label total, kept for reporting. */
   labelCount: number;
+  /** Names on file/folder/user nodes. Bounded by nodeCount, so cheap. */
+  nodeLabelCount?: number;
+  /** Per-edge access-level text ("read"/"write"/"admin"). The costly, dense one. */
+  edgeLabelCount?: number;
   fileNodeCount: number;
   folderNodeCount: number;
   userNodeCount: number;
@@ -135,7 +141,13 @@ export interface GraphRenderDecision {
   large: boolean;
   exceeded: string[];
   disabled: string[];
+  /**
+   * Node names (files, folders, users). Off ONLY when the user picks
+   * `labelsMode: "off"` — a busy graph must never silently hide names.
+   */
   labelModeUsed: "on" | "off";
+  /** Per-edge access-level text. Auto-drops once past the edge-label budget. */
+  edgeLabelModeUsed: "on" | "off";
   layoutModeUsed: "radial" | "force" | "grid" | "folder" | "sections";
   hoverEnabled: boolean;
   animationEnabled: boolean;
@@ -168,7 +180,13 @@ export interface GraphDebugReadoutModel {
 export const DEFAULT_GRAPH_BUDGETS: GraphComplexityBudgets = {
   maxRenderedNodes: 900,
   maxRenderedEdges: 1600,
+  // Combined node+edge label total. Still reported in `exceeded`, but it no
+  // longer suppresses node names — those are governed by maxRenderedNodes,
+  // which is what they actually scale with.
   maxRenderedLabels: 220,
+  // Per-edge access-level text only. This is the dense, expensive label class,
+  // so it keeps an auto-drop budget of its own.
+  maxRenderedEdgeLabels: 220,
   maxExplainRows: 60,
   maxForceLayoutEdges: 350,
   maxInitialFiles: 1000,
@@ -564,6 +582,8 @@ export function estimateDetailedGraphComplexity(
     nodeCount,
     edgeCount,
     labelCount: nodeCount + permissionEdgeCount,
+    nodeLabelCount: nodeCount,
+    edgeLabelCount: permissionEdgeCount,
     fileNodeCount,
     folderNodeCount,
     userNodeCount,
@@ -584,13 +604,27 @@ export function decideGraphRender(
   if (estimate.labelCount > budgets.maxRenderedLabels) exceeded.push("maxRenderedLabels");
   if (estimate.nodeCount + estimate.edgeCount > budgets.largeGraphThreshold) exceeded.push("largeGraphThreshold");
 
-  const labelModeUsed =
+  // Node names and per-edge access text are separate decisions.
+  //
+  // Names are what makes the graph readable and they scale with nodeCount,
+  // which already has its own budget (maxRenderedNodes) plus the maxFiles cap.
+  // They used to share one on/off flag with edge labels against a combined
+  // 220-label budget, so enabling Users + Files + Folders added enough
+  // permission edges to push the total past the cap and every name vanished —
+  // while hiding files or folders brought them back. Names now drop only when
+  // the user explicitly asks for it.
+  const labelModeUsed = options.labelsMode === "off" ? "off" : "on";
+
+  // Edge labels are the dense, expensive class (one string per permission edge),
+  // so they keep an auto-drop budget.
+  const edgeLabelCount = estimate.edgeLabelCount ?? estimate.permissionEdgeCount;
+  const edgeLabelModeUsed =
     options.labelsMode === "on"
       ? "on"
-      : options.labelsMode === "off" || estimate.labelCount > budgets.maxRenderedLabels
+      : options.labelsMode === "off" || edgeLabelCount > budgets.maxRenderedEdgeLabels
         ? "off"
         : "on";
-  if (labelModeUsed === "off" && options.labelsMode !== "off") disabled.push("labels");
+  if (edgeLabelModeUsed === "off" && options.labelsMode !== "off") disabled.push("edge labels");
 
   const forceUnsafe = estimate.edgeCount > budgets.maxForceLayoutEdges;
   let layoutModeUsed: GraphRenderDecision["layoutModeUsed"];
@@ -615,7 +649,12 @@ export function decideGraphRender(
     layoutModeUsed = "radial";
   }
 
-  const unsafe = exceeded.some((budget) => budget !== "maxRenderedLabels" || options.labelsMode === "on");
+  // A label-budget overflow is never a reason to abandon the detailed graph.
+  // It used to escalate to aggregated/refused whenever the user set Labels =
+  // "On", which turned the one control that asks for names into the control
+  // that removed the whole detailed view. Node/edge/large-graph budgets still
+  // gate genuinely oversized graphs.
+  const unsafe = exceeded.some((budget) => budget !== "maxRenderedLabels");
   const actualMode: GraphActualMode =
     options.renderMode === "aggregated"
       ? "aggregated"
@@ -642,6 +681,7 @@ export function decideGraphRender(
     exceeded,
     disabled: Array.from(new Set(disabled)),
     labelModeUsed,
+    edgeLabelModeUsed,
     layoutModeUsed,
     hoverEnabled,
     animationEnabled,

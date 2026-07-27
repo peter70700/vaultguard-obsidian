@@ -36,7 +36,7 @@ roadmap.)
 | Terraform  | >= 1.6   | Infrastructure deployment              |
 | npm        | Latest   | Package management                     |
 | Git        | >= 2.x   | Source control                         |
-| Obsidian   | >= 1.4.0 | Plugin host                            |
+| Obsidian   | >= 1.11.5 | Plugin host                           |
 
 ### AWS Account Requirements
 
@@ -340,7 +340,7 @@ use Option 2.
 3. Create the plugin directory inside your vault:
 
    ```bash
-   mkdir -p /path/to/your/vault/.obsidian/plugins/vaultguard
+   mkdir -p /path/to/your/vault/.obsidian/plugins/vaultguard-sync
    ```
 
 4. Copy the three files into that directory.
@@ -358,7 +358,7 @@ npm run build
 # Output: main.js, manifest.json, styles.css
 ```
 
-Copy those three files into your vault's `.obsidian/plugins/vaultguard/`
+Copy those three files into your vault's `.obsidian/plugins/vaultguard-sync/`
 directory and enable the plugin in Obsidian.
 
 ***

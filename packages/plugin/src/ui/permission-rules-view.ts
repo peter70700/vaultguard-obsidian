@@ -18,6 +18,7 @@ import {
   type ExplainTrace,
   type ExplainVaultRole,
 } from "./graph/permission-explain";
+import { OperationOwner } from "./operation-owner";
 
 /**
  * Vault-wide permission-rules manager, rendered INTO a container (e.g. the
@@ -259,6 +260,9 @@ export class PermissionRulesView {
   private rowsContainer: HTMLElement | null = null;
   private explanationContainer: HTMLElement | null = null;
   private explanation: ExplanationState | null = null;
+  private readonly loadOwner = new OperationOwner();
+  private readonly explanationOwner = new OperationOwner();
+  private readonly actionOwner = new OperationOwner();
 
   constructor(
     apiClient: VaultGuardApiClient,
@@ -275,11 +279,26 @@ export class PermissionRulesView {
 
   /** Renders the view and kicks off the data load. */
   mount(): void {
+    this.loadOwner.activate();
+    this.explanationOwner.activate();
+    this.actionOwner.activate();
     this.container.addClass("vaultguard-rules-view");
     void this.load();
   }
 
+  /** Invalidates all in-flight work before the host removes this view. */
+  destroy(): void {
+    this.loadOwner.close();
+    this.explanationOwner.close();
+    this.actionOwner.close();
+    this.loading = false;
+    this.explanation = null;
+    this.rowsContainer = null;
+    this.explanationContainer = null;
+  }
+
   private async load(): Promise<void> {
+    const operation = this.loadOwner.begin();
     this.loading = true;
     this.loadError = null;
     this.render();
@@ -290,17 +309,21 @@ export class PermissionRulesView {
         this.apiClient.listUsers().catch(() => [] as UserListEntry[]),
         vaultId ? this.apiClient.listVaultMembers(vaultId).catch(() => [] as VaultMemberRecord[]) : [],
       ]);
+      if (!operation.isCurrent()) return;
       this.rules = rules;
       this.users = users;
       this.members = members;
       this.usersById = new Map(users.map((u) => [u.id, u]));
       this.membersById = new Map(members.map((m) => [m.userId, m]));
     } catch (err) {
+      if (!operation.isCurrent()) return;
       this.loadError = err instanceof Error ? err.message : String(err);
     } finally {
-      this.loading = false;
+      if (operation.isCurrent()) {
+        this.loading = false;
+        this.render();
+      }
     }
-    this.render();
   }
 
   private render(): void {
@@ -402,13 +425,16 @@ export class PermissionRulesView {
   }
 
   private async showExplanation(pathPattern: string): Promise<void> {
+    const operation = this.explanationOwner.begin();
     const path = this.normalizeExplainPath(pathPattern);
     this.explanation = { path, loading: true, error: null, access: null };
     this.renderExplanation();
     try {
       const access = await this.apiClient.getPathAccess(path);
+      if (!operation.isCurrent()) return;
       this.explanation = { path, loading: false, error: null, access };
     } catch (err) {
+      if (!operation.isCurrent()) return;
       this.explanation = {
         path,
         loading: false,
@@ -440,6 +466,7 @@ export class PermissionRulesView {
     header
       .createEl("button", { text: "Close" })
       .addEventListener("click", () => {
+        this.explanationOwner.invalidate();
         this.explanation = null;
         this.renderExplanation();
       });
@@ -739,16 +766,19 @@ export class PermissionRulesView {
       new Notice("You can't delete a rule that grants your own admin access — ask another admin.");
       return;
     }
+    const operation = this.actionOwner.begin();
     const ok = await this.confirmDelete(
       `Delete the ${this.principalLabel(rule)} rule on "${rule.pathPattern}"? This cannot be undone.`
     );
-    if (!ok) return;
+    if (!operation.isCurrent() || !ok) return;
     try {
       await this.apiClient.deletePermission(rule.id);
+      if (!operation.isCurrent()) return;
       new Notice("Permission rule deleted.");
       this.onChanged();
       await this.load();
     } catch (err) {
+      if (!operation.isCurrent()) return;
       new Notice(`Failed to delete: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -920,6 +950,7 @@ export class PermissionRulesView {
 
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving…";
+    const operation = this.actionOwner.begin();
     try {
       if (shouldSetExactLevel) {
         await this.apiClient.setPermissionLevel({
@@ -928,21 +959,31 @@ export class PermissionRulesView {
           pathPattern,
           level: form.level,
         });
-        new Notice(form.rule ? "Permission level updated." : "Permission level set.");
       } else if (form.rule) {
         await this.apiClient.updatePermission(form.rule.id, payload);
-        new Notice("Permission rule updated.");
       } else {
         await this.apiClient.createPermission({ ...payload, upsert: true });
-        new Notice("Permission rule created.");
       }
+      if (!operation.isCurrent()) return;
+      new Notice(
+        shouldSetExactLevel
+          ? form.rule
+            ? "Permission level updated."
+            : "Permission level set."
+          : form.rule
+            ? "Permission rule updated."
+            : "Permission rule created.",
+      );
       this.onChanged();
       this.closeForm();
       await this.load();
     } catch (err) {
+      if (!operation.isCurrent()) return;
       new Notice(`Failed to save: ${err instanceof Error ? err.message : String(err)}`);
-      saveBtn.disabled = false;
-      saveBtn.textContent = form.rule ? "Save changes" : "Create rule";
+      if (saveBtn.isConnected) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = form.rule ? "Save changes" : "Create rule";
+      }
     }
   }
 }

@@ -93,8 +93,42 @@ export interface AtRestDecryptAndDisableResult {
   failures: Array<{ path: string; error: string }>;
 }
 
+export interface AutomaticLocalProjectMemoryModeSafetyInspection {
+  safe: boolean;
+  reason: "safe" | "ciphertext" | "inspection-failed";
+  inspectedFiles: number;
+  evidencePath?: string;
+}
+
+export interface AutomaticLocalProjectMemoryModeInspectionBudget {
+  maxFiles: number;
+  maxBytes: number;
+  maxElapsedMs: number;
+}
+
+/**
+ * Budgets for the pre-activation ciphertext sweep. Generous enough for a real
+ * repository vault, small enough that a pathological one (a vault rooted on a
+ * checkout with `node_modules`, build output or large media) fails closed
+ * instead of holding plugin startup open.
+ */
+export const AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_FILES = 20_000;
+export const AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_BYTES = 256 * 1024 * 1024;
+export const AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_MS = 10_000;
+
 export class AtRestAdapterRuntime {
   private originalAdapterMethods: VaultAdapterOriginalMethods = emptyAdapterMethods();
+  /**
+   * The exact wrapper functions this runtime installed on the adapter.
+   *
+   * Obsidian's `unloadPlugin` calls `plugin.unload()` without awaiting, and
+   * `Component.unload()` / `onunload()` are declared `: void` — so an async
+   * `onunload` tail keeps running while the next plugin instance boots and
+   * installs its own interception. Restoring by identity means a superseded
+   * instance can never strip the live instance's at-rest interception (which
+   * would silently write plaintext and read raw ciphertext for the session).
+   */
+  private installedAdapterMethods: VaultAdapterOriginalMethods = emptyAdapterMethods();
   private atRestCipher: AtRestCipher | null = null;
   /**
    * Phase 12 (vault idle-lock): fail-closed content gate. When true the LAK is
@@ -105,6 +139,8 @@ export class AtRestAdapterRuntime {
    */
   private locked = false;
   private atRestFirstRunOffered = false;
+  /** One-shot proof reused by initAtRestCipher after automatic activation. */
+  private automaticLocalProjectMemoryPlaintextVerified = false;
   private readOnlyFallbackNoticeAt: Map<string, number> = new Map();
   private cloudDecryptFallbackNoticeAt: Map<string, number> = new Map();
   private cipherInitPromise: Promise<boolean> | null = null;
@@ -532,6 +568,85 @@ export class AtRestAdapterRuntime {
     return this.ctx.computeHashBytes(bytes);
   }
 
+  /**
+   * Read-only, fail-closed inspection used before automatically entering Local
+   * Project Memory Mode. Raw reads stay in this at-rest helper so the caller
+   * cannot accidentally inspect decrypted adapter output. No file is changed.
+   *
+   * The caller awaits this inline during `onload`, and a Git-root vault indexes
+   * everything that is not dot-hidden (`node_modules` included), so the sweep
+   * is budgeted. Exhausting any budget reports `inspection-failed` — the
+   * existing fail-closed outcome, already surfaced to the user — rather than
+   * auto-enabling on partial evidence or blocking startup indefinitely.
+   */
+  async inspectAutomaticLocalProjectMemoryModeSafety(
+    budget: Partial<AutomaticLocalProjectMemoryModeInspectionBudget> = {},
+  ): Promise<AutomaticLocalProjectMemoryModeSafetyInspection> {
+    const readBinary = this.originalAdapterMethods.readBinary;
+    if (!readBinary) {
+      return {
+        safe: false,
+        reason: "inspection-failed",
+        inspectedFiles: 0,
+      };
+    }
+
+    const maxFiles = budget.maxFiles ?? AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_FILES;
+    const maxBytes = budget.maxBytes ?? AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_BYTES;
+    const maxElapsedMs = budget.maxElapsedMs ?? AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_MS;
+    const startedAt = Date.now();
+
+    const exhausted = (
+      reason: string,
+      inspectedFiles: number,
+    ): AutomaticLocalProjectMemoryModeSafetyInspection => {
+      this.log(
+        `Automatic Local Project Memory Mode inspection stopped after ${inspectedFiles} file(s): ${reason}. Leaving this vault unchanged.`,
+      );
+      return { safe: false, reason: "inspection-failed", inspectedFiles };
+    };
+
+    const files = this.app.vault.getFiles();
+    if (files.length > maxFiles) {
+      return exhausted(`vault holds ${files.length} files (limit ${maxFiles})`, 0);
+    }
+
+    let inspectedFiles = 0;
+    let inspectedBytes = 0;
+    for (const file of files) {
+      if (Date.now() - startedAt > maxElapsedMs) {
+        return exhausted(`exceeded the ${maxElapsedMs} ms deadline`, inspectedFiles);
+      }
+      try {
+        const bytes = await readBinary(file.path);
+        inspectedFiles += 1;
+        inspectedBytes += bytes.byteLength;
+        if (this.hasVg1MagicBytes(bytes)) {
+          return {
+            safe: false,
+            reason: "ciphertext",
+            inspectedFiles,
+            evidencePath: file.path,
+          };
+        }
+        if (inspectedBytes > maxBytes) {
+          return exhausted(`read past the ${maxBytes} byte budget`, inspectedFiles);
+        }
+      } catch (error) {
+        this.logError("Automatic Local Project Memory Mode ciphertext probe failed", error);
+        return {
+          safe: false,
+          reason: "inspection-failed",
+          inspectedFiles,
+          evidencePath: file.path,
+        };
+      }
+    }
+
+    this.automaticLocalProjectMemoryPlaintextVerified = true;
+    return { safe: true, reason: "safe", inspectedFiles };
+  }
+
   private async markLargeFilePending(
     path: string,
     bytes: ArrayBuffer,
@@ -704,7 +819,10 @@ export class AtRestAdapterRuntime {
       } catch (err) {
         this.logError(`[local-project-memory] Probing at-rest envelope at ${envelopePath} failed`, err);
       }
-      const ciphertextExists = await this.hasAtRestCiphertextOnDisk();
+      const ciphertextExists = this.automaticLocalProjectMemoryPlaintextVerified
+        ? false
+        : await this.hasAtRestCiphertextOnDisk();
+      this.automaticLocalProjectMemoryPlaintextVerified = false;
       if (!envelopeExists) {
         this.atRestCipher = null;
         this.cipherInitPromise = null;
@@ -1535,6 +1653,7 @@ export class AtRestAdapterRuntime {
       const remaining = await this.findAtRestCiphertextFiles();
       if (remaining.length === 0) {
         this.settings.localProjectMemoryMode = true;
+        this.settings.localProjectMemoryModeAutoEnableSuppressed = false;
         this.settings.atRestFirstRunDismissed = true;
         await this.saveSettings();
         new Notice("VaultGuard Sync: at-rest encryption disabled; no VG1 files were found.", 6000);
@@ -1605,6 +1724,7 @@ export class AtRestAdapterRuntime {
     }
 
     this.settings.localProjectMemoryMode = true;
+    this.settings.localProjectMemoryModeAutoEnableSuppressed = false;
     this.settings.atRestFirstRunDismissed = true;
     await this.saveSettings();
 
@@ -1731,59 +1851,71 @@ export class AtRestAdapterRuntime {
     }
 
     // Intercept read operations
-    adapter.read = async (normalizedPath: string): Promise<string> => {
+    this.installedAdapterMethods.read = async (normalizedPath: string): Promise<string> => {
       return this.interceptedRead(normalizedPath);
     };
+    adapter.read = this.installedAdapterMethods.read;
 
     // Intercept write operations
-    adapter.write = async (
+    this.installedAdapterMethods.write = async (
       normalizedPath: string,
       data: string
     ): Promise<void> => {
       return this.interceptedWrite(normalizedPath, data);
     };
+    adapter.write = this.installedAdapterMethods.write;
 
     // Intercept binary read/write so attachments (images, PDFs, ...) also
     // get at-rest decryption/encryption. Without this, every non-text file
     // in the vault would round-trip in plaintext on disk.
     if (this.originalAdapterMethods.readBinary) {
-      (adapter as unknown as {
-        readBinary: (p: string) => Promise<ArrayBuffer>;
-      }).readBinary = async (normalizedPath: string): Promise<ArrayBuffer> => {
+      this.installedAdapterMethods.readBinary = async (
+        normalizedPath: string
+      ): Promise<ArrayBuffer> => {
         return this.interceptedReadBinary(normalizedPath);
       };
+      (adapter as unknown as {
+        readBinary: (p: string) => Promise<ArrayBuffer>;
+      }).readBinary = this.installedAdapterMethods.readBinary;
     }
     if (this.originalAdapterMethods.writeBinary) {
-      (adapter as unknown as {
-        writeBinary: (p: string, d: ArrayBuffer) => Promise<void>;
-      }).writeBinary = async (
+      this.installedAdapterMethods.writeBinary = async (
         normalizedPath: string,
         data: ArrayBuffer
       ): Promise<void> => {
         return this.interceptedWriteBinary(normalizedPath, data);
       };
+      (adapter as unknown as {
+        writeBinary: (p: string, d: ArrayBuffer) => Promise<void>;
+      }).writeBinary = this.installedAdapterMethods.writeBinary;
     }
 
     // Intercept list operations
-    adapter.list = async (
+    this.installedAdapterMethods.list = async (
       normalizedPath: string
     ): Promise<{ files: string[]; folders: string[] }> => {
       return this.interceptedList(normalizedPath);
     };
+    adapter.list = this.installedAdapterMethods.list;
 
     // Intercept delete operations
-    adapter.remove = async (normalizedPath: string): Promise<void> => {
+    this.installedAdapterMethods.remove = async (normalizedPath: string): Promise<void> => {
       return this.interceptedDelete(normalizedPath);
     };
+    adapter.remove = this.installedAdapterMethods.remove;
 
     // Intercept rename — without this the server keeps the old name forever
     // (Obsidian renames don't go through write/remove, so the existing
     // interceptors never fire) and the renamed file appears as a duplicate
     // until the user manually deletes the old path.
     if (this.originalAdapterMethods.rename) {
-      adapter.rename = async (oldPath: string, newPath: string): Promise<void> => {
+      this.installedAdapterMethods.rename = async (
+        oldPath: string,
+        newPath: string
+      ): Promise<void> => {
         return this.interceptedRename(oldPath, newPath);
       };
+      adapter.rename = this.installedAdapterMethods.rename;
     }
 
     // Intercept getResourcePath so at-rest-encrypted media (images, PDFs, ...)
@@ -1797,6 +1929,7 @@ export class AtRestAdapterRuntime {
         __vaultguard?: boolean;
       };
       override.__vaultguard = true;
+      this.installedAdapterMethods.getResourcePath = override;
       (adapter as unknown as { getResourcePath: (p: string) => string }).getResourcePath =
         override;
     }
@@ -1807,38 +1940,49 @@ export class AtRestAdapterRuntime {
   /**
    * Restores the original vault adapter methods.
    * Called during plugin unload to prevent issues with other plugins.
+   *
+   * Restores by identity: a method is handed back only while the adapter still
+   * holds the wrapper THIS runtime installed. Obsidian does not await
+   * `onunload` (`Component.unload()`/`onunload()` are `: void`, and
+   * `unloadPlugin` calls `plugin.unload()` un-awaited), so a superseded
+   * instance can reach this point after the next instance has already
+   * intercepted the adapter. Blind reassignment there would strip live at-rest
+   * interception and leave the vault writing plaintext for the rest of the
+   * session.
    */
   restoreVaultAdapter(): void {
     const adapter = this.app.vault.adapter;
+    const mutableAdapter = adapter as unknown as Record<string, unknown>;
+    const superseded: string[] = [];
 
-    if (this.originalAdapterMethods.read) {
-      adapter.read = this.originalAdapterMethods.read;
+    const restoreMethod = (name: keyof VaultAdapterOriginalMethods): void => {
+      const original = this.originalAdapterMethods[name];
+      if (!original) return;
+      const installed = this.installedAdapterMethods[name];
+      // No recorded wrapper means this runtime never installed one (legacy
+      // callers, partial interception) — fall back to the previous behavior.
+      if (installed && mutableAdapter[name] !== installed) {
+        superseded.push(name);
+        return;
+      }
+      mutableAdapter[name] = original;
+    };
+
+    restoreMethod("read");
+    restoreMethod("write");
+    restoreMethod("readBinary");
+    restoreMethod("writeBinary");
+    restoreMethod("list");
+    restoreMethod("remove");
+    restoreMethod("rename");
+    restoreMethod("getResourcePath");
+
+    if (superseded.length > 0) {
+      this.log(
+        `Vault adapter restore skipped for ${superseded.join(", ")}: another VaultGuard instance owns the adapter.`
+      );
     }
-    if (this.originalAdapterMethods.write) {
-      adapter.write = this.originalAdapterMethods.write;
-    }
-    if (this.originalAdapterMethods.readBinary) {
-      (adapter as unknown as { readBinary: (p: string) => Promise<ArrayBuffer> }).readBinary =
-        this.originalAdapterMethods.readBinary;
-    }
-    if (this.originalAdapterMethods.writeBinary) {
-      (adapter as unknown as {
-        writeBinary: (p: string, d: ArrayBuffer) => Promise<void>;
-      }).writeBinary = this.originalAdapterMethods.writeBinary;
-    }
-    if (this.originalAdapterMethods.list) {
-      adapter.list = this.originalAdapterMethods.list;
-    }
-    if (this.originalAdapterMethods.remove) {
-      adapter.remove = this.originalAdapterMethods.remove;
-    }
-    if (this.originalAdapterMethods.rename) {
-      adapter.rename = this.originalAdapterMethods.rename;
-    }
-    if (this.originalAdapterMethods.getResourcePath) {
-      (adapter as unknown as { getResourcePath: (p: string) => string }).getResourcePath =
-        this.originalAdapterMethods.getResourcePath;
-    }
+    this.installedAdapterMethods = emptyAdapterMethods();
 
     // Revoke every decrypted blob URL so they don't leak past unload.
     this.revokeAllResourcePreviews();

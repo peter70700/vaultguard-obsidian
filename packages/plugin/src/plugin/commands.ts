@@ -645,9 +645,8 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
     name: "Create agent bridge lease",
     checkCallback: (checking: boolean) => {
       if (!ctx.isOptionalModuleEnabled("agentAccess")) return false;
-      if (ctx.localProjectMemoryMode) return false;
       if (Platform.isMobileApp) return false;
-      const ready = !!ctx.session && !!ctx.settings.serverVaultId;
+      const ready = !!ctx.session && (ctx.localProjectMemoryMode || !!ctx.settings.serverVaultId);
       if (checking) return ready;
       ctx.openAgentBridgeLeaseModal();
     },
@@ -658,7 +657,6 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
     name: "Revoke agent bridge leases",
     checkCallback: (checking: boolean) => {
       if (!ctx.isOptionalModuleEnabled("agentAccess")) return false;
-      if (ctx.localProjectMemoryMode) return false;
       if (Platform.isMobileApp) return false;
       if (checking) return true;
       ctx.revokeAllAgentBridgeLeases();
@@ -675,10 +673,6 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
     checkCallback: (checking: boolean) => {
       if (!ctx.isOptionalModuleEnabled("agentAccess")) return false;
       if (checking) return true;
-      if (ctx.localProjectMemoryMode) {
-        new Notice("VaultGuard Sync: server bridge leases are disabled in Local Project Memory Mode.", 6000);
-        return;
-      }
       if (Platform.isMobileApp) {
         new Notice(
           "Agent bridge requires Obsidian desktop. This feature is unavailable on mobile.",
@@ -686,9 +680,11 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
         );
         return;
       }
-      if (!ctx.session || !ctx.settings.serverVaultId) {
+      if (!ctx.session || (!ctx.localProjectMemoryMode && !ctx.settings.serverVaultId)) {
         new Notice(
-          "Agent bridge requires Obsidian desktop. Sign in and pick a vault to mint a lease.",
+          ctx.localProjectMemoryMode
+            ? "Agent bridge requires an active VaultGuard login in Local Project Memory Mode."
+            : "Agent bridge requires Obsidian desktop. Sign in and pick a vault to mint a lease.",
           6000
         );
         return;

@@ -148,7 +148,7 @@ OS keychain (macOS Keychain / Windows DPAPI / Linux libsecret)
             │
             └─▶ LAK (Local At-rest Key)
                  ─ AES-256, generated once per device-vault binding
-                 ─ Stored at .obsidian/plugins/vaultguard/lak.envelope
+                 ─ Stored at .obsidian/plugins/vaultguard-sync/lak.envelope
                    (wrapped by safeStorage; binary-opaque on disk)
                  ─ Never leaves the device through normal operation
                  ─ Held in process memory only while the plugin runs
@@ -333,7 +333,7 @@ the override is active.
 
 - **First load on a device**: a fresh 32-byte LAK is generated, wrapped
   by `safeStorage`, and persisted to
-  `.obsidian/plugins/vaultguard/lak.envelope`. New writes are
+  `.obsidian/plugins/vaultguard-sync/lak.envelope`. New writes are
   encrypted from this moment on.
 - **Subsequent loads**: `lak.envelope` is read, unwrapped via
   `safeStorage`, and held in memory. No user prompt — at-rest is

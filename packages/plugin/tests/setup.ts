@@ -118,6 +118,8 @@ class MockPluginSettingTab {
     this.app = app;
     this.plugin = plugin;
   }
+
+  hide(): void {}
 }
 
 class MockSetting {

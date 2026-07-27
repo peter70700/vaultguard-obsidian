@@ -3,13 +3,17 @@ import { AnthropicClient } from "./anthropic-client";
 import type { OpenAiModelInfo } from "./openai-client";
 import { OpenAiResponsesClient } from "./openai-client";
 import {
+  listCodexSubscriptionModels,
+  type CodexSubscriptionModelInfo,
+} from "./codex-cli/codex-model-discovery";
+import {
   AI_CHAT_MODELS,
   OPENAI_CHAT_MODELS,
   humanizeModelId,
   type ChatModelOption,
 } from "./models";
 
-export type ProviderModelCatalogProvider = "anthropic" | "openai";
+export type ProviderModelCatalogProvider = "anthropic" | "openai" | "codex";
 export type ModelCatalogSource = "live" | "cache" | "fallback";
 
 export const MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -19,13 +23,16 @@ const MAX_MODEL_ID_LENGTH = 200;
 export interface ResolveModelCatalogInput {
   provider: ProviderModelCatalogProvider;
   apiKey: string | null;
+  codexBinaryPath?: string | null;
   selectedModel: string;
   forceRefresh?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface ResolvedModelCatalog {
   provider: ProviderModelCatalogProvider;
   options: ReadonlyArray<ChatModelOption>;
+  selectedModel: string;
   source: ModelCatalogSource;
   fetchedAt?: number;
   warning?: string;
@@ -34,17 +41,24 @@ export interface ResolvedModelCatalog {
 export interface ProviderModelCatalogLoaders {
   loadAnthropic(apiKey: string): Promise<AnthropicModelInfo[]>;
   loadOpenAi(apiKey: string): Promise<OpenAiModelInfo[]>;
+  loadCodex(binaryPath: string, signal?: AbortSignal): Promise<CodexSubscriptionModelInfo[]>;
 }
 
 interface CatalogCacheEntry {
   options: ReadonlyArray<ChatModelOption>;
+  defaultModel?: string;
   fetchedAt: number;
   generation: number;
 }
 
 interface InFlightCatalog {
   generation: number;
-  promise: Promise<ReadonlyArray<ChatModelOption> | null>;
+  promise: Promise<LoadedCatalog | null>;
+}
+
+interface LoadedCatalog {
+  options: ReadonlyArray<ChatModelOption>;
+  defaultModel?: string;
 }
 
 const DEFAULT_LOADERS: ProviderModelCatalogLoaders = {
@@ -52,6 +66,8 @@ const DEFAULT_LOADERS: ProviderModelCatalogLoaders = {
     new AnthropicClient({ apiKey, model: AI_CHAT_MODELS[0]?.id ?? "" }).listModels(),
   loadOpenAi: (apiKey) =>
     new OpenAiResponsesClient({ apiKey, model: OPENAI_CHAT_MODELS[0]?.id ?? "" }).listModels(),
+  loadCodex: (binaryPath, signal) =>
+    listCodexSubscriptionModels(binaryPath, { signal }),
 };
 
 export class ProviderModelCatalogService {
@@ -60,12 +76,16 @@ export class ProviderModelCatalogService {
   private readonly generations: Record<ProviderModelCatalogProvider, number> = {
     anthropic: 0,
     openai: 0,
+    codex: 0,
   };
+  private readonly loaders: ProviderModelCatalogLoaders;
 
   constructor(
-    private readonly loaders: ProviderModelCatalogLoaders = DEFAULT_LOADERS,
+    loaders: Partial<ProviderModelCatalogLoaders> = DEFAULT_LOADERS,
     private readonly now: () => number = Date.now,
-  ) {}
+  ) {
+    this.loaders = { ...DEFAULT_LOADERS, ...loaders };
+  }
 
   invalidate(provider: ProviderModelCatalogProvider): void {
     this.generations[provider]++;
@@ -77,9 +97,16 @@ export class ProviderModelCatalogService {
     const selectedModel = normalizeModelId(input.selectedModel);
     const fallback = () => mergeSelected(selectedModel, fallbackOptions(input.provider));
     const cached = this.cache.get(input.provider);
+    const credential =
+      input.provider === "codex" ? input.codexBinaryPath?.trim() : input.apiKey?.trim();
 
-    if (!input.apiKey) {
-      return { provider: input.provider, options: fallback(), source: "fallback" };
+    if (!credential) {
+      return {
+        provider: input.provider,
+        options: fallback(),
+        selectedModel,
+        source: "fallback",
+      };
     }
 
     if (
@@ -90,7 +117,7 @@ export class ProviderModelCatalogService {
     ) {
       return {
         provider: input.provider,
-        options: mergeSelected(selectedModel, cached.options),
+        ...resolveSelection(selectedModel, cached),
         source: "cache",
         fetchedAt: cached.fetchedAt,
       };
@@ -99,12 +126,12 @@ export class ProviderModelCatalogService {
     const generation = this.generations[input.provider];
     let request = this.inFlight.get(input.provider);
     if (!request || request.generation !== generation) {
-      const promise = this.load(input.provider, input.apiKey)
-        .then((options) => {
+      const promise = this.load(input.provider, credential, input.signal)
+        .then((catalog) => {
           if (this.generations[input.provider] !== generation) return null;
           const fetchedAt = this.now();
-          this.cache.set(input.provider, { options, fetchedAt, generation });
-          return options;
+          this.cache.set(input.provider, { ...catalog, fetchedAt, generation });
+          return catalog;
         })
         .finally(() => {
           const current = this.inFlight.get(input.provider);
@@ -120,13 +147,14 @@ export class ProviderModelCatalogService {
         return {
           provider: input.provider,
           options: fallback(),
+          selectedModel,
           source: "fallback",
           warning: discoveryWarning(input.provider),
         };
       }
       return {
         provider: input.provider,
-        options: mergeSelected(selectedModel, options),
+        ...resolveSelection(selectedModel, options),
         source: "live",
         fetchedAt: this.cache.get(input.provider)?.fetchedAt,
       };
@@ -134,7 +162,9 @@ export class ProviderModelCatalogService {
       const safeCache = this.cache.get(input.provider);
       return {
         provider: input.provider,
-        options: safeCache ? mergeSelected(selectedModel, safeCache.options) : fallback(),
+        ...(safeCache
+          ? resolveSelection(selectedModel, safeCache)
+          : { options: fallback(), selectedModel }),
         source: safeCache ? "cache" : "fallback",
         fetchedAt: safeCache?.fetchedAt,
         warning: discoveryWarning(input.provider),
@@ -144,11 +174,16 @@ export class ProviderModelCatalogService {
 
   private async load(
     provider: ProviderModelCatalogProvider,
-    apiKey: string,
-  ): Promise<ReadonlyArray<ChatModelOption>> {
-    return provider === "openai"
-      ? normalizeOpenAiModels(await this.loaders.loadOpenAi(apiKey))
-      : normalizeAnthropicModels(await this.loaders.loadAnthropic(apiKey));
+    credential: string,
+    signal?: AbortSignal,
+  ): Promise<LoadedCatalog> {
+    if (provider === "openai") {
+      return { options: normalizeOpenAiModels(await this.loaders.loadOpenAi(credential)) };
+    }
+    if (provider === "anthropic") {
+      return { options: normalizeAnthropicModels(await this.loaders.loadAnthropic(credential)) };
+    }
+    return normalizeCodexModels(await this.loaders.loadCodex(credential, signal));
   }
 }
 
@@ -203,6 +238,39 @@ function normalizeAnthropicModels(models: ReadonlyArray<AnthropicModelInfo>): Ch
   );
 }
 
+function normalizeCodexModels(
+  models: ReadonlyArray<CodexSubscriptionModelInfo>,
+): LoadedCatalog {
+  const valid = models.filter(isCodexModelRecord);
+  const options = dedupeOptions(
+    valid.map((model) => ({
+      id: normalizeModelId(model.model),
+      label:
+        typeof model.displayName === "string" && model.displayName.trim()
+          ? model.displayName.trim()
+          : humanizeModelId(model.model),
+    })),
+  );
+  const defaultModel = valid.find(
+    (model) => model.isDefault === true && options.some((option) => option.id === model.model.trim()),
+  )?.model.trim();
+  return { options, ...(defaultModel ? { defaultModel } : {}) };
+}
+
+function isCodexModelRecord(value: unknown): value is CodexSubscriptionModelInfo {
+  if (!value || typeof value !== "object") return false;
+  const model = value as Partial<CodexSubscriptionModelInfo>;
+  const id = normalizeModelId(model.id);
+  const requestModel = normalizeModelId(model.model);
+  return (
+    id.length > 0 &&
+    id.length <= MAX_MODEL_ID_LENGTH &&
+    requestModel.length > 0 &&
+    requestModel.length <= MAX_MODEL_ID_LENGTH &&
+    model.hidden !== true
+  );
+}
+
 function isOpenAiModelRecord(value: unknown): value is OpenAiModelInfo {
   return (
     !!value &&
@@ -243,11 +311,26 @@ function mergeSelected(
   ].slice(0, MAX_CATALOG_MODELS);
 }
 
+function resolveSelection(
+  selectedModel: string,
+  catalog: Pick<LoadedCatalog, "options" | "defaultModel">,
+): { options: ReadonlyArray<ChatModelOption>; selectedModel: string } {
+  const selectedAvailable = catalog.options.some((option) => option.id === selectedModel);
+  const defaultAvailable =
+    !!catalog.defaultModel && catalog.options.some((option) => option.id === catalog.defaultModel);
+  const resolved = selectedAvailable
+    ? selectedModel
+    : defaultAvailable
+      ? catalog.defaultModel!
+      : selectedModel;
+  return { options: mergeSelected(resolved, catalog.options), selectedModel: resolved };
+}
+
 function fallbackOptions(provider: ProviderModelCatalogProvider): ReadonlyArray<ChatModelOption> {
-  return provider === "openai" ? OPENAI_CHAT_MODELS : AI_CHAT_MODELS;
+  return provider === "anthropic" ? AI_CHAT_MODELS : OPENAI_CHAT_MODELS;
 }
 
 function discoveryWarning(provider: ProviderModelCatalogProvider): string {
-  const label = provider === "openai" ? "OpenAI" : "Anthropic";
+  const label = provider === "openai" ? "OpenAI" : provider === "codex" ? "Codex" : "Anthropic";
   return `Could not refresh ${label} models; using the current and saved fallback choices.`;
 }

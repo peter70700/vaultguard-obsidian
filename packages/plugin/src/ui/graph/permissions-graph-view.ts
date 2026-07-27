@@ -83,6 +83,7 @@ import {
 
 export { VAULTGUARD_GRAPH_VIEW_TYPE } from "../view-types";
 import { VAULTGUARD_GRAPH_VIEW_TYPE } from "../view-types";
+import { OperationOwner, type OperationLease } from "../operation-owner";
 
 // ─── Data source contract (provided by the plugin; see main.ts) ───────────────
 //
@@ -236,6 +237,7 @@ export class PermissionsGraphView extends ItemView {
   // Lets the per-permission trace offer a "← back" to the node list it came from.
   private lastExplainContext: { kind: "path" | "user"; key: string } | null = null;
   private currentVaultId: string | null = null;
+  private readonly loadOwner = new OperationOwner();
 
   // Cached fetched data for click→explain narration.
   private rules: PermissionRule[] = [];
@@ -263,6 +265,7 @@ export class PermissionsGraphView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
+    this.loadOwner.activate();
     this.registerEvent(
       this.app.workspace.on("css-change", () => {
         this.applyGraphStageAppearance();
@@ -284,6 +287,12 @@ export class PermissionsGraphView extends ItemView {
   }
 
   private async render(): Promise<void> {
+    // refresh() is called across open leaves by the plugin (permissions-graph
+    // wiring, on reconnect). Obsidian awaits View.onClose(), so a leaf can be
+    // mid-teardown — with its owner already closed — when that lands.
+    // OperationOwner.begin() throws for a closed owner, so guard before it.
+    if (this.loadOwner.isClosed) return;
+    const operation = this.loadOwner.begin();
     const container = (this.contentEl ??
       (this.containerEl.children[1] as HTMLElement)) as HTMLElement;
     // Tear down any prior render (cytoscape instance + cached state) so a
@@ -321,13 +330,14 @@ export class PermissionsGraphView extends ItemView {
 
     try {
       this.buildChrome(container);
-      await this.loadAndRender(vaultId);
+      await this.loadAndRender(vaultId, false, operation);
     } catch (err) {
-      this.renderError(container, err);
+      if (operation.isCurrent()) this.renderError(container, err);
     }
   }
 
   async onClose(): Promise<void> {
+    this.loadOwner.close();
     this.teardown();
   }
 
@@ -1403,15 +1413,21 @@ export class PermissionsGraphView extends ItemView {
 
   // ─── Data load + render ─────────────────────────────────────────────────────
 
-  private async loadAndRender(vaultId: string, force = false): Promise<void> {
+  private async loadAndRender(
+    vaultId: string,
+    force = false,
+    operation: OperationLease = this.loadOwner.begin(),
+  ): Promise<void> {
     // Use the plugin's cache (memory, then the encrypted on-disk envelope) so
     // reopening — even after a restart — is instant; only hit the network on
     // first load, after the TTL, or on an explicit refresh.
     const scopedFetch = this.graphOptions.pathPrefix.length > 0;
     const desiredFiles = Math.min(this.graphOptions.maxFiles, DEFAULT_GRAPH_BUDGETS.maxInitialFiles);
     let cached = force || scopedFetch ? null : await this.plugin.loadPersistedPermissionsGraphCache(vaultId);
+    if (!operation.isCurrent()) return;
     if (cached && cached.scanned < Math.min(desiredFiles, cached.total)) cached = null;
-    const dataset = cached ?? (await this.fetchDataset(vaultId, scopedFetch));
+    const dataset = cached ?? (await this.fetchDataset(vaultId, scopedFetch, operation));
+    if (!operation.isCurrent()) return;
     if (!cached && !scopedFetch) void this.plugin.setPermissionsGraphCache(vaultId, dataset);
 
     this.rules = dataset.rules;
@@ -1486,15 +1502,22 @@ export class PermissionsGraphView extends ItemView {
   }
 
   /** Fetch the raw dataset: members + rules + a parallel access sweep of files AND folders. */
-  private async fetchDataset(vaultId: string, scopedFetch = false): Promise<PermissionsGraphDataset> {
+  private async fetchDataset(
+    vaultId: string,
+    scopedFetch = false,
+    operation: OperationLease,
+  ): Promise<PermissionsGraphDataset> {
     const source = this.plugin.getPermissionsGraphDataSource();
-    this.setStatus("Loading members and permissions…");
+    if (operation.isCurrent()) this.setStatus("Loading members and permissions…");
 
     // Members + rules (rules drive the expiring/dashed determination + explain).
     const [members, rules] = await Promise.all([
       source.listVaultMembers(vaultId),
       source.getPermissions().catch(() => [] as PermissionRule[]),
     ]);
+    if (!operation.isCurrent()) {
+      return { members: [], rules: [], summaries: [], folderSummaries: [], scanned: 0, total: 0, truncated: false };
+    }
 
     // Sweep the viewer's visible files, bounded by the cap.
     const allPaths = source.getAllFilePaths();
@@ -1505,8 +1528,13 @@ export class PermissionsGraphView extends ItemView {
     const capped = scopedPaths.slice(0, cap);
     const truncated = scopedPaths.length > capped.length;
 
-    this.setStatus(`Resolving access for ${capped.length} file(s)…`);
+    if (operation.isCurrent()) {
+      this.setStatus(`Resolving access for ${capped.length} file(s)…`);
+    }
     const summaries = await this.sweepAccess(source, capped, "file");
+    if (!operation.isCurrent()) {
+      return { members: [], rules: [], summaries: [], folderSummaries: [], scanned: 0, total: 0, truncated: false };
+    }
 
     // Folders: evaluate access at each ancestor folder of a readable file, so
     // folder-level grants show up as user→folder edges just like files.
@@ -1517,8 +1545,13 @@ export class PermissionsGraphView extends ItemView {
 
     let folderSummaries: GraphPathSummary[] = [];
     if (folderPaths.length > 0) {
-      this.setStatus(`Resolving access for ${folderPaths.length} folder(s)…`);
+      if (operation.isCurrent()) {
+        this.setStatus(`Resolving access for ${folderPaths.length} folder(s)…`);
+      }
       folderSummaries = await this.sweepAccess(source, folderPaths, "folder");
+      if (!operation.isCurrent()) {
+        return { members: [], rules: [], summaries: [], folderSummaries: [], scanned: 0, total: 0, truncated: false };
+      }
     }
 
     return {
@@ -1899,7 +1932,12 @@ export class PermissionsGraphView extends ItemView {
     const writeColor = cssVar("--color-yellow", "#e0a526");
     const adminColor = cssVar("--color-purple", "#a371e0");
     const denyColor = cssVar("--color-red", "#d64545");
+    // Node names vs per-edge access text are separate decisions: names stay on
+    // unless the user picks Labels = Off, while the dense edge labels auto-drop
+    // past their budget. Sharing one flag meant enabling Users + Files +
+    // Folders added enough permission edges to hide every name.
     const labelsOn = (this.renderDecision?.labelModeUsed ?? "on") === "on";
+    const edgeLabelsOn = (this.renderDecision?.edgeLabelModeUsed ?? "on") === "on";
     // User-adjustable text size (Graph Studio → Text size). Multiplies every label
     // font size so the graph stays readable at the default fit-to-view zoom.
     const labelScale = this.graphOptions.appearance.labelScale ?? 1;
@@ -1998,7 +2036,7 @@ export class PermissionsGraphView extends ItemView {
       {
         selector: "edge[label]",
         style: {
-          label: labelsOn ? "data(label)" : "",
+          label: edgeLabelsOn ? "data(label)" : "",
           "font-size": fontPx(11),
           color: mutedColor,
           "text-rotation": "autorotate",

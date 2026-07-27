@@ -12,6 +12,7 @@ import {
   setIcon,
 } from "obsidian";
 import { setButtonLoading, setControlBusy } from "./loading-button";
+import { OperationOwner } from "./operation-owner";
 import {
   VaultGuardApiClient,
   PermissionRule,
@@ -78,6 +79,8 @@ export class PathPermissionsModal extends Modal {
   private accessSummary: PathAccessSummary | null = null;
   private explainedPrincipalId: string | null = null;
   private permissionEditor: PermissionEditor;
+  private readonly contentOwner = new OperationOwner();
+  private readonly usersOwner = new OperationOwner();
 
   constructor(cfg: PathPermissionsConfig) {
     super(cfg.app);
@@ -88,6 +91,9 @@ export class PathPermissionsModal extends Modal {
   }
 
   async onOpen(): Promise<void> {
+    this.contentOwner.activate();
+    this.usersOwner.activate();
+    const operation = this.contentOwner.begin();
     this.isClosed = false;
     this.permissionsLoaded = false;
     this.modalEl.addClass("vaultguard-path-perms-modal");
@@ -95,27 +101,33 @@ export class PathPermissionsModal extends Modal {
     this.renderLoading();
 
     try {
-      this.accessSummary = await this.cfg.apiClient.getPathAccess(this.cfg.path).catch(() => null);
-      this.currentUserLevel = this.accessSummary?.currentUserLevel ?? "none";
-      this.mergeAccessSummaryIntoDirectory();
-      this.canManage = this.cfg.isAdmin || this.currentUserLevel === "admin";
-      this.usersLoading = this.cfg.isAdmin;
-      if (this.cfg.isAdmin) {
-        void this.loadUsers();
-      }
-
-      this.rules = this.canManage
+      const accessSummary = await this.cfg.apiClient.getPathAccess(this.cfg.path).catch(() => null);
+      if (!operation.isCurrent()) return;
+      const currentUserLevel = accessSummary?.currentUserLevel ?? "none";
+      const canManage = this.cfg.isAdmin || currentUserLevel === "admin";
+      const rules = canManage
         ? await this.cfg.apiClient.getPermissions(this.cfg.path).catch(() => [])
         : [];
+      if (!operation.isCurrent()) return;
+
+      this.accessSummary = accessSummary;
+      this.currentUserLevel = currentUserLevel;
+      this.canManage = canManage;
+      this.rules = rules;
+      this.mergeAccessSummaryIntoDirectory();
+      this.usersLoading = this.cfg.isAdmin;
+      if (this.cfg.isAdmin) void this.loadUsers();
       this.seedInitialExplanation();
       this.permissionsLoaded = true;
       this.render();
     } catch (error) {
-      this.renderError((error as Error).message);
+      if (operation.isCurrent()) this.renderError((error as Error).message);
     }
   }
 
   onClose(): void {
+    this.contentOwner.close();
+    this.usersOwner.close();
     this.isClosed = true;
     this.modalEl.removeClass("vaultguard-path-perms-modal");
     this.contentEl.removeClass("vaultguard-path-perms-content");
@@ -753,8 +765,21 @@ export class PathPermissionsModal extends Modal {
   }
 
   private async refresh(): Promise<void> {
+    if (this.contentOwner.isClosed) return;
+    const operation = this.contentOwner.begin();
     try {
-      this.accessSummary = await this.cfg.apiClient.getPathAccess(this.cfg.path).catch(() => this.accessSummary);
+      const accessSummary = await this.cfg.apiClient
+        .getPathAccess(this.cfg.path)
+        .catch(() => this.accessSummary);
+      if (!operation.isCurrent()) return;
+      const currentUserLevel = accessSummary?.currentUserLevel ?? this.currentUserLevel;
+      const canManage = this.cfg.isAdmin || currentUserLevel === "admin";
+      const rules = canManage
+        ? await this.cfg.apiClient.getPermissions(this.cfg.path).catch(() => [])
+        : [];
+      if (!operation.isCurrent()) return;
+
+      this.accessSummary = accessSummary;
       // Post-write read consistency: rules live in DDB tables that publish
       // to GSIs eventually (typically <1s, occasionally longer). A refresh
       // fired immediately after a set-level write can read the stale view
@@ -763,18 +788,16 @@ export class PathPermissionsModal extends Modal {
       // by the server yet, and drop a patch as soon as the server's view
       // matches it (self-healing without TTL guesswork).
       this.reconcilePendingLevelPatches();
-      this.currentUserLevel = this.accessSummary?.currentUserLevel ?? this.currentUserLevel;
+      this.currentUserLevel = currentUserLevel;
       this.mergeAccessSummaryIntoDirectory();
-      this.canManage = this.cfg.isAdmin || this.currentUserLevel === "admin";
-      this.rules = this.canManage
-        ? await this.cfg.apiClient.getPermissions(this.cfg.path).catch(() => [])
-        : [];
+      this.canManage = canManage;
+      this.rules = rules;
       this.seedInitialExplanation();
       this.permissionsLoaded = true;
       this.render();
       this.cfg.onRulesChanged?.();
     } catch (error) {
-      this.renderError((error as Error).message);
+      if (operation.isCurrent()) this.renderError((error as Error).message);
     }
   }
 
@@ -822,19 +845,21 @@ export class PathPermissionsModal extends Modal {
   }
 
   private async loadUsers(): Promise<void> {
+    if (this.usersOwner.isClosed) return;
+    const operation = this.usersOwner.begin();
     try {
       const users = await this.cfg.apiClient.listUsers();
-      if (this.isClosed) return;
+      if (!operation.isCurrent()) return;
 
       this.users = sortAccessUsers(users);
       this.userMap = buildAccessUserMap(this.users);
       this.usersLoadError = null;
     } catch (error) {
-      if (this.isClosed) return;
+      if (!operation.isCurrent()) return;
       this.usersLoadError = (error as Error).message;
     } finally {
-      this.usersLoading = false;
-      if (!this.isClosed && this.permissionsLoaded) {
+      if (operation.isCurrent()) this.usersLoading = false;
+      if (operation.isCurrent() && this.permissionsLoaded) {
         this.render();
       }
     }

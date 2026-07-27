@@ -66,6 +66,7 @@ export class UserManager {
           ? this.apiClient.listVaultMembers(this.currentVaultId).catch(() => [])
           : Promise.resolve([] as VaultMemberRecord[]),
       ]);
+      if (container.isConnected === false) return;
       const membershipByUser = new Map(memberships.map((membership) => [
         membership.userId,
         membership,
@@ -105,6 +106,7 @@ export class UserManager {
         });
       }
     } catch (error) {
+      if (container.isConnected === false) return;
       container.empty();
       container.setAttribute("aria-busy", "false");
       const errorEl = container.createDiv({
@@ -336,6 +338,7 @@ class InviteUserModal extends Modal {
   private sendWelcomeEmail: boolean = true;
   private inviteButton: ButtonComponent | null = null;
   private readonly i18n = createI18n();
+  private active = false;
 
   constructor(
     app: App,
@@ -350,6 +353,7 @@ class InviteUserModal extends Modal {
   }
 
   async onOpen(): Promise<void> {
+    this.active = true;
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-dialog-modal");
@@ -420,7 +424,7 @@ class InviteUserModal extends Modal {
       try {
         vaults = (await this.apiClient.listVaults()).filter((vault) => !vault.archived);
       } catch (error) {
-        if (version !== renderVersion || this.accessKind !== "guest") return;
+        if (!this.active || version !== renderVersion || this.accessKind !== "guest") return;
         const errorEl = accessDetails.createDiv({
           cls: "vaultguard-error",
           text: this.i18n.t("guest.vaultLoadFailed", {
@@ -432,7 +436,7 @@ class InviteUserModal extends Modal {
         accessDetails.setAttribute("aria-busy", "false");
         return;
       }
-      if (version !== renderVersion || this.accessKind !== "guest") return;
+      if (!this.active || version !== renderVersion || this.accessKind !== "guest") return;
       accessDetails.setAttribute("aria-busy", "false");
       const validVaultIds = new Set(vaults.map((vault) => vault.vaultId));
       for (const selectedVaultId of this.selectedVaultIds) {
@@ -487,6 +491,7 @@ class InviteUserModal extends Modal {
       );
     contentEl.appendChild(accessDetails);
     await renderAccessDetails();
+    if (!this.active) return;
 
     new Setting(contentEl)
       .setName(this.i18n.t("guest.welcome.name"))
@@ -508,6 +513,7 @@ class InviteUserModal extends Modal {
   }
 
   onClose(): void {
+    this.active = false;
     this.modalEl.removeClass("vaultguard-dialog-modal");
     this.contentEl.removeClass("vaultguard-dialog-content");
     this.inviteButton = null;
@@ -549,6 +555,7 @@ class InviteUserModal extends Modal {
           : {}),
         sendWelcomeEmail: this.sendWelcomeEmail,
       });
+      if (!this.active) return;
       if (result?.provisioningStatus === "partial") {
         new Notice(this.i18n.t("guest.provisioningPartial", {
           failures: result.vaultProvisioningFailures ?? 0,
@@ -559,14 +566,18 @@ class InviteUserModal extends Modal {
         new Notice(this.i18n.t("guest.sent", { email: this.email }));
       }
       await this.onInvited();
+      if (!this.active) return;
       this.close();
     } catch (error) {
+      if (!this.active) return;
       new Notice(this.i18n.t("guest.failed", {
         message: error instanceof Error ? error.message : String(error),
       }));
     } finally {
-      this.contentEl.setAttribute("aria-busy", "false");
-      this.inviteButton?.setDisabled(false).setButtonText(this.i18n.t("guest.send"));
+      if (this.active && this.contentEl.isConnected) {
+        this.contentEl.setAttribute("aria-busy", "false");
+        this.inviteButton?.setDisabled(false).setButtonText(this.i18n.t("guest.send"));
+      }
     }
   }
 }
@@ -576,6 +587,7 @@ class InviteUserModal extends Modal {
 class UserPermissionsModal extends Modal {
   private apiClient: VaultGuardApiClient;
   private user: VaultGuardUser;
+  private active = false;
 
   constructor(app: App, apiClient: VaultGuardApiClient, user: VaultGuardUser) {
     super(app);
@@ -584,6 +596,7 @@ class UserPermissionsModal extends Modal {
   }
 
   async onOpen(): Promise<void> {
+    this.active = true;
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-dialog-modal");
@@ -595,6 +608,7 @@ class UserPermissionsModal extends Modal {
 
     try {
       const permissions = await this.apiClient.getUserPermissions(this.user.id);
+      if (!this.active) return;
       contentEl.empty();
       contentEl.createEl("h3", { text: `Permissions: ${this.user.displayName}` });
 
@@ -625,6 +639,7 @@ class UserPermissionsModal extends Modal {
         row.createEl("td", { text: perm.role ? `role:${perm.role}` : `user:${perm.userId}` });
       }
     } catch (error) {
+      if (!this.active) return;
       contentEl.empty();
       contentEl.createDiv({
         cls: "vaultguard-error",
@@ -634,6 +649,7 @@ class UserPermissionsModal extends Modal {
   }
 
   onClose(): void {
+    this.active = false;
     this.modalEl.removeClass("vaultguard-dialog-modal");
     this.contentEl.removeClass("vaultguard-dialog-content");
     this.contentEl.empty();
@@ -645,6 +661,7 @@ class UserPermissionsModal extends Modal {
 class UserActivityModal extends Modal {
   private apiClient: VaultGuardApiClient;
   private user: VaultGuardUser;
+  private active = false;
 
   constructor(app: App, apiClient: VaultGuardApiClient, user: VaultGuardUser) {
     super(app);
@@ -653,6 +670,7 @@ class UserActivityModal extends Modal {
   }
 
   async onOpen(): Promise<void> {
+    this.active = true;
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-dialog-modal");
@@ -664,6 +682,7 @@ class UserActivityModal extends Modal {
 
     try {
       const activities = await this.apiClient.getUserActivity(this.user.id);
+      if (!this.active) return;
       contentEl.empty();
       contentEl.createEl("h3", { text: `Recent Activity: ${this.user.displayName}` });
 
@@ -694,6 +713,7 @@ class UserActivityModal extends Modal {
         row.createEl("td", { text: activity.deviceInfo });
       }
     } catch (error) {
+      if (!this.active) return;
       contentEl.empty();
       contentEl.createDiv({
         cls: "vaultguard-error",
@@ -703,6 +723,7 @@ class UserActivityModal extends Modal {
   }
 
   onClose(): void {
+    this.active = false;
     this.modalEl.removeClass("vaultguard-dialog-modal");
     this.contentEl.removeClass("vaultguard-dialog-content");
     this.contentEl.empty();
@@ -716,6 +737,7 @@ class RoleEditorModal extends Modal {
   private user: VaultGuardUser;
   private onUpdated: () => Promise<void>;
   private selectedRole: UserRole;
+  private active = false;
 
   constructor(app: App, apiClient: VaultGuardApiClient, user: VaultGuardUser, onUpdated: () => Promise<void>) {
     super(app);
@@ -726,6 +748,7 @@ class RoleEditorModal extends Modal {
   }
 
   onOpen(): void {
+    this.active = true;
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-dialog-modal");
@@ -760,6 +783,7 @@ class RoleEditorModal extends Modal {
   }
 
   onClose(): void {
+    this.active = false;
     this.modalEl.removeClass("vaultguard-dialog-modal");
     this.contentEl.removeClass("vaultguard-dialog-content");
     this.contentEl.empty();
@@ -774,10 +798,13 @@ class RoleEditorModal extends Modal {
 
     try {
       await this.apiClient.updateUserRole(this.user.id, this.selectedRole);
+      if (!this.active) return;
       new Notice(`${this.user.displayName}'s role updated to ${this.selectedRole}.`);
       await this.onUpdated();
+      if (!this.active) return;
       this.close();
     } catch (error) {
+      if (!this.active) return;
       new Notice(`Failed to update role: ${(error as Error).message}`);
     }
   }
@@ -789,6 +816,7 @@ class RevokeAccessModal extends Modal {
   private apiClient: VaultGuardApiClient;
   private user: VaultGuardUser;
   private onRevoked: () => Promise<void>;
+  private active = false;
 
   constructor(app: App, apiClient: VaultGuardApiClient, user: VaultGuardUser, onRevoked: () => Promise<void>) {
     super(app);
@@ -798,6 +826,7 @@ class RevokeAccessModal extends Modal {
   }
 
   onOpen(): void {
+    this.active = true;
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-revoke-modal");
@@ -852,6 +881,7 @@ class RevokeAccessModal extends Modal {
   }
 
   onClose(): void {
+    this.active = false;
     this.modalEl.removeClass("vaultguard-revoke-modal");
     this.contentEl.removeClass("vaultguard-dialog-content");
     this.contentEl.empty();
@@ -860,10 +890,13 @@ class RevokeAccessModal extends Modal {
   private async handleRevoke(): Promise<void> {
     try {
       await this.apiClient.revokeUser(this.user.id);
+      if (!this.active) return;
       new Notice(`Access revoked for ${this.user.displayName}. All sessions terminated.`);
       await this.onRevoked();
+      if (!this.active) return;
       this.close();
     } catch (error) {
+      if (!this.active) return;
       new Notice(`Failed to revoke access: ${(error as Error).message}`);
     }
   }

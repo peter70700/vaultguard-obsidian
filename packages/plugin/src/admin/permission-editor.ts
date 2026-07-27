@@ -16,6 +16,7 @@ import {
   VaultGuardApiClient,
   VaultMemberRecord,
 } from "../api/client";
+import { OperationOwner } from "../ui/operation-owner";
 
 export type PermissionLevel = "none" | "read" | "write" | "admin";
 
@@ -113,6 +114,7 @@ class PermissionRuleModal extends Modal {
   private userOptionsError: string | null = null;
   private userFilter: string = "";
   private isOpen: boolean = false;
+  private readonly saveOwner = new OperationOwner();
 
   // UI references
   private saveButton: ButtonComponent | null = null;
@@ -145,6 +147,7 @@ class PermissionRuleModal extends Modal {
 
   onOpen(): void {
     this.isOpen = true;
+    this.saveOwner.activate();
     this.modalEl.addClass("vaultguard-permission-rule-modal");
     this.contentEl.addClass("vaultguard-dialog-content");
     this.renderModalContent();
@@ -179,6 +182,7 @@ class PermissionRuleModal extends Modal {
 
   onClose(): void {
     this.isOpen = false;
+    this.saveOwner.close();
     this.modalEl.removeClass("vaultguard-permission-rule-modal");
     this.contentEl.removeClass("vaultguard-dialog-content");
     this.contentEl.empty();
@@ -645,6 +649,7 @@ class PermissionRuleModal extends Modal {
       this.saveButton.setDisabled(true);
       this.saveButton.setButtonText(targets.length > 1 ? `Saving ${targets.length}...` : "Saving...");
     }
+    const operation = this.saveOwner.begin();
 
     try {
       const pathPattern = this.normalizeRulePath(this.selectedPath);
@@ -663,15 +668,18 @@ class PermissionRuleModal extends Modal {
       if (this.existingRule && !existingStillCovered) {
         await this.apiClient.deletePermission(this.existingRule.id);
       }
+      if (!operation.isCurrent()) return;
 
       new Notice(this.successNoticeText(targets));
 
       await this.onSave();
+      if (!operation.isCurrent()) return;
       this.close();
     } catch (error) {
+      if (!operation.isCurrent()) return;
       new Notice(`Failed to save: ${(error as Error).message}`);
     } finally {
-      if (this.saveButton) {
+      if (operation.isCurrent() && this.saveButton?.buttonEl.isConnected) {
         this.saveButton.setDisabled(false);
         this.saveButton.setButtonText(this.existingRule ? "Update Rule" : "Create Rule");
       }

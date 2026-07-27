@@ -73,6 +73,8 @@ export class LoginModal extends Modal {
   private requireOrgSlug: boolean;
   /** True only when Obsidian failed to attach the shipped plugin stylesheet. */
   private styleFallbackApplied: boolean = false;
+  private modalActive = false;
+  private readonly deferredTimers = new Set<ReturnType<typeof setTimeout>>();
 
   constructor(
     app: App,
@@ -103,6 +105,7 @@ export class LoginModal extends Modal {
   }
 
   onOpen(): void {
+    this.modalActive = true;
     // Reset transient credential/challenge state on every (re-)render of the
     // login form. onOpen() is re-invoked after a password reset succeeds and by
     // "Back to login", and it rebuilds the DOM from scratch — but the string
@@ -332,7 +335,7 @@ export class LoginModal extends Modal {
     });
 
     // Focus first visible input on open
-    setTimeout(() => {
+    this.scheduleWhileOpen(() => {
       if (this.currentOrgSlug || !this.requireOrgSlug) {
         emailInput.focus();
       } else {
@@ -349,6 +352,9 @@ export class LoginModal extends Modal {
   }
 
   onClose(): void {
+    this.modalActive = false;
+    for (const timer of this.deferredTimers) clearTimeout(timer);
+    this.deferredTimers.clear();
     if (this.styleFallbackApplied) {
       clearLoginStyleFallback(this.modalEl, this.contentEl);
       this.styleFallbackApplied = false;
@@ -356,6 +362,14 @@ export class LoginModal extends Modal {
     this.modalEl.removeClass("vaultguard-login-modal");
     this.contentEl.removeClass("vaultguard-login-modal-content");
     this.contentEl.empty();
+  }
+
+  private scheduleWhileOpen(callback: () => void, delayMs: number): void {
+    const timer = setTimeout(() => {
+      this.deferredTimers.delete(timer);
+      if (this.modalActive) callback();
+    }, delayMs);
+    this.deferredTimers.add(timer);
   }
 
   /**
@@ -609,8 +623,10 @@ export class LoginModal extends Modal {
         zkSetup: this.isZkSetup,
         newPassword: this.showNewPassword ? this.newPasswordValue : undefined,
       });
+      if (!this.modalActive) return;
       this.close();
     } catch (error) {
+      if (!this.modalActive) return;
       const msg = error instanceof Error ? error.message : "Login failed";
 
       // The NEW_PASSWORD_REQUIRED sentinel must be matched BEFORE the generic
@@ -625,7 +641,7 @@ export class LoginModal extends Modal {
         this.showError(msg);
       }
     } finally {
-      if (submitEl?.isConnected) {
+      if (this.modalActive && submitEl?.isConnected) {
         setButtonLoading(submitEl, false);
         // Keep the button label in sync with the current flow state.
         const label = this.showNewPassword
@@ -720,14 +736,16 @@ export class LoginModal extends Modal {
 
         try {
           await this.onForgotPassword!(email);
+          if (!this.modalActive) return;
           showResetSuccess("If an account exists with this email, a reset code has been sent. Check your inbox.");
           // Show the confirmation fields
           confirmSection.show();
-          setTimeout(() => codeInput.focus(), 50);
+          this.scheduleWhileOpen(() => codeInput.focus(), 50);
         } catch (err) {
+          if (!this.modalActive) return;
           showResetError(err instanceof Error ? err.message : "Failed to send reset code.");
         } finally {
-          if (sendCodeBtn.buttonEl.isConnected) {
+          if (this.modalActive && sendCodeBtn.buttonEl.isConnected) {
             setButtonLoading(sendCodeBtn.buttonEl, false);
             sendCodeBtn.setButtonText("Resend code");
           }
@@ -803,13 +821,15 @@ export class LoginModal extends Modal {
 
         try {
           await this.onConfirmReset!(email, code, newPass);
+          if (!this.modalActive) return;
           showResetSuccess("Password reset successfully. You can now sign in with your new password.");
           // After a short delay, switch back to login form
-          setTimeout(() => this.onOpen(), 2000);
+          this.scheduleWhileOpen(() => this.onOpen(), 2000);
         } catch (err) {
+          if (!this.modalActive) return;
           showResetError(err instanceof Error ? err.message : "Password reset failed.");
         } finally {
-          if (resetBtn.buttonEl.isConnected) {
+          if (this.modalActive && resetBtn.buttonEl.isConnected) {
             setButtonLoading(resetBtn.buttonEl, false);
           }
         }
@@ -826,7 +846,7 @@ export class LoginModal extends Modal {
       .onClick(() => this.onOpen());
 
     // Focus email input
-    setTimeout(() => resetEmailInput.focus(), 50);
+    this.scheduleWhileOpen(() => resetEmailInput.focus(), 50);
   }
 
   /**
@@ -856,6 +876,7 @@ export class LoginModal extends Modal {
 
     try {
       await this.onRecoveryCode(this.email, code);
+      if (!this.modalActive) return;
       // Reset MFA state: the next login will hit MFA_SETUP and the modal's
       // owner will reopen the setup modal automatically.
       this.recoveryMode = false;
@@ -876,10 +897,11 @@ export class LoginModal extends Modal {
         this.errorEl.show();
       }
     } catch (err) {
+      if (!this.modalActive) return;
       const msg = err instanceof Error ? err.message : "Recovery failed.";
       this.showError(msg);
     } finally {
-      if (submitEl?.isConnected) {
+      if (this.modalActive && submitEl?.isConnected) {
         setButtonLoading(submitEl, false);
         this.submitBtn?.setButtonText(this.recoveryMode ? "Use Recovery Code" : (this.showMfa ? "Verify MFA" : "Sign In"));
       }

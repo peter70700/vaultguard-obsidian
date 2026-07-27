@@ -13,6 +13,7 @@
 
 import { App, ButtonComponent, Modal, Notice } from "obsidian";
 import { VaultGuardApiClient, VaultKind, VaultMemberRole, VaultRecord } from "../api/client";
+import { OperationOwner } from "../ui/operation-owner";
 
 export interface VaultPickerResult {
   vaultId: string;
@@ -36,6 +37,8 @@ export class VaultPickerModal extends Modal {
   private busy = false;
   /** One-shot guard so single-vault auto-bind only fires once per modal. */
   private autoBindAttempted = false;
+  private readonly loadOwner = new OperationOwner();
+  private readonly actionOwner = new OperationOwner();
 
   constructor(
     app: App,
@@ -50,6 +53,10 @@ export class VaultPickerModal extends Modal {
   }
 
   onOpen(): void {
+    this.loadOwner.activate();
+    this.actionOwner.activate();
+    this.busy = false;
+    this.autoBindAttempted = false;
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-vault-picker-modal");
@@ -160,6 +167,9 @@ export class VaultPickerModal extends Modal {
   }
 
   onClose(): void {
+    this.loadOwner.close();
+    this.actionOwner.close();
+    this.busy = false;
     this.modalEl.removeClass("vaultguard-vault-picker-modal");
     this.contentEl.removeClass("vaultguard-vault-picker-content");
     this.contentEl.empty();
@@ -177,10 +187,13 @@ export class VaultPickerModal extends Modal {
 
   private async loadVaults(): Promise<void> {
     if (!this.listEl) return;
+    const operation = this.loadOwner.begin();
     try {
       const vaults = await this.apiClient.listVaults();
+      if (!operation.isCurrent()) return;
       this.renderVaultList(vaults);
     } catch (err) {
+      if (!operation.isCurrent()) return;
       const msg = err instanceof Error ? err.message : "Failed to load vaults";
       this.listEl.empty();
       this.listEl.createEl("p", {
@@ -303,6 +316,7 @@ export class VaultPickerModal extends Modal {
 
   /** Re-show "Loading…" then refetch the vault list. */
   private retry(): void {
+    if (this.loadOwner.isClosed) return;
     if (this.listEl) {
       this.listEl.empty();
       this.listEl.createEl("p", {
@@ -315,15 +329,18 @@ export class VaultPickerModal extends Modal {
 
   private async pick(result: VaultPickerResult): Promise<void> {
     if (this.busy) return;
+    const operation = this.actionOwner.begin();
     this.busy = true;
     try {
       await this.onPick(result);
+      if (!operation.isCurrent()) return;
       new Notice(`VaultGuard: bound to "${result.name}"`);
       this.close();
     } catch (err) {
+      if (!operation.isCurrent()) return;
       this.showError(err instanceof Error ? err.message : "Could not bind to vault");
     } finally {
-      this.busy = false;
+      if (operation.isCurrent()) this.busy = false;
     }
   }
 
@@ -334,6 +351,7 @@ export class VaultPickerModal extends Modal {
     defaultRole: VaultMemberRole
   ): Promise<void> {
     if (this.busy) return;
+    const operation = this.actionOwner.begin();
     this.busy = true;
     try {
       const vault = await this.apiClient.createVault({
@@ -342,17 +360,20 @@ export class VaultPickerModal extends Modal {
         kind,
         defaultRole,
       });
+      if (!operation.isCurrent()) return;
       await this.onPick({
         vaultId: vault.vaultId,
         name: vault.name,
         slug: vault.slug,
       });
+      if (!operation.isCurrent()) return;
       new Notice(`VaultGuard: created and bound to "${vault.name}"`);
       this.close();
     } catch (err) {
+      if (!operation.isCurrent()) return;
       this.showError(err instanceof Error ? err.message : "Could not create vault");
     } finally {
-      this.busy = false;
+      if (operation.isCurrent()) this.busy = false;
     }
   }
 }

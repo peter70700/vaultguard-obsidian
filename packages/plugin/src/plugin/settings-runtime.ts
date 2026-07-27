@@ -26,6 +26,16 @@ type VaultGuardPluginData = Partial<VaultGuardSettings> & {
   storedSessions?: Record<string, unknown>;
 };
 
+export function normalizeCodexModelPreference(
+  rawData: Pick<Partial<VaultGuardSettings>, "codexModel" | "openAiModel">,
+): string {
+  const codexModel = typeof rawData.codexModel === "string" ? rawData.codexModel.trim() : "";
+  if (codexModel) return codexModel;
+  const priorSharedModel =
+    typeof rawData.openAiModel === "string" ? rawData.openAiModel.trim() : "";
+  return priorSharedModel || DEFAULT_SETTINGS.codexModel;
+}
+
 export type SettingsLoadMode = "startup" | "external";
 
 const RECOGNIZED_LEGACY_SETTINGS_KEYS = new Set<keyof VaultGuardSettings>([
@@ -38,6 +48,7 @@ const RECOGNIZED_LEGACY_SETTINGS_KEYS = new Set<keyof VaultGuardSettings>([
   "syncInterval",
   "cacheEncryptionStrength",
   "localProjectMemoryMode",
+  "localProjectMemoryModeAutoEnableSuppressed",
   "showStatusBar",
   "excludedPaths",
   "lastSyncTimestamp",
@@ -217,6 +228,7 @@ export class PluginSettingsRuntime {
     }
     delete data.storedSessions;
     this.ctx.setSettings(Object.assign({}, DEFAULT_SETTINGS, data));
+    this.settings.codexModel = normalizeCodexModelPreference(data);
     this.settings.optionalModules = normalizeOptionalModules(data as Record<string, unknown>);
     Object.assign(
       this.settings,

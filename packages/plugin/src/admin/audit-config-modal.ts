@@ -12,6 +12,7 @@
 import { App, ButtonComponent, Modal, Notice, Setting } from "obsidian";
 import type { VaultGuardApiClient } from "../api/client";
 import { AUDIT_ACTION_CATALOG, ALL_AUDIT_ACTION_VALUES } from "./audit-actions";
+import { OperationOwner } from "../ui/operation-owner";
 
 export class AuditConfigModal extends Modal {
   private readonly apiClient: VaultGuardApiClient;
@@ -21,6 +22,7 @@ export class AuditConfigModal extends Modal {
   private loaded = false;
   private saving = false;
   private bodyEl!: HTMLElement;
+  private readonly lifecycleOwner = new OperationOwner();
 
   constructor(app: App, apiClient: VaultGuardApiClient) {
     super(app);
@@ -28,6 +30,8 @@ export class AuditConfigModal extends Modal {
   }
 
   async onOpen(): Promise<void> {
+    this.lifecycleOwner.activate();
+    const operation = this.lifecycleOwner.begin();
     this.modalEl.addClass("vaultguard-audit-config");
     const c = this.contentEl;
     c.empty();
@@ -43,10 +47,12 @@ export class AuditConfigModal extends Modal {
 
     try {
       const settings = await this.apiClient.getOrgSettings();
+      if (!operation.isCurrent()) return;
       this.disabled = new Set(settings.disabledAuditActions ?? []);
       this.loaded = true;
       this.renderBody();
     } catch (err) {
+      if (!operation.isCurrent()) return;
       this.bodyEl.empty();
       this.bodyEl.createDiv({
         cls: "vaultguard-error",
@@ -146,15 +152,18 @@ export class AuditConfigModal extends Modal {
 
   private async handleSave(): Promise<void> {
     if (this.saving) return;
+    const operation = this.lifecycleOwner.begin();
     this.saving = true;
     this.renderBody();
     try {
       // Persist only known catalog actions so stale entries can't accumulate.
       const payload = ALL_AUDIT_ACTION_VALUES.filter((v) => this.disabled.has(v));
       await this.apiClient.updateOrgSettings({ disabledAuditActions: payload });
+      if (!operation.isCurrent()) return;
       new Notice("VaultGuard: audit logging settings saved.");
       this.close();
     } catch (err) {
+      if (!operation.isCurrent()) return;
       this.saving = false;
       this.renderBody();
       new Notice(
@@ -166,6 +175,8 @@ export class AuditConfigModal extends Modal {
   }
 
   onClose(): void {
+    this.lifecycleOwner.close();
+    this.saving = false;
     this.contentEl.empty();
   }
 }

@@ -8,14 +8,17 @@ import { setIcon } from "obsidian";
 
 const SAVED_CONTENT = Symbol("vaultguard-loading-saved");
 const SAVED_DISABLED = Symbol("vaultguard-loading-disabled");
+const BUSY_COUNT = Symbol("vaultguard-loading-count");
 
 interface ButtonWithSavedState extends HTMLButtonElement {
   [SAVED_CONTENT]?: Node[];
   [SAVED_DISABLED]?: boolean;
+  [BUSY_COUNT]?: number;
 }
 
 interface ControlWithSavedState extends HTMLElement {
   [SAVED_DISABLED]?: boolean;
+  [BUSY_COUNT]?: number;
 }
 
 /**
@@ -30,10 +33,14 @@ export function setButtonLoading(
 ): void {
   const btn = button as ButtonWithSavedState;
   if (loading) {
-    if (!btn[SAVED_CONTENT]) {
-      btn[SAVED_CONTENT] = Array.from(btn.childNodes).map((node) => node.cloneNode(true));
+    const count = btn[BUSY_COUNT] ?? 0;
+    if (count === 0) {
+      // Preserve the real nodes rather than clones so child-owned listeners and
+      // state survive a loading round trip.
+      btn[SAVED_CONTENT] = Array.from(btn.childNodes);
       btn[SAVED_DISABLED] = btn.disabled;
     }
+    btn[BUSY_COUNT] = count + 1;
     btn.disabled = true;
     btn.replaceChildren();
     const spinner = btn.createSpan({ cls: "vaultguard-sb-spinner vaultguard-btn-spinner" });
@@ -44,14 +51,20 @@ export function setButtonLoading(
     return;
   }
 
+  const count = btn[BUSY_COUNT] ?? 0;
+  if (count === 0) return;
+  if (count > 1) {
+    btn[BUSY_COUNT] = count - 1;
+    return;
+  }
+
   if (btn[SAVED_CONTENT]) {
     btn.replaceChildren(...btn[SAVED_CONTENT]!);
     btn.disabled = btn[SAVED_DISABLED] ?? false;
     delete btn[SAVED_CONTENT];
     delete btn[SAVED_DISABLED];
-  } else {
-    btn.disabled = false;
   }
+  delete btn[BUSY_COUNT];
 }
 
 /**
@@ -64,15 +77,24 @@ export function setControlBusy(
 ): void {
   const el = control as ControlWithSavedState & { disabled?: boolean };
   if (busy) {
-    if (el[SAVED_DISABLED] === undefined) {
+    const count = el[BUSY_COUNT] ?? 0;
+    if (count === 0) {
       el[SAVED_DISABLED] = el.disabled ?? false;
     }
+    el[BUSY_COUNT] = count + 1;
     el.disabled = true;
     return;
   }
 
+  const count = el[BUSY_COUNT] ?? 0;
+  if (count === 0) return;
+  if (count > 1) {
+    el[BUSY_COUNT] = count - 1;
+    return;
+  }
   el.disabled = el[SAVED_DISABLED] ?? false;
   delete el[SAVED_DISABLED];
+  delete el[BUSY_COUNT];
 }
 
 /**

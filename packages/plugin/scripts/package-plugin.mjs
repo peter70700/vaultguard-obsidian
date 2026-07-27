@@ -24,18 +24,14 @@ for (const asset of requiredAssets) {
 
 rmSync(zipPath, { force: true });
 
-const zip = spawnSync(
-  "zip",
-  ["-j", "-X", zipPath, ...requiredAssets.map((asset) => join(rootDir, asset))],
-  { cwd: rootDir, stdio: "inherit" }
-);
+const zip = createZipArchive();
 
 if (zip.error) {
-  throw new Error(`Failed to run zip: ${zip.error.message}`);
+  throw new Error(`Failed to run archive tool: ${zip.error.message}`);
 }
 
 if (zip.status !== 0) {
-  throw new Error(`zip exited with status ${zip.status}`);
+  throw new Error(`Archive tool exited with status ${zip.status}`);
 }
 
 console.log(`Packaged ${manifest.name} ${manifest.version}`);
@@ -66,4 +62,33 @@ function validateAssets() {
       throw new Error(`Missing ${asset}. Run npm run build before packaging.`);
     }
   }
+}
+
+function createZipArchive() {
+  const assetPaths = requiredAssets.map((asset) => join(rootDir, asset));
+
+  if (process.platform === "win32") {
+    const files = assetPaths.map(toPowerShellLiteral).join(", ");
+    const command = [
+      "$ErrorActionPreference = 'Stop'",
+      `$files = @(${files})`,
+      `Compress-Archive -LiteralPath $files -DestinationPath ${toPowerShellLiteral(zipPath)} -CompressionLevel Optimal -Force`,
+    ].join("; ");
+
+    return spawnSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", command],
+      { cwd: rootDir, stdio: "inherit", windowsHide: true }
+    );
+  }
+
+  return spawnSync("zip", ["-j", "-X", zipPath, ...assetPaths], {
+    cwd: rootDir,
+    stdio: "inherit",
+    windowsHide: true,
+  });
+}
+
+function toPowerShellLiteral(value) {
+  return `'${value.replace(/'/g, "''")}'`;
 }

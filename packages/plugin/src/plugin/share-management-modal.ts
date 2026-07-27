@@ -10,10 +10,12 @@
 
 import { App, ButtonComponent, Modal, Notice } from "obsidian";
 import type { ShareRecord, VaultGuardApiClient } from "../api/client";
+import { OperationOwner } from "../ui/operation-owner";
 
 export class ShareManagementModal extends Modal {
   private apiClient: VaultGuardApiClient;
   private shares: ShareRecord[] = [];
+  private readonly lifecycleOwner = new OperationOwner();
 
   constructor(app: App, apiClient: VaultGuardApiClient) {
     super(app);
@@ -21,6 +23,8 @@ export class ShareManagementModal extends Modal {
   }
 
   async onOpen(): Promise<void> {
+    this.lifecycleOwner.activate();
+    const operation = this.lifecycleOwner.begin();
     const { contentEl } = this;
     contentEl.empty();
     this.modalEl.addClass("vaultguard-share-modal");
@@ -40,8 +44,11 @@ export class ShareManagementModal extends Modal {
     listEl.createEl("p", { text: "Loading…", cls: "setting-item-description" });
 
     try {
-      this.shares = await this.apiClient.listShares();
+      const shares = await this.apiClient.listShares();
+      if (!operation.isCurrent()) return;
+      this.shares = shares;
     } catch (err) {
+      if (!operation.isCurrent()) return;
       listEl.empty();
       const msg = err instanceof Error ? err.message : String(err);
       listEl.createEl("p", {
@@ -87,8 +94,10 @@ export class ShareManagementModal extends Modal {
         .onClick(async () => {
           try {
             await navigator.clipboard.writeText(share.url);
+            if (this.lifecycleOwner.isClosed) return;
             new Notice("Link copied to clipboard.");
           } catch {
+            if (this.lifecycleOwner.isClosed) return;
             new Notice(share.url, 12000);
           }
         });
@@ -99,6 +108,7 @@ export class ShareManagementModal extends Modal {
         .onClick(async () => {
           try {
             await this.apiClient.revokeShare(share.shareId);
+            if (this.lifecycleOwner.isClosed) return;
             this.shares = this.shares.filter((s) => s.shareId !== share.shareId);
             const parentEl = row.parentElement;
             row.remove();
@@ -107,6 +117,7 @@ export class ShareManagementModal extends Modal {
             }
             new Notice("Share link revoked.");
           } catch (err) {
+            if (this.lifecycleOwner.isClosed) return;
             const msg = err instanceof Error ? err.message : String(err);
             new Notice(`Failed to revoke: ${msg}`, 6000);
           }
@@ -115,6 +126,7 @@ export class ShareManagementModal extends Modal {
   }
 
   onClose(): void {
+    this.lifecycleOwner.close();
     this.contentEl.empty();
   }
 }

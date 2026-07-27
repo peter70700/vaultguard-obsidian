@@ -119,6 +119,7 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   showStatusBar: true,
   showRibbonIcons: true,
   localProjectMemoryMode: false,
+  localProjectMemoryModeAutoEnableSuppressed: false,
   optionalModules: {
     schemaVersion: 2,
     // AI chat + permissions graph ship enabled by default (each still has its own
@@ -136,6 +137,7 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   aiChatModel: "claude-opus-4-8",
   aiChatEffort: "high",
   openAiModel: "gpt-5.5",
+  codexModel: "gpt-5.5",
   openAiReasoningEffort: "medium",
   openAiVerbosity: "medium",
   openAiMaxOutputTokens: 8192,
@@ -241,6 +243,11 @@ interface ChatGptConnectorReveal {
   copiedToClipboard: boolean;
 }
 
+type SettingsCollapsibleSectionId =
+  | "manage-vaults-members"
+  | "advanced"
+  | "ai-automation";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings Tab
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,6 +265,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   private aiChatKeyStore: AnthropicKeyStore | null = null;
   private openAiKeyStore: OpenAiKeyStore | null = null;
   private codexStatusAbort: AbortController | null = null;
+  private codexModelAbort: AbortController | null = null;
+  private readonly openCollapsibleSectionIds = new Set<SettingsCollapsibleSectionId>();
+  private collapsibleSectionSessionActive = false;
+  private collapsibleSectionStateEpoch = 0;
 
   constructor(app: App, plugin: VaultGuardPlugin) {
     super(app, plugin);
@@ -379,6 +390,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   hide(): void {
     this.codexStatusAbort?.abort();
     this.codexStatusAbort = null;
+    this.codexModelAbort?.abort();
+    this.codexModelAbort = null;
+    this.openCollapsibleSectionIds.clear();
+    this.collapsibleSectionSessionActive = false;
+    this.collapsibleSectionStateEpoch += 1;
     super.hide();
   }
 
@@ -767,15 +783,61 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               if (value) {
                 await this.plugin.enableLocalProjectMemoryMode();
               } else {
-                this.plugin.settings.localProjectMemoryMode = false;
-                await this.plugin.saveSettings();
-                this.plugin.restartSyncTimer();
+                await this.plugin.disableLocalProjectMemoryMode();
               }
               this.display();
             } catch (err) {
               this.showStatus(
                 containerEl,
                 err instanceof Error ? err.message : "Local Project Memory Mode update failed.",
+                true,
+              );
+            }
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Automatically use this mode for Git repository vaults")
+      .setDesc(
+        "Global desktop preference for this Obsidian profile. On VaultGuard startup, a vault is activated only when .git exists at its root and the vault is plaintext, readable, unbound, and not locally opted out. Protected, encrypted, mobile, and uncertain vaults are skipped.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.isAutomaticLocalProjectMemoryModeForGitReposEnabled())
+          .onChange(async (value) => {
+            try {
+              this.plugin.setAutomaticLocalProjectMemoryModeForGitRepos(value);
+              if (value) {
+                const result = await this.plugin.maybeAutoEnableLocalProjectMemoryMode();
+                if (result.kind === "protected") {
+                  new Notice(
+                    "VaultGuard Sync: automatic Local Project Memory Mode was not enabled here because existing at-rest protection was detected. Review and decrypt this vault manually before changing modes.",
+                    10000,
+                  );
+                } else if (result.kind === "inspection-failed") {
+                  new Notice(
+                    "VaultGuard Sync: automatic Local Project Memory Mode was not enabled here because the local protection inspection could not finish safely.",
+                    10000,
+                  );
+                } else if (result.kind === "server-bound") {
+                  new Notice(
+                    "VaultGuard Sync: this vault remains unchanged because it is bound to a server vault.",
+                    8000,
+                  );
+                } else if (result.kind === "suppressed") {
+                  new Notice(
+                    "VaultGuard Sync: this vault keeps its local opt-out. Manually enable Local Project Memory Mode to clear it.",
+                    8000,
+                  );
+                }
+              }
+              this.display();
+            } catch (err) {
+              this.showStatus(
+                containerEl,
+                err instanceof Error
+                  ? err.message
+                  : "Automatic Local Project Memory Mode preference update failed.",
                 true,
               );
             }
@@ -1204,24 +1266,32 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           "and the Codex thread is ephemeral with VaultGuard as its only MCP tool surface.",
       );
 
-    new Setting(containerEl)
+    const modelSetting = new Setting(containerEl)
       .setName("Model")
       .setDesc(
-        "Requested Codex model. Availability follows your ChatGPT plan and workspace policy.",
+        "Models available to this ChatGPT login load from the official Codex client.",
       )
       .addDropdown((dropdown) => {
         this.populateModelSelect(
           dropdown.selectEl,
           OPENAI_CHAT_MODELS,
-          this.plugin.settings.openAiModel,
+          this.plugin.settings.codexModel,
         );
         dropdown
-          .setValue(this.plugin.settings.openAiModel)
+          .setValue(this.plugin.settings.codexModel)
           .onChange(async (value) => {
-            this.plugin.settings.openAiModel = value;
+            this.plugin.settings.codexModel = value;
             await this.plugin.saveSettings();
           });
       });
+    const modelStatus = modelSetting.descEl.createDiv({
+      cls: "vaultguard-model-catalog-status",
+      text: "Loading models available to this ChatGPT login…",
+    });
+    void this.refreshCodexModelSelect(
+      modelSetting.controlEl.querySelector("select"),
+      modelStatus,
+    );
 
     new Setting(containerEl)
       .setName("Reasoning effort")
@@ -1259,7 +1329,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private async refreshProviderModelSelect(
-    provider: ProviderModelCatalogProvider,
+    provider: Exclude<ProviderModelCatalogProvider, "codex">,
     selectEl: HTMLSelectElement | null,
     statusEl: HTMLElement,
   ): Promise<void> {
@@ -1292,6 +1362,73 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             ? "Loaded from a recent provider API result."
             : "Using bundled choices until an API key is available."),
     );
+  }
+
+  private async refreshCodexModelSelect(
+    selectEl: HTMLSelectElement | null,
+    statusEl: HTMLElement,
+  ): Promise<void> {
+    if (!selectEl) return;
+    this.codexModelAbort?.abort();
+    const controller = new AbortController();
+    this.codexModelAbort = controller;
+    try {
+      let status: CodexAuthStatus;
+      try {
+        status = await getCodexAuthStatus(undefined, controller.signal);
+      } catch {
+        if (controller.signal.aborted) return;
+        statusEl.setText("Could not check the Codex login; using saved fallback choices.");
+        return;
+      }
+      if (controller.signal.aborted) return;
+      if (!status.loggedIn || !status.isChatGptSubscription || !status.binaryPath) {
+        statusEl.setText(
+          status.classification === "not-installed"
+            ? "Install the official Codex client to load subscription models."
+            : "Sign in to Codex with ChatGPT to load account models.",
+        );
+        return;
+      }
+
+      const catalog = await providerModelCatalog.resolve({
+        provider: "codex",
+        apiKey: null,
+        codexBinaryPath: status.binaryPath,
+        selectedModel: this.plugin.settings.codexModel,
+        signal: controller.signal,
+      });
+      if (
+        controller.signal.aborted ||
+        this.plugin.settings.aiChatProvider !== "codex" ||
+        !selectEl.isConnected || !statusEl.isConnected
+      ) {
+        return;
+      }
+
+      if (catalog.selectedModel !== this.plugin.settings.codexModel) {
+        this.plugin.settings.codexModel = catalog.selectedModel;
+        await this.plugin.saveSettings();
+        if (
+          controller.signal.aborted ||
+          this.plugin.settings.aiChatProvider !== "codex" ||
+          !selectEl.isConnected || !statusEl.isConnected
+        ) {
+          return;
+        }
+      }
+      this.populateModelSelect(selectEl, catalog.options, catalog.selectedModel);
+      statusEl.setText(
+        catalog.warning ??
+          (catalog.source === "live"
+            ? "Loaded from this signed-in ChatGPT account."
+            : catalog.source === "cache"
+              ? "Loaded from a recent signed-in Codex result."
+              : "Using saved fallback choices until Codex model discovery is available."),
+      );
+    } finally {
+      if (this.codexModelAbort === controller) this.codexModelAbort = null;
+    }
   }
 
   /**
@@ -1601,7 +1738,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       statusSetting.setDesc(`Could not start Codex sign-in: ${(error as Error).message}`);
       return;
     }
+    providerModelCatalog.invalidate("codex");
     await this.refreshCodexStatus(statusSetting);
+    this.display();
   }
 
   /**
@@ -1610,18 +1749,33 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * settings-tab scroll. The summary is a plain-text label (NOT a setHeading —
    * a <summary> cannot host an Obsidian Setting); the builder writes into the
    * body div, where the existing render* helpers keep emitting their own
-   * setHeading() labels unchanged. Defaults to CLOSED (no `open` attribute) by
-   * design. Native <details> open/closed state is browser-managed and resets on
-   * each this.display() re-render — accepted tradeoff for this mechanism.
+   * setHeading() labels unchanged. Each disclosure defaults to closed when the
+   * settings tab is first opened, then keeps its state across this.display()
+   * re-renders for as long as the tab remains open. hide() clears that transient
+   * state, while a child modal layered above Settings leaves it untouched.
    * Styling is class-only (no `.style` assignments) per CLAUDE.md / Obsidian review.
    */
   private renderCollapsibleSection(
     containerEl: HTMLElement,
+    sectionId: SettingsCollapsibleSectionId,
     label: string,
     builder: (bodyEl: HTMLElement) => void
   ): void {
     const details = containerEl.createEl("details", {
       cls: "vaultguard-settings-section",
+    });
+    details.dataset.vaultguardSettingsSection = sectionId;
+    details.open = this.openCollapsibleSectionIds.has(sectionId);
+    const stateEpoch = this.collapsibleSectionStateEpoch;
+    details.addEventListener("toggle", () => {
+      // Ignore a delayed native toggle from DOM belonging to an already-closed
+      // Settings session.
+      if (stateEpoch !== this.collapsibleSectionStateEpoch) return;
+      if (details.open) {
+        this.openCollapsibleSectionIds.add(sectionId);
+      } else {
+        this.openCollapsibleSectionIds.delete(sectionId);
+      }
     });
     details.createEl("summary", {
       text: label,
@@ -2046,6 +2200,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     rootEl: HTMLElement,
     session: UserSession
   ): Promise<void> {
+    const ownerDetached = (): boolean =>
+      sectionEl.isConnected === false || rootEl.isConnected === false;
     let vaults: VaultRecord[] = [];
     let vaultListError: unknown = null;
     let currentVault: VaultRecord | null = null;
@@ -2057,6 +2213,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     } catch (error) {
       vaultListError = error;
     }
+    if (ownerDetached()) return;
 
     if (this.plugin.settings.serverVaultId) {
       try {
@@ -2066,6 +2223,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         currentVaultError = error;
       }
     }
+    if (ownerDetached()) return;
 
     sectionEl.empty();
 
@@ -2075,27 +2233,32 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // (Available vaults list, Create vault, Current vault options, Vault members)
     // move into a single "Manage vaults & members" disclosure to reduce overwhelm.
     const summaryEl = sectionEl.createDiv({ cls: "vaultguard-current-vault-summary" });
-    this.renderCollapsibleSection(sectionEl, "Manage vaults & members", (manageBody) => {
-      this.renderVaultBindingSettings(
-        summaryEl,
-        manageBody,
-        sectionEl,
-        rootEl,
-        session,
-        vaults,
-        vaultListError,
-        currentVault,
-        currentVaultError,
-        memberRole
-      );
+    this.renderCollapsibleSection(
+      sectionEl,
+      "manage-vaults-members",
+      "Manage vaults & members",
+      (manageBody) => {
+        this.renderVaultBindingSettings(
+          summaryEl,
+          manageBody,
+          sectionEl,
+          rootEl,
+          session,
+          vaults,
+          vaultListError,
+          currentVault,
+          currentVaultError,
+          memberRole
+        );
 
-      if (currentVault) {
-        this.renderLoadedVaultSettings(manageBody, sectionEl, rootEl, session, currentVault, memberRole);
-        this.renderVaultMembersSettings(manageBody, sectionEl, rootEl, session, currentVault, memberRole);
-      }
+        if (currentVault) {
+          this.renderLoadedVaultSettings(manageBody, sectionEl, rootEl, session, currentVault, memberRole);
+          this.renderVaultMembersSettings(manageBody, sectionEl, rootEl, session, currentVault, memberRole);
+        }
 
-      this.renderCreateVaultSettings(manageBody, rootEl, session);
-    });
+        this.renderCreateVaultSettings(manageBody, rootEl, session);
+      },
+    );
   }
 
   private renderVaultBindingSettings(
@@ -2510,6 +2673,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     vault: VaultRecord,
     memberRole: VaultMemberRole | null
   ): Promise<void> {
+    const ownerDetached = (): boolean =>
+      membersEl.isConnected === false ||
+      sectionEl.isConnected === false ||
+      rootEl.isConnected === false;
     try {
       const [members, usersResult] = await Promise.all([
         this.plugin.listCurrentVaultMembers(),
@@ -2517,6 +2684,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           .then((users) => ({ users, error: null as unknown }))
           .catch((error) => ({ users: [] as UserListEntry[], error })),
       ]);
+      if (ownerDetached()) return;
       const canManage = this.canManageVault(session, memberRole) && !vault.archived;
       const users = usersResult.users;
       const userById = this.buildVaultMemberUserLabelMap(members);
@@ -2567,6 +2735,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
       this.renderAddVaultMemberForm(membersEl, sectionEl, rootEl, session, vault, members, users);
     } catch (error) {
+      if (ownerDetached()) return;
       membersEl.empty();
       new Setting(membersEl)
         .setName("Could not load vault members")
@@ -2808,8 +2977,31 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   display(): void {
+    if (this.collapsibleSectionSessionActive) {
+      const collapsibleSections = Array.from(
+        this.containerEl.querySelectorAll<HTMLDetailsElement>(
+          "details.vaultguard-settings-section[data-vaultguard-settings-section]",
+        ),
+      );
+      for (const details of collapsibleSections) {
+        const sectionId = details.dataset
+          .vaultguardSettingsSection as SettingsCollapsibleSectionId;
+        if (details.open) {
+          this.openCollapsibleSectionIds.add(sectionId);
+        } else {
+          this.openCollapsibleSectionIds.delete(sectionId);
+        }
+      }
+    } else {
+      this.openCollapsibleSectionIds.clear();
+      this.collapsibleSectionStateEpoch += 1;
+      this.collapsibleSectionSessionActive = true;
+    }
+
     this.codexStatusAbort?.abort();
     this.codexStatusAbort = null;
+    this.codexModelAbort?.abort();
+    this.codexModelAbort = null;
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("vaultguard-settings-tab");
@@ -3440,7 +3632,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     // ── Advanced (collapsed) ─────────────────────────────────────────────────
     // Security + Reliability + at-rest maintenance live behind one disclosure.
-    this.renderCollapsibleSection(containerEl, "Advanced", (body) => {
+    this.renderCollapsibleSection(containerEl, "advanced", "Advanced", (body) => {
       // ── Security ────────────────────────────────────────────────────────
       new Setting(body).setName("Security").setHeading();
 
@@ -3539,16 +3731,21 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       this.plugin.isOptionalModuleEnabled("aiChat") ||
       this.plugin.isOptionalModuleEnabled("agentAccess")
     ) {
-      this.renderCollapsibleSection(containerEl, "AI & automation", (body) => {
-        if (this.plugin.isOptionalModuleEnabled("agentAccess")) {
-          this.renderVaultOrientationSection(body);
-          this.renderAgentBridgeSection(body);
-          this.renderChatGptConnectorSection(body);
-        }
-        if (this.plugin.isOptionalModuleEnabled("aiChat")) {
-          this.renderAiChatSection(body);
-        }
-      });
+      this.renderCollapsibleSection(
+        containerEl,
+        "ai-automation",
+        "AI & automation",
+        (body) => {
+          if (this.plugin.isOptionalModuleEnabled("agentAccess")) {
+            this.renderVaultOrientationSection(body);
+            this.renderAgentBridgeSection(body);
+            this.renderChatGptConnectorSection(body);
+          }
+          if (this.plugin.isOptionalModuleEnabled("aiChat")) {
+            this.renderAiChatSection(body);
+          }
+        },
+      );
     }
 
     // ── Danger Zone ─────────────────────────────────────────────────────────
@@ -3652,10 +3849,12 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           includeGit: true,
           forceRefresh,
         });
+        if (summaryEl.isConnected === false) return snapshot;
         summaryEl.empty();
         this.renderVaultOrientationSummary(summaryEl, snapshot);
         return snapshot;
       } catch (error) {
+        if (summaryEl.isConnected === false) return null;
         summaryEl.empty();
         summaryEl.createDiv({
           cls: "setting-item-description mod-warning",
@@ -3676,7 +3875,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         button.setButtonText("Refresh").onClick(async () => {
           button.setDisabled(true).setButtonText("Refreshing...");
           await renderSnapshot(true);
-          button.setDisabled(false).setButtonText("Refresh");
+          if (button.buttonEl.isConnected !== false) {
+            button.setDisabled(false).setButtonText("Refresh");
+          }
         }),
       )
       .addButton((button) =>
@@ -3686,6 +3887,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           const copied = snapshot
             ? await this.writeClipboard(JSON.stringify(snapshot, null, 2))
             : false;
+          if (button.buttonEl.isConnected === false) return;
           new Notice(copied ? "Vault orientation diagnostics copied." : "Could not copy diagnostics.");
           button.setDisabled(false).setButtonText("Copy diagnostics");
         }),
@@ -3808,13 +4010,13 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   private renderAgentBridgeSection(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("Agent bridge connections (desktop only.)").setHeading();
 
-    if (this.plugin.isLocalProjectMemoryModeEnabled()) {
+    const localProjectMemoryMode = this.plugin.isLocalProjectMemoryModeEnabled();
+    if (localProjectMemoryMode) {
       containerEl.createEl("p", {
         cls: "setting-item-description",
         text:
-          "Agent bridge leases are disabled in Local Project Memory Mode. Use the local files panel and AI chat for repo-root project-memory workflows without exposing remote VaultGuard tools.",
+          "Local Project Memory Mode allows explicitly authorized localhost MCP connections after VaultGuard sign-in. Leases are time-limited, kept only in memory, revoked with the login session or plugin, and cannot use the generic RPC or remote ChatGPT connector surfaces.",
       });
-      return;
     }
 
     // Agent bridge needs a local HTTP server (Node `http` module). That's
@@ -3833,21 +4035,28 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text:
-        "Agent bridge leases let an external agent (Codex, Claudian, Claude Code, Cursor, custom MCP client) talk to this vault through VaultGuard Sync tools. Each lease has its own bearer token; revoking or rotating one does not disturb the others. Hidden paths (.obsidian, .trash, .git, ...) are always blocked.",
+        localProjectMemoryMode
+          ? "Create a scoped bearer lease for a local MCP client such as Codex, Claudian, Claude Code, or Cursor. The bridge remains on 127.0.0.1 and keeps the existing scope, write-confirmation, hidden-path, and audit gates. A server vault binding is not required."
+          : "Agent bridge leases let an external agent (Codex, Claudian, Claude Code, Cursor, custom MCP client) talk to this vault through VaultGuard Sync tools. Each lease has its own bearer token; revoking or rotating one does not disturb the others. Hidden paths (.obsidian, .trash, .git, ...) are always blocked.",
     });
 
     const surface = this.plugin.getAgentBridge();
     const description = surface.describe();
     const activeLeases = description.activeLeases;
     const server = description.server;
-    const canCreate = Boolean(this.plugin.getSession() && this.plugin.settings.serverVaultId);
+    const canCreate = Boolean(
+      this.plugin.getSession() &&
+        (localProjectMemoryMode || this.plugin.settings.serverVaultId)
+    );
 
     new Setting(containerEl)
       .setName("Bridge lease actions")
       .setDesc(
         canCreate
           ? "Create a new scoped bridge lease, or revoke every current bridge lease for this vault."
-          : "Log in and bind this Obsidian folder to a server vault before creating bridge leases."
+          : localProjectMemoryMode
+            ? "Log in to VaultGuard before creating a local MCP bridge lease."
+            : "Log in and bind this Obsidian folder to a server vault before creating bridge leases."
       )
       .addButton((button) =>
         button
@@ -4000,14 +4209,21 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     if (server) {
       const serverInfo = containerEl.createDiv({ cls: "vaultguard-agent-bridge-server" });
       serverInfo.createEl("strong", { text: "Bridge server: " });
-      serverInfo.appendText(`${server.endpoint} (MCP at ${server.mcpEndpoint})`);
+      const localProjectMemoryMode = this.plugin.isLocalProjectMemoryModeEnabled();
+      serverInfo.appendText(
+        localProjectMemoryMode
+          ? `${server.mcpEndpoint} (localhost MCP only)`
+          : `${server.endpoint} (MCP at ${server.mcpEndpoint})`
+      );
 
       const buttons = serverInfo.createDiv({ cls: "vaultguard-agent-bridge-inline-actions" });
-      const copyRpc = new ButtonComponent(buttons);
-      copyRpc.setButtonText("Copy RPC URL").onClick(async () => {
-        const copied = await this.writeClipboard(server.endpoint);
-        new Notice(copied ? "Bridge RPC URL copied." : "Could not copy the bridge RPC URL.");
-      });
+      if (!localProjectMemoryMode) {
+        const copyRpc = new ButtonComponent(buttons);
+        copyRpc.setButtonText("Copy RPC URL").onClick(async () => {
+          const copied = await this.writeClipboard(server.endpoint);
+          new Notice(copied ? "Bridge RPC URL copied." : "Could not copy the bridge RPC URL.");
+        });
+      }
 
       const copyMcp = new ButtonComponent(buttons);
       copyMcp.setButtonText("Copy MCP URL").onClick(async () => {
@@ -4316,11 +4532,13 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       body: reveal.mcpConfig,
       copyLabel: "Copy MCP config",
     });
-    this.renderAgentBridgeCopyBlock(block, {
-      title: "Generic HTTP-RPC connection",
-      body: reveal.connectionJson,
-      copyLabel: "Copy connection JSON",
-    });
+    if (!this.plugin.isLocalProjectMemoryModeEnabled()) {
+      this.renderAgentBridgeCopyBlock(block, {
+        title: "Generic HTTP-RPC connection",
+        body: reveal.connectionJson,
+        copyLabel: "Copy connection JSON",
+      });
+    }
     this.renderAgentBridgeCopyBlock(block, {
       title: "Codex config.toml",
       body: reveal.codexConfig,

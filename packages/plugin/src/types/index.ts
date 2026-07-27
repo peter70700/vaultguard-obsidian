@@ -569,6 +569,12 @@ export interface VaultGuardSettings {
    */
   localProjectMemoryMode: boolean;
   /**
+   * Per-vault opt-out from the profile-wide automatic Git-repository default.
+   * Set when the user explicitly disables Local Project Memory Mode and cleared
+   * by an explicit manual enable. It never changes the global preference.
+   */
+  localProjectMemoryModeAutoEnableSuppressed: boolean;
+  /**
    * Mainstream installs start with advanced modules off. A one-time migration
    * enables them for established installs that predate this preference.
    */
@@ -700,6 +706,8 @@ export interface VaultGuardSettings {
   aiChatEffort: AnthropicEffort;
   /** OpenAI Responses API model id for the AI Chat panel (default "gpt-5.5"). */
   openAiModel: string;
+  /** ChatGPT subscription model id requested through the official Codex client. */
+  codexModel: string;
   /** Reasoning effort for OpenAI Responses API turns (default "medium"). */
   openAiReasoningEffort: OpenAiReasoningEffort;
   /** Text verbosity for OpenAI Responses API turns (default "medium"). */

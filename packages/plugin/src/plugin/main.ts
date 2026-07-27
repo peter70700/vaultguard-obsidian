@@ -60,7 +60,11 @@ import { AtRestRecoveryModal } from "../ui/at-rest-recovery-modal";
 import { isKnownBinaryExtensionPath } from "./binary-content";
 import {
   LOCAL_PROJECT_MEMORY_MODE_NOTICE,
+  decideAutomaticLocalProjectMemoryMode,
   isLocalProjectMemoryModeEnabled,
+  readAutomaticLocalProjectMemoryModePreference,
+  writeAutomaticLocalProjectMemoryModePreference,
+  type AutomaticLocalProjectMemoryModeDecision,
 } from "./local-project-memory-mode";
 import { PathPermissionsModal } from "../ui/path-permissions-modal";
 import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
@@ -178,6 +182,10 @@ import {
   LongOperationUiController,
   renderLongOperationStatusBar,
 } from "../ui/long-operation-progress";
+import {
+  settleCleanupTasks,
+  type NamedCleanupTask,
+} from "./lifecycle-cleanup";
 import {
   VaultOrientationService,
   type ConnectorStatusMatrix,
@@ -447,8 +455,77 @@ export default class VaultGuardPlugin extends Plugin {
     return isLocalProjectMemoryModeEnabled(this.settings);
   }
 
-  async enableLocalProjectMemoryMode(): Promise<void> {
+  isAutomaticLocalProjectMemoryModeForGitReposEnabled(): boolean {
+    try {
+      return readAutomaticLocalProjectMemoryModePreference(this.app);
+    } catch (error) {
+      this.logError("Reading the global automatic Local Project Memory Mode preference failed", error);
+      return false;
+    }
+  }
+
+  setAutomaticLocalProjectMemoryModeForGitRepos(enabled: boolean): void {
+    writeAutomaticLocalProjectMemoryModePreference(this.app, enabled);
+  }
+
+  async maybeAutoEnableLocalProjectMemoryMode(): Promise<
+    AutomaticLocalProjectMemoryModeDecision | { kind: "enabled" }
+  > {
+    const baseInput = {
+      globalEnabled: this.isAutomaticLocalProjectMemoryModeForGitReposEnabled(),
+      alreadyEnabled: this.isLocalProjectMemoryModeEnabled(),
+      suppressed: this.settings.localProjectMemoryModeAutoEnableSuppressed === true,
+      mobile: Platform.isMobileApp,
+      serverBound: Boolean(this.settings.serverVaultId?.trim()),
+      gitRootDetected: true,
+      protection: { safe: true, reason: "safe" as const },
+    };
+    let decision = decideAutomaticLocalProjectMemoryMode(baseInput);
+    if (decision.kind !== "eligible") return decision;
+
+    let gitRootDetected = false;
+    try {
+      const git = await this.getVaultOrientationService().getGitSummary({
+        includeStatus: false,
+        forceRefresh: true,
+      });
+      gitRootDetected = git.detected;
+    } catch (error) {
+      this.logError("Automatic Local Project Memory Mode Git-root probe failed", error);
+      return { kind: "inspection-failed" };
+    }
+    decision = decideAutomaticLocalProjectMemoryMode({
+      ...baseInput,
+      gitRootDetected,
+    });
+    if (decision.kind !== "eligible") return decision;
+
+    let protection;
+    try {
+      protection = await this.ensureAtRestAdapterRuntimeObject()
+        .inspectAutomaticLocalProjectMemoryModeSafety();
+    } catch (error) {
+      this.logError("Automatic Local Project Memory Mode protection inspection failed", error);
+      return { kind: "inspection-failed" };
+    }
+    decision = decideAutomaticLocalProjectMemoryMode({
+      ...baseInput,
+      gitRootDetected,
+      protection,
+    });
+    if (decision.kind !== "eligible") return decision;
+
+    await this.enableLocalProjectMemoryMode("automatic");
+    return { kind: "enabled" };
+  }
+
+  async enableLocalProjectMemoryMode(
+    source: "manual" | "automatic" = "manual",
+  ): Promise<void> {
     this.settings.localProjectMemoryMode = true;
+    if (source === "manual") {
+      this.settings.localProjectMemoryModeAutoEnableSuppressed = false;
+    }
     this.settings.atRestFirstRunDismissed = true;
     this.keyLease = null;
     this.vaultLeaseDenied = false;
@@ -462,6 +539,14 @@ export default class VaultGuardPlugin extends Plugin {
     await this.saveSettings();
     this.updateStatusBar();
     new Notice(`VaultGuard Sync: ${LOCAL_PROJECT_MEMORY_MODE_NOTICE}`, 8000);
+  }
+
+  async disableLocalProjectMemoryMode(): Promise<void> {
+    this.settings.localProjectMemoryMode = false;
+    this.settings.localProjectMemoryModeAutoEnableSuppressed = true;
+    await this.saveSettings();
+    this.restartSyncTimer();
+    this.updateStatusBar();
   }
 
   /** Restart-safe, protected session backups persisted through Obsidian's plugin data file */
@@ -887,6 +972,8 @@ export default class VaultGuardPlugin extends Plugin {
   private updateChecker: UpdateChecker | null = null;
   private settingTab: VaultGuardSettingTab | null = null;
   private externalSettingsReload: Promise<void> | null = null;
+  private unloading = false;
+  private lifecycleGeneration = 0;
 
   /** Sidebar view configuration (set once, injected into view instances) */
   private sidebarViewConfig: VaultGuardSidebarViewConfig | null = null;
@@ -980,16 +1067,10 @@ export default class VaultGuardPlugin extends Plugin {
     const codexStatus = this.getAgentBridgeCodexSkillStatus();
     const openaiChat = this.settings.encryptedOpenAiKey ? "available" : "not-configured";
     return {
-      claude: localMode
-        ? "disabled"
-        : claudeStatus.available && claudeStatus.installed
-          ? "available"
-          : "not-configured",
-      codex: localMode
-        ? "disabled"
-        : codexStatus.available && codexStatus.installed
-          ? "available"
-          : "not-configured",
+      claude:
+        claudeStatus.available && claudeStatus.installed ? "available" : "not-configured",
+      codex:
+        codexStatus.available && codexStatus.installed ? "available" : "not-configured",
       openaiChat,
       chatgptRemote: localMode
         ? "disabled"
@@ -1876,6 +1957,8 @@ export default class VaultGuardPlugin extends Plugin {
    * Initializes authentication, sync engine, commands, and vault interception.
    */
   async onload(): Promise<void> {
+    this.unloading = false;
+    this.lifecycleGeneration += 1;
     this.log("Loading VaultGuard plugin...");
     this.syncDiagnostics.record("onload.start", { mobile: Platform.isMobileApp });
 
@@ -1899,6 +1982,11 @@ export default class VaultGuardPlugin extends Plugin {
     // agent-driven chat slash command (/import-knowledge) inside the AI chat
     // panel — the agent surveys the picked folder through a gated, sandboxed
     // source-read tool and builds an organized KB, rather than dumping files 1:1.
+
+    // Register the stable core view before the first await so a preserved leaf
+    // is never left as "Plugin no longer active" while startup initializes.
+    // Optional views remain behind their cipher/settings prerequisites.
+    registerVaultGuardViews(this.createViewRegistrationContext());
 
     // Load persisted settings
     await this.loadSettings();
@@ -2006,6 +2094,11 @@ export default class VaultGuardPlugin extends Plugin {
     // Early reads route through readPlainFromDisk, which fails closed via
     // `cipherInitPromise` until init settles.
     this.interceptVaultAdapter();
+
+    // Evaluate the shared Git-repository default only after raw adapter methods
+    // are captured for a fail-closed protection inspection and before the
+    // at-rest runtime can provision or unlock local protection.
+    await this.maybeAutoEnableLocalProjectMemoryMode();
 
     // BIN-A preview: pre-decrypt an opened media file into the resource-preview
     // blob cache so standalone image/PDF views get a synchronous getResourcePath
@@ -2152,7 +2245,6 @@ export default class VaultGuardPlugin extends Plugin {
     // users from accumulating edits that fail at save time.
     this.initReadOnlyGuard();
 
-    registerVaultGuardViews(this.createViewRegistrationContext());
     await this.registerEnabledOptionalViews();
 
     // Phase 9: subscribe the sidebar to the unified permission bus. One
@@ -2164,6 +2256,9 @@ export default class VaultGuardPlugin extends Plugin {
     if (sidebarConfig) {
       this.sidebarViewConfig = sidebarConfig;
     }
+    // A persisted sidebar leaf may have opened against the synchronous shell
+    // before settings/session restore. Rehydrate it now without a manual close.
+    this.reloadVaultGuardSidebar();
 
     // Initialize file explorer decorations (permission dots + avatar stacks)
     this.initFileExplorerDecorations();
@@ -2332,7 +2427,11 @@ export default class VaultGuardPlugin extends Plugin {
    * sensitive data from memory.
    */
   async onunload(): Promise<void> {
+    this.unloading = true;
+    this.lifecycleGeneration += 1;
     this.log("Unloading VaultGuard plugin...");
+    const cleanupTasks: NamedCleanupTask[] = [];
+
     this.discoveryRuntime?.cancel();
     this.discoveryRuntime = null;
     this.discoveryRuntimePromise = null;
@@ -2340,9 +2439,12 @@ export default class VaultGuardPlugin extends Plugin {
     semanticRuntime?.cancel();
     this.semanticRuntime = null;
     this.semanticRuntimePromise = null;
-    await semanticRuntime?.cancelAndWait().catch((error) =>
-      this.logError("Waiting for semantic work to stop during unload failed", error),
-    );
+    if (semanticRuntime) {
+      cleanupTasks.push({
+        name: "semantic-runtime",
+        promise: semanticRuntime.cancelAndWait(),
+      });
+    }
     this.semanticStatusListeners.clear();
     this.discoveryLifecycleListeners.clear();
     this.settingTab = null;
@@ -2355,12 +2457,15 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.offlineQueuePersistTimer) {
       clearTimeout(this.offlineQueuePersistTimer);
       this.offlineQueuePersistTimer = null;
-      await this.persistOfflineQueue().catch(() => {});
+      cleanupTasks.push({ name: "offline-queue-persist", promise: this.persistOfflineQueue() });
     }
     if (this.remoteFileStatePersistTimer) {
       clearTimeout(this.remoteFileStatePersistTimer);
       this.remoteFileStatePersistTimer = null;
-      await this.persistRemoteFileState().catch(() => {});
+      cleanupTasks.push({
+        name: "remote-file-state-persist",
+        promise: this.persistRemoteFileState(),
+      });
     }
 
     // Stop all timers
@@ -2380,53 +2485,60 @@ export default class VaultGuardPlugin extends Plugin {
     this.longOperationUi = null;
     this.longOperations.destroy();
 
-    // Restore original vault adapter methods
-    this.restoreVaultAdapter();
-
-    if (this.agentBridgeRuntime) {
-      await this.agentBridgeRuntime.shutdown();
-      this.agentBridgeRuntime = null;
+    const agentBridgeRuntime = this.agentBridgeRuntime;
+    this.agentBridgeRuntime = null;
+    if (agentBridgeRuntime) {
+      cleanupTasks.push({ name: "agent-bridge", promise: agentBridgeRuntime.shutdown() });
     }
 
-    // Tear down API client
-    if (this.apiClient) {
-      this.apiClient.destroy();
-      this.apiClient = null;
+    let cleanupSummary = { fulfilled: [] as string[], rejected: [] as string[], timedOut: [] as string[] };
+    try {
+      cleanupSummary = await settleCleanupTasks(cleanupTasks, 900);
+    } finally {
+      // Restore adapter/API/UI ownership even if a cleanup dependency ignores
+      // cancellation. Late work has already lost live runtime references.
+      this.restoreVaultAdapter();
+
+      if (this.apiClient) {
+        this.apiClient.destroy();
+        this.apiClient = null;
+      }
+
+      this.clearSensitiveData(false);
+      this.setGlobalAuthChromeState(false);
+
+      if (this.filePermissionHeader) {
+        this.filePermissionHeader.destroy();
+        this.filePermissionHeader = null;
+      }
+      if (this.readOnlyGuard) {
+        this.readOnlyGuard.destroy();
+        this.readOnlyGuard = null;
+      }
+      if (this.fileExplorerDecorations) {
+        this.fileExplorerDecorations.destroy();
+        this.fileExplorerDecorations = null;
+      }
+
+      // Sidebar leaves remain attached so Obsidian can restore their placement.
+      if (this.statusBarEl) {
+        this.statusBarEl.remove();
+        this.statusBarEl = null;
+      }
     }
 
-    // Clear sensitive data from memory
-    this.clearSensitiveData();
-    this.setGlobalAuthChromeState(false);
-
-    // Remove file permission header
-    if (this.filePermissionHeader) {
-      this.filePermissionHeader.destroy();
-      this.filePermissionHeader = null;
+    if (cleanupSummary.rejected.length > 0) {
+      this.logError(
+        `Plugin unload cleanup rejected: ${cleanupSummary.rejected.join(", ")}`,
+        new Error("Lifecycle cleanup rejected."),
+      );
     }
-
-    // Unlock any editors locked by the read-only guard
-    if (this.readOnlyGuard) {
-      this.readOnlyGuard.destroy();
-      this.readOnlyGuard = null;
+    if (cleanupSummary.timedOut.length > 0) {
+      this.logError(
+        `Plugin unload cleanup timed out: ${cleanupSummary.timedOut.join(", ")}`,
+        new Error("Lifecycle cleanup deadline exceeded."),
+      );
     }
-
-    // Remove file explorer decorations
-    if (this.fileExplorerDecorations) {
-      this.fileExplorerDecorations.destroy();
-      this.fileExplorerDecorations = null;
-    }
-
-    // Note: VaultGuard sidebar leaves are intentionally NOT detached here.
-    // Obsidian persists leaf placement, and detaching on unload resets the
-    // view to its default location the next time the plugin loads, discarding
-    // any spot the user moved it to.
-
-    // Remove status bar
-    if (this.statusBarEl) {
-      this.statusBarEl.remove();
-      this.statusBarEl = null;
-    }
-
     this.log("VaultGuard plugin unloaded.");
   }
 
@@ -2566,13 +2678,33 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   async createAgentBridgeLease(input: AgentBridgeLeaseInput = {}): Promise<AgentBridgeLeaseSecret> {
-    if (this.isLocalProjectMemoryModeEnabled()) {
-      throw new Error("Agent bridge server leases are disabled in Local Project Memory Mode.");
-    }
     if (!this.isOptionalModuleEnabled("agentAccess")) {
       throw new Error("External agent access is off. Enable it in VaultGuard settings first.");
     }
-    const lease = this.ensureAgentBridgeRuntime().createLease(input);
+    if (!this.session) {
+      throw new Error("VaultGuard agent bridge requires an active VaultGuard login.");
+    }
+    const localProjectMemoryMode = this.isLocalProjectMemoryModeEnabled();
+    if (localProjectMemoryMode && input.persistent === true) {
+      throw new Error(
+        "Local Project Memory Mode only supports time-limited, session-bound leases."
+      );
+    }
+    const lease = this.ensureAgentBridgeRuntime().createLease({
+      ...input,
+      // The current storage mode is plugin-owned. External callers cannot use
+      // this input flag to bypass the normal server-vault prerequisite.
+      localProjectMemoryMode,
+      ...(localProjectMemoryMode
+        ? {
+            persistent: false,
+            expiresWithSession: true,
+            // Public local bridge leases remain clock-bounded as well as
+            // session-bound. The trusted in-app lease omits a TTL separately.
+            ttlMinutes: input.ttlMinutes ?? 30,
+          }
+        : {}),
+    });
     this.vaultOrientationService?.invalidate("agent-bridge-lease-created");
     return lease;
   }
@@ -2670,6 +2802,7 @@ export default class VaultGuardPlugin extends Plugin {
   private async ensureOptionalViewRegistered(
     moduleId: OptionalModuleId,
   ): Promise<boolean> {
+    if (this.unloading) return false;
     if (!this.isOptionalModuleEnabled(moduleId)) return false;
     if (moduleId === "agentAccess") return true;
     if (moduleId === "aiChat" && this.chatViewRegistered) return true;
@@ -2679,11 +2812,14 @@ export default class VaultGuardPlugin extends Plugin {
     const existing = this.optionalViewRegistrationPromises.get(moduleId);
     if (existing) return existing;
 
+    const lifecycleGeneration = this.lifecycleGeneration;
+    const mayRegister = () =>
+      !this.unloading && lifecycleGeneration === this.lifecycleGeneration;
     const registration = (async (): Promise<boolean> => {
       switch (moduleId) {
         case "aiChat": {
           const { VaultGuardChatView } = await import("../ui/chat/chat-view");
-          if (!this.isOptionalModuleEnabled(moduleId)) return false;
+          if (!mayRegister() || !this.isOptionalModuleEnabled(moduleId)) return false;
           this.registerView(
             VAULTGUARD_CHAT_VIEW_TYPE,
             (leaf) =>
@@ -2699,7 +2835,7 @@ export default class VaultGuardPlugin extends Plugin {
           const { PermissionsGraphView } = await import(
             "../ui/graph/permissions-graph-view"
           );
-          if (!this.isOptionalModuleEnabled(moduleId)) return false;
+          if (!mayRegister() || !this.isOptionalModuleEnabled(moduleId)) return false;
           this.registerView(
             VAULTGUARD_GRAPH_VIEW_TYPE,
             (leaf) =>
@@ -2713,7 +2849,7 @@ export default class VaultGuardPlugin extends Plugin {
         }
         case "secureDiscovery": {
           const { SecureSearchView } = await import("../ui/discovery/secure-search-view");
-          if (!this.isOptionalModuleEnabled(moduleId)) return false;
+          if (!mayRegister() || !this.isOptionalModuleEnabled(moduleId)) return false;
           this.registerView(
             VAULTGUARD_DISCOVERY_VIEW_TYPE,
             (leaf) => new SecureSearchView(leaf, this.createSecureSearchViewContext()),
@@ -3235,9 +3371,9 @@ export default class VaultGuardPlugin extends Plugin {
 
   /**
    * Trusted in-app chat lease factory. Unlike the public bridge API this method
-   * force-binds the lease to the current login session and never persists it.
-   * Local Project Memory Mode may use this capability through the loopback MCP
-   * endpoint; callers cannot opt into a generic or longer-lived lease.
+   * enables the in-app-only tool capabilities, force-binds the lease to the
+   * current login session, and never persists it. Callers cannot opt into a
+   * generic or longer-lived lease.
    */
   async createInAppChatAgentBridgeLease(
     capability: InAppChatCapability,
@@ -3413,11 +3549,11 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   async startAgentBridgeServer(): Promise<AgentBridgeServerInfo> {
-    if (this.isLocalProjectMemoryModeEnabled()) {
-      throw new Error("Agent bridge server leases are disabled in Local Project Memory Mode.");
-    }
     if (!this.isOptionalModuleEnabled("agentAccess")) {
       throw new Error("External agent access is off. Enable it in VaultGuard settings first.");
+    }
+    if (!this.session) {
+      throw new Error("VaultGuard agent bridge requires an active VaultGuard login.");
     }
     return this.ensureAgentBridgeRuntime().startServer();
   }
@@ -3444,7 +3580,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   async stopAgentBridgeServer(): Promise<void> {
-    await this.ensureAgentBridgeRuntime().stopServer();
+    await this.agentBridgeRuntime?.stopServerIfInitialized();
   }
 
   /**
@@ -3517,10 +3653,6 @@ export default class VaultGuardPlugin extends Plugin {
   private openAgentBridgeLeaseModal(): void {
     if (!this.isOptionalModuleEnabled("agentAccess")) {
       new Notice("VaultGuard Sync: Enable External agent access in settings first.");
-      return;
-    }
-    if (this.isLocalProjectMemoryModeEnabled()) {
-      new Notice("VaultGuard Sync: server bridge leases are disabled in Local Project Memory Mode.", 6000);
       return;
     }
     this.ensureAgentBridgeRuntimeObject().openLeaseModal();
@@ -11004,7 +11136,7 @@ export default class VaultGuardPlugin extends Plugin {
    * Clears all sensitive data from memory.
    * Called on plugin unload and forced logout.
    */
-  private clearSensitiveData(): void {
+  private clearSensitiveData(persistClearedState = true): void {
     this.session = null;
     this.keyLease = null;
     // Drop the API client's cached JWTs so no privileged request (an open
@@ -11028,8 +11160,10 @@ export default class VaultGuardPlugin extends Plugin {
     this.remoteFileState.clear();
     // SY5: an empty queue removes the persisted envelope, so a logout/lock
     // never leaves another user's queued edits on disk for the next session.
-    this.scheduleOfflineQueuePersist();
-    this.scheduleRemoteFileStatePersist();
+    if (persistClearedState) {
+      this.scheduleOfflineQueuePersist();
+      this.scheduleRemoteFileStatePersist();
+    }
     this.log("Sensitive data cleared from memory.");
   }
 
@@ -11150,6 +11284,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private scheduleOfflineQueuePersist(): void {
+    if (this.unloading) return;
     if (this.offlineQueuePersistTimer) clearTimeout(this.offlineQueuePersistTimer);
     this.offlineQueuePersistTimer = setTimeout(() => {
       this.offlineQueuePersistTimer = null;
@@ -11275,6 +11410,7 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private scheduleRemoteFileStatePersist(): void {
+    if (this.unloading) return;
     if (this.remoteFileStatePersistTimer) clearTimeout(this.remoteFileStatePersistTimer);
     this.remoteFileStatePersistTimer = setTimeout(() => {
       this.remoteFileStatePersistTimer = null;

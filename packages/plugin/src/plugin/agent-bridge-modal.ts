@@ -13,6 +13,7 @@ import {
   buildCodexTokenEnvCommand,
 } from "./agent-bridge-codex";
 import { AtRestPasswordConfirmModal } from "./at-rest-modals";
+import { OperationOwner } from "../ui/operation-owner";
 
 interface BridgeConnection {
   endpoint: string;
@@ -21,6 +22,7 @@ interface BridgeConnection {
   leaseId: string;
   expiresAt: string;
   tools: AgentBridgeServerInfo["tools"];
+  mcpOnly?: boolean;
 }
 
 type LifetimePreset = "30m" | "1h" | "2h" | "until-logout";
@@ -32,6 +34,7 @@ export class AgentBridgeLeaseModal extends Modal {
   private bridgeScope = "/**";
   private lifetime: LifetimePreset = "30m";
   private writeMode: AgentWriteMode = "confirm";
+  private readonly createOwner = new OperationOwner();
 
   private get persistent(): boolean {
     return this.lifetime === "until-logout";
@@ -57,11 +60,21 @@ export class AgentBridgeLeaseModal extends Modal {
   }
 
   onOpen(): void {
+    this.createOwner.activate();
     this.renderForm();
+  }
+
+  onClose(): void {
+    this.createOwner.close();
+    this.contentEl.empty();
   }
 
   private renderForm(): void {
     const { contentEl } = this;
+    const localProjectMemoryMode = this.plugin.isLocalProjectMemoryModeEnabled();
+    if (localProjectMemoryMode && this.persistent) {
+      this.lifetime = "30m";
+    }
     contentEl.empty();
     contentEl.createEl("h2", { text: "Create agent bridge lease" });
     contentEl.createEl("p", {
@@ -123,20 +136,25 @@ export class AgentBridgeLeaseModal extends Modal {
     new Setting(contentEl)
       .setName("Lifetime")
       .setDesc(
-        "Time-limited leases live in memory only and expire on the clock. 'until logout' leases are persistent — they survive Obsidian restarts (encrypted on disk via the at-rest cipher) and end when you log out. Persistent leases require re-auth and cannot use 'allow writes'."
+        localProjectMemoryMode
+          ? "Local Project Memory Mode leases live only in memory, expire on the clock, and are also revoked when the VaultGuard login session or plugin ends. Persistent leases are unavailable in this mode."
+          : "Time-limited leases live in memory only and expire on the clock. 'until logout' leases are persistent — they survive Obsidian restarts (encrypted on disk via the at-rest cipher) and end when you log out. Persistent leases require re-auth and cannot use 'allow writes'."
       )
-      .addDropdown((dropdown) =>
+      .addDropdown((dropdown) => {
         dropdown
           .addOption("30m", "30 minutes")
           .addOption("1h", "1 hour")
-          .addOption("2h", "2 hours (max time-limited)")
-          .addOption("until-logout", "Until logout (persistent)")
+          .addOption("2h", "2 hours (max time-limited)");
+        if (!localProjectMemoryMode) {
+          dropdown.addOption("until-logout", "Until logout (persistent)");
+        }
+        dropdown
           .setValue(this.lifetime)
           .onChange((value) => {
             this.lifetime = value as LifetimePreset;
             refreshValidation();
-          })
-      );
+          });
+      });
 
     new Setting(contentEl)
       .setName("Writes")
@@ -162,11 +180,13 @@ export class AgentBridgeLeaseModal extends Modal {
           .setButtonText("Create lease")
           .setCta()
           .onClick(async () => {
+            const operation = this.createOwner.begin();
             button.setDisabled(true).setButtonText("Creating...");
             let lease: AgentBridgeLeaseSecret | null = null;
             try {
               if (this.persistent) {
                 const ok = await this.confirmPersistentReauth();
+                if (!operation.isCurrent()) return;
                 if (!ok) {
                   button.setDisabled(false).setButtonText("Create lease");
                   return;
@@ -179,7 +199,15 @@ export class AgentBridgeLeaseModal extends Modal {
                 writeMode: this.writeMode,
                 persistent: this.persistent,
               });
+              if (!operation.isCurrent()) {
+                this.plugin.revokeAgentBridgeLease(lease.leaseId);
+                return;
+              }
               const server = await this.plugin.startAgentBridgeServer();
+              if (!operation.isCurrent()) {
+                this.plugin.revokeAgentBridgeLease(lease.leaseId);
+                return;
+              }
               const connection: BridgeConnection = {
                 endpoint: server.endpoint,
                 mcpEndpoint: server.mcpEndpoint,
@@ -187,11 +215,13 @@ export class AgentBridgeLeaseModal extends Modal {
                 leaseId: lease.leaseId,
                 expiresAt: lease.expiresAt,
                 tools: server.tools,
+                ...(this.plugin.isLocalProjectMemoryModeEnabled() ? { mcpOnly: true } : {}),
               };
               this.renderConnection(connection, lease);
               this.onLeaseCreated?.();
             } catch (err) {
               if (lease) this.plugin.revokeAgentBridgeLease(lease.leaseId);
+              if (!operation.isCurrent()) return;
               new Notice(
                 `VaultGuard: Could not create agent bridge lease - ${
                   err instanceof Error ? err.message : String(err)
@@ -216,6 +246,12 @@ export class AgentBridgeLeaseModal extends Modal {
     severity: "ok" | "warning" | "error";
     message: string;
   } {
+    if (this.plugin.isLocalProjectMemoryModeEnabled() && this.persistent) {
+      return {
+        severity: "error",
+        message: "Local Project Memory Mode only supports time-limited, session-bound leases.",
+      };
+    }
     if (!this.persistent) return { severity: "ok", message: "" };
 
     const scope = this.bridgeScope.trim();
@@ -258,7 +294,9 @@ export class AgentBridgeLeaseModal extends Modal {
 
     const intro = contentEl.createEl("p");
     intro.appendText(
-      `Lease for "${lease.agentName}" created. Scope: ${lease.scopes.join(", ")}. Write mode: ${lease.writeMode}. Expires ${lease.expiresAt}. Hand the agent only the snippets below — never the LAK, recovery code, or the vault folder itself.`
+      connection.mcpOnly
+        ? `Lease for "${lease.agentName}" created. Scope: ${lease.scopes.join(", ")}. Write mode: ${lease.writeMode}. Expires ${lease.expiresAt}. This token is accepted only by the localhost MCP endpoint and is revoked when the VaultGuard session or plugin ends.`
+        : `Lease for "${lease.agentName}" created. Scope: ${lease.scopes.join(", ")}. Write mode: ${lease.writeMode}. Expires ${lease.expiresAt}. Hand the agent only the snippets below — never the LAK, recovery code, or the vault folder itself.`
     );
 
     const rawJson = JSON.stringify(connection, null, 2);
@@ -268,13 +306,15 @@ export class AgentBridgeLeaseModal extends Modal {
     const codexLaunchCommand = buildCodexTempWorkspaceLaunchCommand(connection.token);
     const codexAgentsGuidance = buildCodexAgentsGuidance();
 
-    this.renderCopyableBlock(contentEl, {
-      title: "Generic agent connection (custom HTTP-RPC)",
-      description:
-        "For agents you wrote yourself or that target VaultGuard's plain HTTP-RPC at /rpc. Paste this JSON wherever your agent expects its connection settings.",
-      json: rawJson,
-      copyLabel: "Copy connection JSON",
-    });
+    if (!connection.mcpOnly) {
+      this.renderCopyableBlock(contentEl, {
+        title: "Generic agent connection (custom HTTP-RPC)",
+        description:
+          "For agents you wrote yourself or that target VaultGuard's plain HTTP-RPC at /rpc. Paste this JSON wherever your agent expects its connection settings.",
+        json: rawJson,
+        copyLabel: "Copy connection JSON",
+      });
+    }
 
     this.renderCopyableBlock(contentEl, {
       title: "Claudian / Claude Code MCP server",

@@ -95,17 +95,21 @@ export class AgentBridgeRuntime {
   }
 
   async shutdown(): Promise<void> {
-    if (!this.bridge) return;
-    await this.bridge.stopHttpServer().catch((err) =>
+    const bridge = this.bridge;
+    if (!bridge) return;
+    // Remove live authority before asynchronous server drain. Late callers on
+    // the old runtime cannot reuse leases while Obsidian replaces the plugin.
+    this.bridge = null;
+    bridge.revokeAllLeases();
+    await bridge.stopHttpServer().catch((err) =>
       this.ctx.logError("Stopping agent bridge server failed", err),
     );
-    this.bridge.revokeAllLeases();
-    this.bridge = null;
   }
 
   async stopServerIfInitialized(): Promise<void> {
-    if (!this.bridge) return;
-    await this.bridge.stopHttpServer();
+    const bridge = this.bridge;
+    if (!bridge) return;
+    await bridge.stopHttpServer();
   }
 
   getConversationStore(): ConversationStore | null {
@@ -317,7 +321,7 @@ export class AgentBridgeRuntime {
   }
 
   stopServer(): Promise<void> {
-    return this.ensureBridge().stopHttpServer();
+    return this.bridge?.stopHttpServer() ?? Promise.resolve();
   }
 
   openLeaseModal(): void {

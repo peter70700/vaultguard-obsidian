@@ -18,6 +18,7 @@ import type {
   VaultOrientationOptions,
   VaultOrientationSnapshot,
 } from "./vault-orientation";
+import { settleCleanupTasks } from "./lifecycle-cleanup";
 
 // Cherry-picked from AuditAction so the bridge only emits its own events
 // and gets a compile error if those names drift.
@@ -143,9 +144,10 @@ export interface AgentBridgeLeaseInput {
   // on disk via the LAK) and dies on logout. Stricter scope/writeMode
   // rules apply — see createLease().
   persistent?: boolean;
-  // Internal plugin flag for in-app chat while Local Project Memory Mode is
-  // active. Allows a session-bound, in-process lease without a server vault.
-  // External HTTP/MCP leases and persistent leases must never set this.
+  // Plugin-owned marker for leases created while Local Project Memory Mode is
+  // active. It permits a missing server vault only for non-persistent,
+  // session-bound leases and restricts loopback HTTP authorization to MCP.
+  // Public callers cannot choose the active storage mode.
   localProjectMemoryMode?: boolean;
 }
 
@@ -621,14 +623,13 @@ interface AgentBridgeLease extends AgentBridgeLeaseSummary {
   // Number.POSITIVE_INFINITY here (and a literal "session" sentinel in
   // expiresAt) so the prune check is a simple `expiresAtMs <= now`.
   expiresAtMs: number;
-  // Pinning a persistent lease to the session that created it — restored
-  // leases for a different user or vault binding are dropped on load.
-  // null for ephemeral leases.
+  // Pins session-bound and persistent leases to the user that created them.
+  // Restored persistent leases for another user or vault binding are dropped;
+  // in-memory session-bound leases also fail closed after a user change.
   sessionUserId: string | null;
   sessionVaultId: string | null;
-  // True only for the official in-app chat lease while Local Project Memory
-  // Mode is active. It stays in-process and is never persisted or served over
-  // HTTP/MCP.
+  // True for any lease minted while Local Project Memory Mode is active. Such
+  // leases are never persisted and authorize loopback MCP, but not generic RPC.
   localProjectMemoryMode: boolean;
 }
 
@@ -840,6 +841,8 @@ type NodeServerResponse = {
 type NodeHttpServer = {
   listen(port: number, hostname: string, cb: () => void): void;
   close(cb?: (err?: Error) => void): void;
+  closeIdleConnections?(): void;
+  closeAllConnections?(): void;
   address(): { port: number } | string | null;
   on(event: "error", cb: (err: Error) => void): void;
 };
@@ -1432,6 +1435,7 @@ const CHATGPT_CONNECTOR_REQUIRED_SCOPES: Record<ChatGptConnectorToolName, ChatGp
   graph: ["vg.vault.read", "vg.graph.read"],
 };
 const HTTP_BODY_LIMIT_BYTES = 1024 * 1024;
+const AGENT_BRIDGE_CLOSE_TIMEOUT_MS = 500;
 // Try this localhost port first so the URL pasted into Claudian / .mcp.json
 // stays stable across plugin reloads. Falls back to a random port if the
 // preferred one is taken (another VaultGuard instance, another process).
@@ -2021,7 +2025,7 @@ export class VaultGuardAgentBridge {
     const localProjectMemoryMode = input.localProjectMemoryMode === true;
     if (localProjectMemoryMode && (persistent || !expiresWithSession)) {
       throw new Error(
-        "Local Project Memory Mode only allows session-bound in-app chat leases."
+        "Local Project Memory Mode only supports time-limited, session-bound leases."
       );
     }
     this.assertBridgePrereqs({ allowMissingServerVault: localProjectMemoryMode });
@@ -2055,9 +2059,14 @@ export class VaultGuardAgentBridge {
       }
     }
 
-    const ttlMinutes = expiresWithSession
-      ? null
-      : this.clampNumber(input.ttlMinutes ?? DEFAULT_TTL_MINUTES, MIN_TTL_MINUTES, MAX_TTL_MINUTES);
+    // Trusted in-app leases may live for the login session without a wall-clock
+    // deadline. User-created Local Project Memory leases carry both boundaries:
+    // main.ts always supplies a TTL and forces expiresWithSession=true.
+    const hasWallClockExpiry =
+      !expiresWithSession || (localProjectMemoryMode && input.ttlMinutes !== undefined);
+    const ttlMinutes = hasWallClockExpiry
+      ? this.clampNumber(input.ttlMinutes ?? DEFAULT_TTL_MINUTES, MIN_TTL_MINUTES, MAX_TTL_MINUTES)
+      : null;
     const now = Date.now();
     const maxReadBytes = this.clampNumber(input.maxReadBytes ?? DEFAULT_MAX_READ_BYTES, 1024, MAX_READ_BYTES);
     const maxSearchResults = this.clampNumber(
@@ -2097,18 +2106,18 @@ export class VaultGuardAgentBridge {
       // backend re-authorizes every op (vault-admin) and every op is confirmed.
       allowMembershipWrites: input.allowMembershipWrites === true,
       createdAt: new Date(now).toISOString(),
-      expiresAt: expiresWithSession
-        ? SESSION_EXPIRY_SENTINEL
-        : new Date(now + (ttlMinutes as number) * 60_000).toISOString(),
-      expiresAtMs: expiresWithSession
-        ? Number.POSITIVE_INFINITY
-        : now + (ttlMinutes as number) * 60_000,
+      expiresAt:
+        ttlMinutes === null
+          ? SESSION_EXPIRY_SENTINEL
+          : new Date(now + ttlMinutes * 60_000).toISOString(),
+      expiresAtMs:
+        ttlMinutes === null ? Number.POSITIVE_INFINITY : now + ttlMinutes * 60_000,
       persistent,
       maxReadBytes,
       maxSearchResults,
       tools: TOOLS,
       token: this.randomId("agt"),
-      sessionUserId: persistent ? session?.userId ?? null : null,
+      sessionUserId: expiresWithSession ? session?.userId ?? null : null,
       sessionVaultId: persistent ? vaultId || null : null,
       localProjectMemoryMode,
     };
@@ -2422,12 +2431,38 @@ export class VaultGuardAgentBridge {
 
     if (!server) return;
 
-    await new Promise<void>((resolve, reject) => {
-      server.close((err?: Error) => {
-        if (err) reject(err);
-        else resolve();
-      });
+    const closePromise = new Promise<void>((resolve, reject) => {
+      try {
+        server.close((err?: Error) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      } catch (error) {
+        reject(error);
+      }
     });
+
+    // Node's close callback waits for active connections. Modern Electron
+    // exposes explicit connection drains; feature-detect them so older
+    // Obsidian runtimes remain compatible while update teardown stays bounded.
+    try {
+      server.closeIdleConnections?.();
+      server.closeAllConnections?.();
+    } catch {
+      // The deadline below remains authoritative if a runtime-specific close
+      // helper throws. Do not propagate teardown-only errors to Obsidian.
+    }
+
+    const summary = await settleCleanupTasks(
+      [{ name: "agent-bridge-http-server", promise: closePromise }],
+      AGENT_BRIDGE_CLOSE_TIMEOUT_MS,
+    );
+    if (summary.rejected.length > 0) {
+      this.deps.log("Agent bridge HTTP server close failed; detached during plugin teardown.");
+    }
+    if (summary.timedOut.length > 0) {
+      this.deps.log("Agent bridge HTTP server close timed out; forced teardown continued.");
+    }
   }
 
   getServerInfo(): AgentBridgeServerInfo {
@@ -4223,6 +4258,10 @@ export class VaultGuardAgentBridge {
     this.assertBridgePrereqs({
       allowMissingServerVault: lease.localProjectMemoryMode,
     });
+    const session = this.deps.getSession();
+    if (lease.sessionUserId && lease.sessionUserId !== session?.userId) {
+      throw new Error("VaultGuard agent lease belongs to a different login session.");
+    }
     return lease;
   }
 
@@ -5358,11 +5397,10 @@ export class VaultGuardAgentBridge {
     const leaseId = this.tokenIndex.get(token);
     if (!leaseId) return null;
     const lease = this.leases.get(leaseId) ?? null;
-    // A Local Project Memory lease is minted only by the plugin's dedicated
-    // in-app chat API. It may cross this loopback MCP transport so an official
-    // local subscription client can use the same VaultGuard gates as API chat,
-    // but it remains unusable over the generic RPC transport. The HTTP server
-    // itself binds only 127.0.0.1 and still requires this unguessable bearer.
+    // Local Project Memory leases may cross the loopback MCP transport so
+    // explicitly authorized local clients use the normal scope, write, and
+    // audit gates. They remain unusable over generic RPC. The HTTP server binds
+    // only 127.0.0.1 and still requires this unguessable bearer.
     if (lease?.localProjectMemoryMode && transport !== "mcp") return null;
     return lease;
   }

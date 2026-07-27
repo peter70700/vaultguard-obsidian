@@ -26,6 +26,7 @@ import { getAccessUserDisplayName } from "../ui/access-user-utils";
 import { ProUpsellModal } from "../ui/pro-upsell-modal";
 import type { ServerFeatures } from "../types";
 import { createI18n } from "../i18n";
+import { OperationOwner, type OperationLease } from "../ui/operation-owner";
 
 type TabId = "users" | "permissions" | "audit" | "settings" | "recovery";
 type OrgSettings = OrgSettingsResponse;
@@ -139,6 +140,9 @@ export class AdminModal extends Modal {
   private principalDirectoryPromise: Promise<void> | null = null;
   private auditUserEmailsLoaded = false;
   private readonly context: AdminModalContext;
+  private readonly tabRenderOwner = new OperationOwner();
+  private readonly auditOwner = new OperationOwner();
+  private activePermissionRulesView: PermissionRulesView | null = null;
 
   constructor(
     app: App,
@@ -158,6 +162,8 @@ export class AdminModal extends Modal {
   }
 
   onOpen(): void {
+    this.tabRenderOwner.activate();
+    this.auditOwner.activate();
     const contentEl = this.contentEl;
     contentEl.replaceChildren();
     this.modalEl.classList.add("vaultguard-admin-modal");
@@ -199,6 +205,10 @@ export class AdminModal extends Modal {
   }
 
   onClose(): void {
+    this.tabRenderOwner.close();
+    this.auditOwner.close();
+    this.activePermissionRulesView?.destroy();
+    this.activePermissionRulesView = null;
     if (this.unsubscribeConnection) {
       this.unsubscribeConnection();
       this.unsubscribeConnection = null;
@@ -295,43 +305,52 @@ export class AdminModal extends Modal {
   }
 
   private renderActiveTab(): void {
+    const operation = this.tabRenderOwner.begin();
+    this.auditOwner.invalidate();
+    this.activePermissionRulesView?.destroy();
+    this.activePermissionRulesView = null;
+    const activeTab = this.activeTab;
     this.contentContainer.replaceChildren();
     this.contentContainer.setAttribute(
       "aria-labelledby",
       `vaultguard-admin-tab-${this.activeTab}`,
     );
+    const renderRoot = this.contentContainer.createDiv({ cls: "vaultguard-tab-render-root" });
+    const renderError = (error: unknown): void => {
+      if (operation.isCurrent()) this.renderTabError(error, activeTab);
+    };
 
     switch (this.activeTab) {
       case "users":
-        void this.renderUsersTab().catch((error: unknown) => this.renderTabError(error));
+        void this.renderUsersTab(renderRoot, operation).catch(renderError);
         break;
       case "permissions":
-        void this.renderPermissionsTab().catch((error: unknown) => this.renderTabError(error));
+        void this.renderPermissionsTab(renderRoot, operation).catch(renderError);
         break;
       case "audit":
-        void this.renderAuditTab().catch((error: unknown) => this.renderTabError(error));
+        void this.renderAuditTab(renderRoot, operation).catch(renderError);
         break;
       case "recovery":
-        void this.renderRecoveryTab().catch((error: unknown) => this.renderTabError(error));
+        void this.renderRecoveryTab(renderRoot, operation).catch(renderError);
         break;
       case "settings":
-        void this.renderSettingsTab().catch((error: unknown) => this.renderTabError(error));
+        void this.renderSettingsTab(renderRoot, operation).catch(renderError);
         break;
     }
   }
 
-  private renderTabError(error: unknown): void {
+  private renderTabError(error: unknown, tab: TabId = this.activeTab): void {
     this.contentContainer.replaceChildren();
     const errorEl = this.createDivElement(this.contentContainer, "vaultguard-error");
     errorEl.setAttribute("role", "alert");
     errorEl.setAttribute("aria-live", "assertive");
-    errorEl.textContent = `Failed to render ${this.activeTab}: ${errorMessage(error)}`;
+    errorEl.textContent = `Failed to render ${tab}: ${errorMessage(error)}`;
   }
 
   // ─── Users Tab ───────────────────────────────────────────────────────
 
-  private async renderUsersTab(): Promise<void> {
-    const container = this.createDivElement(this.contentContainer, "vaultguard-users-tab");
+  private async renderUsersTab(root: HTMLElement, operation: OperationLease): Promise<void> {
+    const container = this.createDivElement(root, "vaultguard-users-tab");
 
     // Toolbar
     const toolbar = this.createDivElement(container, "vaultguard-toolbar");
@@ -348,6 +367,7 @@ export class AdminModal extends Modal {
     // User list
     const userList = this.createDivElement(container, "vaultguard-user-list");
     await this.userManager.renderUserList(userList);
+    if (!operation.isCurrent()) return;
   }
 
   private filterUsers(query: string, container: HTMLElement): void {
@@ -365,8 +385,8 @@ export class AdminModal extends Modal {
 
   // ─── Permissions Tab ─────────────────────────────────────────────────
 
-  private async renderPermissionsTab(): Promise<void> {
-    const container = this.contentContainer.createDiv({ cls: "vaultguard-permissions-tab" });
+  private async renderPermissionsTab(root: HTMLElement, operation: OperationLease): Promise<void> {
+    const container = root.createDiv({ cls: "vaultguard-permissions-tab" });
 
     // Admin "Vault access": the full rules table (search, add / edit / delete,
     // principal dropdowns, level, priority, expiry) — same as the web admin
@@ -383,6 +403,7 @@ export class AdminModal extends Modal {
         onChanged: this.context.onPermissionsChanged,
         initialSearch: this.context.permissionsInitialSearch,
       });
+      this.activePermissionRulesView = view;
       view.mount();
       return;
     }
@@ -406,6 +427,7 @@ export class AdminModal extends Modal {
 
     // Rule list grouped visually by path pattern
     await this.renderPermissionTree(treeContainer);
+    if (!operation.isCurrent()) return;
   }
 
   private async renderPermissionTree(container: HTMLElement): Promise<void> {
@@ -767,9 +789,12 @@ export class AdminModal extends Modal {
 
   // ─── Audit Log Tab ───────────────────────────────────────────────────
 
-  private async renderAuditTab(): Promise<void> {
+  private async renderAuditTab(
+    root: HTMLElement = this.contentContainer,
+    operation: OperationLease = { generation: 0, isCurrent: () => true },
+  ): Promise<void> {
     if (this.permissionsUserId) {
-      this.contentContainer.createDiv({
+      root.createDiv({
         cls: "vaultguard-empty-state",
         text: "Audit logs are available only in the admin panel.",
       });
@@ -786,9 +811,11 @@ export class AdminModal extends Modal {
         // Non-critical — fall back to showing userId
       }
     }
+    if (!operation.isCurrent()) return;
 
-    const container = this.contentContainer.createDiv({ cls: "vaultguard-audit-tab" });
+    const container = root.createDiv({ cls: "vaultguard-audit-tab" });
     const auditVault = await this.loadAuditVaultRecord();
+    if (!operation.isCurrent()) return;
     this.renderAuditVaultContext(container, auditVault);
 
     // Filters toolbar
@@ -863,6 +890,7 @@ export class AdminModal extends Modal {
     append: boolean = false,
     vaultRecord: VaultRecord | null = null
   ): Promise<void> {
+    const operation = this.auditOwner.begin();
     if (!append) {
       container.empty();
       this.auditCursor = null;
@@ -879,6 +907,7 @@ export class AdminModal extends Modal {
         cursor: append ? this.auditCursor : null,
         limit: this.auditPageSize,
       });
+      if (!operation.isCurrent()) return;
       const entries = response.entries ?? [];
       this.auditCursor = response.nextCursor ?? null;
       this.auditHasMore = Boolean(this.auditCursor);
@@ -920,10 +949,16 @@ export class AdminModal extends Modal {
         loadMoreBtn.setButtonText("Load more").onClick(async () => {
           loadMoreBtn.setDisabled(true);
           loadMoreBtn.setButtonText("Loading...");
-          await this.fetchAndRenderAuditLog(container, filters, true, vaultRecord);
+          try {
+            await this.fetchAndRenderAuditLog(container, filters, true, vaultRecord);
+          } finally {
+            loadMoreBtn.setDisabled(false);
+            loadMoreBtn.setButtonText("Load more");
+          }
         });
       }
     } catch (error) {
+      if (!operation.isCurrent()) return;
       if (!append) {
         container.empty();
       }
@@ -1100,8 +1135,8 @@ export class AdminModal extends Modal {
 
   // ─── Recovery Tab ──────────────────────────────────────────────────
 
-  private async renderRecoveryTab(): Promise<void> {
-    const container = this.contentContainer.createDiv({ cls: "vaultguard-recovery-tab" });
+  private async renderRecoveryTab(root: HTMLElement, _operation: OperationLease): Promise<void> {
+    const container = root.createDiv({ cls: "vaultguard-recovery-tab" });
 
     container.createEl("h3", { text: "Key recovery & re-encryption" });
     container.createEl("p", {
@@ -1356,8 +1391,8 @@ export class AdminModal extends Modal {
     }
   }
 
-  private async renderSettingsTab(): Promise<void> {
-    const container = this.contentContainer.createDiv({ cls: "vaultguard-settings-tab" });
+  private async renderSettingsTab(root: HTMLElement, operation: OperationLease): Promise<void> {
+    const container = root.createDiv({ cls: "vaultguard-settings-tab" });
 
     const loadingEl = container.createDiv({ cls: "vaultguard-loading" });
     loadingEl.setAttribute("role", "status");
@@ -1366,10 +1401,12 @@ export class AdminModal extends Modal {
 
     try {
       const settings = await this.apiClient.getOrgSettings();
+      if (!operation.isCurrent()) return;
       container.empty();
 
       this.renderOrgSettings(container, settings as OrgSettings);
     } catch (error) {
+      if (!operation.isCurrent()) return;
       container.empty();
       if (shouldUseFallbackOrgSettings(error)) {
         container.createDiv({

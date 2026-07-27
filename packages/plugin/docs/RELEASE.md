@@ -110,7 +110,7 @@ npm run package
 ```
 
 This runs the production build, validates release metadata, copies the plugin
-assets to `dist/vaultguard/`, and creates:
+assets to `dist/vaultguard-sync/`, and creates:
 
 ```text
 dist/vaultguard-sync-<version>.zip
@@ -118,6 +118,8 @@ dist/vaultguard-sync-<version>.zip
 
 The zip contains only `main.js`, `manifest.json`, and `styles.css` at the zip
 root, which is the expected layout for manual Obsidian installation.
+The packaging script uses the system `zip` command on Unix-like hosts and
+PowerShell `Compress-Archive` on Windows.
 
 ## Install Into a Local Vault
 
@@ -179,7 +181,10 @@ tests, packages the plugin, and creates a GitHub release with:
 - `main.js`
 - `manifest.json`
 - `styles.css`
-- `dist/vaultguard-sync-<version>.zip`
+
+The workflow currently uploads those three direct Obsidian assets. The local
+ZIP remains a manual-install artifact unless the workflow is explicitly
+changed and verified to upload it.
 
 The tag must exactly match `manifest.json` version.
 

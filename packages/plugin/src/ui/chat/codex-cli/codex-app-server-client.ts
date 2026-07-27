@@ -87,6 +87,21 @@ const SAFE_ENV_KEYS = new Set([
 ]);
 
 function toml(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value
+      .map((item) => {
+        if (typeof item === "string") {
+          if (!/^[A-Za-z0-9_.:-]+$/.test(item)) {
+            throw new Error("Unsupported TOML string array value.");
+          }
+          // The Windows npm shim runs through cmd.exe, which strips JSON's
+          // double quotes. TOML literal strings survive that shell boundary.
+          return `'${item}'`;
+        }
+        return toml(item);
+      })
+      .join(",")}]`;
+  }
   return JSON.stringify(value);
 }
 
@@ -94,11 +109,7 @@ function pushOverride(args: string[], key: string, value: unknown): void {
   args.push("-c", `${key}=${toml(value)}`);
 }
 
-export function buildCodexAppServerArgs(input: {
-  mcpUrl: string;
-  tokenEnvName: string;
-}): string[] {
-  const args: string[] = [];
+function pushSafeCodexOverrides(args: string[]): void {
   for (const feature of CODEX_DISABLED_FEATURES) {
     pushOverride(args, `features.${feature}`, false);
   }
@@ -110,6 +121,21 @@ export function buildCodexAppServerArgs(input: {
   pushOverride(args, "project_doc_max_bytes", 0);
   pushOverride(args, "project_doc_fallback_filenames", []);
   pushOverride(args, "analytics.enabled", false);
+}
+
+export function buildCodexModelDiscoveryArgs(): string[] {
+  const args: string[] = [];
+  pushSafeCodexOverrides(args);
+  args.push("app-server", "--stdio");
+  return args;
+}
+
+export function buildCodexAppServerArgs(input: {
+  mcpUrl: string;
+  tokenEnvName: string;
+}): string[] {
+  const args: string[] = [];
+  pushSafeCodexOverrides(args);
   pushOverride(args, "mcp_servers.vaultguard.url", input.mcpUrl);
   pushOverride(
     args,
@@ -117,6 +143,13 @@ export function buildCodexAppServerArgs(input: {
     input.tokenEnvName,
   );
   pushOverride(args, "mcp_servers.vaultguard.enabled_tools", CODEX_TOOL_NAMES);
+  // Codex 0.144+ has an MCP-specific approval layer that is independent from
+  // turn approvalPolicy. VaultGuard already owns per-tool read/write gating,
+  // so approve only the explicitly enabled VaultGuard tools here.
+  pushOverride(args, "mcp_servers.vaultguard.default_tools_approval_mode", "approve");
+  for (const tool of CODEX_TOOL_NAMES) {
+    pushOverride(args, `mcp_servers.vaultguard.tools.${tool}.approval_mode`, "approve");
+  }
   pushOverride(args, "mcp_servers.vaultguard.required", true);
   pushOverride(args, "mcp_servers.vaultguard.startup_timeout_sec", 15);
   pushOverride(args, "mcp_servers.vaultguard.tool_timeout_sec", 300);
@@ -124,11 +157,7 @@ export function buildCodexAppServerArgs(input: {
   return args;
 }
 
-export function buildCodexChildEnv(
-  parent: NodeJS.ProcessEnv,
-  tokenEnvName: string,
-  leaseToken: string,
-): NodeJS.ProcessEnv {
+export function buildCodexBaseChildEnv(parent: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(parent)) {
     if (value === undefined) continue;
@@ -137,6 +166,15 @@ export function buildCodexChildEnv(
     }
   }
   env[REMOTE_CONTROL_DISABLED_ENV] = "1";
+  return env;
+}
+
+export function buildCodexChildEnv(
+  parent: NodeJS.ProcessEnv,
+  tokenEnvName: string,
+  leaseToken: string,
+): NodeJS.ProcessEnv {
+  const env = buildCodexBaseChildEnv(parent);
   env[tokenEnvName] = leaseToken;
   return env;
 }
@@ -192,7 +230,7 @@ export interface CodexAppServerClientConfig {
 }
 
 interface RpcResponse {
-  id?: number;
+  id?: number | string;
   result?: any;
   error?: { code?: number; message?: string; data?: unknown };
   method?: string;
@@ -322,7 +360,7 @@ export class CodexAppServerClient {
   private closing = false;
 
   constructor(private readonly config: CodexAppServerClientConfig) {
-    this.deps = config.deps ?? loadNodeDeps();
+    this.deps = config.deps ?? loadCodexAppServerDeps();
   }
 
   isSupported(): boolean {
@@ -413,7 +451,7 @@ export class CodexAppServerClient {
         cwd: this.cwd,
         environments: [],
         approvalPolicy: "never",
-        sandboxPolicy: { type: "readOnly" },
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
         model: this.config.model,
         effort: this.config.reasoningEffort,
       });
@@ -514,7 +552,7 @@ export class CodexAppServerClient {
       cwd: this.cwd,
       runtimeWorkspaceRoots: [],
       approvalPolicy: "never",
-      sandbox: "readOnly",
+      sandbox: "read-only",
       config: buildThreadConfig(mcpNames),
       serviceName: "vaultguard_obsidian",
       baseInstructions: lockedInstructions(this.config),
@@ -588,17 +626,68 @@ export class CodexAppServerClient {
         }
         continue;
       }
-      if (typeof message.id === "number" && message.method) {
-        // Native approval/input requests are outside VaultGuard's allowed tool
-        // contract. Decline immediately and fail the active turn.
-        this.child?.stdin?.write(
-          `${JSON.stringify({ id: message.id, error: { code: -32000, message: "VaultGuard blocks native Codex requests." } })}\n`,
-        );
-        this.failIsolation(`server request ${message.method}`);
+      if (
+        (typeof message.id === "number" || typeof message.id === "string") &&
+        message.method
+      ) {
+        this.handleServerRequest(message.id, message.method, message.params ?? {});
         continue;
       }
       if (message.method) this.handleNotification(message.method, message.params ?? {});
     }
+  }
+
+  private handleServerRequest(id: number | string, method: string, params: any): void {
+    if (method !== "mcpServer/elicitation/request") {
+      this.rejectServerRequest(id);
+      this.failIsolation(`server request ${method}`);
+      return;
+    }
+
+    const active = this.activeTurn;
+    const scopeMatches =
+      active !== null &&
+      params?.serverName === "vaultguard" &&
+      params?.threadId === active.threadId &&
+      (params?.turnId == null || params.turnId === active.turnId);
+    if (!scopeMatches) {
+      this.rejectServerRequest(id);
+      this.failIsolation(`server request ${method}`);
+      return;
+    }
+
+    const meta = params?._meta;
+    const isVaultGuardToolApproval =
+      params?.mode === "form" &&
+      typeof params?.message === "string" &&
+      params?.requestedSchema !== null &&
+      typeof params?.requestedSchema === "object" &&
+      !Array.isArray(params.requestedSchema) &&
+      meta !== null &&
+      typeof meta === "object" &&
+      !Array.isArray(meta) &&
+      meta.codex_approval_kind === "mcp_tool_call";
+    if (isVaultGuardToolApproval) {
+      this.resolveServerRequest(id, { action: "accept", content: {} });
+      return;
+    }
+
+    // VaultGuard's current MCP server does not issue general form or URL
+    // elicitations. Return the protocol-defined cancellation response so Codex
+    // can clear its pending request, then stop the turn instead of guessing at
+    // user input or opening a URL.
+    this.resolveServerRequest(id, { action: "cancel", content: null });
+    this.failUnsupportedVaultGuardElicitation();
+  }
+
+  private resolveServerRequest(id: number | string, result: unknown): void {
+    this.child?.stdin?.write(`${JSON.stringify({ id, result })}\n`);
+  }
+
+  private rejectServerRequest(id: number | string): void {
+    this.child?.stdin?.write(
+      `${JSON.stringify({ id, error: { code: -32000, message: "VaultGuard blocks native Codex requests." } })}\n`,
+    );
   }
 
   private handleNotification(method: string, params: any): void {
@@ -701,6 +790,22 @@ export class CodexAppServerClient {
     );
   }
 
+  private failUnsupportedVaultGuardElicitation(): void {
+    const active = this.activeTurn;
+    if (!active) return;
+    const turnId = active.turnId;
+    if (turnId) {
+      void this.request("turn/interrupt", { threadId: active.threadId, turnId }).catch(
+        () => undefined,
+      );
+    }
+    this.rejectActiveTurn(
+      new Error(
+        "Codex requested an unsupported VaultGuard MCP elicitation. The request was cancelled without collecting input or opening a URL.",
+      ),
+    );
+  }
+
   private resolveActiveTurn(): void {
     const active = this.activeTurn;
     if (!active || active.settled) return;
@@ -742,7 +847,7 @@ function nodeRequire(): NodeRequire | null {
     : null;
 }
 
-function loadNodeDeps(): CodexAppServerClientDeps | null {
+export function loadCodexAppServerDeps(): CodexAppServerClientDeps | null {
   const req = nodeRequire();
   if (!req) return null;
   try {

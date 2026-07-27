@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
-import { Menu, Notice, TFile, requestUrl } from "obsidian";
+import { Menu, Notice, Platform, TFile, requestUrl } from "obsidian";
 
 import VaultGuardPlugin from "../src/plugin/main";
 import { IN_APP_CHAT_CAPABILITY } from "../src/ui/chat/in-app-chat-capability";
@@ -1716,12 +1717,18 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     );
   });
 
-  it("keeps generic bridge APIs blocked but permits a forced session-bound in-app chat bridge", async () => {
+  it("permits forced session-bound MCP bridge leases in local mode without enabling persistence", async () => {
     const plugin = makePlugin();
     plugin.settings.localProjectMemoryMode = true;
+    plugin.settings.serverVaultId = "";
+    plugin.settings.optionalModules = {
+      ...plugin.settings.optionalModules,
+      agentAccess: true,
+    };
+    plugin.session = makeSession();
     const createLease = vi.fn().mockReturnValue({
-      leaseId: "lease-chat",
-      token: "agt_chat",
+      leaseId: "lease-local",
+      token: "agt_local",
       expiresAt: "2026-07-13T12:00:00.000Z",
     });
     const startServer = vi.fn().mockResolvedValue({
@@ -1734,13 +1741,30 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     plugin.agentBridgeRuntime = { createLease, startServer };
 
     await expect(
-      plugin.createAgentBridgeLease({ agentName: "spoofed VaultGuard Chat" }),
-    ).rejects.toThrow("disabled in Local Project Memory Mode");
-    await expect(plugin.startAgentBridgeServer()).rejects.toThrow(
-      "disabled in Local Project Memory Mode",
+      plugin.createAgentBridgeLease({
+        agentName: "Codex",
+        expiresWithSession: false,
+        localProjectMemoryMode: false,
+      }),
+    ).resolves.toMatchObject({ leaseId: "lease-local" });
+    expect(createLease).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        agentName: "Codex",
+        persistent: false,
+        expiresWithSession: true,
+        localProjectMemoryMode: true,
+      }),
     );
-    expect(createLease).not.toHaveBeenCalled();
-    expect(startServer).not.toHaveBeenCalled();
+
+    await expect(
+      plugin.createAgentBridgeLease({ agentName: "Codex", persistent: true }),
+    ).rejects.toThrow("time-limited, session-bound leases");
+    expect(createLease).toHaveBeenCalledTimes(1);
+
+    await expect(plugin.startAgentBridgeServer()).resolves.toMatchObject({
+      mcpEndpoint: "http://127.0.0.1:47711/mcp",
+    });
 
     await expect(
       plugin.createInAppChatAgentBridgeLease(Symbol("forged"), {
@@ -1763,7 +1787,8 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       mcpEndpoint: "http://127.0.0.1:47711/mcp",
     });
 
-    expect(createLease).toHaveBeenCalledWith(
+    expect(createLease).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({
         agentName: "VaultGuard Chat (Codex subscription)",
         persistent: false,
@@ -1771,7 +1796,33 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
         localProjectMemoryMode: true,
       }),
     );
-    expect(startServer).toHaveBeenCalledTimes(1);
+    expect(startServer).toHaveBeenCalledTimes(2);
+
+    await expect(plugin.createChatGptConnectorSession()).rejects.toThrow(
+      "ChatGPT connector sessions are disabled in Local Project Memory Mode",
+    );
+
+    plugin.session = null;
+    await expect(plugin.createAgentBridgeLease()).rejects.toThrow("active VaultGuard login");
+    await expect(plugin.startAgentBridgeServer()).rejects.toThrow("active VaultGuard login");
+
+    plugin.session = makeSession();
+    plugin.settings.optionalModules.agentAccess = false;
+    await expect(plugin.createAgentBridgeLease()).rejects.toThrow("External agent access is off");
+    await expect(plugin.startAgentBridgeServer()).rejects.toThrow("External agent access is off");
+  });
+
+  it("reports installed local bridge connectors in local mode while keeping remote ChatGPT disabled", () => {
+    const plugin = makePlugin();
+    plugin.settings.localProjectMemoryMode = true;
+    plugin.getAgentBridgeSkillStatus = vi.fn(() => ({ available: true, installed: true }));
+    plugin.getAgentBridgeCodexSkillStatus = vi.fn(() => ({ available: true, installed: true }));
+
+    expect(plugin.getVaultOrientationConnectorStatus()).toMatchObject({
+      claude: "available",
+      codex: "available",
+      chatgptRemote: "disabled",
+    });
   });
 
   it("notifies every open AI Chat view when the provider changes", () => {
@@ -6177,5 +6228,166 @@ describe("VaultGuardPlugin vaultMemberRole persistence — 1.0.31 Issue A", () =
 
     const withoutRole = plugin.materializeSession({ ...makeSession() });
     expect(withoutRole?.vaultMemberRole).toBeNull();
+  });
+});
+
+describe("VaultGuardPlugin automatic Local Project Memory Mode", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+    Object.assign(Platform, { isMobileApp: false });
+  });
+
+  afterEach(() => {
+    Object.assign(Platform, { isMobileApp: false });
+  });
+
+  function prepareAutomaticPlugin(options: {
+    gitRootDetected?: boolean;
+    safety?: { safe: boolean; reason: string; inspectedFiles: number };
+  } = {}) {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "";
+    plugin.settings.localProjectMemoryMode = false;
+    plugin.settings.localProjectMemoryModeAutoEnableSuppressed = false;
+    plugin.setAutomaticLocalProjectMemoryModeForGitRepos(true);
+    const getGitSummary = vi.fn(async () => ({
+      detected: options.gitRootDetected ?? true,
+    }));
+    const inspectAutomaticLocalProjectMemoryModeSafety = vi.fn(async () =>
+      options.safety ?? { safe: true, reason: "safe", inspectedFiles: 2 },
+    );
+    plugin.getVaultOrientationService = vi.fn(() => ({ getGitSummary }));
+    plugin.ensureAtRestAdapterRuntimeObject = vi.fn(() => ({
+      inspectAutomaticLocalProjectMemoryModeSafety,
+    }));
+    plugin.enableLocalProjectMemoryMode = vi.fn(async (source: string) => {
+      plugin.settings.localProjectMemoryMode = true;
+      expect(source).toBe("automatic");
+    });
+    return { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety };
+  }
+
+  it("activates a qualifying Git-root vault through the existing transition", async () => {
+    const { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety } =
+      prepareAutomaticPlugin();
+
+    await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
+      kind: "enabled",
+    });
+
+    expect(getGitSummary).toHaveBeenCalledWith({ includeStatus: false, forceRefresh: true });
+    expect(inspectAutomaticLocalProjectMemoryModeSafety).toHaveBeenCalledOnce();
+    expect(plugin.enableLocalProjectMemoryMode).toHaveBeenCalledWith("automatic");
+  });
+
+  it("evaluates automatic mode after adapter interception and before cipher initialization", () => {
+    const source = readFileSync(new URL("../src/plugin/main.ts", import.meta.url), "utf8");
+    const interceptIndex = source.indexOf("    this.interceptVaultAdapter();");
+    const automaticIndex = source.indexOf("    await this.maybeAutoEnableLocalProjectMemoryMode();");
+    const cipherIndex = source.indexOf("    await this.initAtRestCipher();");
+
+    expect(interceptIndex).toBeGreaterThan(-1);
+    expect(automaticIndex).toBeGreaterThan(interceptIndex);
+    expect(cipherIndex).toBeGreaterThan(automaticIndex);
+  });
+
+  it("shares the global preference between plugin instances in one desktop profile", () => {
+    const first = makePlugin();
+    const second = makePlugin();
+
+    expect(second.isAutomaticLocalProjectMemoryModeForGitReposEnabled()).toBe(false);
+    first.setAutomaticLocalProjectMemoryModeForGitRepos(true);
+    expect(second.isAutomaticLocalProjectMemoryModeForGitReposEnabled()).toBe(true);
+    second.setAutomaticLocalProjectMemoryModeForGitRepos(false);
+    expect(first.isAutomaticLocalProjectMemoryModeForGitReposEnabled()).toBe(false);
+  });
+
+  it("skips mobile before running Git or protection probes", async () => {
+    Object.assign(Platform, { isMobileApp: true });
+    const { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety } =
+      prepareAutomaticPlugin();
+
+    await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
+      kind: "mobile",
+    });
+    expect(getGitSummary).not.toHaveBeenCalled();
+    expect(inspectAutomaticLocalProjectMemoryModeSafety).not.toHaveBeenCalled();
+  });
+
+  it("skips a server-bound vault before Git or protection probes", async () => {
+    const { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety } =
+      prepareAutomaticPlugin();
+    plugin.settings.serverVaultId = "vault-protected";
+
+    await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
+      kind: "server-bound",
+    });
+    expect(getGitSummary).not.toHaveBeenCalled();
+    expect(inspectAutomaticLocalProjectMemoryModeSafety).not.toHaveBeenCalled();
+  });
+
+  it("skips non-root and protected repositories without enabling the mode", async () => {
+    const nonRoot = prepareAutomaticPlugin({ gitRootDetected: false });
+    await expect(nonRoot.plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
+      kind: "not-git-root",
+    });
+
+    const protectedVault = prepareAutomaticPlugin({
+      safety: { safe: false, reason: "ciphertext", inspectedFiles: 1 },
+    });
+    await expect(
+      protectedVault.plugin.maybeAutoEnableLocalProjectMemoryMode(),
+    ).resolves.toEqual({ kind: "protected" });
+    expect(protectedVault.plugin.enableLocalProjectMemoryMode).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the protection inspector rejects unexpectedly", async () => {
+    const { plugin } = prepareAutomaticPlugin();
+    plugin.ensureAtRestAdapterRuntimeObject = vi.fn(() => ({
+      inspectAutomaticLocalProjectMemoryModeSafety: vi.fn(async () => {
+        throw new Error("probe failed");
+      }),
+    }));
+
+    await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
+      kind: "inspection-failed",
+    });
+    expect(plugin.enableLocalProjectMemoryMode).not.toHaveBeenCalled();
+  });
+
+  it("persists a per-vault suppression on manual disable and clears it on manual enable", async () => {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "";
+    plugin.settings.localProjectMemoryMode = true;
+    plugin.settings.localProjectMemoryModeAutoEnableSuppressed = false;
+    plugin.saveSettings = vi.fn(async () => undefined);
+    plugin.restartSyncTimer = vi.fn();
+
+    await plugin.disableLocalProjectMemoryMode();
+    expect(plugin.settings.localProjectMemoryMode).toBe(false);
+    expect(plugin.settings.localProjectMemoryModeAutoEnableSuppressed).toBe(true);
+
+    await plugin.enableLocalProjectMemoryMode();
+    expect(plugin.settings.localProjectMemoryMode).toBe(true);
+    expect(plugin.settings.localProjectMemoryModeAutoEnableSuppressed).toBe(false);
+  });
+
+  it("keeps a persisted per-vault suppression across two simulated startups", async () => {
+    for (let startup = 1; startup <= 2; startup += 1) {
+      const { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety } =
+        prepareAutomaticPlugin();
+      plugin.settings.localProjectMemoryModeAutoEnableSuppressed = true;
+
+      await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
+        kind: "suppressed",
+      });
+      expect(getGitSummary, `startup ${startup}`).not.toHaveBeenCalled();
+      expect(
+        inspectAutomaticLocalProjectMemoryModeSafety,
+        `startup ${startup}`,
+      ).not.toHaveBeenCalled();
+      expect(plugin.enableLocalProjectMemoryMode, `startup ${startup}`).not.toHaveBeenCalled();
+    }
   });
 });

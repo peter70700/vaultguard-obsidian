@@ -118,6 +118,9 @@ export class AtRestRecoveryModal extends Modal {
   private altBtn?: ButtonComponent;
   private statusEl?: HTMLElement;
   private busy = false;
+  // Public runReset() is deliberately callable before DOM open in unit tests;
+  // onClose is the authoritative transition to inactive.
+  private active = true;
 
   /**
    * Last status text rendered. Exposed for tests — the obsidian mock's
@@ -134,6 +137,7 @@ export class AtRestRecoveryModal extends Modal {
   }
 
   onOpen(): void {
+    this.active = true;
     this.modalEl.addClass("vaultguard-at-rest-recovery-reset-modal");
     const { contentEl } = this;
     contentEl.empty();
@@ -209,6 +213,8 @@ export class AtRestRecoveryModal extends Modal {
   }
 
   onClose(): void {
+    this.active = false;
+    this.busy = false;
     this.modalEl.removeClass("vaultguard-at-rest-recovery-reset-modal");
     this.contentEl.empty();
   }
@@ -239,8 +245,10 @@ export class AtRestRecoveryModal extends Modal {
       await this.host.resetLocalAtRestAndResync();
       // SC4 — surface the fresh recovery code with a save prompt.
       await this.host.surfaceNewRecoveryCodeAfterReset();
+      if (!this.active) return;
       this.close();
     } catch (err) {
+      if (!this.active) return;
       this.busy = false;
       this.resetBtn?.setDisabled(false).setButtonText("Reset & re-download");
       // Guard (offline / logged out / not-needs-recovery) or a re-pull failure.

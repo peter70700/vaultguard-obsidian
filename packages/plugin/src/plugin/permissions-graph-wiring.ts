@@ -127,7 +127,10 @@ export class PermissionsGraphRuntime {
     for (const leaf of leaves) {
       const view = leaf.view;
       if (view instanceof PermissionsGraphView) {
-        void view.refresh();
+        void view.refresh().catch(() => {
+          // A leaf can be torn down between this lookup and the refresh; a
+          // superseded view must never surface an unhandled rejection.
+        });
       }
     }
   }

@@ -11,6 +11,7 @@
 import { App, Modal, ButtonComponent } from "obsidian";
 import qrcode from "qrcode-generator";
 import { createQrSvg } from "../ui/icons";
+import { OperationOwner } from "../ui/operation-owner";
 
 const RECOVERY_CODE_COUNT = 8;
 
@@ -33,6 +34,7 @@ export class MfaSetupModal extends Modal {
   private completed = false;
   /** Guards `onCancel` so the Cancel button + onClose can't double-fire it. */
   private cancelNotified = false;
+  private readonly verifyOwner = new OperationOwner();
 
   constructor(
     app: App,
@@ -67,12 +69,14 @@ export class MfaSetupModal extends Modal {
   }
 
   onOpen(): void {
+    this.verifyOwner.activate();
     this.modalEl.addClass("vaultguard-mfa-setup-modal");
     this.contentEl.addClass("vaultguard-mfa-setup-content");
     this.renderSetupStep();
   }
 
   onClose(): void {
+    this.verifyOwner.close();
     // Closing without completing setup (X button, Esc, click-outside) must
     // still notify the caller so the awaited login Promise settles.
     this.notifyCancel();
@@ -163,9 +167,11 @@ export class MfaSetupModal extends Modal {
       verifyBtn.setDisabled(true);
       verifyBtn.setButtonText("Verifying...");
       errorEl.hide();
+      const operation = this.verifyOwner.begin();
 
       try {
         const result = await this.onVerify(code, this.session);
+        if (!operation.isCurrent()) return;
         if (result.status === "SUCCESS") {
           this.recoveryCodes = this.generateRecoveryCodes();
           this.renderRecoveryCodesStep(result.session);
@@ -174,11 +180,14 @@ export class MfaSetupModal extends Modal {
           errorEl.show();
         }
       } catch (error) {
+        if (!operation.isCurrent()) return;
         errorEl.setText(error instanceof Error ? error.message : "Verification failed");
         errorEl.show();
       } finally {
-        verifyBtn.setDisabled(false);
-        verifyBtn.setButtonText("Verify & enable");
+        if (operation.isCurrent() && verifyBtn.buttonEl.isConnected) {
+          verifyBtn.setDisabled(false);
+          verifyBtn.setButtonText("Verify & enable");
+        }
       }
     });
 

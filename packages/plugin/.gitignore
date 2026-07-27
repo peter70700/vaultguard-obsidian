@@ -3,6 +3,8 @@ main.js
 *.js.map
 dist/
 .build/
+build/
+*.log
 
 # Dependencies
 node_modules/

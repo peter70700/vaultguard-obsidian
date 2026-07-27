@@ -29,6 +29,7 @@ import type {
   AgentBridgeAskUserResult,
   AgentBridgeConfirmPausedHandler,
 } from "../../plugin/agent-bridge";
+import { settleCleanupTasks } from "../../plugin/lifecycle-cleanup";
 import {
   AnthropicClient,
   type AnthropicContentBlock,
@@ -114,7 +115,10 @@ import {
   chatPermissionWriteMode,
   permissionModeLabel,
 } from "./models";
-import { providerModelCatalog } from "./model-catalog";
+import {
+  providerModelCatalog,
+  type ProviderModelCatalogProvider,
+} from "./model-catalog";
 import type { AiChatEffort, AiChatPermissionMode, AiChatProvider } from "../../types";
 import {
   isLocalImportAvailable,
@@ -174,6 +178,7 @@ export class VaultGuardChatView extends ItemView {
   private importSessionActive = false;
   private model: string;
   private abortController: AbortController | null = null;
+  private modelDiscoveryAbort: AbortController | null = null;
 
   // Official CLI subscription transport (Claude Code or Codex). Lazily built
   // on the first subscription turn and rebuilt when provider/model changes.
@@ -245,9 +250,11 @@ export class VaultGuardChatView extends ItemView {
   constructor(leaf: WorkspaceLeaf, private readonly plugin: VaultGuardPlugin) {
     super(leaf);
     this.model =
-      plugin.settings.aiChatProvider === "openai" || plugin.settings.aiChatProvider === "codex"
-        ? plugin.settings.openAiModel
-        : plugin.settings.aiChatModel;
+      plugin.settings.aiChatProvider === "codex"
+        ? plugin.settings.codexModel
+        : plugin.settings.aiChatProvider === "openai"
+          ? plugin.settings.openAiModel
+          : plugin.settings.aiChatModel;
   }
 
   getViewType(): string {
@@ -435,17 +442,22 @@ export class VaultGuardChatView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    this.cancelModelDiscovery();
     this.handleCancel();
     this.endImportSessionIfActive();
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
+    // Settle UI-owned request gates before stopping the bridge. An active MCP
+    // request may itself be waiting for this answer; waiting for server close
+    // first creates a teardown deadlock during plugin update.
+    this.cancelActiveUserQuestion("VaultGuard Chat closed before the question was answered.");
     this.disposeProviderSession();
-    await this.bridgeCleanup;
+    const bridgeCleanup = this.bridgeCleanup;
+    this.bridgeCleanup = Promise.resolve();
     this.pendingToolCards = [];
     this.activeAssistantBubble = null;
-    this.cancelActiveUserQuestion("VaultGuard Chat closed before the question was answered.");
     this.pendingIndicator = null;
     this.streamController = null;
     this.inputController = null;
@@ -458,6 +470,14 @@ export class VaultGuardChatView extends ItemView {
     this.expandedTabKeys.clear();
     this.listEl = null;
     this.convoTitleEl = null;
+
+    const summary = await settleCleanupTasks(
+      [{ name: "chat-agent-bridge", promise: bridgeCleanup }],
+      600,
+    );
+    if (summary.rejected.length > 0 || summary.timedOut.length > 0) {
+      console.warn("[VaultGuard Chat] Bridge cleanup did not settle before the view-close deadline.");
+    }
   }
 
   // ─── Connect / empty state (§11) ───────────────────────────────────────────
@@ -546,6 +566,12 @@ export class VaultGuardChatView extends ItemView {
       : "anthropic";
   }
 
+  private currentCatalogProvider(): ProviderModelCatalogProvider {
+    return this.currentProvider() === "codex"
+      ? "codex"
+      : this.currentApiKeyProvider();
+  }
+
   private currentEffort(): AiChatEffort {
     return this.currentProvider() === "openai" || this.currentProvider() === "codex"
       ? this.plugin.settings.openAiReasoningEffort
@@ -553,9 +579,11 @@ export class VaultGuardChatView extends ItemView {
   }
 
   private currentModelSetting(): string {
-    return this.currentProvider() === "openai" || this.currentProvider() === "codex"
-      ? this.plugin.settings.openAiModel
-      : this.plugin.settings.aiChatModel;
+    return this.currentProvider() === "codex"
+      ? this.plugin.settings.codexModel
+      : this.currentProvider() === "openai"
+        ? this.plugin.settings.openAiModel
+        : this.plugin.settings.aiChatModel;
   }
 
   private syncModelFromSettings(): void {
@@ -938,6 +966,22 @@ export class VaultGuardChatView extends ItemView {
         return;
       }
       binaryPath = status.binaryPath;
+      const catalogController = new AbortController();
+      this.modelDiscoveryAbort?.abort();
+      this.modelDiscoveryAbort = catalogController;
+      try {
+        const catalog = await providerModelCatalog.resolve({
+          provider: "codex",
+          apiKey: null,
+          codexBinaryPath: binaryPath,
+          selectedModel: this.model,
+          signal: catalogController.signal,
+        });
+        if (catalogController.signal.aborted || this.currentProvider() !== "codex") return;
+        if (catalog.selectedModel !== this.model) this.setModel(catalog.selectedModel);
+      } finally {
+        if (this.modelDiscoveryAbort === catalogController) this.modelDiscoveryAbort = null;
+      }
     } else {
       let status: ClaudeAuthStatus;
       try {
@@ -1184,7 +1228,9 @@ export class VaultGuardChatView extends ItemView {
   }
 
   private handleCancel(): void {
+    this.cancelModelDiscovery();
     this.cancelActiveUserQuestion("Question cancelled.");
+    this.settlePendingToolCards("Cancelled before the tool returned a result.");
     const hadCliSession = this.cliClient !== null;
     if (this.abortController) {
       this.abortController.abort();
@@ -1195,6 +1241,7 @@ export class VaultGuardChatView extends ItemView {
 
   /** Settings-provider changes are an immediate cancellation/revocation boundary. */
   handleProviderConfigurationChanged(): void {
+    this.cancelModelDiscovery();
     this.handleCancel();
     this.disposeProviderSession();
     this.syncModelFromSettings();
@@ -1259,7 +1306,7 @@ export class VaultGuardChatView extends ItemView {
 
   private async handleModelCommand(model: string): Promise<void> {
     const catalog = await this.resolveCurrentModelCatalog();
-    if (catalog.provider !== this.currentApiKeyProvider()) return;
+    if (!this.listEl || catalog.provider !== this.currentCatalogProvider()) return;
     if (!catalog.options.some((option) => option.id === model)) {
       new Notice(`VaultGuard Chat: model "${model}" is not available to this provider account.`);
       return;
@@ -2270,6 +2317,14 @@ export class VaultGuardChatView extends ItemView {
     this.scrollToBottom();
   }
 
+  /** No visible tool card may remain in the indeterminate Running state. */
+  private settlePendingToolCards(message: string): void {
+    const pending = this.pendingToolCards.splice(0);
+    for (const card of pending) {
+      card.setResult({ content: message, isError: true });
+    }
+  }
+
   private onCliStatus(message: string): void {
     this.pendingIndicator?.setLabel(message);
     this.scrollToBottom();
@@ -2535,7 +2590,7 @@ export class VaultGuardChatView extends ItemView {
   // next session.
   private async openModelMenu(evt: MouseEvent): Promise<void> {
     const catalog = await this.resolveCurrentModelCatalog();
-    if (catalog.provider !== this.currentApiKeyProvider()) return;
+    if (!this.listEl || catalog.provider !== this.currentCatalogProvider()) return;
     const menu = new Menu();
 
     for (const m of catalog.options) {
@@ -2554,18 +2609,52 @@ export class VaultGuardChatView extends ItemView {
   }
 
   private async resolveCurrentModelCatalog() {
-    const provider = this.currentApiKeyProvider();
-    const apiKey =
-      this.currentProvider() === "subscription" || this.currentProvider() === "codex"
-        ? null
-        : provider === "openai"
-          ? await new OpenAiKeyStore(this.plugin).getKey()
-          : await this.ensureAnthropicApiKey();
-    return providerModelCatalog.resolve({
-      provider,
-      apiKey,
-      selectedModel: this.model,
-    });
+    this.cancelModelDiscovery();
+    const controller = new AbortController();
+    this.modelDiscoveryAbort = controller;
+    const provider = this.currentCatalogProvider();
+    try {
+      let apiKey: string | null = null;
+      let codexBinaryPath: string | null = null;
+      if (provider === "codex") {
+        try {
+          const status = await getCodexAuthStatus(undefined, controller.signal);
+          if (status.loggedIn && status.isChatGptSubscription && status.binaryPath) {
+            codexBinaryPath = status.binaryPath;
+          }
+        } catch {
+          if (controller.signal.aborted) throw new Error("Codex model discovery was cancelled.");
+        }
+      } else if (this.currentProvider() !== "subscription") {
+        apiKey =
+          provider === "openai"
+            ? await new OpenAiKeyStore(this.plugin).getKey()
+            : await this.ensureAnthropicApiKey();
+      }
+      const catalog = await providerModelCatalog.resolve({
+        provider,
+        apiKey,
+        codexBinaryPath,
+        selectedModel: this.model,
+        signal: controller.signal,
+      });
+      if (
+        !controller.signal.aborted &&
+        provider === "codex" &&
+        this.currentCatalogProvider() === "codex" &&
+        catalog.selectedModel !== this.model
+      ) {
+        this.setModel(catalog.selectedModel);
+      }
+      return catalog;
+    } finally {
+      if (this.modelDiscoveryAbort === controller) this.modelDiscoveryAbort = null;
+    }
+  }
+
+  private cancelModelDiscovery(): void {
+    this.modelDiscoveryAbort?.abort();
+    this.modelDiscoveryAbort = null;
   }
 
   private openEffortMenu(evt: MouseEvent): void {
@@ -2633,7 +2722,9 @@ export class VaultGuardChatView extends ItemView {
     this.statusPanel?.setModel(model);
     // Persist so the choice survives a panel reopen / new chat (mirrors
     // setEffort) and stays in sync with the settings dropdown.
-    if (this.currentProvider() === "openai" || this.currentProvider() === "codex") {
+    if (this.currentProvider() === "codex") {
+      this.plugin.settings.codexModel = model;
+    } else if (this.currentProvider() === "openai") {
       this.plugin.settings.openAiModel = model;
     } else {
       this.plugin.settings.aiChatModel = model;

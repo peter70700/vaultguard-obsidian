@@ -19,6 +19,7 @@ import {
 import { PermissionLevel } from "../types";
 import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
 import { createI18n } from "../i18n";
+import { OperationOwner, type OperationLease } from "./operation-owner";
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
@@ -132,6 +133,7 @@ export class VaultGuardSidebarView extends ItemView {
   private revokeReason = "";
   private leaseExpiresAt: number | null = null;
   private batchAccessUnavailable = false;
+  private readonly loadOwner = new OperationOwner();
 
   // At-rest needs-recovery banner state (Phase 13 #1). Driven by BOTH a live
   // push (setAtRestRecoveryState) and a fresh-view pull (getAtRestRecoveryState
@@ -175,6 +177,7 @@ export class VaultGuardSidebarView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
+    this.loadOwner.activate();
     const container = this.containerEl.children[1] as HTMLElement;
     container.empty();
     container.addClass("vaultguard-sidebar");
@@ -201,6 +204,7 @@ export class VaultGuardSidebarView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    this.loadOwner.close();
     if (this.searchDebounce !== null) {
       window.clearTimeout(this.searchDebounce);
       this.searchDebounce = null;
@@ -218,6 +222,8 @@ export class VaultGuardSidebarView extends ItemView {
     this.sharedToggleEl = null;
     this.searchInputEl = null;
     this.atRestBannerEl = null;
+    this.contentEl_ = null;
+    this.isLoading = false;
   }
 
   // ─── At-Rest Needs-Recovery Banner (Phase 13 #1) ──────────────────────
@@ -771,6 +777,7 @@ export class VaultGuardSidebarView extends ItemView {
   private async loadEntries(): Promise<void> {
     if (!this.config || !this.contentEl_) return;
 
+    const operation = this.loadOwner.begin();
     this.isLoading = true;
     this.renderEntries();
 
@@ -791,13 +798,16 @@ export class VaultGuardSidebarView extends ItemView {
       // useful for admin-only role filters, but it must never be the only
       // way the sidebar learns per-file permissions.
       this.allRules = [];
-      const [rules, accessByPath] = await Promise.all([
+      const [rules, accessByPath, userMap] = await Promise.all([
         this.loadRulesIfAllowed(),
-        this.loadAccessSummaries(paths),
+        this.loadAccessSummaries(paths, operation),
         this.loadUsersIfNeeded(),
-      ]).then(([rulesResult, accessResult]) => [rulesResult, accessResult] as const);
+      ]);
+
+      if (!operation.isCurrent()) return;
 
       this.allRules = rules;
+      this.userMap = userMap;
       if (this.allRules.length > 0) {
         this.ruleCache.set("__all__", { rules: this.allRules, fetchedAt: Date.now() });
       }
@@ -813,21 +823,25 @@ export class VaultGuardSidebarView extends ItemView {
         this.buildEntry(path, this.allRules, accessByPath.get(this.normalizePath(path)))
       );
     } catch {
+      if (!operation.isCurrent()) return;
       this.entries = [];
     } finally {
-      this.isLoading = false;
-      this.hasLoadedOnce = true;
-      this.renderEntries();
+      if (operation.isCurrent()) {
+        this.isLoading = false;
+        this.hasLoadedOnce = true;
+        this.renderEntries();
+      }
     }
   }
 
-  private async loadUsersIfNeeded(): Promise<void> {
-    if (this.userMap.size > 0) return;
+  private async loadUsersIfNeeded(): Promise<Map<string, UserListEntry>> {
+    if (this.userMap.size > 0) return this.userMap;
     try {
       const users = await this.config!.apiClient.listUsers();
-      this.userMap = buildAccessUserMap(users);
+      return buildAccessUserMap(users);
     } catch {
       // Silently fail — degrades to showing user IDs
+      return this.userMap;
     }
   }
 
@@ -843,7 +857,10 @@ export class VaultGuardSidebarView extends ItemView {
     }
   }
 
-  private async loadAccessSummaries(paths: string[]): Promise<Map<string, PathAccessSummary>> {
+  private async loadAccessSummaries(
+    paths: string[],
+    operation?: OperationLease,
+  ): Promise<Map<string, PathAccessSummary>> {
     const summariesByPath = new Map<string, PathAccessSummary>();
     if (!this.config || paths.length === 0) return summariesByPath;
 
@@ -863,13 +880,14 @@ export class VaultGuardSidebarView extends ItemView {
     for (let i = 0; i < pending.length; i += BATCH_PATH_LIMIT) {
       const chunk = pending.slice(i, i + BATCH_PATH_LIMIT);
       for (const summary of await this.fetchAccessChunk(chunk)) {
+        if (operation && !operation.isCurrent()) return summariesByPath;
         const key = this.normalizePath(summary.path);
         this.accessCache.set(key, { summary, fetchedAt: now });
         summariesByPath.set(key, summary);
       }
     }
 
-    await this.applyEffectiveLevels(paths, summariesByPath, now);
+    await this.applyEffectiveLevels(paths, summariesByPath, now, operation);
 
     return summariesByPath;
   }
@@ -909,7 +927,8 @@ export class VaultGuardSidebarView extends ItemView {
   private async applyEffectiveLevels(
     paths: string[],
     summariesByPath: Map<string, PathAccessSummary>,
-    fetchedAt: number
+    fetchedAt: number,
+    operation?: OperationLease,
   ): Promise<void> {
     if (!this.config?.getPermissionLevel) return;
 
@@ -918,6 +937,7 @@ export class VaultGuardSidebarView extends ItemView {
         const level = this.permissionLevelToAccessLevel(
           await this.config!.getPermissionLevel!(path)
         );
+        if (operation && !operation.isCurrent()) return;
         const key = this.normalizePath(path);
         const existing = summariesByPath.get(key);
         const summary: PathAccessSummary = existing
