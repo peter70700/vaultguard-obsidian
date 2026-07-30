@@ -33,6 +33,7 @@ import {
   requireVaultMember,
   assertVaultWritable,
   pathMatchesPattern,
+  queryAllPages,
   getVaultMembership,
   listVaultMembers,
   logAudit,
@@ -1117,6 +1118,16 @@ async function handleCheckPermission(
 
   // Evaluate permission within this vault.
   const targetAliases = await aliasesForTargetUser(targetUserId, user, vault.orgId);
+  // SD-03-F15: this endpoint answers "what access does the TARGET have on this
+  // path" — the same class of question as the access summary
+  // (resolvePathAccessLevel) and the file-op handlers, both of which already
+  // honour `allowAdminPerFileRestrictions`. It is not a caller-side
+  // authorization gate, so it must thread the org policy rather than keep the
+  // unconditional admin bypass; without it the client's per-path probe can
+  // never return a restricted answer. Caller-side gates
+  // (handleListPermissions' admin check, authorizePermissionMutation)
+  // deliberately keep the default bypass — see shared/utils.ts:830-843.
+  const respectAdminBypass = await shouldRespectAdminBypassFor(vault.orgId);
   const result = await evaluatePermission(
     targetUserId,
     resolvedRoles,
@@ -1124,7 +1135,7 @@ async function handleCheckPermission(
     path,
     vault.orgId,
     vault.vaultId,
-    { userAliases: targetAliases }
+    { userAliases: targetAliases, respectAdminBypass }
   );
 
   await logAudit({
@@ -2233,45 +2244,44 @@ async function fetchAllUserRules(
   // User-specific rules (scoped to org + vault). Include legacy aliases so
   // older email-targeted rules resolve to the same effective permissions
   // view as canonical Cognito subject rules.
+  //
+  // SD-03-F18: every family MUST paginate. The org+vault scoping below is a
+  // FilterExpression, and DynamoDB applies filters AFTER the 1 MB evaluated
+  // page — so a partition can return LastEvaluatedKey while surfacing only a
+  // handful of visible rows. A single-page read silently omits later-page
+  // rules, and an omitted DENY widens the answer this feed hands the client.
+  // `queryAllPages` is the one shared fail-closed definition (shared/utils.ts);
+  // a local copy is exactly the drift that produced this finding.
   for (const lookupUserId of principalLookupValues(userId, aliases)) {
-    const userResult = await docClient.send(
-      new QueryCommand({
-        TableName: PERMISSIONS_TABLE,
-        IndexName: 'userId-index',
-        KeyConditionExpression: 'userId = :uid',
-        FilterExpression: 'orgId = :orgId AND vaultId = :vaultId',
-        ExpressionAttributeValues: { ':uid': lookupUserId, ':orgId': orgId, ':vaultId': vaultId },
-      })
-    );
-    pushRules(userResult.Items);
-  }
-
-  // Role-based rules (scoped to org + vault)
-  for (const role of roles) {
-    const roleResult = await docClient.send(
-      new QueryCommand({
-        TableName: PERMISSIONS_TABLE,
-        IndexName: 'role-index',
-        KeyConditionExpression: '#role = :role',
-        ExpressionAttributeNames: { '#role': 'role' },
-        FilterExpression: 'orgId = :orgId AND vaultId = :vaultId',
-        ExpressionAttributeValues: { ':role': role, ':orgId': orgId, ':vaultId': vaultId },
-      })
-    );
-    pushRules(roleResult.Items);
-  }
-
-  // Wildcard rules (scoped to org + vault)
-  const wildcardResult = await docClient.send(
-    new QueryCommand({
+    pushRules(await queryAllPages({
       TableName: PERMISSIONS_TABLE,
       IndexName: 'userId-index',
       KeyConditionExpression: 'userId = :uid',
       FilterExpression: 'orgId = :orgId AND vaultId = :vaultId',
-      ExpressionAttributeValues: { ':uid': '*', ':orgId': orgId, ':vaultId': vaultId },
-    })
-  );
-  pushRules(wildcardResult.Items);
+      ExpressionAttributeValues: { ':uid': lookupUserId, ':orgId': orgId, ':vaultId': vaultId },
+    }));
+  }
+
+  // Role-based rules (scoped to org + vault)
+  for (const role of roles) {
+    pushRules(await queryAllPages({
+      TableName: PERMISSIONS_TABLE,
+      IndexName: 'role-index',
+      KeyConditionExpression: '#role = :role',
+      ExpressionAttributeNames: { '#role': 'role' },
+      FilterExpression: 'orgId = :orgId AND vaultId = :vaultId',
+      ExpressionAttributeValues: { ':role': role, ':orgId': orgId, ':vaultId': vaultId },
+    }));
+  }
+
+  // Wildcard rules (scoped to org + vault)
+  pushRules(await queryAllPages({
+    TableName: PERMISSIONS_TABLE,
+    IndexName: 'userId-index',
+    KeyConditionExpression: 'userId = :uid',
+    FilterExpression: 'orgId = :orgId AND vaultId = :vaultId',
+    ExpressionAttributeValues: { ':uid': '*', ':orgId': orgId, ':vaultId': vaultId },
+  }));
 
   return results;
 }

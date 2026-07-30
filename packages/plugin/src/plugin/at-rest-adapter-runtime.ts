@@ -1,6 +1,8 @@
 import { Notice, Platform, TFolder } from "obsidian";
 import {
   AtRestCipher,
+  type AtRestCiphertextSample,
+  type AtRestRestoreOutcome,
   type AtRestStorage,
   type AtRestStatus,
 } from "../crypto/at-rest-cipher";
@@ -12,6 +14,7 @@ import {
 } from "../types";
 import type {
   AtRestAdapterRuntimeContext,
+  MutationIntent,
   RemoteFileContentResponse,
   RemoteFileWriteResponse,
   RemoteWriteConflictResolutionResult,
@@ -40,6 +43,14 @@ import {
   isLocalProjectMemoryModeEnabled,
   isLocalProjectMemoryPlaintextPath,
 } from "./local-project-memory-mode";
+// SD-07-F5: cross-generation adapter ownership — unwrap-at-capture plus the
+// detached-delegate error. See adapter-ownership.ts for why the marker is a
+// plain string and not a Symbol.
+import {
+  AtRestAdapterDetachedError,
+  markAdapterWrapper,
+  resolveAdapterMethodBase,
+} from "./adapter-ownership";
 
 function getActiveObsidianDocument(): Document | null {
   if (typeof activeDocument !== "undefined") {
@@ -129,6 +140,19 @@ export class AtRestAdapterRuntime {
    * would silently write plaintext and read raw ciphertext for the session).
    */
   private installedAdapterMethods: VaultAdapterOriginalMethods = emptyAdapterMethods();
+  /**
+   * SD-07-F5: true once restoreVaultAdapter has released this runtime's
+   * delegates. A null delegate then means "we let go", not "the adapter never
+   * had this method" — and a mutation must fail loud rather than report success.
+   */
+  private adapterDetached = false;
+  /**
+   * Method names this runtime actually captured a live delegate for. Retained
+   * across detach precisely so the two meanings of a null delegate stay
+   * distinguishable. Names only — holding the functions would keep the old
+   * adapter alive for nothing.
+   */
+  private capturedAdapterMethodNames: Set<keyof VaultAdapterOriginalMethods> = new Set();
   private atRestCipher: AtRestCipher | null = null;
   /**
    * Phase 12 (vault idle-lock): fail-closed content gate. When true the LAK is
@@ -172,6 +196,14 @@ export class AtRestAdapterRuntime {
 
   setOriginalAdapterMethods(methods: VaultAdapterOriginalMethods): void {
     this.originalAdapterMethods = methods;
+    // SD-07-F5: an explicit re-seed re-attaches this runtime. Keep the detach
+    // discriminator in sync or a re-seeded runtime keeps throwing.
+    this.adapterDetached = false;
+    this.capturedAdapterMethodNames = new Set(
+      (Object.keys(methods) as Array<keyof VaultAdapterOriginalMethods>).filter(
+        (name) => methods[name] != null,
+      ),
+    );
   }
 
   getAtRestCipher(): AtRestCipher | null {
@@ -311,16 +343,76 @@ export class AtRestAdapterRuntime {
     return this.atRestCipher.exportRecoveryCode();
   }
 
-  async restoreAtRestFromRecoveryCode(code: string): Promise<boolean> {
+  /**
+   * SD-05-F3: yield every managed VG1 file for recovery-code validation,
+   * SMALLEST FIRST so a wrong code is refused after one cheap decrypt.
+   *
+   * FAIL-CLOSED (binding): every failure THROWS out of the iterator. The cipher
+   * treats a throw as "cannot verify" and refuses the restore with nothing
+   * changed. This deliberately does NOT copy `hasExistingCiphertext`'s per-file
+   * "catch and keep scanning" swallow — that swallow is open finding SD-05-F5,
+   * and replicating it here would let an unreadable file silently downgrade
+   * validation to "no ciphertext exists" and re-open exactly this finding.
+   *
+   * Raw `originalAdapterMethods.readBinary` is the sanctioned Local-At-Rest-Rule
+   * exception (same one `hasExistingCiphertext` uses): this is cipher-internal
+   * key machinery, not content access, and the bytes stay ciphertext throughout.
+   */
+  private async *iterateCiphertextForValidation(): AsyncGenerator<AtRestCiphertextSample> {
+    const readBin = this.originalAdapterMethods.readBinary;
+    if (!readBin) {
+      throw new Error(
+        "VaultGuard Sync: cannot verify the recovery code — the vault adapter's binary read is unavailable."
+      );
+    }
+    const files = this.app.vault
+      .getFiles()
+      .filter((file) => !this.isAtRestExcluded(file.path))
+      .sort((a, b) => (a.stat?.size ?? 0) - (b.stat?.size ?? 0));
+    for (const file of files) {
+      const bytes = await readBin(file.path); // throws -> fail closed, by design
+      const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      if (!this.looksLikeCiphertextBytes(view)) continue; // plaintext/legacy: not ours to check
+      yield { path: file.path, bytes: view };
+    }
+  }
+
+  async restoreAtRestFromRecoveryCode(
+    code: string,
+    opts?: { confirmReplace?: boolean }
+  ): Promise<AtRestRestoreOutcome> {
     if (!this.atRestCipher) {
       await this.initAtRestCipher();
     }
-    if (!this.atRestCipher) return false;
-    const restored = await this.atRestCipher.restoreFromRecoveryCode(code);
+    if (!this.atRestCipher) {
+      // Fail closed: with no cipher we cannot even ask the question.
+      return { ok: false, reason: "validation-error" };
+    }
+    const result = await this.atRestCipher.restoreFromRecoveryCode(code, opts);
+
+    // D2 (main.ts:10899-10904): a PIN wraps a SPECIFIC LAK. When the key was
+    // REPLACED rather than proven (`continuity: "replaced"` — a confirmed
+    // zero-ciphertext replacement), the PIN envelope wraps a key this device no
+    // longer uses. Leaving it enrolled would let a later PIN unlock resurrect
+    // the old key. Continuity proven ("same-key"/"verified") => PIN untouched:
+    // it wraps exactly the key we just re-adopted.
+    if (result.ok && result.continuity === "replaced" && this.isPinLockEnrolled()) {
+      try {
+        await this.ctx.disablePinLock?.();
+        new Notice(
+          "VaultGuard Sync: your PIN was removed because the local encryption key was replaced. Set a new PIN in Settings if you want one.",
+          9000
+        );
+      } catch (err) {
+        this.logError("Clearing PIN enrollment after a recovery-code key replacement failed", err);
+      }
+    }
+
     // Recovery-code door: re-assert the #1 surfaces so a successful restore
-    // CLEARS the status bar + sidebar banner + sticky (W2).
-    this.ctx.refreshAtRestRecoverySurfaces?.();
-    return restored;
+    // CLEARS the status bar + sidebar banner + sticky (W2). A refusal changes
+    // nothing, so there is nothing to refresh.
+    if (result.ok) this.ctx.refreshAtRestRecoverySurfaces?.();
+    return result;
   }
 
   getAdapterReadBinary(): ((normalizedPath: string) => Promise<ArrayBuffer>) | null {
@@ -348,6 +440,16 @@ export class AtRestAdapterRuntime {
   /** True when a device PIN currently owns the LAK (Phase 12; optional ctx signal). */
   private isPinLockEnrolled(): boolean {
     return this.ctx.isPinLockEnrolled?.() ?? false;
+  }
+
+  /**
+   * True when the org has per-file restrictions on admins enabled (SD-03-F15;
+   * optional ctx signal). The optional call plus `=== true` is required:
+   * partial `any` ctx fixtures in existing suites do not supply the member,
+   * and absent must mean "unrestricted" (today's behaviour).
+   */
+  private adminRestrictionActive(): boolean {
+    return this.ctx.isAdminRestrictionActive?.() === true;
   }
 
   private get session() {
@@ -470,6 +572,95 @@ export class AtRestAdapterRuntime {
     return this.ctx.getExpectedVersionId(path);
   }
 
+  /**
+   * SD-06-F1 / DECISION 6 — probe input for the local-new upgrade: did `path`
+   * exist in the vault index immediately BEFORE this write?
+   *
+   * MUST be captured before any `await` in the calling write — an await lets
+   * Obsidian's vault index move underneath us and the answer stops describing
+   * "before this write".
+   *
+   * FAIL-SAFE DIRECTION: when the index cannot be probed at all (a host or a
+   * test double without `getAbstractFileByPath`, or a lookup that throws) this
+   * returns TRUE — "it existed" — which SUPPRESSES the create upgrade and
+   * leaves the write in today's exact lane. Every failure mode of this probe
+   * must point that way.
+   */
+  private localFileExistedBeforeWrite(path: string): boolean {
+    const vault = this.app?.vault as
+      | { getAbstractFileByPath?: (p: string) => unknown }
+      | undefined;
+    if (typeof vault?.getAbstractFileByPath !== "function") return true;
+    try {
+      return vault.getAbstractFileByPath(path) != null;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * SD-06-F1 / DECISION 6 — the mutation intent for an ONLINE small-file write.
+   *
+   * Store resolution, plus a local-new upgrade that fires only when ALL THREE
+   * of these hold:
+   *   1. the store resolution is `unknown`,
+   *   2. the store holds NO entry at all for the path (never tracked), and
+   *   3. the local file did not exist immediately before this write.
+   *
+   * Two conditions would not be enough. A `present`-but-versionless entry (P17)
+   * and an explicit `unknown` entry BOTH resolve to `{kind:"unknown"}`, but the
+   * store has SEEN those paths — its absence knowledge is not fresh — so
+   * declaring `mustBeAbsent` for them could 409 a file that really exists. The
+   * "no entry at all" condition is what separates "never heard of it" from
+   * "heard of it, lost the details".
+   *
+   * Why the probe is acceptable without an fs `stat`: Obsidian's
+   * `vault.create()` calls `adapter.write()` BEFORE the new `TFile` is
+   * registered in the index, so the probe reads null for a genuine create and
+   * non-null for a `vault.modify()`. If a future Obsidian version registered
+   * the TFile first, the probe would return non-null, the intent would stay
+   * `unknown`, and the write would land in TODAY's exact lane. The probe can
+   * only ever fail *toward* current behavior.
+   *
+   * Returns `undefined` — not `{kind:"unknown"}` — when the context predates
+   * `resolveMutationIntent` (DECISION 5). An undefined intent leaves
+   * buildWriteBody on its legacy `expectedVersionId` derivation, i.e. today's
+   * exact body; forcing the unknown lane instead would silently DROP the
+   * version guard that call site passes.
+   */
+  /**
+   * SD-06-F1 / DECISION 6 — the intent a RENAME DESTINATION declares. Twin of
+   * `SyncRuntime.resolveRenameDestIntent`; duplicated per module rather than
+   * shared through a barrel, matching this file's existing convention for tiny
+   * helpers.
+   *
+   * Resolve from the store, then upgrade an `unknown` to `must-be-absent` on a
+   * STRUCTURAL fact rather than a probe: Obsidian refuses a rename onto an
+   * existing local path, so a rename destination is by definition locally new.
+   * A destination the store knows is `present(v)` still resolves to
+   * `expect-version` — which is what keeps the P18 anchor byte-identical.
+   */
+  private resolveRenameDestIntent(destPath: string): MutationIntent | undefined {
+    const resolve = this.ctx.resolveMutationIntent;
+    if (typeof resolve !== "function") return undefined;
+    const intent = resolve.call(this.ctx, destPath);
+    if (!intent) return undefined;
+    return intent.kind === "unknown" ? { kind: "must-be-absent" } : intent;
+  }
+
+  private resolveWriteIntent(
+    path: string,
+    existedLocally: boolean,
+  ): MutationIntent | undefined {
+    const resolve = this.ctx.resolveMutationIntent;
+    if (typeof resolve !== "function") return undefined;
+    const intent = resolve.call(this.ctx, path);
+    if (!intent || intent.kind !== "unknown") return intent;
+    if (existedLocally) return intent;
+    if (this.ctx.getRemoteFileState(path) !== null) return intent;
+    return { kind: "must-be-absent" };
+  }
+
   private recordRemoteFilePresent(
     path: string,
     update: {
@@ -491,26 +682,75 @@ export class AtRestAdapterRuntime {
     path: string,
     localContent: string,
     baseVersionId?: string | null,
+    // SD-06-F1 / DECISION 2: forwarded verbatim — see the ctx declaration.
+    options?: { createConflict?: boolean },
   ): Promise<RemoteWriteConflictResolutionResult> {
-    return this.ctx.handleRemoteWriteConflict(path, localContent, baseVersionId);
+    return this.ctx.handleRemoteWriteConflict(path, localContent, baseVersionId, options);
   }
 
   private buildWriteBody(
     path: string,
     encryptedContent: string,
     hash: string,
-    options: { forceOverwrite?: boolean; expectedVersionId?: string | null } = {},
+    options: {
+      forceOverwrite?: boolean;
+      expectedVersionId?: string | null;
+      intent?: MutationIntent;
+      lane?: string;
+    } = {},
   ): Record<string, unknown> {
     const body: Record<string, unknown> = {
       content: encryptedContent,
       hash,
     };
-    const expectedVersionId =
+    // SD-06-F1 — DECISION 3 precedence. THIS FUNCTION IS DUPLICATED: the copy in
+    // sync-runtime.ts and the copy in at-rest-adapter-runtime.ts are kept
+    // TEXTUALLY IDENTICAL. Diff both bodies after any edit — drift here means
+    // one runtime silently stops declaring intent while the other still does.
+    //
+    //   1. `forceOverwrite: true` wins outright: it is how the conflict
+    //      KEEP_LOCAL path already declares a deliberate unconditional write.
+    //   2. else an explicitly supplied `options.intent`.
+    //   3. else — and ONLY when `intent` was not supplied at all — today's
+    //      derivation from `options.expectedVersionId` / the store lookup, so
+    //      every untouched call site keeps its exact current body.
+    //
+    // The legacy branch PRESERVES the pre-existing `undefined`-vs-`null`
+    // distinction exactly: `undefined` means "option not supplied, look the
+    // version up in the store"; `null` means "force-omit the guard, do NOT look
+    // anything up" (the reconciliation JSON lane depends on that). Collapsing
+    // the two would start sending `expectedVersionId` on catch-up re-uploads.
+    const legacyExpectedVersionId =
       options.expectedVersionId === undefined
-        ? this.getExpectedVersionId(path)
+        ? this.ctx.getExpectedVersionId(path)
         : options.expectedVersionId ?? undefined;
-    if (!options.forceOverwrite && expectedVersionId) {
-      body.expectedVersionId = expectedVersionId;
+    const intent: MutationIntent = options.forceOverwrite
+      ? { kind: "force" }
+      : (options.intent ??
+        (legacyExpectedVersionId
+          ? { kind: "expect-version", versionId: legacyExpectedVersionId }
+          : { kind: "unknown" }));
+    // Field names are 16-01's SHIPPED wire contract, verbatim (16-01-SUMMARY.md
+    // — "The wire contract you must emit, verbatim"): `expectedVersionId` is a
+    // string, `mustBeAbsent` / `force` are the boolean LITERAL `true`, and at
+    // most one of the three may appear or the server answers 400.
+    if (intent.kind === "expect-version") {
+      body.expectedVersionId = intent.versionId;
+    } else if (intent.kind === "must-be-absent") {
+      body.mustBeAbsent = true;
+    } else if (intent.kind === "force") {
+      body.force = true;
+    } else {
+      // Unknown lane: TODAY's exact body (no intent key at all) plus ONE
+      // device-local breadcrumb, so the residual is measurable before anyone
+      // flips server enforcement. Never map unknown to `force` — that would
+      // make every lost-track write an explicit unconditional overwrite forever
+      // and permanently blind the telemetry the flip depends on. Never map it
+      // to `must-be-absent` either: not knowing is not knowing.
+      this.ctx.recordSyncDiagnostic?.("mutationIntent.unknown", {
+        path,
+        lane: options.lane ?? "unspecified",
+      });
     }
     return body;
   }
@@ -953,6 +1193,9 @@ export class AtRestAdapterRuntime {
         }
         return false;
       },
+      // SD-05-F3: candidate-key validation source for restoreFromRecoveryCode.
+      // Fail-closed: the generator THROWS rather than skipping unreadable files.
+      listCiphertextForValidation: () => this.iterateCiphertextForValidation(),
       saveWrappedLak: async (blob: string) => {
         await adapter.write(envelopePath, blob);
       },
@@ -1604,6 +1847,13 @@ export class AtRestAdapterRuntime {
             // paused sync loop suppress the vault.on('delete') propagation path.
             await remove(path);
             wipedPaths.push(path);
+            // SD-07-F4: register in the CROSS-INSTANCE suppression registry the
+            // instant the file is gone. The post-wipe bulk registration in the
+            // caller is unreachable if this promise is orphaned by a hot reload
+            // or aborted at unload. Only after a SUCCESSFUL remove: a failed
+            // remove leaves the file on disk, so a later delete event for it is
+            // genuine and must propagate.
+            this.ctx.recordWipedPathAwaitingRepull?.(path);
           } catch (err) {
             failed += 1;
             this.logError(`At-rest reset: failed to remove "${path}"`, err);
@@ -1826,95 +2076,126 @@ export class AtRestAdapterRuntime {
   interceptVaultAdapter(): void {
     const adapter = this.app.vault.adapter;
 
-    // Save original methods
-    this.originalAdapterMethods.read = adapter.read.bind(adapter);
-    this.originalAdapterMethods.write = adapter.write.bind(adapter);
-    this.originalAdapterMethods.list = adapter.list.bind(adapter);
-    this.originalAdapterMethods.remove = adapter.remove.bind(adapter);
-    if (typeof (adapter as unknown as Record<string, unknown>).readBinary === "function") {
-      this.originalAdapterMethods.readBinary = (
-        adapter as unknown as { readBinary: (p: string) => Promise<ArrayBuffer> }
-      ).readBinary.bind(adapter);
+    // SD-07-F5: a fresh interception re-attaches this runtime.
+    this.adapterDetached = false;
+    this.capturedAdapterMethodNames.clear();
+
+    // Save original methods.
+    //
+    // SD-07-F5: capture the REAL adapter method, not whatever wrapper happens to
+    // be installed. A superseded instance's un-awaited unload tail may still own
+    // the adapter here; chaining onto its wrapper leaves this runtime delegating
+    // into functions the old runtime is about to null. Every wrapper this plugin
+    // installs carries the base it delegates to, so resolveAdapterMethodBase
+    // walks back to the true adapter method (a LOOP — A→B→C generations stack).
+    // An unwrapped base is NOT re-bound: it was already `.bind(adapter)`-ed by
+    // the generation that first captured it, and re-binding would mint a fresh
+    // function object per generation.
+    const baseRead = resolveAdapterMethodBase(adapter.read) ?? adapter.read.bind(adapter);
+    this.originalAdapterMethods.read = baseRead;
+    this.capturedAdapterMethodNames.add("read");
+    const baseWrite = resolveAdapterMethodBase(adapter.write) ?? adapter.write.bind(adapter);
+    this.originalAdapterMethods.write = baseWrite;
+    this.capturedAdapterMethodNames.add("write");
+    const baseList = resolveAdapterMethodBase(adapter.list) ?? adapter.list.bind(adapter);
+    this.originalAdapterMethods.list = baseList;
+    this.capturedAdapterMethodNames.add("list");
+    const baseRemove = resolveAdapterMethodBase(adapter.remove) ?? adapter.remove.bind(adapter);
+    this.originalAdapterMethods.remove = baseRemove;
+    this.capturedAdapterMethodNames.add("remove");
+    const rawReadBinary = (adapter as unknown as Record<string, unknown>).readBinary;
+    if (typeof rawReadBinary === "function") {
+      const fn = rawReadBinary as (p: string) => Promise<ArrayBuffer>;
+      this.originalAdapterMethods.readBinary = resolveAdapterMethodBase(fn) ?? fn.bind(adapter);
+      this.capturedAdapterMethodNames.add("readBinary");
     }
-    if (typeof (adapter as unknown as Record<string, unknown>).writeBinary === "function") {
-      this.originalAdapterMethods.writeBinary = (
-        adapter as unknown as { writeBinary: (p: string, d: ArrayBuffer) => Promise<void> }
-      ).writeBinary.bind(adapter);
+    const rawWriteBinary = (adapter as unknown as Record<string, unknown>).writeBinary;
+    if (typeof rawWriteBinary === "function") {
+      const fn = rawWriteBinary as (p: string, d: ArrayBuffer) => Promise<void>;
+      this.originalAdapterMethods.writeBinary = resolveAdapterMethodBase(fn) ?? fn.bind(adapter);
+      this.capturedAdapterMethodNames.add("writeBinary");
     }
     if (typeof adapter.rename === "function") {
-      this.originalAdapterMethods.rename = adapter.rename.bind(adapter);
+      const fn = adapter.rename;
+      this.originalAdapterMethods.rename = resolveAdapterMethodBase(fn) ?? fn.bind(adapter);
+      this.capturedAdapterMethodNames.add("rename");
     }
-    if (typeof (adapter as unknown as Record<string, unknown>).getResourcePath === "function") {
-      this.originalAdapterMethods.getResourcePath = (
-        adapter as unknown as { getResourcePath: (p: string) => string }
-      ).getResourcePath.bind(adapter);
+    const rawGetResourcePath = (adapter as unknown as Record<string, unknown>).getResourcePath;
+    if (typeof rawGetResourcePath === "function") {
+      const fn = rawGetResourcePath as (p: string) => string;
+      this.originalAdapterMethods.getResourcePath =
+        resolveAdapterMethodBase(fn) ?? fn.bind(adapter);
+      this.capturedAdapterMethodNames.add("getResourcePath");
     }
 
-    // Intercept read operations
-    this.installedAdapterMethods.read = async (normalizedPath: string): Promise<string> => {
-      return this.interceptedRead(normalizedPath);
-    };
+    // Intercept read operations. Every install is marked with the base it
+    // delegates to (SD-07-F5) so the NEXT generation can unwrap past it.
+    this.installedAdapterMethods.read = markAdapterWrapper(
+      async (normalizedPath: string): Promise<string> => this.interceptedRead(normalizedPath),
+      baseRead,
+    );
     adapter.read = this.installedAdapterMethods.read;
 
     // Intercept write operations
-    this.installedAdapterMethods.write = async (
-      normalizedPath: string,
-      data: string
-    ): Promise<void> => {
-      return this.interceptedWrite(normalizedPath, data);
-    };
+    this.installedAdapterMethods.write = markAdapterWrapper(
+      async (normalizedPath: string, data: string): Promise<void> =>
+        this.interceptedWrite(normalizedPath, data),
+      baseWrite,
+    );
     adapter.write = this.installedAdapterMethods.write;
 
     // Intercept binary read/write so attachments (images, PDFs, ...) also
     // get at-rest decryption/encryption. Without this, every non-text file
     // in the vault would round-trip in plaintext on disk.
-    if (this.originalAdapterMethods.readBinary) {
-      this.installedAdapterMethods.readBinary = async (
-        normalizedPath: string
-      ): Promise<ArrayBuffer> => {
-        return this.interceptedReadBinary(normalizedPath);
-      };
+    const baseReadBinary = this.originalAdapterMethods.readBinary;
+    if (baseReadBinary) {
+      this.installedAdapterMethods.readBinary = markAdapterWrapper(
+        async (normalizedPath: string): Promise<ArrayBuffer> =>
+          this.interceptedReadBinary(normalizedPath),
+        baseReadBinary,
+      );
       (adapter as unknown as {
         readBinary: (p: string) => Promise<ArrayBuffer>;
       }).readBinary = this.installedAdapterMethods.readBinary;
     }
-    if (this.originalAdapterMethods.writeBinary) {
-      this.installedAdapterMethods.writeBinary = async (
-        normalizedPath: string,
-        data: ArrayBuffer
-      ): Promise<void> => {
-        return this.interceptedWriteBinary(normalizedPath, data);
-      };
+    const baseWriteBinary = this.originalAdapterMethods.writeBinary;
+    if (baseWriteBinary) {
+      this.installedAdapterMethods.writeBinary = markAdapterWrapper(
+        async (normalizedPath: string, data: ArrayBuffer): Promise<void> =>
+          this.interceptedWriteBinary(normalizedPath, data),
+        baseWriteBinary,
+      );
       (adapter as unknown as {
         writeBinary: (p: string, d: ArrayBuffer) => Promise<void>;
       }).writeBinary = this.installedAdapterMethods.writeBinary;
     }
 
     // Intercept list operations
-    this.installedAdapterMethods.list = async (
-      normalizedPath: string
-    ): Promise<{ files: string[]; folders: string[] }> => {
-      return this.interceptedList(normalizedPath);
-    };
+    this.installedAdapterMethods.list = markAdapterWrapper(
+      async (normalizedPath: string): Promise<{ files: string[]; folders: string[] }> =>
+        this.interceptedList(normalizedPath),
+      baseList,
+    );
     adapter.list = this.installedAdapterMethods.list;
 
     // Intercept delete operations
-    this.installedAdapterMethods.remove = async (normalizedPath: string): Promise<void> => {
-      return this.interceptedDelete(normalizedPath);
-    };
+    this.installedAdapterMethods.remove = markAdapterWrapper(
+      async (normalizedPath: string): Promise<void> => this.interceptedDelete(normalizedPath),
+      baseRemove,
+    );
     adapter.remove = this.installedAdapterMethods.remove;
 
     // Intercept rename — without this the server keeps the old name forever
     // (Obsidian renames don't go through write/remove, so the existing
     // interceptors never fire) and the renamed file appears as a duplicate
     // until the user manually deletes the old path.
-    if (this.originalAdapterMethods.rename) {
-      this.installedAdapterMethods.rename = async (
-        oldPath: string,
-        newPath: string
-      ): Promise<void> => {
-        return this.interceptedRename(oldPath, newPath);
-      };
+    const baseRename = this.originalAdapterMethods.rename;
+    if (baseRename) {
+      this.installedAdapterMethods.rename = markAdapterWrapper(
+        async (oldPath: string, newPath: string): Promise<void> =>
+          this.interceptedRename(oldPath, newPath),
+        baseRename,
+      );
       adapter.rename = this.installedAdapterMethods.rename;
     }
 
@@ -1923,11 +2204,15 @@ export class AtRestAdapterRuntime {
     // reads the on-disk bytes directly, bypassing readBinary decryption — without
     // this, encrypted attachments preview as broken. The override is tagged
     // __vaultguard so the preview diagnostic reports interception as active.
-    if (this.originalAdapterMethods.getResourcePath) {
-      const override = ((normalizedPath: string): string =>
-        this.interceptedGetResourcePath(normalizedPath)) as ((p: string) => string) & {
-        __vaultguard?: boolean;
-      };
+    const baseGetResourcePath = this.originalAdapterMethods.getResourcePath;
+    if (baseGetResourcePath) {
+      const override = markAdapterWrapper(
+        ((normalizedPath: string): string =>
+          this.interceptedGetResourcePath(normalizedPath)) as ((p: string) => string) & {
+          __vaultguard?: boolean;
+        },
+        baseGetResourcePath,
+      );
       override.__vaultguard = true;
       this.installedAdapterMethods.getResourcePath = override;
       (adapter as unknown as { getResourcePath: (p: string) => string }).getResourcePath =
@@ -1987,6 +2272,10 @@ export class AtRestAdapterRuntime {
     // Revoke every decrypted blob URL so they don't leak past unload.
     this.revokeAllResourcePreviews();
 
+    // SD-07-F5: mark detached BEFORE clearing, so every guard below can tell a
+    // released delegate from an adapter that never had the method.
+    this.adapterDetached = true;
+
     this.originalAdapterMethods = {
       read: null,
       write: null,
@@ -1998,6 +2287,32 @@ export class AtRestAdapterRuntime {
       getResourcePath: null,
     };
     this.log("Vault adapter methods restored.");
+  }
+
+  /**
+   * SD-07-F5. A null delegate has two meanings and only one is an error:
+   *
+   *   - NEVER CAPTURED (a legacy adapter with no writeBinary/rename/…): the
+   *     documented silent/no-op behavior is preserved verbatim. See
+   *     interceptedWriteBinary's doc contract ("Legacy adapters without
+   *     writeBinary retain the existing silent return").
+   *   - DETACHED (captured, then cleared by this runtime's restoreVaultAdapter):
+   *     a stale caller from a torn-down generation. Reporting success for a write
+   *     that cannot reach disk is the SD-07-F5 failure mode itself, so throw.
+   *
+   * With the unwrap-at-capture fix in place a LIVE generation can never hold a
+   * dead delegate, so this only fires for genuinely stale references — an old
+   * instance's in-flight async flow calling its own runtime after unload.
+   */
+  private failIfAdapterDetached(
+    method: keyof VaultAdapterOriginalMethods,
+    path: string,
+  ): void {
+    if (!this.adapterDetached) return;
+    if (!this.capturedAdapterMethodNames.has(method)) return;
+    throw new AtRestAdapterDetachedError(
+      `VaultGuard Sync: cannot ${method} "${path}" — this VaultGuard instance has been unloaded and no longer owns the vault adapter. The change was NOT written to disk.`,
+    );
   }
 
   private async readLocalProjectMemoryText(path: string): Promise<string> {
@@ -2036,12 +2351,18 @@ export class AtRestAdapterRuntime {
   }
 
   private async writeLocalProjectMemoryText(path: string, data: string): Promise<void> {
-    if (!this.originalAdapterMethods.write) return;
+    if (!this.originalAdapterMethods.write) {
+      this.failIfAdapterDetached("write", path);
+      return; // legacy adapter without this method: unchanged silent return
+    }
     await this.originalAdapterMethods.write(path, data);
   }
 
   private async writeLocalProjectMemoryBinary(path: string, data: ArrayBuffer): Promise<void> {
-    if (!this.originalAdapterMethods.writeBinary) return;
+    if (!this.originalAdapterMethods.writeBinary) {
+      this.failIfAdapterDetached("writeBinary", path);
+      return; // legacy adapter without this method: unchanged silent return
+    }
     await this.originalAdapterMethods.writeBinary(path, data);
   }
 
@@ -2341,6 +2662,11 @@ export class AtRestAdapterRuntime {
    * @throws Error if the user lacks WRITE permission
    */
   async interceptedWrite(path: string, data: string): Promise<void> {
+    // SD-06-F1 / DECISION 6: capture the local-new probe at the EARLIEST point
+    // in the function — before the ciphertext check and therefore before any
+    // `await` — so it still describes the vault index as it was *before* this
+    // write. Only the online JSON lane below consumes it.
+    const existedLocally = this.localFileExistedBeforeWrite(path);
     if (this.looksLikeCiphertext(data)) {
       this.hostNotifyCorruptedWrite(path);
       this.logError(
@@ -2369,6 +2695,8 @@ export class AtRestAdapterRuntime {
     if (this.isPathExcluded(path)) {
       if (this.originalAdapterMethods.write) {
         await this.originalAdapterMethods.write(path, data);
+      } else {
+        this.failIfAdapterDetached("write", path);
       }
       return;
     }
@@ -2420,7 +2748,11 @@ export class AtRestAdapterRuntime {
           return;
         } catch (error) {
           if (this.isNetworkError(error)) this.setConnectionStatus("offline");
-          await this.originalAdapterMethods.write?.(path, data);
+          if (this.originalAdapterMethods.write) {
+            await this.originalAdapterMethods.write(path, data);
+          } else {
+            this.failIfAdapterDetached("write", path);
+          }
           await this.markLargeFilePending(
             path,
             textBytes,
@@ -2436,7 +2768,11 @@ export class AtRestAdapterRuntime {
         }
       }
 
-      await this.originalAdapterMethods.write?.(path, data);
+      if (this.originalAdapterMethods.write) {
+        await this.originalAdapterMethods.write(path, data);
+      } else {
+        this.failIfAdapterDetached("write", path);
+      }
       const reason: PendingLargeFileRecord["reason"] = !this.isOnline()
         ? "offline"
         : !this.keyLease
@@ -2459,18 +2795,56 @@ export class AtRestAdapterRuntime {
       // In manual mode, defer remote writes until the user runs a sync explicitly.
       if (this.shouldUploadChangesImmediately() && this.isOnline() && this.keyLease) {
         const encrypted = await this.encryptContent(data);
+        // SD-06-F1: resolved ONCE so the 409 branch below can route on the
+        // intent this write actually DECLARED, rather than re-deriving it after
+        // the round trip (the store may have moved in between).
+        const writeIntent = this.resolveWriteIntent(path, existedLocally);
+        const declaredCreate = writeIntent?.kind === "must-be-absent";
         const response = await this.apiRequest<RemoteFileWriteResponse>(
           "PUT",
           this.vaultPath(`/files/${encodeURIComponent(path)}`),
-          this.buildWriteBody(path, encrypted, hash, { expectedVersionId: baseVersionId })
+          // SD-06-F1: declare what we know. `expectedVersionId` stays as the
+          // DECISION 5 fallback — if the ctx predates resolveMutationIntent the
+          // intent is undefined and buildWriteBody's legacy derivation produces
+          // today's exact body rather than dropping the guard.
+          this.buildWriteBody(path, encrypted, hash, {
+            expectedVersionId: baseVersionId,
+            intent: writeIntent,
+            lane: "online-text",
+          })
         );
 
         if (!response.success) {
           if (response.error?.statusCode === 409) {
-            const resolution = await this.handleRemoteWriteConflict(path, data, baseVersionId);
+            // SD-06-F1 / DECISION 1 — a create-409 must NEVER lose the bytes.
+            // For an UPDATE the old content is already on disk, so "leave the
+            // local file untouched" preserves it. For a CREATE there is no
+            // local file yet (Obsidian's vault.create() calls adapter.write()
+            // first), so returning without writing means the user's brand-new
+            // note exists nowhere. Persist first, then route — every outcome
+            // below then operates on a file that survives.
+            //
+            // Gated on the DECLARED intent, so update-409 behavior is
+            // byte-identical to today.
+            if (declaredCreate) {
+              await this.hostWritePlainToDisk(path, data);
+            }
+            const resolution = await this.handleRemoteWriteConflict(
+              path,
+              data,
+              baseVersionId,
+              { createConflict: declaredCreate },
+            );
             if (resolution === "keep-local") {
               await this.hostWritePlainToDisk(path, data);
               await this.emitAuditEvent("file.write", path);
+              this.updateStatusBar();
+            } else if (resolution === "converged") {
+              // DECISION 2: both devices created the same bytes. This is a
+              // successful write, so it runs the same tail as the success path
+              // — no conflict was recorded and none should be implied.
+              await this.emitAuditEvent("file.write", path);
+              this.syncState.pendingChanges++;
               this.updateStatusBar();
             }
             return;
@@ -2659,7 +3033,10 @@ export class AtRestAdapterRuntime {
       return;
     }
     if (this.isAtRestExcluded(path)) {
-      if (!this.originalAdapterMethods.write) return;
+      if (!this.originalAdapterMethods.write) {
+        this.failIfAdapterDetached("write", path);
+        return; // legacy adapter without this method: unchanged silent return
+      }
       await this.originalAdapterMethods.write(path, data);
       return;
     }
@@ -2994,7 +3371,10 @@ export class AtRestAdapterRuntime {
       return;
     }
     if (this.isAtRestExcluded(path)) {
-      if (!this.originalAdapterMethods.writeBinary) return;
+      if (!this.originalAdapterMethods.writeBinary) {
+        this.failIfAdapterDetached("writeBinary", path);
+        return; // legacy adapter without this method: unchanged silent return
+      }
       await this.originalAdapterMethods.writeBinary(path, data);
       return;
     }
@@ -3006,7 +3386,13 @@ export class AtRestAdapterRuntime {
     const ciphertext = await this.atRestCipher.encryptBinary(data);
     if (this.originalAdapterMethods.writeBinary) {
       await this.originalAdapterMethods.writeBinary(path, ciphertext);
+      return;
     }
+    this.failIfAdapterDetached("writeBinary", path);
+    // R-3: a legacy adapter with no writeBinary still resolves silently here.
+    // Unchanged on purpose — never-captured semantics are frozen by SD-07-F5's
+    // constraints. Asymmetric with writePlainToDisk, which throws AR2; fixing
+    // that is a separate behavior change outside this finding's scope.
   }
 
   /**
@@ -3075,7 +3461,13 @@ export class AtRestAdapterRuntime {
    * the existing silent return.
    */
   async interceptedWriteBinary(path: string, data: ArrayBuffer): Promise<void> {
-    if (!this.originalAdapterMethods.writeBinary) return;
+    // SD-06-F1 / DECISION 6: same earliest-point capture as interceptedWrite —
+    // before any `await`, so it describes the index before this write.
+    const existedLocally = this.localFileExistedBeforeWrite(path);
+    if (!this.originalAdapterMethods.writeBinary) {
+      this.failIfAdapterDetached("writeBinary", path);
+      return; // legacy adapter without this method: unchanged silent return
+    }
     if (this.looksLikeCiphertextBytes(data)) {
       this.hostNotifyCorruptedWrite(path);
       this.logError(
@@ -3189,11 +3581,21 @@ export class AtRestAdapterRuntime {
       // In manual mode, defer remote writes until the user runs a sync explicitly.
       if (this.shouldUploadChangesImmediately() && this.isOnline() && this.keyLease) {
         const encrypted = await this.encryptContentBytes(data);
+        // SD-06-F1: resolved once, same reason as interceptedWrite — the 409
+        // branch routes on what this write DECLARED.
+        const writeIntent = this.resolveWriteIntent(path, existedLocally);
+        const declaredCreate = writeIntent?.kind === "must-be-absent";
         const response = await this.apiRequest<RemoteFileWriteResponse>(
           "PUT",
           this.vaultPath(`/files/${encodeURIComponent(path)}`),
           {
-            ...this.buildWriteBody(path, encrypted, hash, { expectedVersionId: baseVersionId }),
+            // SD-06-F1: the binary seam is wired INDEPENDENTLY of the text seam
+            // (same DECISION 5 fallback rationale as interceptedWrite).
+            ...this.buildWriteBody(path, encrypted, hash, {
+              expectedVersionId: baseVersionId,
+              intent: writeIntent,
+              lane: "online-binary",
+            }),
             contentType,
           },
           undefined,
@@ -3202,10 +3604,33 @@ export class AtRestAdapterRuntime {
 
         if (!response.success) {
           if (response.error?.statusCode === 409) {
-            new Notice(
-              `VaultGuard Sync: Remote copy of "${path}" changed before this attachment upload completed. Run sync to reconcile before retrying.`,
-              10000
-            );
+            if (declaredCreate) {
+              // SD-06-F1 / DECISION 1 — persist the pasted attachment BEFORE
+              // throwing, or it exists nowhere. This DELIBERATELY departs from
+              // the CR-1 PUT-first ordering documented below, and the departure
+              // is sound: CR-1 protects against an orphaned local-only VG1
+              // binary with NO server copy at that path, but a create-409
+              // PROVES a server copy exists there. The resulting divergence is
+              // classified by reconciliation as `binaryBoth`, which routes to a
+              // user-chosen strategy and never auto-forces. Losing the paste to
+              // uphold an invariant whose premise does not hold would be the
+              // wrong trade under the availability rule.
+              //
+              // The store is left ABSENT for this path (no recordSuccessfulWrite
+              // runs on a failed response, and nothing else records presence),
+              // so a retry re-declares the create and stays loud rather than
+              // silently clobbering the other device's copy.
+              await this.hostWritePlainBinaryToDisk(path, data);
+              new Notice(
+                `VaultGuard Sync: "${path}" was created on another device at the same time. Your copy is saved locally — run sync to reconcile the two.`,
+                10000
+              );
+            } else {
+              new Notice(
+                `VaultGuard Sync: Remote copy of "${path}" changed before this attachment upload completed. Run sync to reconcile before retrying.`,
+                10000
+              );
+            }
             throw new Error(response.error.message);
           }
           if (response.error?.statusCode === 401 || response.error?.statusCode === 403) {
@@ -3275,7 +3700,17 @@ export class AtRestAdapterRuntime {
       return false;
     }
 
-    if (this.session.role === "admin" || this.session.role === "owner") {
+    // SD-03-F15: the org-admin short-circuit is the fourth client fast path
+    // (the other three live in PermissionStore). With the org restriction on,
+    // fall through to the EXISTING member path: online => POST
+    // /permissions/check with action:"delete" (policy-aware server-side since
+    // plan 14-01); offline or transient failure => the cached-permission
+    // fallback, where a warmed root ADMIN still answers (M6) and a cold cache
+    // denies exactly as it does for every member today (M5).
+    if (
+      !this.adminRestrictionActive() &&
+      (this.session.role === "admin" || this.session.role === "owner")
+    ) {
       return true;
     }
 
@@ -3337,6 +3772,7 @@ export class AtRestAdapterRuntime {
     path: string
   ): Promise<{ files: string[]; folders: string[] }> {
     if (!this.originalAdapterMethods.list) {
+      this.failIfAdapterDetached("list", path);
       return { files: [], folders: [] };
     }
 
@@ -3451,6 +3887,8 @@ export class AtRestAdapterRuntime {
     // best-effort on top.
     if (this.originalAdapterMethods.rename) {
       await this.originalAdapterMethods.rename(oldPath, newPath);
+    } else {
+      this.failIfAdapterDetached("rename", oldPath);
     }
 
     if (this.isLocalProjectMemoryModeEnabled()) {
@@ -3619,10 +4057,17 @@ export class AtRestAdapterRuntime {
       const putResp = await this.apiRequest<RemoteFileWriteResponse>(
         "PUT",
         this.vaultPath(`/files/${encodeURIComponent(newNormalized)}`),
-        this.buildWriteBody(newNormalized, encrypted, hash, { expectedVersionId: baseVersionId })
+        // SD-06-F1 / DECISION 6: declare the destination's intent.
+        this.buildWriteBody(newNormalized, encrypted, hash, {
+          expectedVersionId: baseVersionId,
+          intent: this.resolveRenameDestIntent(newNormalized),
+          lane: "rename-dest",
+        })
       );
 
       if (!putResp.success) {
+        // 409 → conflict flow and RETURN, before the DELETE below. The old
+        // server copy survives; verified per-function for 16-03.
         if (putResp.error?.statusCode === 409) {
           await this.handleRemoteWriteConflict(newNormalized, content, baseVersionId);
           return;
@@ -3801,7 +4246,12 @@ export class AtRestAdapterRuntime {
         "PUT",
         this.vaultPath(`/files/${encodeURIComponent(newNormalized)}`),
         {
-          ...this.buildWriteBody(newNormalized, encrypted, hash, { expectedVersionId: baseVersionId }),
+          // SD-06-F1 / DECISION 6: declare the destination's intent.
+          ...this.buildWriteBody(newNormalized, encrypted, hash, {
+            expectedVersionId: baseVersionId,
+            intent: this.resolveRenameDestIntent(newNormalized),
+            lane: "rename-dest",
+          }),
           contentType,
         },
         undefined,
@@ -3815,6 +4265,10 @@ export class AtRestAdapterRuntime {
             10000
           );
         }
+        // The throw below is a NON-network error, so the catch at the bottom of
+        // this function rethrows rather than queueing — which is what skips the
+        // old-path DELETE. Verified per-function for 16-03; do not "simplify"
+        // the catch into a blanket queue-and-continue.
         throw new Error(putResp.error?.message ?? `Rename: writing "${newPath}" failed.`);
       }
       this.recordSuccessfulWrite(newNormalized, hash, putResp);

@@ -57,6 +57,18 @@ change affects vault scoping, file APIs, permissions, auth, security posture,
 operations, testing, or release behavior, update the relevant docs in the same
 PR and prefer repository-backed statements over roadmap language.
 
+Follow [docs/DOCUMENTATION-SYSTEM.md](docs/DOCUMENTATION-SYSTEM.md) for
+document lifecycle, formatting, traceability, and index obligations. Use the
+[Graph Atlas](docs/GRAPH-ATLAS.md) to find the smallest relevant source, test,
+spec, decision, report, and hub set. New spec artifacts belong in
+[specs/INDEX.md](specs/INDEX.md); new reports or handoffs belong in
+[reports/INDEX.md](reports/INDEX.md).
+
+Keep current and historical claims separate. A checked task ledger or dated
+test result is not evergreen runtime proof; link to its evidence and retain the
+revision/environment boundary. Use `Implemented`, `Partial`, `Planned`,
+`Stale`, or `Unknown` for non-trivial behavior claims.
+
 For file, permission, audit, and share-link APIs, keep
 [docs/VAULTS.md](docs/VAULTS.md) and [docs/API.md](docs/API.md) aligned with the
 handlers. Every file/permission API path must remain under

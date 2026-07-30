@@ -427,6 +427,15 @@ export async function verifyActiveUser(
   await assertUserNotRevoked(user);
   await assertTokenNewerThanLogoutCutoff(user);
   await assertSessionActiveIfPresent(event, user);
+  // SD-02-F1 session-header policy. Placed AFTER assertSessionActiveIfPresent so
+  // a header-bearing caller reaches it as a proven no-op, and BEFORE the
+  // MFA/subscription gates so it sits with the session checks it complements.
+  // Honest consequence of that placement: observe-mode telemetry counts
+  // headerless callers that passed the token/revocation/cutoff/session checks,
+  // INCLUDING callers the later MFA or subscription gates go on to reject — a
+  // slight over-count, which is acceptable for adoption telemetry (it never
+  // under-reports the population that would need a header before enforcing).
+  await applySessionHeaderPolicy(event, user);
   await assertOrgMfaSatisfied(user);
   if (!options.allowPendingCheckout) {
     await assertSubscriptionAllowsAccess(user);
@@ -600,7 +609,19 @@ export async function requireSuperAdmin(event: APIGatewayProxyEvent): Promise<Us
   assertSuperAdminIdentity(user, parseSuperAdminEmails(process.env.SUPER_ADMIN_EMAILS));
   await assertSuperAdminMfaEnrolled(user);
   await assertUserNotRevoked(user);
+  // SD-02-F1 super-admin cell: run the SAME header-independent logout cutoff
+  // verifyActiveUser already runs, so an operator's own logout kills their
+  // stolen pre-logout tokens on the platform surface too. Ordered after
+  // assertUserNotRevoked to match verifyActiveUser (admin-revoke's 403 wins
+  // over the cutoff's 401). This can only fire once a `logout-cutoff#<userId>`
+  // row exists — i.e. after that operator's OWN explicit logout or password
+  // reset — and it never blocks a fresh login, because the comparison is on
+  // the token's `iat`: signing in again always produces a passing token.
+  await assertTokenNewerThanLogoutCutoff(user);
   await assertSessionActiveIfPresent(event, user);
+  // skipAgePolicy: super-admins operate cross-org, so there is no single org
+  // whose maxSessionDurationHours could legitimately be applied to them.
+  await applySessionHeaderPolicy(event, user, { skipAgePolicy: true });
   return user;
 }
 
@@ -729,6 +750,168 @@ function getSessionIdFromRequest(event: APIGatewayProxyEvent): string {
   )?.[1];
 
   return typeof headerValue === 'string' ? headerValue.trim() : '';
+}
+
+// ─── Org Session-Age Policy (single definition) ──────────────────────────────
+
+/**
+ * Milliseconds a single sign-in stays usable under the org's policy.
+ *
+ * The `Math.max(..., 1)` floor is load-bearing: a mis-stored `0` would
+ * otherwise mean "every session is already too old" and expire an entire org
+ * on the next request.
+ *
+ * Moved verbatim from `auth/handler.ts` (SD-02-F1) — see
+ * `assertSessionAgePolicy` for why there is now exactly one definition.
+ */
+export function getSessionDurationMs(settings: OrgSettings): number {
+  return Math.max(settings.maxSessionDurationHours, 1) * 60 * 60 * 1000;
+}
+
+/**
+ * Org max-session-age policy: rejects a caller whose original sign-in
+ * (`auth_time`) is older than the org's `maxSessionDurationHours`.
+ *
+ * **SD-02-F1 — hoisted here from `auth/handler.ts` so there is exactly ONE
+ * definition.** The auth/lease endpoints call it unconditionally (login,
+ * session refresh, key-lease), and the dormant `enforce` branch of
+ * `applySessionHeaderPolicy` calls it for ordinary routes. Were the two
+ * definitions allowed to drift, flipping enforcement would start enforcing a
+ * session lifetime *different* from the one login enforces — the caller would
+ * be admitted at the door and rejected in the hallway, or vice versa. Same
+ * single-definition reasoning as `queryAllPages` (SD-03-F18).
+ *
+ * Body moved byte-for-byte; the `!user.authTime` fail-open at the top is
+ * deliberate (a token without the claim is left untouched — unchanged
+ * behaviour, not an oversight).
+ */
+export function assertSessionAgePolicy(user: UserContext, settings: OrgSettings): void {
+  if (!user.authTime) {
+    return;
+  }
+
+  const authAgeMs = Date.now() - user.authTime * 1000;
+  if (authAgeMs > getSessionDurationMs(settings)) {
+    throw new AuthError(
+      'Session duration limit reached. Please sign in again.',
+      401
+    );
+  }
+}
+
+// ─── Session Enforcement Mode (SD-02-F1) ─────────────────────────────────────
+
+/**
+ * How strictly the server treats an authenticated request that does NOT carry
+ * `X-VaultGuard-Session-Id`.
+ *
+ * - `off` — no telemetry, no enforcement.
+ * - `observe` — **the default.** Emits one `[SESSION_TELEMETRY]` line per
+ *   headerless authenticated call and changes nothing else: not the status, not
+ *   the body, not a header.
+ * - `enforce` — rejects headerless authenticated calls with 401 and, for
+ *   ordinary (non-super-admin) callers, additionally applies the org
+ *   session-age policy to header-bearing calls.
+ */
+export type SessionEnforcementMode = 'off' | 'observe' | 'enforce';
+
+/**
+ * Resolves the session-enforcement mode from `SESSION_ENFORCEMENT_MODE`.
+ *
+ * **Scope ceiling — binding.** The default is `observe`, and observe never
+ * rejects, so with no configuration change every authenticated response stays
+ * byte-identical to today's. `enforce` is fully built and fully tested but
+ * DORMANT: **no Terraform in this phase sets this variable.** Flipping it is an
+ * operator decision made against real adoption telemetry — the admin panel
+ * sends no session header today, so a premature flip would brick every deployed
+ * panel until an Amplify deploy caught up (the 2026-07-11 production-incident
+ * class: an audit finding's wrong premise, applied confidently).
+ *
+ * **The env var is read live on every call — deliberately NOT captured in a
+ * module-level const** like this file's other env constants, for two reasons:
+ *   1. module-level constants resolve at Lambda cold start, which would make
+ *      the mode untestable without module resets; and
+ *   2. it would make the operator's flip take effect only after a cold start
+ *      rather than on the next invocation.
+ * The cost is one `process.env` read per authenticated request — free next to
+ * the DynamoDB round trips already on that path.
+ */
+export function getSessionEnforcementMode(): SessionEnforcementMode {
+  const raw = (process.env.SESSION_ENFORCEMENT_MODE || '').trim().toLowerCase();
+  if (raw === 'off' || raw === 'observe' || raw === 'enforce') {
+    return raw;
+  }
+  return 'observe';
+}
+
+/**
+ * SD-02-F1 — the single definition of what happens when an authenticated caller
+ * does not volunteer a session header.
+ *
+ * Shared by `verifyActiveUser` and `requireSuperAdmin` so the two can never
+ * drift apart. Behaviour:
+ *
+ * | header  | off   | observe (default)  | enforce                            |
+ * |---------|-------|--------------------|------------------------------------|
+ * | present | no-op | no-op              | org age policy (ordinary callers)  |
+ * | absent  | no-op | ONE telemetry line | 401                                |
+ *
+ * Header-present is a no-op below `enforce` because `assertSessionActiveIfPresent`
+ * has already validated the session row upstream in BOTH callers — this helper
+ * never re-reads it and never emits telemetry for it.
+ *
+ * The telemetry payload is fixed at five non-secret fields. It must **never**
+ * carry the token, any header value, the email or the org id: CloudWatch
+ * retention turns a convenience field into an information-disclosure surface.
+ *
+ * @param options.skipAgePolicy - set by `requireSuperAdmin`; super-admins
+ *   operate cross-org and have no single org's settings to apply.
+ */
+export async function applySessionHeaderPolicy(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  options: { skipAgePolicy?: boolean } = {}
+): Promise<void> {
+  const mode = getSessionEnforcementMode();
+  const hasHeader = getSessionIdFromRequest(event) !== '';
+
+  if (!hasHeader) {
+    if (mode === 'observe') {
+      console.warn('[SESSION_TELEMETRY]', {
+        resource: event.resource || event.path || '',
+        method: event.httpMethod,
+        userId: user.userId,
+        hasHeader: false,
+        userAgent: getUserAgent(event),
+      });
+      return;
+    }
+    if (mode === 'enforce') {
+      throw new AuthError(
+        'A VaultGuard session is required. Please sign in again.',
+        401
+      );
+    }
+    return; // 'off' — silent, unchanged behaviour
+  }
+
+  // Header present and already validated upstream. Only `enforce` adds anything.
+  if (mode !== 'enforce' || options.skipAgePolicy) {
+    return;
+  }
+
+  const settings = await getEffectiveOrgSettings(user.orgId);
+  // DECISION 1 — null org settings SKIP the age policy; they never throw.
+  // `getEffectiveOrgSettings` is nullable, and the auth handler's
+  // `getRequiredOrgSettings` turns null into a 403 — correct for a login
+  // endpoint, catastrophic if copied onto every ordinary route. A missing
+  // org-settings row must never become a fleet-wide 401/403: that is exactly
+  // the 2026-07-11 incident class (a confidently-applied wrong premise taking
+  // production down), and availability wins here.
+  if (!settings) {
+    return;
+  }
+  assertSessionAgePolicy(user, settings);
 }
 
 /**
@@ -1175,6 +1358,40 @@ function scopesOverlap(left: string, right: string): boolean {
 }
 
 /**
+ * Runs a permission-rule Query to exhaustion, following `LastEvaluatedKey`.
+ *
+ * Authorization must be complete. DynamoDB Query is capped at 1 MB and can
+ * return LastEvaluatedKey even when a filter leaves few visible rows. A
+ * single-page lookup can therefore miss a later deny rule and widen access.
+ * Paginate every principal/role/wildcard query; any failed page rejects the
+ * whole evaluation so callers fail closed.
+ *
+ * SD-03-F18: this invariant lived as a closure inside `fetchApplicableRules`,
+ * so `permissions/handler.ts:fetchAllUserRules` — the feed behind the client's
+ * warmup, duplicate detection, set-level lookup and conflict detection — never
+ * inherited it and drifted into un-paginated single-page reads. Keeping exactly
+ * ONE exported definition is the fix: a second copy is how the drift happened.
+ *
+ * @param input - Query input; `ExclusiveStartKey` is supplied by the loop
+ * @returns Every matching rule across every page
+ */
+export async function queryAllPages(input: QueryCommandInput): Promise<PermissionRule[]> {
+  const items: PermissionRule[] = [];
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  do {
+    const page = await docClient.send(
+      new QueryCommand({
+        ...input,
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      })
+    );
+    items.push(...((page.Items ?? []) as PermissionRule[]));
+    exclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (exclusiveStartKey);
+  return items;
+}
+
+/**
  * Fetches all permission rules applicable to a user (by ID, roles, or wildcard).
  *
  * @param userId - The user ID to fetch rules for
@@ -1204,32 +1421,12 @@ async function fetchApplicableRules(
     scopeValues: { ':orgId': orgId, ':vaultId': vaultId } as Record<string, unknown>,
   };
 
-  // Authorization must be complete. DynamoDB Query is capped at 1 MB and can
-  // return LastEvaluatedKey even when a filter leaves few visible rows. A
-  // single-page lookup can therefore miss a later deny rule and widen access.
-  // Paginate every principal/role/wildcard query; any failed page rejects the
-  // whole evaluation so callers fail closed.
-  const queryAll = async (input: QueryCommandInput): Promise<PermissionRule[]> => {
-    const items: PermissionRule[] = [];
-    let exclusiveStartKey: Record<string, unknown> | undefined;
-    do {
-      const page = await docClient.send(
-        new QueryCommand({
-          ...input,
-          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
-        })
-      );
-      items.push(...((page.Items ?? []) as PermissionRule[]));
-      exclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
-    } while (exclusiveStartKey);
-    return items;
-  };
-
   // Fetch user-specific rules. Include canonical subject id plus legacy
   // aliases (notably email-address principals) so old rules and new rules
-  // are evaluated by the same backend source of truth.
+  // are evaluated by the same backend source of truth. Pagination lives in
+  // the shared `queryAllPages` helper above — one definition, fail-closed.
   for (const lookupUserId of userIds) {
-    pushRules(await queryAll({
+    pushRules(await queryAllPages({
       TableName: PERMISSIONS_TABLE,
       IndexName: 'userId-index',
       KeyConditionExpression: 'userId = :uid',
@@ -1240,7 +1437,7 @@ async function fetchApplicableRules(
 
   // Fetch role-based rules
   for (const role of roles) {
-    pushRules(await queryAll({
+    pushRules(await queryAllPages({
       TableName: PERMISSIONS_TABLE,
       IndexName: 'role-index',
       KeyConditionExpression: '#role = :role',
@@ -1251,7 +1448,7 @@ async function fetchApplicableRules(
   }
 
   // Fetch wildcard rules (apply to all users within the same org+vault)
-  pushRules(await queryAll({
+  pushRules(await queryAllPages({
     TableName: PERMISSIONS_TABLE,
     IndexName: 'userId-index',
     KeyConditionExpression: 'userId = :uid',

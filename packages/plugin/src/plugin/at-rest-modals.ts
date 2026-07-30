@@ -11,6 +11,7 @@
  */
 
 import { App, ButtonComponent, Modal, Notice } from "obsidian";
+import type { AtRestRestoreOutcome } from "../crypto/at-rest-cipher";
 
 export interface AtRestPasswordConfirmModalOptions {
   /** Short title shown at the top of the dialog (e.g. "View recovery code"). */
@@ -196,20 +197,82 @@ export class AtRestRecoveryCodeModal extends Modal {
 
 export interface AtRestRestoreModalOptions {
   /**
-   * Attempts to restore the cipher from `code`. Should resolve true when
-   * the LAK was reconstituted successfully and false when the code is
-   * malformed / fails the checksum.
+   * Attempts to restore the cipher from `code`. Returns the cipher's rich
+   * outcome so the modal can distinguish "that isn't a code" from "that code
+   * doesn't open THIS vault" from "we couldn't check". Pass
+   * `{ confirmReplace: true }` to re-submit after the user has confirmed a
+   * `needs-confirmation` key replacement.
    */
-  onSubmit: (code: string) => Promise<boolean>;
+  onSubmit: (
+    code: string,
+    opts?: { confirmReplace?: boolean }
+  ) => Promise<AtRestRestoreOutcome>;
   /** Called once a code has been accepted, after the modal closes. */
   onRestored?: () => void;
+}
+
+export interface AtRestRestoreOutcomeCopy {
+  /** Message rendered in the modal's status line. */
+  message: string;
+  /** True only for `needs-confirmation`: show the explicit "Replace key" button. */
+  offerReplace: boolean;
+}
+
+/**
+ * Outcome -> user-facing copy. Pure and exported so it is unit-testable without
+ * a DOM (the vitest `obsidian` Modal mock has no real `contentEl`).
+ *
+ * `key-mismatch` is deliberately DISTINGUISHED from `malformed`. That leaks
+ * nothing: the code IS the key, so an offline attacker holding a candidate
+ * already has a perfect local oracle. The generic-copy rationale in this file's
+ * class banner is about transcription UX, and it still applies to `malformed`.
+ */
+export function describeAtRestRestoreOutcome(
+  outcome: AtRestRestoreOutcome
+): AtRestRestoreOutcomeCopy {
+  if (outcome.ok) return { message: "", offerReplace: false };
+  switch (outcome.reason) {
+    case "malformed":
+      return {
+        message:
+          "That code isn't recognised. Check for typos — recovery codes start with VG1- and contain hex characters in groups of four.",
+        offerReplace: false,
+      };
+    case "key-mismatch":
+      return {
+        message:
+          "That code is valid but doesn't match the encrypted files in this vault — it may belong to a different vault or device. Nothing was changed. If you saved more than one code, try the one created on this device.",
+        offerReplace: false,
+      };
+    case "validation-error":
+      return {
+        message:
+          "Couldn't verify the code against this vault's encrypted files. Nothing was changed. Try again.",
+        offerReplace: false,
+      };
+    case "needs-confirmation":
+      return {
+        message:
+          "This vault has no encrypted files to check the code against, and this device already has a working encryption key. Replacing it with a different key can't be undone. Continue only if you're sure this is the right code for this vault.",
+        offerReplace: true,
+      };
+  }
 }
 
 /**
  * Restore a vault from a recovery code on a new machine. Accepts the
  * formatted code as written, plus messy paste artefacts (whitespace,
- * mixed case). Reports a generic "code not recognised" error on failure
- * to avoid leaking whether prefix/length/checksum was the wrong part.
+ * mixed case).
+ *
+ * A MALFORMED code still gets the deliberately generic "code not recognised"
+ * error, so nothing leaks about which of prefix/length/checksum was wrong.
+ * SD-05-F3 outcomes are different in kind and ARE distinguished: a well-formed
+ * code that does not open this vault's existing ciphertext (`key-mismatch`), a
+ * vault whose ciphertext could not be read (`validation-error`), and a healthy
+ * key that would be REPLACED with nothing to validate against
+ * (`needs-confirmation`, which offers an explicit "Replace key" button). Telling
+ * the user the truth there costs no secrecy — the code is the key — and hiding
+ * it is what let a wrong-device code silently create a mixed-key vault.
  */
 export class AtRestRestoreModal extends Modal {
   private onSubmit: AtRestRestoreModalOptions["onSubmit"];
@@ -254,35 +317,59 @@ export class AtRestRestoreModal extends Modal {
       .onClick(() => this.close());
 
     const submitBtn = new ButtonComponent(buttons);
+
+    // Set only by the explicit "Replace key" button, consumed by the very next
+    // submit and then cleared, so a confirmation can never leak into a later,
+    // different code entry.
+    let confirmReplace = false;
+    let replaceBtn: ButtonComponent | null = null;
+
+    const submit = async (): Promise<void> => {
+      const code = textarea.value.trim();
+      if (!code) {
+        status.setText("Enter a recovery code to continue.");
+        return;
+      }
+      const confirming = confirmReplace;
+      submitBtn.setButtonText("Verifying your encrypted files…").setDisabled(true);
+      status.setText("");
+      try {
+        const result = await this.onSubmit(code, confirming ? { confirmReplace: true } : undefined);
+        if (!result.ok) {
+          const copy = describeAtRestRestoreOutcome(result);
+          status.setText(copy.message);
+          submitBtn.setButtonText("Restore").setDisabled(false);
+          // Any outcome other than a fresh needs-confirmation drops the flag.
+          confirmReplace = false;
+          if (copy.offerReplace && replaceBtn === null) {
+            replaceBtn = new ButtonComponent(buttons);
+            replaceBtn
+              .setButtonText("Replace key")
+              .setWarning()
+              .onClick(() => {
+                confirmReplace = true;
+                void submit();
+              });
+          }
+          return;
+        }
+        this.restored = true;
+        new Notice("VaultGuard at-rest key restored.", 5000);
+        this.close();
+      } catch (err) {
+        confirmReplace = false;
+        status.setText(
+          `Restore failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        submitBtn.setButtonText("Restore").setDisabled(false);
+      }
+    };
+
     submitBtn
       .setButtonText("Restore")
       .setCta()
-      .onClick(async () => {
-        const code = textarea.value.trim();
-        if (!code) {
-          status.setText("Enter a recovery code to continue.");
-          return;
-        }
-        submitBtn.setButtonText("Restoring…").setDisabled(true);
-        status.setText("");
-        try {
-          const ok = await this.onSubmit(code);
-          if (!ok) {
-            status.setText(
-              "That code isn't recognised. Check for typos — recovery codes start with VG1- and contain hex characters in groups of four."
-            );
-            submitBtn.setButtonText("Restore").setDisabled(false);
-            return;
-          }
-          this.restored = true;
-          new Notice("VaultGuard at-rest key restored.", 5000);
-          this.close();
-        } catch (err) {
-          status.setText(
-            `Restore failed: ${err instanceof Error ? err.message : String(err)}`
-          );
-          submitBtn.setButtonText("Restore").setDisabled(false);
-        }
+      .onClick(() => {
+        void submit();
       });
   }
 

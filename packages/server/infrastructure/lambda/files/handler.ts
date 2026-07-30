@@ -1838,6 +1838,100 @@ async function handleIssueDirectDownload(
   }, requestId);
 }
 
+// ─── Mutation Intent Mode (SD-06-F1) ─────────────────────────────────────────
+
+/**
+ * How strictly the server treats a write that does NOT declare a mutation
+ * intent (none of `expectedVersionId`, `mustBeAbsent`, `force`).
+ *
+ * - `off` — no telemetry, no enforcement.
+ * - `observe` — **the default.** Emits one `[MUTATION_INTENT_TELEMETRY]` line
+ *   per intent-less AUTHORIZED write and changes nothing else: not the status,
+ *   not the body, not a header.
+ * - `enforce` — rejects intent-less writes with 428 Precondition Required.
+ *
+ * The mode gates the INTENT-LESS legacy lane ONLY. A DECLARED intent is always
+ * honored — in `off`, in `observe` and in `enforce` alike.
+ */
+export type MutationIntentMode = 'off' | 'observe' | 'enforce';
+
+/**
+ * Which mutation intent a write declared. Resolved exactly once, in
+ * `handleWriteFile`, before any S3 work.
+ *
+ * `legacy` means the caller declared nothing — today's every-fielded-client
+ * lane, and the only lane the mode switch touches.
+ */
+type WriteIntent = 'expect-version' | 'must-be-absent' | 'force' | 'legacy';
+
+/**
+ * Resolves the mutation-intent mode from `MUTATION_INTENT_MODE`.
+ *
+ * **Scope ceiling — binding.** The default is `observe`, and observe never
+ * rejects, so with no configuration change every intent-less write stays
+ * byte-identical to today's. `enforce` is fully built and fully tested but
+ * DORMANT: **no Terraform in this phase sets this variable** —
+ * `grep -rn "MUTATION_INTENT_MODE" terraform/` being EMPTY is a recorded
+ * verification gate for phase 16 (the 15-02 precedent). Flipping it is an
+ * operator decision made against real adoption telemetry: no fielded plugin
+ * declares an intent today (the body fields did not exist before this change),
+ * so a premature flip would 428 every deployed client's writes until a plugin
+ * release caught up — the 2026-07-11 production-incident class, where an audit
+ * finding's wrong premise, applied confidently, took production down.
+ *
+ * **The env var is read live on every call — deliberately NOT captured in a
+ * module-level const** like this file's other env constants, for two reasons:
+ *   1. module-level constants resolve at Lambda cold start, which would make
+ *      the mode untestable without module resets; and
+ *   2. it would make the operator's flip take effect only after a cold start
+ *      rather than on the very next invocation.
+ * The cost is one `process.env` read per write request — free next to the
+ * DynamoDB and S3 round trips already on that path.
+ *
+ * **Why this lives here and not in `shared/utils.ts`** beside its 15-02 sibling
+ * `getSessionEnforcementMode`: every `tests/files-*.test.ts` harness stubs
+ * `../infrastructure/lambda/shared/utils` WHOLESALE with an enumerated export
+ * list, so a new import from that module would break those harnesses at import
+ * time. The session helper is shared because two shared entry points consume
+ * it; this one has exactly ONE consumer (`handleWriteFile`). Exported only so
+ * `tests/files-write-intent-mode.test.ts` can pin it directly.
+ */
+export function getMutationIntentMode(): MutationIntentMode {
+  const raw = (process.env.MUTATION_INTENT_MODE || '').trim().toLowerCase();
+  if (raw === 'off' || raw === 'observe' || raw === 'enforce') {
+    return raw;
+  }
+  return 'observe';
+}
+
+/**
+ * SD-06-F1 observe-mode telemetry: ONE line per intent-less authorized write,
+ * so the unknown lane can be measured before anyone considers the enforce flip.
+ *
+ * The payload is fixed at five non-secret fields. It must **never** carry the
+ * concrete file path, the org id, the vault id, the email, a content hash or
+ * any token: CloudWatch retention turns a convenience field into an
+ * information-disclosure surface (SD-14 posture). `resource` is the API-Gateway
+ * resource TEMPLATE (`/vaults/{vaultId}/files/{filePath+}`), never the concrete
+ * path. The exact key set is pinned by `tests/files-write-intent-mode.test.ts`
+ * so that adding a sixth field is a deliberate act, not a drive-by.
+ *
+ * Kept a named function rather than an inline `console.warn` so the key set has
+ * exactly one home and the tests have one thing to pin.
+ */
+export function emitMutationIntentTelemetry(
+  event: APIGatewayProxyEvent,
+  user: UserContext
+): void {
+  console.warn('[MUTATION_INTENT_TELEMETRY]', {
+    resource: event.resource || event.path || '',
+    method: event.httpMethod,
+    userId: user.userId,
+    hasIntent: false,
+    userAgent: getUserAgent(event),
+  });
+}
+
 // ─── PUT /vaults/{vaultId}/files/{path} ─────────────────────────────────────
 
 /**
@@ -1847,7 +1941,14 @@ async function handleIssueDirectDownload(
  * Request body:
  * - content: Base64-encoded file content
  * - contentType: MIME type (optional, defaults to 'text/markdown')
- * - expectedVersionId: For optimistic locking (optional)
+ * - expectedVersionId: For optimistic locking (optional). A string, or
+ *   `null`/omitted for "no version". Any other type is a 400.
+ * - mustBeAbsent: `true` when the client believes the path is unused — the PUT
+ *   carries `IfNoneMatch: '*'` and a racing create gets a 409 (SD-06-F1)
+ * - force: `true` for a deliberate unconditional overwrite (today's behaviour,
+ *   now declared rather than inferred from an omission)
+ *
+ * At most ONE of `expectedVersionId` / `mustBeAbsent` / `force` may appear.
  *
  * @param event - API Gateway event with path parameter and file content in body
  * @param user - Authenticated user context
@@ -1879,7 +1980,96 @@ async function handleWriteFile(
 
   const content = (body.content as string | undefined) ?? '';
   const contentType = (body.contentType as string) || 'text/markdown';
-  const expectedVersionId = body.expectedVersionId as string | undefined;
+  const rawExpectedVersionId = body.expectedVersionId;
+  const expectedVersionId = typeof rawExpectedVersionId === 'string'
+    ? rawExpectedVersionId
+    : undefined;
+
+  // ── SD-06-F1: declared mutation intent ────────────────────────────────────
+  //
+  // The caller may declare exactly ONE of `expectedVersionId`, `mustBeAbsent`
+  // or `force`. The union is resolved once, here, before any S3 work, so every
+  // lane below reads a single `writeIntent` value instead of re-deriving the
+  // caller's meaning from an omission — today a deliberate force-overwrite and
+  // a blind create are indistinguishable on the wire, which is the whole reason
+  // a racing create can silently win.
+  //
+  // These 400s are reached BEFORE the permission check. That is deliberate and
+  // safe: every one of them describes the caller's OWN request body and
+  // discloses nothing about the vault, the path, or whether the object exists.
+  // Rejecting a malformed body cheaply also keeps a garbage request off the
+  // DynamoDB permission path entirely.
+
+  // DECISION 2 — `expectedVersionId` had NO validation in this handler while
+  // the direct/large lane validated it. The length / CR-LF rules below are that
+  // lane's verbatim. Fielded clients send real S3 version ids; the only
+  // behaviour change for them is that garbage input moves from 409 to 400.
+  //
+  // The TYPE rule is deliberately STRICTER than the direct lane's
+  // treat-a-non-string-as-absent cast:
+  //   undefined / null → field-absent (JSON clients legitimately serialize
+  //                      `null` to mean "no version I know of")
+  //   string           → validated below, non-empty enters the expect-version lane
+  //   anything else    → 400
+  // The direct lane's cast would silently turn a truthy non-string (a number, a
+  // stray object) into an UNCONDITIONAL write. Pre-fix such a value was truthy,
+  // entered the guarded lane and generally 409'd — so treating it as absent
+  // would be a guard LOOSENING on a malformed input, and this handler must
+  // never resolve ambiguity in favour of overwriting. It is also the same
+  // strictness `mustBeAbsent` / `force` get: a wrong type is a client bug, and
+  // a client bug must be loud, not silently downgraded.
+  if (
+    rawExpectedVersionId !== undefined &&
+    rawExpectedVersionId !== null &&
+    typeof rawExpectedVersionId !== 'string'
+  ) {
+    return formatError(400, 'expectedVersionId is invalid', requestId);
+  }
+  if (expectedVersionId && (expectedVersionId.length > 1024 || /[\r\n]/.test(expectedVersionId))) {
+    return formatError(400, 'expectedVersionId is invalid', requestId);
+  }
+
+  // DECISION 1 — a field is "declared" ONLY when its value is the boolean
+  // literal `true`. Literal `false` is treated as field-absent: a harmless
+  // no-op, because an older or generated client may serialize its defaults.
+  // Anything else ("yes", 1, null, {}) is a 400 naming the field, so a
+  // client bug can never be silently downgraded into an unguarded write.
+  const rawMustBeAbsent = body.mustBeAbsent;
+  const rawForce = body.force;
+  if (rawMustBeAbsent !== undefined && typeof rawMustBeAbsent !== 'boolean') {
+    return formatError(400, 'mustBeAbsent must be a boolean', requestId);
+  }
+  if (rawForce !== undefined && typeof rawForce !== 'boolean') {
+    return formatError(400, 'force must be a boolean', requestId);
+  }
+  const mustBeAbsent = rawMustBeAbsent === true;
+  const force = rawForce === true;
+
+  // DECISION 1 — two intents in one body is a contradiction, not a precedence
+  // puzzle. Reject rather than pick a winner: whichever we picked would be a
+  // guess about which one the client meant, and guessing is how ambiguity turns
+  // into data loss.
+  const declaredIntents = [
+    expectedVersionId ? 'expectedVersionId' : '',
+    mustBeAbsent ? 'mustBeAbsent' : '',
+    force ? 'force' : '',
+  ].filter((name) => name !== '');
+  if (declaredIntents.length > 1) {
+    return formatError(
+      400,
+      `Conflicting mutation intents (${declaredIntents.join(' + ')}): declare at most one of ` +
+        'expectedVersionId, mustBeAbsent or force',
+      requestId
+    );
+  }
+
+  const writeIntent: WriteIntent = expectedVersionId
+    ? 'expect-version'
+    : mustBeAbsent
+      ? 'must-be-absent'
+      : force
+        ? 'force'
+        : 'legacy';
 
   // Decode content to check size
   const contentBuffer = Buffer.from(content, 'base64');
@@ -1916,10 +2106,47 @@ async function handleWriteFile(
     return formatError(403, 'Access denied: insufficient permissions to write this file', requestId);
   }
 
+  // ── SD-06-F1 mode switch — the INTENT-LESS legacy lane, and nothing else ──
+  //
+  // DECISION 3, placement. This sits immediately AFTER the permission check and
+  // BEFORE any S3 work, deliberately: observe-mode telemetry then counts only
+  // AUTHORIZED intent-less writes. An unauthorized caller was already 403'd
+  // above and never reaches this line, so the adoption numbers the operator
+  // will read before considering the flip measure real client behaviour rather
+  // than denied noise. (The 15-02 placement-honesty note, mirrored.)
+  //
+  // A DECLARED intent is honored in EVERY mode — including `off`. The mode
+  // gates nothing but this legacy lane; the intent lanes below sit outside it
+  // on purpose, so turning telemetry off can never turn a guard off.
+  if (writeIntent === 'legacy') {
+    const intentMode = getMutationIntentMode();
+    if (intentMode === 'enforce') {
+      // DORMANT branch. Reachable only through MUTATION_INTENT_MODE, which no
+      // Terraform in phase 16 sets. 428 and not 409: fielded clients
+      // string-match /conflict|409/i into their blocked/conflict machinery and
+      // would misroute a 409 into a state they never retry out of. Not 400
+      // either: that conflates with malformed requests in every dashboard.
+      return formatError(
+        428,
+        'Precondition required: this write must declare a mutation intent ' +
+          '(expectedVersionId, mustBeAbsent, or force)',
+        requestId
+      );
+    }
+    if (intentMode === 'observe') {
+      emitMutationIntentTelemetry(event, user);
+    }
+    // 'off' — silent, and byte-identical to today's behaviour.
+  }
+
   // Optimistic locking: check current version if expectedVersionId is provided.
   // The matching ETag is sent as IfMatch on the PUT to close the HEAD->PUT race.
+  //
+  // SD-06-F1: the guard is now the RESOLVED lane rather than the bare presence
+  // of `expectedVersionId`, so it is unmistakable that `must-be-absent` and
+  // `force` skip this HEAD entirely. Nothing inside the block changed.
   let currentEtag: string | undefined;
-  if (expectedVersionId) {
+  if (writeIntent === 'expect-version') {
     try {
       const headResponse = await s3Client.send(
         new HeadObjectCommand({
@@ -1962,6 +2189,25 @@ async function handleWriteFile(
   // cross-DEK restore endpoint can match noncurrent versions back to their DEK.
   const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
 
+  // SD-06-F1 (DECISION 5) — the S3 precondition, resolved per lane:
+  //   expect-version  → IfMatch (unchanged; the HEAD above already 409s when
+  //                     the ETag is missing, so it is non-empty here)
+  //   must-be-absent  → IfNoneMatch: '*' — and NO pre-HEAD. The condition is
+  //                     the authority either way; a HEAD would buy nothing but
+  //                     a nicer error message at the cost of a round trip on
+  //                     every create.
+  //   force / legacy  → unconditional. `force` says so explicitly; `legacy` is
+  //                     exactly today's behaviour, preserved.
+  // This is deliberately the same shape as the already-deployed direct/large
+  // lane's finalize CopyObject (`current?.ETag ? IfMatch : IfNoneMatch: '*'`),
+  // so a future reader sees one pattern for absence-safety, not two.
+  const writeCondition: { IfMatch?: string; IfNoneMatch?: string } =
+    writeIntent === 'expect-version' && currentEtag
+      ? { IfMatch: currentEtag }
+      : writeIntent === 'must-be-absent'
+        ? { IfNoneMatch: '*' }
+        : {};
+
   // Write to S3
   let putResponse;
   try {
@@ -1976,7 +2222,7 @@ async function handleWriteFile(
           'modified-at': new Date().toISOString(),
           ...(activeKeyId ? { 'vaultguard-key-id': activeKeyId } : {}),
         },
-        ...(expectedVersionId && currentEtag ? { IfMatch: currentEtag } : {}),
+        ...writeCondition,
       })
     );
   } catch (err: unknown) {
@@ -1985,6 +2231,23 @@ async function handleWriteFile(
       return formatError(
         409,
         'Conflict: file has been modified or deleted since your write began',
+        requestId
+      );
+    }
+    // SD-06-F1 — the create lane gets its OWN branch, not a widened version of
+    // the update lane's. Its error-name set differs (`ConditionalRequestConflict`
+    // is what S3 returns when two conditional writes race) and its message
+    // differs on purpose: clients do not need the distinction, but humans
+    // reading an audit trail do. `NotFound` is deliberately NOT mapped here —
+    // a NotFound on an `IfNoneMatch: '*'` create means something else is wrong,
+    // and flattening it into a 409 would hide a real fault.
+    if (
+      writeIntent === 'must-be-absent' &&
+      (name === 'PreconditionFailed' || name === 'ConditionalRequestConflict')
+    ) {
+      return formatError(
+        409,
+        'Conflict: this file was created on another device before your create completed',
         requestId
       );
     }
@@ -2002,10 +2265,23 @@ async function handleWriteFile(
   // best-effort: we treat the absence of an `expectedVersionId` as a hint
   // that the client believes the file is new. Receivers don't differentiate
   // anyway — both apply via download.
+  //
+  // SD-06-F1 (DECISION 6): for a DECLARED intent it is no longer a hint. A
+  // `must-be-absent` write that reached this line provably CREATED the object
+  // (`IfNoneMatch: '*'` succeeded, so nothing was there); `expect-version` and
+  // `force` provably replaced one. Only the intent-less legacy lane keeps the
+  // old heuristic, unchanged.
+  const activityAction =
+    writeIntent === 'must-be-absent'
+      ? 'created'
+      : writeIntent === 'expect-version' || writeIntent === 'force'
+        ? 'modified'
+        : expectedVersionId ? 'modified' : 'created';
+
   await recordVaultActivity({
     orgId: user.orgId,
     vaultId: vault.vaultId,
-    action: expectedVersionId ? 'modified' : 'created',
+    action: activityAction,
     path: '/' + filePath,
     actorUserId: user.userId,
   });

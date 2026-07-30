@@ -10,6 +10,7 @@ import {
   Notice,
   Platform,
   PluginSettingTab,
+  SearchComponent,
   SecretComponent,
   Setting,
   SettingGroup,
@@ -54,7 +55,6 @@ import {
   getCodexAuthStatus,
   type CodexAuthStatus,
 } from "../ui/chat/codex-cli/codex-detector";
-import { LOCAL_PROJECT_MEMORY_MODE_NOTICE } from "./local-project-memory-mode";
 import type {
   UserListEntry,
   VaultKind,
@@ -259,10 +259,48 @@ interface ChatGptConnectorReveal {
   copiedToClipboard: boolean;
 }
 
+/**
+ * Every top-level section is a disclosure. The ones a user meets first default
+ * to OPEN so the tab looks unchanged on arrival — the point is that they can now
+ * be collapsed, not that they start collapsed. The rare, heavy, or destructive
+ * ones default to CLOSED.
+ */
 type SettingsCollapsibleSectionId =
+  // default open
+  | "protection"
+  | "connection"
+  | "account"
+  | "vault"
+  | "synchronization"
+  | "access-unlock"
+  | "display"
+  | "capabilities"
+  // default closed
   | "manage-vaults-members"
+  | "encryption-maintenance"
   | "advanced"
-  | "ai-automation";
+  | "ai-automation"
+  | "danger-zone";
+
+/** Sections that start expanded. Everything else starts collapsed. */
+const DEFAULT_OPEN_SECTIONS: readonly SettingsCollapsibleSectionId[] = [
+  "protection",
+  "connection",
+  "account",
+  "vault",
+  "synchronization",
+  "access-unlock",
+  "display",
+  "capabilities",
+];
+
+/** Marks the tab while a search is active, so non-`Setting` blocks (lead copy,
+ *  notes, status panels) can drop out of a result list via CSS alone. */
+const FILTERING_CLS = "vaultguard-settings-filtering";
+/** Applied to rows, headings and disclosures filtered out by the search. */
+const FILTER_HIDDEN_CLS = "vaultguard-settings-filter-hidden";
+/** Wrapper for the search control itself — never filtered. */
+const SEARCH_CLS = "vaultguard-settings-search";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings Tab
@@ -282,9 +320,21 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   private openAiKeyStore: OpenAiKeyStore | null = null;
   private codexStatusAbort: AbortController | null = null;
   private codexModelAbort: AbortController | null = null;
+  private latestVaultOrientationSnapshot: VaultOrientationSnapshot | null = null;
+  private vaultOrientationRequestGeneration = 0;
   private readonly openCollapsibleSectionIds = new Set<SettingsCollapsibleSectionId>();
+  /** Sections rendered at least once this session. Distinguishes "never shown,
+   *  so apply its default" from "shown and currently closed by the user". */
+  private readonly collapsibleSectionSeenIds = new Set<SettingsCollapsibleSectionId>();
   private collapsibleSectionSessionActive = false;
   private collapsibleSectionStateEpoch = 0;
+  /** Current search text. Survives `display()` re-renders so a filtered view is
+   *  not thrown away when a toggle triggers a re-render. Cleared by `hide()`. */
+  private settingsFilterQuery = "";
+  /** Set while the filter opens disclosures programmatically. Without it the
+   *  native `toggle` listener would record those forced opens as user intent and
+   *  permanently mark every section as open once someone searched. */
+  private suppressCollapsibleTracking = false;
 
   constructor(app: App, plugin: VaultGuardPlugin) {
     super(app, plugin);
@@ -408,9 +458,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     this.codexStatusAbort = null;
     this.codexModelAbort?.abort();
     this.codexModelAbort = null;
+    this.vaultOrientationRequestGeneration += 1;
+    this.latestVaultOrientationSnapshot = null;
     this.openCollapsibleSectionIds.clear();
+    this.collapsibleSectionSeenIds.clear();
     this.collapsibleSectionSessionActive = false;
     this.collapsibleSectionStateEpoch += 1;
+    // Reopening Settings should start from the configured defaults, not from
+    // whatever someone last typed into the search box.
+    this.settingsFilterQuery = "";
     super.hide();
   }
 
@@ -505,7 +561,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     window.setTimeout(() => el.remove(), 6000);
   }
 
-  private renderOptionalModulesSection(containerEl: HTMLElement): void {
+  /** `nested` suppresses the section's own heading when an enclosing disclosure
+   *  already shows the same label. */
+  private renderOptionalModulesSection(containerEl: HTMLElement, nested = false): void {
     const modules = [
       {
         id: "aiChat" as const,
@@ -575,8 +633,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       requireApiVersion("1.11.0") &&
       typeof SettingGroup === "function"
     ) {
+      // Empty heading detaches the group's header row. The enclosing disclosure
+      // already carries this label, and repeating it directly beneath the
+      // summary reads as a rendering bug.
       const group = new SettingGroup(containerEl).setHeading(
-        this.i18n.t("settings.modules.heading"),
+        nested ? "" : this.i18n.t("settings.modules.heading"),
       );
       for (const module of modules) {
         group.addSetting((setting) => configure(setting, module));
@@ -584,9 +645,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       return;
     }
 
-    new Setting(containerEl)
-      .setName(this.i18n.t("settings.modules.heading"))
-      .setHeading();
+    if (!nested) {
+      new Setting(containerEl)
+        .setName(this.i18n.t("settings.modules.heading"))
+        .setHeading();
+    }
     for (const module of modules) {
       configure(new Setting(containerEl), module);
     }
@@ -785,12 +848,312 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
   }
 
-  private renderLocalProjectMemoryModeSection(containerEl: HTMLElement): void {
+  /**
+   * The deduped union of this device's `excludedPaths` and the admin-pushed
+   * `serverExcludedPaths`. Mirrors what `isPathExcluded` actually matches
+   * against (`main.ts:8105` iterates `[...server, ...local]`), so the summary
+   * count can never disagree with the runtime matcher.
+   *
+   * Normalization matches the matcher's: trim, strip leading and trailing
+   * slashes. Without it "Archive" and "Archive/" would count twice while
+   * behaving as one rule.
+   */
+  /**
+   * Standalone explanatory paragraph in the settings tab.
+   *
+   * Obsidian's `.setting-item-description` is a caption style for one line of
+   * text INSIDE a setting row — `--font-ui-smaller` (12px), tight line height,
+   * `overflow: hidden` + `text-overflow: ellipsis`. Every standalone `<p>` in
+   * this tab used it, so body copy rendered two steps smaller than the heading
+   * above it with clipped descenders. Use this helper instead; `"lead"` is for
+   * the paragraph directly under the tab title.
+   */
+  private renderSettingsNote(
+    parent: HTMLElement,
+    text: string,
+    variant: "lead" | "note" = "note",
+  ): HTMLElement {
+    return parent.createEl("p", {
+      text,
+      cls: `vaultguard-settings-${variant}`,
+    });
+  }
+
+  private effectiveExcludedPaths(): {
+    local: string[];
+    server: string[];
+    union: string[];
+  } {
+    const normalize = (raw: string): string =>
+      raw.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+    const local = (this.plugin.settings.excludedPaths ?? [])
+      .map(normalize)
+      .filter((entry) => entry.length > 0);
+    const server = (this.plugin.settings.serverExcludedPaths ?? [])
+      .map(normalize)
+      .filter((entry) => entry.length > 0);
+    return { local, server, union: [...new Set([...server, ...local])] };
+  }
+
+  /** Entries a user probably expects to glob but which match literally. */
+  private wildcardExcludedPathEntries(entries: string[]): string[] {
+    return entries.filter((entry) => entry.includes("*") || entry.includes("?"));
+  }
+
+  /**
+   * "Protection scope" — the single place that answers *what does VaultGuard do
+   * with this path?* at every scope, narrowest first.
+   *
+   * This section deliberately collects controls that used to live three places
+   * apart: the whole-vault plaintext toggle (previously an unlabelled pair at
+   * the very top of the tab), the excluded-path list (previously under
+   * Synchronization, which understated that exclusion also disables at-rest
+   * encryption), and the at-rest status (previously visible only inside the
+   * Advanced collapsible). The full at-rest panel stays in Advanced — only its
+   * status surfaces here.
+   *
+   * Ordering is deliberate: the narrow, reversible tool comes first and the
+   * whole-vault escalation comes last. The old layout inverted that and, worse,
+   * *hid* the exclusion list whenever the whole-vault mode was on — so the user
+   * who only wanted to exempt one folder lost the control that would have done
+   * it. Nothing here is hidden by the mode any more; controls that the mode
+   * makes redundant render disabled with a reason.
+   */
+  private renderProtectionScopeSection(containerEl: HTMLElement): void {
     const enabled = this.plugin.isLocalProjectMemoryModeEnabled();
 
+    // Deliberately NOT SettingGroup (unlike renderOptionalModulesSection):
+    // SettingGroup only accepts Setting rows via addSetting(), with no seam for
+    // the read-only summary paragraph or the at-rest status badge this section
+    // leads with. A `<details>` takes arbitrary content and, unlike the plain
+    // setHeading() this used to be, can actually be collapsed — which every
+    // top-level section in this tab now can.
+    this.renderCollapsibleSection(containerEl, "protection", "Protection", (body) =>
+      this.renderProtectionScopeBody(body, enabled),
+    );
+  }
+
+  private renderProtectionScopeBody(containerEl: HTMLElement, enabled: boolean): void {
+    // Lead with what protection MEANS before any control to configure it. This
+    // is the first copy in the tab, and for most users the only sentence they
+    // need: their files on this disk are ciphertext.
+    this.renderSettingsNote(containerEl, this.atRestExplanation());
+    this.renderProtectionScopeSummary(containerEl, enabled);
+    this.renderExcludedPathsSetting(containerEl, enabled);
+    this.renderServerExcludedPathsSetting(containerEl);
+    this.renderAlwaysExcludedSetting(containerEl);
+    this.renderPurgeExcludedPathsSetting(containerEl, enabled);
+    this.renderPlaintextVaultModeSetting(containerEl, enabled);
+    // Promoted out of the collapsed Advanced disclosure — see
+    // `renderRecoveryCodeSetting`. It belongs with the at-rest status badge this
+    // section already leads with: the badge says the files are encrypted, and
+    // this is what lets you read them again if this device is lost.
+    this.renderRecoveryCodeSetting(containerEl);
+
+    // The at-rest maintenance actions used to live in Advanced, which split one
+    // concept across two sections at two depths: the exclusion rules that decide
+    // WHAT is encrypted sat here, while the controls that encrypt, decrypt and
+    // rebuild it sat behind a different disclosure — and both rendered their own
+    // copy of the status badge. They are the same layer, so they are one section
+    // now. The actions stay collapsed because they are rare and two of them are
+    // destructive; the STATUS above is always visible.
+    this.renderCollapsibleSection(
+      containerEl,
+      "encryption-maintenance",
+      "Encryption maintenance",
+      (body) => this.renderAtRestSection(body),
+    );
+  }
+
+  /**
+   * Read-only "where do I stand" line plus the at-rest status badge. The count
+   * comes from the same union the runtime matcher uses, so a user can reconcile
+   * this number against behaviour.
+   */
+  private renderProtectionScopeSummary(containerEl: HTMLElement, localMode: boolean): void {
+    const { union } = this.effectiveExcludedPaths();
+    const summary = localMode
+      ? "Every file in this vault is plaintext on disk and local-only. Cloud sync, sharing, and organization permissions are off."
+      : union.length === 0
+        ? "Encrypted on disk and synced: every file in this vault, apart from the always-excluded paths listed below."
+        : `Encrypted on disk and synced: every file in this vault, apart from ${union.length} excluded path${
+            union.length === 1 ? "" : "s"
+          } and the always-excluded paths listed below.`;
+
+    this.renderSettingsNote(containerEl, summary);
+
+    // The badge is only informative while at-rest encryption is in play. In
+    // plaintext local-only mode getAtRestStatus() returns kind:"disabled" and
+    // the badge would just restate the summary line above — using the mode's
+    // internal wording, which no longer matches the label shown here.
+    //
+    // This is now the ONLY badge in the tab. The at-rest panel used to render a
+    // second copy of it; that panel is nested inside this section's own
+    // "Encryption maintenance" disclosure, so showing it again there would just
+    // repeat what is already on screen a few rows above.
+    if (!localMode) {
+      this.renderAtRestStatusBadge(containerEl, this.plugin.getAtRestStatus());
+    }
+    // The file counts back the badge with something reconcilable against
+    // observed behaviour, so they belong together.
+    this.renderAtRestTally(containerEl, localMode);
+  }
+
+  /**
+   * The local exclusion list. The description states BOTH effects on purpose:
+   * `isAtRestExcluded()` is `configDir ∪ .trash ∪ isPathExcluded()`
+   * (at-rest-adapter-runtime.ts), so adding a path here silently opts it out of
+   * at-rest encryption as well as sync. The previous copy mentioned only the
+   * server half, which made "exclude it to save bandwidth" quietly mean "and
+   * leave it readable in Finder".
+   */
+  private renderExcludedPathsSetting(containerEl: HTMLElement, localMode: boolean): void {
+    const configDir = this.app.vault.configDir;
+    const configWorkspacePath = `${configDir}/workspace.json`;
+    const configPluginsPath = `${configDir}/plugins`;
+
+    const setting = new Setting(containerEl)
+      .setName("Excluded paths (this device)")
+      .setDesc(
+        "One path per line. Matching files and folders are never uploaded, downloaded, or deleted on the server, " +
+        "AND are left unencrypted on disk — exclusion opts a path out of local at-rest encryption too. " +
+        `Use an exact path (e.g. ${configWorkspacePath}) or a folder prefix (e.g. ${configPluginsPath}); ` +
+        "wildcards are not supported. Applies to this device only. \".trash\" is always re-added."
+      );
+    setting.settingEl.addClass("vaultguard-excluded-paths-setting");
+
+    // Warning line lives outside the Setting so it can be re-rendered on every
+    // keystroke without rebuilding the textarea (which would lose the caret).
+    const warningEl = containerEl.createEl("p", {
+      cls: "vaultguard-settings-note vaultguard-excluded-paths-warning",
+    });
+    const refreshWarning = (entries: string[]): void => {
+      const wildcards = this.wildcardExcludedPathEntries(entries);
+      warningEl.setText(
+        wildcards.length === 0
+          ? ""
+          : `Matched literally, not as a pattern: ${wildcards.join(", ")}. ` +
+            "Replace each with the exact path or the folder prefix it should cover."
+      );
+      warningEl.toggleClass("vaultguard-excluded-paths-warning-active", wildcards.length > 0);
+    };
+    refreshWarning(this.plugin.settings.excludedPaths ?? []);
+
+    setting.addTextArea((textArea) => {
+      textArea.inputEl.rows = 6;
+      textArea.inputEl.addClass("vaultguard-mono-textarea");
+      textArea
+        .setPlaceholder(`${configWorkspacePath}\n${configPluginsPath}\n.trash`)
+        .setValue((this.plugin.settings.excludedPaths ?? []).join("\n"))
+        .setDisabled(localMode)
+        .onChange(async (value) => {
+          const entries = value
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0);
+          this.plugin.settings.excludedPaths = entries;
+          refreshWarning(entries);
+          await this.plugin.saveSettings();
+        });
+      return textArea;
+    });
+
+    if (localMode) {
+      this.appendLocalModeRedundantNote(setting);
+    }
+  }
+
+  /**
+   * Admin-pushed exclusions, cached from the vault record. Read-only here by
+   * design — a member cannot override them — but previously invisible, which
+   * made the effective list impossible to reconcile with observed behaviour.
+   */
+  private renderServerExcludedPathsSetting(containerEl: HTMLElement): void {
+    const { server } = this.effectiveExcludedPaths();
+    if (server.length === 0) return;
+
     new Setting(containerEl)
-      .setName("Local Project Memory Mode")
-      .setDesc(LOCAL_PROJECT_MEMORY_MODE_NOTICE)
+      .setName("Excluded by your admin")
+      .setDesc(
+        `Set on the server vault and applied on top of your own list: ${server.join(", ")}. ` +
+        "These cannot be removed from this device."
+      );
+  }
+
+  private renderAlwaysExcludedSetting(containerEl: HTMLElement): void {
+    new Setting(containerEl)
+      .setName("Always excluded")
+      .setDesc(
+        `The "${this.app.vault.configDir}" folder and every vault-root entry whose name starts with a dot ` +
+        "(.git, .trash, and other plugins' sidecar folders) are always local-only and always plaintext. " +
+        "You do not need to list them."
+      );
+  }
+
+  private renderPurgeExcludedPathsSetting(containerEl: HTMLElement, localMode: boolean): void {
+    new Setting(containerEl)
+      .setName("Purge excluded paths from server")
+      .setDesc(
+        "Delete every server-side copy of files that match the excluded paths above. " +
+        "Useful after adding a new exclusion: without this, other members on other " +
+        "devices keep pulling the file down. This affects the shared server vault."
+      )
+      .addButton((button) => {
+        button
+          .setButtonText("Purge from server")
+          .setWarning()
+          .setDisabled(localMode)
+          .onClick(async () => {
+            const patterns = this.plugin.settings.excludedPaths ?? [];
+            if (patterns.length === 0) {
+              this.showStatus(containerEl, "No excluded paths configured.", true);
+              return;
+            }
+            const confirmed = await this.showDestructiveConfirmation(
+              containerEl,
+              "PURGE FROM SERVER",
+              "Delete every matching file from the shared server vault? " +
+                "Other members will lose these files on their next sync. " +
+                "Local copies on this device are kept.\n\n" +
+                `Patterns:\n${patterns.join("\n")}\n\n` +
+                "Type PURGE FROM SERVER to confirm."
+            );
+            if (!confirmed) return;
+            try {
+              button.setDisabled(true);
+              button.setButtonText("Purging…");
+              const result = await this.plugin.purgeExcludedFromServer();
+              const summary = `Matched ${result.matched}, deleted ${result.deleted}` +
+                (result.failed > 0 ? `, ${result.failed} failed` : "");
+              this.showStatus(containerEl, summary, result.failed > 0);
+            } catch (err) {
+              this.showStatus(
+                containerEl,
+                err instanceof Error ? err.message : "Purge failed.",
+                true
+              );
+            } finally {
+              button.setDisabled(false);
+              button.setButtonText("Purge from server");
+            }
+          });
+      });
+  }
+
+  /**
+   * The whole-vault escalation, last in the section. The stored setting key is
+   * still `localProjectMemoryMode` and the notice/error strings it triggers are
+   * unchanged — only the label a user reads is stated as the effect rather than
+   * the originating use case.
+   */
+  private renderPlaintextVaultModeSetting(containerEl: HTMLElement, enabled: boolean): void {
+    new Setting(containerEl)
+      .setName("Plaintext local-only vault")
+      .setDesc(
+        "For vaults that are a code repository. Keeps every file plaintext on disk and turns off cloud sync, " +
+        "sharing, and organization permissions for the whole vault. To exempt only some folders, " +
+        "use the excluded paths above instead."
+      )
       .addToggle((toggle) =>
         toggle
           .setValue(enabled)
@@ -812,10 +1175,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Automatically use this mode for Git repository vaults")
+    // Nested under the mode toggle it modifies. The scope that used to be
+    // buried mid-description ("global desktop preference") is now in the name,
+    // because this preference is NOT stored in the vault — it lives in the
+    // shared profile store and applies to every vault on this computer.
+    const autoEl = containerEl.createDiv({ cls: "vaultguard-protection-scope-nested" });
+    new Setting(autoEl)
+      .setName("Auto-enable in all Git repository vaults (this computer)")
       .setDesc(
-        "Global desktop preference for this Obsidian profile. On VaultGuard startup, a vault is activated only when .git exists at its root and the vault is plaintext, readable, unbound, and not locally opted out. Protected, encrypted, mobile, and uncertain vaults are skipped.",
+        "Applies to every vault opened in this Obsidian profile, not just this one. On VaultGuard startup, a vault is activated only when .git exists at its root and the vault is plaintext, readable, unbound, and not locally opted out. Protected, encrypted, mobile, and uncertain vaults are skipped.",
       )
       .addToggle((toggle) =>
         toggle
@@ -862,11 +1230,24 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     if (enabled) {
       containerEl.createEl("p", {
-        cls: "setting-item-description",
+        cls: "vaultguard-settings-note",
         text:
           "Use this mode for repo-root vaults. AGENTS.md, 00_Index.md, docs, reports, handoffs, source, package, config, test, script, Terraform, and infrastructure files stay plaintext for coding agents and normal Git tools.",
       });
     }
+  }
+
+  /**
+   * One-line reason attached to a control the plaintext local-only mode makes
+   * redundant. Disabled-with-a-reason instead of hidden: the old layout removed
+   * these controls entirely, which read as "this setting no longer exists"
+   * rather than "this setting has nothing left to do".
+   */
+  private appendLocalModeRedundantNote(setting: Setting): void {
+    setting.descEl.createDiv({
+      cls: "setting-item-description vaultguard-setting-disabled-reason",
+      text: "Every path is already local-only and plaintext in this mode.",
+    });
   }
 
   /**
@@ -1108,7 +1489,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       });
 
     // ── Custom instructions (appended to the system prompt; API-key mode) ────
-    new Setting(containerEl)
+    // Stacked full-width: a 4-row textarea in Obsidian's default side-by-side
+    // setting layout gets squeezed into the narrow right-hand control column,
+    // which is unusable for prose. Same treatment the excluded-paths textarea
+    // already had.
+    const customInstructionsSetting = new Setting(containerEl)
       .setName("Custom instructions")
       .setDesc(
         "Optional instructions appended to the assistant's system prompt (e.g. tone, formatting, " +
@@ -1117,7 +1502,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .addTextArea((ta) => {
         ta.setPlaceholder("e.g. Answer concisely. Prefer bullet points. Use British spelling.");
         ta.setValue(this.plugin.settings.aiChatSystemPrompt ?? "");
-        ta.inputEl.rows = 4;
+        ta.inputEl.rows = 5;
         ta.inputEl.addClass("vaultguard-chat-system-prompt-input");
         ta.onChange(async (value) => {
           const trimmed = value.trim();
@@ -1125,6 +1510,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
+    customInstructionsSetting.settingEl.addClass("vaultguard-stacked-textarea-setting");
 
     this.renderPromptTemplates(containerEl);
   }
@@ -1278,23 +1664,24 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("ChatGPT subscription transport")
       .setDesc(
-        "Uses your official Codex client login. VaultGuard does not request or store an OpenAI API key, " +
-          "and the Codex thread is ephemeral with VaultGuard as its only MCP tool surface.",
+        "Uses the Codex runtime included with the ChatGPT desktop app, or a standalone Codex CLI when available. " +
+          "VaultGuard launches a private app-server and never requests or stores an OpenAI API key.",
       );
 
     const modelSetting = new Setting(containerEl)
       .setName("Model")
       .setDesc(
-        "Models available to this ChatGPT login load from the official Codex client.",
+        "Visible models are discovered automatically from the signed-in ChatGPT account before VaultGuard starts a chat thread.",
       )
       .addDropdown((dropdown) => {
-        this.populateModelSelect(
-          dropdown.selectEl,
-          OPENAI_CHAT_MODELS,
-          this.plugin.settings.codexModel,
+        // OPENAI_CHAT_MODELS is an API-key fallback, not proof of this ChatGPT
+        // account's subscription entitlements. Do not render a model selector
+        // until the signed-in runtime's model/list result is available.
+        dropdown.selectEl.replaceChildren(
+          new Option("Discovering account models…", ""),
         );
+        dropdown.selectEl.disabled = true;
         dropdown
-          .setValue(this.plugin.settings.codexModel)
           .onChange(async (value) => {
             this.plugin.settings.codexModel = value;
             await this.plugin.saveSettings();
@@ -1302,7 +1689,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       });
     const modelStatus = modelSetting.descEl.createDiv({
       cls: "vaultguard-model-catalog-status",
-      text: "Loading models available to this ChatGPT login…",
+      text: "Discovering models from the signed-in Codex runtime…",
     });
     void this.refreshCodexModelSelect(
       modelSetting.controlEl.querySelector("select"),
@@ -1394,15 +1781,17 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         status = await getCodexAuthStatus(undefined, controller.signal);
       } catch {
         if (controller.signal.aborted) return;
-        statusEl.setText("Could not check the Codex login; using saved fallback choices.");
+        selectEl.replaceChildren(new Option("Account models unavailable", ""));
+        statusEl.setText("Could not check the Codex runtime; the saved selection remains unchanged.");
         return;
       }
       if (controller.signal.aborted) return;
       if (!status.loggedIn || !status.isChatGptSubscription || !status.binaryPath) {
+        selectEl.replaceChildren(new Option("Account models unavailable", ""));
         statusEl.setText(
           status.classification === "not-installed"
-            ? "Install the official Codex client to load subscription models."
-            : "Sign in to Codex with ChatGPT to load account models.",
+            ? "ChatGPT desktop runtime not available. Install or update the ChatGPT app to discover subscription models."
+            : "Sign in to the Codex runtime with ChatGPT to discover account models.",
         );
         return;
       }
@@ -1434,13 +1823,14 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         }
       }
       this.populateModelSelect(selectEl, catalog.options, catalog.selectedModel);
+      selectEl.disabled = catalog.source === "fallback";
       statusEl.setText(
         catalog.warning ??
           (catalog.source === "live"
             ? "Loaded from this signed-in ChatGPT account."
             : catalog.source === "cache"
-              ? "Loaded from a recent signed-in Codex result."
-              : "Using saved fallback choices until Codex model discovery is available."),
+              ? "Loaded from a recent signed-in Codex runtime result."
+              : "Showing only the saved selection until account model discovery is available."),
       );
     } finally {
       if (this.codexModelAbort === controller) this.codexModelAbort = null;
@@ -1536,7 +1926,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .addDropdown((dropdown) => {
         if (!onMobile) {
           dropdown.addOption("subscription", "Claude subscription (Claude Code CLI)");
-          dropdown.addOption("codex", "ChatGPT subscription (Codex CLI)");
+          dropdown.addOption("codex", "ChatGPT subscription (ChatGPT app)");
         }
         dropdown.addOption("apiKey", "Anthropic API key");
         dropdown.addOption("openai", "OpenAI API key / GPT");
@@ -1571,7 +1961,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         .setDesc("Checking…");
       if (onMobile) {
         statusSetting.setDesc(
-          "ChatGPT subscription mode launches the official Codex client and is desktop-only. " +
+          "ChatGPT subscription mode launches the Codex runtime and is desktop-only. " +
             "Use an API-key provider on mobile.",
         );
         return;
@@ -1722,7 +2112,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         break;
       case "not-logged-in":
         statusSetting.setDesc(
-          "Codex is installed but signed out. Sign in through the official client to use your ChatGPT subscription.",
+          "The Codex runtime is available but signed out. Sign in with ChatGPT to use your subscription.",
         );
         statusSetting.addButton((button) =>
           button
@@ -1733,7 +2123,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         break;
       case "not-installed":
         statusSetting.setDesc(
-          "Official Codex client not found. Install it from OpenAI, then reopen settings.",
+          "No usable Codex runtime was found. Install or update the ChatGPT desktop app, sign in, then reopen settings. A separately installed Codex CLI is also supported.",
         );
         break;
       case "unsupported":
@@ -1747,7 +2137,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private async runCodexLogin(statusSetting: Setting): Promise<void> {
-    statusSetting.setDesc("Opening the official Codex sign-in flow…");
+    statusSetting.setDesc("Opening the Codex sign-in flow…");
     try {
       await this.plugin.startCodexCliLogin();
     } catch (error) {
@@ -1781,12 +2171,25 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       cls: "vaultguard-settings-section",
     });
     details.dataset.vaultguardSettingsSection = sectionId;
+    // Seed the default the FIRST time a section is rendered in a Settings
+    // session, then defer to tracked state. Without the seen-set a default-open
+    // section would spring back open on every `display()` re-render, undoing a
+    // collapse the moment the user touched any toggle.
+    if (!this.collapsibleSectionSeenIds.has(sectionId)) {
+      this.collapsibleSectionSeenIds.add(sectionId);
+      if (DEFAULT_OPEN_SECTIONS.includes(sectionId)) {
+        this.openCollapsibleSectionIds.add(sectionId);
+      }
+    }
     details.open = this.openCollapsibleSectionIds.has(sectionId);
     const stateEpoch = this.collapsibleSectionStateEpoch;
     details.addEventListener("toggle", () => {
       // Ignore a delayed native toggle from DOM belonging to an already-closed
       // Settings session.
       if (stateEpoch !== this.collapsibleSectionStateEpoch) return;
+      // A search forces sections open so results are reachable. That is the
+      // filter's doing, not the user's, so it must not become sticky state.
+      if (this.suppressCollapsibleTracking) return;
       if (details.open) {
         this.openCollapsibleSectionIds.add(sectionId);
       } else {
@@ -1799,6 +2202,128 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     });
     const bodyEl = details.createDiv({ cls: "vaultguard-settings-section-body" });
     builder(bodyEl);
+  }
+
+  /**
+   * Search box pinned at the top of the tab.
+   *
+   * This tab renders 98 setting rows and more than half of them already sit
+   * behind a disclosure, so the dominant complaint is not density — it is that
+   * a setting cannot be found by name. Filtering reaches every row including
+   * the collapsed ones (see `applySettingsFilter`), which is also what makes
+   * collapsing safe: nothing becomes unreachable, it just stops being in the way.
+   *
+   * `SettingGroup.addSearch` renders a full-width search card; the guarded
+   * fallback is a plain `Setting` row, whose `addSearch` is long-standing API.
+   * The guard mirrors `renderOptionalModulesSection` — the community-review
+   * linter honours only a literal `requireApiVersion()`.
+   */
+  private renderSettingsSearch(containerEl: HTMLElement): void {
+    const configure = (search: SearchComponent): void => {
+      search
+        .setPlaceholder("Search settings…")
+        .setValue(this.settingsFilterQuery)
+        .onChange((value) => {
+          this.settingsFilterQuery = value;
+          this.applySettingsFilter(containerEl);
+        });
+    };
+
+    if (
+      typeof requireApiVersion === "function" &&
+      requireApiVersion("1.11.0") &&
+      typeof SettingGroup === "function"
+    ) {
+      new SettingGroup(containerEl).addClass("vaultguard-settings-search").addSearch(configure);
+      return;
+    }
+
+    new Setting(containerEl).setClass("vaultguard-settings-search").addSearch(configure);
+  }
+
+  /**
+   * Hides every row whose name/description does not contain the query, then
+   * hides any heading and any disclosure left with nothing under it.
+   *
+   * Class-only (no `.style` writes) per CLAUDE.md / Obsidian review. Matching
+   * rows inside a collapsed `<details>` force it open so results are visible;
+   * `suppressCollapsibleTracking` keeps those forced opens out of the user's
+   * remembered section state.
+   */
+  private applySettingsFilter(rootEl: HTMLElement): void {
+    const query = this.settingsFilterQuery.trim().toLowerCase();
+    const filtering = query.length > 0;
+    rootEl.toggleClass(FILTERING_CLS, filtering);
+
+    const isHiddenRow = (el: Element): boolean => el.classList.contains(FILTER_HIDDEN_CLS);
+    const liveRowIn = (scope: ParentNode): boolean =>
+      scope.querySelector(
+        `.setting-item:not(.setting-item-heading):not(.${FILTER_HIDDEN_CLS})`,
+      ) !== null;
+
+    // 1. Rows. The search box itself is a Setting/SettingGroup and must survive.
+    for (const item of Array.from(rootEl.querySelectorAll<HTMLElement>(".setting-item"))) {
+      if (item.closest(`.${SEARCH_CLS}`) || item.closest(".setting-group-search")) continue;
+      if (item.classList.contains("setting-item-heading")) continue;
+      const haystack = (item.textContent ?? "").toLowerCase();
+      item.toggleClass(FILTER_HIDDEN_CLS, filtering && !haystack.includes(query));
+    }
+
+    // 2. Headings. A heading survives when a row it OWNS survived.
+    //
+    //    Ownership is "nearest preceding heading in document order, within the
+    //    same disclosure scope" — not a walk over following siblings. Sibling
+    //    walking gets this wrong: a `<details>` that appears after a heading is
+    //    a section in its own right, so a match inside it would wrongly keep the
+    //    unrelated heading above it alive. Scoping by nearest ancestor
+    //    disclosure also keeps a section's own headings from claiming rows that
+    //    sit outside it (the Vault summary rows vs. the manage-vaults
+    //    disclosure below them).
+    const owningHeading = new Map<ParentNode, HTMLElement>();
+    const survivingHeadings = new Set<HTMLElement>();
+    for (const item of Array.from(rootEl.querySelectorAll<HTMLElement>(".setting-item"))) {
+      if (item.closest(`.${SEARCH_CLS}`) || item.closest(".setting-group-search")) continue;
+      const scope: ParentNode =
+        item.closest("details.vaultguard-settings-section") ?? rootEl;
+      if (item.classList.contains("setting-item-heading")) {
+        owningHeading.set(scope, item);
+        continue;
+      }
+      if (isHiddenRow(item)) continue;
+      const owner = owningHeading.get(scope);
+      if (owner) survivingHeadings.add(owner);
+    }
+    for (const heading of Array.from(
+      rootEl.querySelectorAll<HTMLElement>(".setting-item-heading"),
+    )) {
+      if (heading.closest(`.${SEARCH_CLS}`)) continue;
+      heading.toggleClass(FILTER_HIDDEN_CLS, filtering && !survivingHeadings.has(heading));
+    }
+
+    // 3. Disclosures. Force open around the tracking guard so a search can see
+    //    into Advanced / AI & automation / Manage vaults without the forced
+    //    state leaking into what the user chose to leave open.
+    this.suppressCollapsibleTracking = true;
+    try {
+      for (const details of Array.from(
+        rootEl.querySelectorAll<HTMLDetailsElement>(
+          "details.vaultguard-settings-section[data-vaultguard-settings-section]",
+        ),
+      )) {
+        const sectionId = details.dataset
+          .vaultguardSettingsSection as SettingsCollapsibleSectionId;
+        if (filtering) {
+          const hasHit = liveRowIn(details);
+          details.toggleClass(FILTER_HIDDEN_CLS, !hasHit);
+          details.open = hasHit;
+        } else {
+          details.removeClass(FILTER_HIDDEN_CLS);
+          details.open = this.openCollapsibleSectionIds.has(sectionId);
+        }
+      }
+    } finally {
+      this.suppressCollapsibleTracking = false;
+    }
   }
 
   /**
@@ -1895,24 +2420,79 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
   }
 
-  private renderAtRestSection(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Local at-rest encryption").setHeading();
-    const localProjectMemoryMode = this.plugin.isLocalProjectMemoryModeEnabled();
-    const atRestDesc = localProjectMemoryMode
-      ? "Disabled by Local Project Memory Mode. Files are kept plaintext for repo-root project memory, Git tools, and coding agents."
-      : Platform.isMobileApp
-        ? "Vault files on this device are encrypted on disk with a per-device key kept in this app's secure storage. Without VaultGuard Sync running, the files on disk are ciphertext — useful if your phone backs up app data to iCloud / Google Drive."
-        : "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard Sync running, opening files in Finder shows ciphertext.";
-    containerEl.createEl("p", {
-      text: atRestDesc,
-      cls: "setting-item-description",
-    });
-
+  /**
+   * "View recovery code" — deliberately rendered in Protection scope, NOT in the
+   * collapsed Advanced disclosure where it used to live alongside the at-rest
+   * maintenance actions.
+   *
+   * This code is the only thing that decrypts this device's files after a
+   * keychain reset, an OS reinstall, or a move to a new machine. Behind a
+   * collapsed section, a user could run for months without learning it exists
+   * and only discover it at the moment it is already too late to read it. It is
+   * a safety control, so it is never more than zero clicks from view; the
+   * destructive at-rest actions stay in Advanced.
+   *
+   * Rendered wherever it is called from — it recomputes its own preconditions
+   * rather than inheriting them, so there is no hidden coupling to the at-rest
+   * panel it was extracted from.
+   */
+  private renderRecoveryCodeSetting(containerEl: HTMLElement): void {
     const status = this.plugin.getAtRestStatus();
-    const panel = containerEl.createDiv({ cls: "vaultguard-at-rest-panel" });
-    this.renderAtRestStatusBadge(panel, status);
+    const session = this.plugin.getSession();
+    const canReauth = status.kind === "unlocked" && Boolean(session);
+    const reauthDisabledHint = !session
+      ? " Log in to your VaultGuard account to enable this action — re-authentication is required so a brief unattended-laptop moment can't expose your at-rest key."
+      : "";
 
-    const tallyEl = panel.createDiv({
+    const recoverySetting = new Setting(containerEl)
+      .setName("Recovery code")
+      .setDesc(
+        "Show the recovery code that lets you decrypt the files on this device after a keychain reset, OS reinstall, or move to a new machine. The code is unique to this device — every member, and every device per member, has its own. Requires re-entering your account password before display." +
+          reauthDisabledHint
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("View recovery code")
+          .setDisabled(!canReauth)
+          .onClick(() => {
+            new AtRestPasswordConfirmModal(this.app, {
+              title: "Confirm: reveal recovery code",
+              description:
+                "Anyone holding this code can decrypt every file on this device. Enter your account password to confirm before it's shown.",
+              onVerify: (pw) => this.plugin.verifyAccountPassword(pw),
+              onConfirmed: () => {
+                void (async () => {
+                  try {
+                    const code = await this.plugin.exportAtRestRecoveryCode();
+                    new AtRestRecoveryCodeModal(this.app, { code }).open();
+                  } catch (err) {
+                    this.showStatus(
+                      containerEl,
+                      `Could not export recovery code: ${(err as Error).message}`,
+                      true
+                    );
+                  }
+                })();
+              },
+            }).open();
+          })
+      );
+    recoverySetting.settingEl.addClass("vaultguard-at-rest-action");
+  }
+
+  /**
+   * "N encrypted, N plaintext, N excluded" — the reconcilable version of the
+   * status badge, rendered directly beneath it at the top of Protection.
+   *
+   * This used to live inside the at-rest panel in the collapsed Advanced
+   * section, which put the product's central claim ("your files are encrypted
+   * on this disk") two clicks from view and duplicated the badge alongside it.
+   * Status belongs where the user lands; only the maintenance ACTIONS are
+   * rare enough to collapse.
+   */
+  private renderAtRestTally(parent: HTMLElement, localProjectMemoryMode: boolean): void {
+    const status = this.plugin.getAtRestStatus();
+    const tallyEl = parent.createDiv({
       cls: "vaultguard-at-rest-tally setting-item-description",
     });
     tallyEl.setText("Counting files…");
@@ -1943,6 +2523,36 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         );
         tallyEl.addClass("vaultguard-at-rest-tally-error");
       });
+  }
+
+  /**
+   * At-rest MAINTENANCE actions: encrypt-all, decrypt-and-disable, guided reset,
+   * restore-from-code. Rendered inside the "Encryption maintenance" disclosure
+   * nested in Protection — not in Advanced, where it used to sit split away from
+   * the exclusion settings that govern the very same layer.
+   *
+   * The status badge and tally are deliberately NOT rendered here: Protection
+   * shows them once, above this disclosure.
+   */
+  /**
+   * Plain-language "what this actually does to my files" copy. Rendered at the
+   * top of Protection rather than beside the maintenance actions: it is the
+   * sentence that answers a new user's first question, so it must not be behind
+   * a disclosure.
+   */
+  private atRestExplanation(): string {
+    if (this.plugin.isLocalProjectMemoryModeEnabled()) {
+      return "Disabled by Local Project Memory Mode. Files are kept plaintext for repo-root project memory, Git tools, and coding agents.";
+    }
+    return Platform.isMobileApp
+      ? "Vault files on this device are encrypted on disk with a per-device key kept in this app's secure storage. Without VaultGuard Sync running, the files on disk are ciphertext — useful if your phone backs up app data to iCloud / Google Drive."
+      : "Vault files on this device are encrypted on disk with a key bound to your OS keychain (or, if unavailable, a per-device key). Without VaultGuard Sync running, opening files in Finder shows ciphertext.";
+  }
+
+  private renderAtRestSection(containerEl: HTMLElement): void {
+    const localProjectMemoryMode = this.plugin.isLocalProjectMemoryModeEnabled();
+    const status = this.plugin.getAtRestStatus();
+    const panel = containerEl.createDiv({ cls: "vaultguard-at-rest-panel" });
 
     const isUnlocked = status.kind === "unlocked";
     const needsRecovery = status.kind === "needs-recovery";
@@ -2043,41 +2653,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       });
     decryptSetting.settingEl.addClass("vaultguard-at-rest-action");
 
-    const recoverySetting = new Setting(panel)
-      .setName("Recovery code")
-      .setDesc(
-        "Show the recovery code that lets you decrypt the files on this device after a keychain reset, OS reinstall, or move to a new machine. The code is unique to this device — every member, and every device per member, has its own. Requires re-entering your account password before display." +
-          reauthDisabledHint
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("View recovery code")
-          .setDisabled(!canReauth)
-          .onClick(() => {
-            new AtRestPasswordConfirmModal(this.app, {
-              title: "Confirm: reveal recovery code",
-              description:
-                "Anyone holding this code can decrypt every file on this device. Enter your account password to confirm before it's shown.",
-              onVerify: (pw) => this.plugin.verifyAccountPassword(pw),
-              onConfirmed: () => {
-                void (async () => {
-                  try {
-                    const code = await this.plugin.exportAtRestRecoveryCode();
-                    new AtRestRecoveryCodeModal(this.app, { code }).open();
-                  } catch (err) {
-                    this.showStatus(
-                      containerEl,
-                      `Could not export recovery code: ${(err as Error).message}`,
-                      true
-                    );
-                  }
-                })();
-              },
-            }).open();
-          })
-      );
-    recoverySetting.settingEl.addClass("vaultguard-at-rest-action");
-
     // Door #2 (D4): the guided-reset entry point. Enabled PRECISELY when the
     // buttons above (Encrypt / Decrypt / View-code) are all disabled — i.e. in
     // needs-recovery with a session + online — so the button that lights up is
@@ -2127,7 +2702,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         if (needsRecovery) btn.setCta();
         btn.onClick(() => {
           new AtRestRestoreModal(this.app, {
-            onSubmit: (code) => this.plugin.restoreAtRestFromRecoveryCode(code),
+            onSubmit: (code, opts) => this.plugin.restoreAtRestFromRecoveryCode(code, opts),
             onRestored: () => {
               new Notice(
                 "VaultGuard Sync: at-rest key restored. Reopening any open notes will now load decrypted content.",
@@ -2193,8 +2768,16 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     badge.createDiv({ cls: "vaultguard-at-rest-status-body", text: body });
   }
 
-  private renderCurrentVaultSettings(containerEl: HTMLElement, session: UserSession | null): void {
-    new Setting(containerEl).setName("Vault").setHeading();
+  private renderCurrentVaultSettings(rootContainerEl: HTMLElement, session: UserSession | null): void {
+    this.renderCollapsibleSection(rootContainerEl, "vault", "Vault", (containerEl) =>
+      this.renderCurrentVaultSettingsBody(containerEl, session),
+    );
+  }
+
+  private renderCurrentVaultSettingsBody(
+    containerEl: HTMLElement,
+    session: UserSession | null,
+  ): void {
     const sectionEl = containerEl.createDiv({ cls: "vaultguard-current-vault-settings" });
 
     if (!session) {
@@ -3010,6 +3593,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       }
     } else {
       this.openCollapsibleSectionIds.clear();
+      this.collapsibleSectionSeenIds.clear();
       this.collapsibleSectionStateEpoch += 1;
       this.collapsibleSectionSessionActive = true;
     }
@@ -3029,447 +3613,466 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // linter (settings-tab/no-problematic-settings-headings, which also bans
     // "settings"/"options"/"general" in setHeading labels). Lead with the
     // description paragraph instead.
-    containerEl.createEl("p", {
-      text: this.i18n.t("settings.intro"),
-      cls: "setting-item-description",
-    });
+    this.renderSettingsNote(containerEl, this.i18n.t("settings.intro"), "lead");
+    this.renderSettingsSearch(containerEl);
 
-    this.renderLocalProjectMemoryModeSection(containerEl);
-    this.renderOptionalModulesSection(containerEl);
-    this.renderSemanticDiscoverySection(containerEl);
+    // ── Protection ──────────────────────────────────────────────────────────
+    // First, and deliberately ahead of Connection / Account / Vault.
+    //
+    // The at-rest layer is INDEPENDENT of the cloud layer (docs/AT-REST-
+    // ENCRYPTION.md: different keys, different recovery, "encrypting or
+    // decrypting at one layer does not affect the other"). A user who never
+    // signs in still gets local encryption, and the excluded-path rules govern
+    // at-rest as well as sync — so nothing here waits on a connection.
+    //
+    // It also means the first thing anyone sees on opening Settings is the
+    // at-rest status badge: reassurance that the product is doing its job,
+    // rather than a configuration decision they are not yet equipped to make.
+    this.renderProtectionScopeSection(containerEl);
 
     // `session` / `isManualMode` are computed once and read by both the
     // Connection and Account blocks below.
     const session = this.plugin.getSession();
     const isManualMode = this.plugin.settings.manualConfig ?? false;
 
-    // ── Connection Settings ─────────────────────────────────────────────────
-    new Setting(containerEl)
-      .setName("Connection")
-      .setHeading()
-      .settingEl.setAttribute("id", "vaultguard-connection-section");
+    // ── Connection ──
+    this.renderCollapsibleSection(containerEl, "connection", "Connection", (body) => {
+      new Setting(body)
+        .setName("Connected to")
+        .setDesc(this.plugin.getConnectionTargetLabel());
 
-    new Setting(containerEl)
-      .setName("Connected to")
-      .setDesc(this.plugin.getConnectionTargetLabel());
-
-    // Mode toggle
-    new Setting(containerEl)
-      .setName("Configuration mode")
-      .setDesc(
-        isManualMode
-          ? "Using manual configuration for self-hosted deployments."
-          : "Using VaultGuard Cloud defaults. Organization details are discovered after sign-in or invite redemption."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setTooltip("Toggle between auto and manual configuration")
-          .setValue(isManualMode)
-          .onChange(async (value) => {
-            try {
-              await this.plugin.setManualConfigurationMode(value);
-              this.display();
-            } catch (err) {
-              this.showStatus(
-                containerEl,
-                `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
-                true
-              );
-            }
-          })
-      );
-
-    if (!isManualMode) {
-      new Setting(containerEl)
-        .setName("VaultGuard Cloud")
-        // Derived, not hardcoded: the public export scrubs example.com
-        // outside saas-defaults, so a literal domain here would ship claiming
-        // the build uses api.example.com while it actually uses the bundled
-        // default. Reading the value means the sentence cannot contradict it.
+      // Mode toggle
+      new Setting(body)
+        .setName("Configuration mode")
         .setDesc(
-          `Uses the bundled ${saasDefaultsHostLabel()} and Cognito configuration. Sign in from the Account section above.`
+          isManualMode
+            ? "Using manual configuration for self-hosted deployments."
+            : "Using VaultGuard Cloud defaults. Organization details are discovered after sign-in or invite redemption."
         )
-        .addButton((button) =>
-          button
-            .setButtonText("Reset")
-            .setTooltip("Clear locally cached connection fields and use the bundled cloud defaults")
-            .onClick(async () => {
-              button.setDisabled(true);
+        .addToggle((toggle) =>
+          toggle
+            .setTooltip("Toggle between auto and manual configuration")
+            .setValue(isManualMode)
+            .onChange(async (value) => {
               try {
-                await this.plugin.resetCloudConnectionDefaults();
-                this.showStatus(containerEl, "VaultGuard Cloud defaults restored.", false);
+                await this.plugin.setManualConfigurationMode(value);
                 this.display();
               } catch (err) {
                 this.showStatus(
-                  containerEl,
+                  body,
+                  `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+                  true
+                );
+              }
+            })
+        );
+
+      if (!isManualMode) {
+        new Setting(body)
+          .setName("VaultGuard Cloud")
+          // Derived, not hardcoded: the public export scrubs example.com
+          // outside saas-defaults, so a literal domain here would ship claiming
+          // the build uses api.example.com while it actually uses the bundled
+          // default. Reading the value means the sentence cannot contradict it.
+          .setDesc(
+            `Uses the bundled ${saasDefaultsHostLabel()} and Cognito configuration. Sign in from the Account section above.`
+          )
+          .addButton((button) =>
+            button
+              .setButtonText("Reset")
+              .setTooltip("Clear locally cached connection fields and use the bundled cloud defaults")
+              .onClick(async () => {
+                button.setDisabled(true);
+                try {
+                  await this.plugin.resetCloudConnectionDefaults();
+                  this.showStatus(body, "VaultGuard Cloud defaults restored.", false);
+                  this.display();
+                } catch (err) {
+                  this.showStatus(
+                    body,
+                    `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+                    true
+                  );
+                } finally {
+                  button.setDisabled(false);
+                }
+              })
+          );
+
+        const orgSlugSetting = new Setting(body)
+          .setName("Organization slug")
+          .setDesc(
+            "Enter the slug your admin gave you (e.g., \"acme-corp\"). " +
+            "All connection details will be configured automatically."
+          );
+
+        orgSlugSetting.addText((text) => {
+          text
+            .setPlaceholder("acme-corp")
+            .setValue(this.plugin.settings.orgSlug)
+            .onChange(async (value) => {
+              this.plugin.settings.orgSlug = value.trim().toLowerCase();
+              await this.plugin.saveSettings();
+            });
+        });
+
+        orgSlugSetting.addButton((button) =>
+          button
+            .setButtonText("Connect")
+            .setCta()
+            .onClick(async () => {
+              const slug = this.plugin.settings.orgSlug;
+              if (!slug) {
+                this.showStatus(body, "Enter an organization slug first.", true);
+                return;
+              }
+              button.setButtonText("Connecting...");
+              button.setDisabled(true);
+              try {
+                await this.plugin.resolveOrgConfig(slug);
+                this.showStatus(body, `Connected to "${slug}" successfully!`, false);
+                this.display();
+              } catch (err) {
+                this.showStatus(
+                  body,
                   `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
                   true
                 );
               } finally {
+                button.setButtonText("Connect");
                 button.setDisabled(false);
               }
             })
         );
 
-      // ── Auto mode: org slug ──────────────────────────────────────────────
-      const orgSlugSetting = new Setting(containerEl)
-        .setName("Organization slug")
-        .setDesc(
-          "Enter the slug your admin gave you (e.g., \"acme-corp\"). " +
-          "All connection details will be configured automatically."
-        );
+        const redeemSetting = new Setting(body)
+          .setName("Redeem invite link")
+          .setDesc(
+            "Paste the obsidian://vaultguard-invite link from your invitation email " +
+            "to auto-configure your organization and set your password."
+          );
 
-      orgSlugSetting.addText((text) => {
-        text
-          .setPlaceholder("acme-corp")
-          .setValue(this.plugin.settings.orgSlug)
-          .onChange(async (value) => {
-            this.plugin.settings.orgSlug = value.trim().toLowerCase();
-            await this.plugin.saveSettings();
-          });
-      });
-
-      orgSlugSetting.addButton((button) =>
-        button
-          .setButtonText("Connect")
-          .setCta()
-          .onClick(async () => {
-            const slug = this.plugin.settings.orgSlug;
-            if (!slug) {
-              this.showStatus(containerEl, "Enter an organization slug first.", true);
-              return;
-            }
-            button.setButtonText("Connecting...");
-            button.setDisabled(true);
-            try {
-              await this.plugin.resolveOrgConfig(slug);
-              this.showStatus(containerEl, `Connected to "${slug}" successfully!`, false);
-              this.display();
-            } catch (err) {
-              this.showStatus(
-                containerEl,
-                `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
-                true
-              );
-            } finally {
-              button.setButtonText("Connect");
-              button.setDisabled(false);
-            }
-          })
-      );
-
-      // ── Redeem invite link (paste fallback for the obsidian:// deep link) ──
-      const redeemSetting = new Setting(containerEl)
-        .setName("Redeem invite link")
-        .setDesc(
-          "Paste the obsidian://vaultguard-invite link from your invitation email " +
-          "to auto-configure your organization and set your password."
-        );
-
-      let redeemInput: HTMLInputElement | null = null;
-      redeemSetting.addText((text) => {
-        text
-          .setPlaceholder("obsidian://vaultguard-invite?org=...&email=...")
-          .setValue("");
-        redeemInput = text.inputEl;
-      });
-
-      redeemSetting.addButton((button) =>
-        button
-          .setButtonText("Redeem")
-          .setCta()
-          .onClick(async () => {
-            const raw = redeemInput?.value.trim() ?? "";
-            if (!raw) {
-              this.showStatus(containerEl, "Paste your invite link first.", true);
-              return;
-            }
-            const parsed = parseInviteLink(raw);
-            if (!parsed.org) {
-              this.showStatus(
-                containerEl,
-                "Could not find an org slug in that link. Make sure you copied the full obsidian://vaultguard-invite URL.",
-                true
-              );
-              return;
-            }
-            button.setButtonText("Redeeming...");
-            button.setDisabled(true);
-            try {
-              await this.plugin.redeemInvite(parsed);
-              if (redeemInput) redeemInput.value = "";
-              this.showStatus(
-                containerEl,
-                `Invite for "${parsed.org}" redeemed. Follow the prompts to set your password.`,
-                false
-              );
-              this.display();
-            } catch (err) {
-              this.showStatus(
-                containerEl,
-                `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
-                true
-              );
-            } finally {
-              button.setButtonText("Redeem");
-              button.setDisabled(false);
-            }
-          })
-      );
-    } else {
-      const serverConfigSetting = new Setting(containerEl)
-        .setName("Server config URL")
-        .setDesc(
-          "Paste your self-hosted server's public config URL, for example https://your-server.com/.well-known/vaultguard.json."
-        );
-
-      let serverConfigInput: HTMLInputElement | null = null;
-      serverConfigSetting.addText((text) => {
-        text
-          .setPlaceholder("https://your-server.com/.well-known/vaultguard.json")
-          .setValue("");
-        serverConfigInput = text.inputEl;
-      });
-
-      serverConfigSetting.addButton((button) =>
-        button
-          .setButtonText("Apply")
-          .setCta()
-          .onClick(async () => {
-            const raw = serverConfigInput?.value.trim() ?? "";
-            if (!raw) {
-              this.showStatus(containerEl, "Paste a server config URL first.", true);
-              return;
-            }
-            button.setButtonText("Applying...");
-            button.setDisabled(true);
-            try {
-              await this.plugin.applyManualServerConfigUrl(raw);
-              if (serverConfigInput) serverConfigInput.value = "";
-              this.showStatus(containerEl, "Self-hosted server configuration applied.", false);
-              this.display();
-            } catch (err) {
-              this.showStatus(
-                containerEl,
-                `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
-                true
-              );
-            } finally {
-              button.setButtonText("Apply");
-              button.setDisabled(false);
-            }
-          })
-      );
-
-      // ── Manual mode: direct field entry ──────────────────────────────────
-      new Setting(containerEl)
-        .setName("API endpoint")
-        .setDesc(
-          "VaultGuard REST API or CloudFront base URL. Pasted /settings or /orgs/... URLs are trimmed automatically."
-        )
-        .addText((text) =>
+        let redeemInput: HTMLInputElement | null = null;
+        redeemSetting.addText((text) => {
           text
-            .setPlaceholder("https://d1234567890.cloudfront.net or https://api.example.com")
-            .setValue(this.plugin.settings.apiEndpoint)
-            .onChange(async (value) => {
-              this.plugin.settings.apiEndpoint = value.trim();
-              await this.plugin.saveSettings();
-            })
-        );
-
-      new Setting(containerEl)
-        .setName("Organization ID")
-        .addText((text) =>
-          text
-            .setValue(this.plugin.settings.organizationId)
-            .onChange(async (value) => {
-              this.plugin.settings.organizationId = value.trim();
-              await this.plugin.saveSettings();
-            })
-        );
-
-      new Setting(containerEl)
-        .setName("Cognito user pool ID")
-        .addText((text) =>
-          text
-            .setPlaceholder("eu-central-1_XXXXXXXXX")
-            .setValue(this.plugin.settings.cognitoUserPoolId)
-            .onChange(async (value) => {
-              this.plugin.settings.cognitoUserPoolId = value.trim();
-              await this.plugin.saveSettings();
-            })
-        );
-
-      new Setting(containerEl)
-        .setName("Cognito client ID")
-        .addText((text) =>
-          text
-            .setPlaceholder("1a2b3c4d5e6f7g8h9i0j")
-            .setValue(this.plugin.settings.cognitoClientId)
-            .onChange(async (value) => {
-              this.plugin.settings.cognitoClientId = value.trim();
-              await this.plugin.saveSettings();
-            })
-        );
-    }
-
-    // ── Account ─────────────────────────────────────────────────────────────
-    if (session) {
-      new Setting(containerEl).setName("Account").setHeading();
-
-      new Setting(containerEl)
-        .setName("Logged in as")
-        .setDesc(`${session.email} (${session.role})`);
-
-      // ── Profile: Display Name ────────────────────────────────────────────
-      new Setting(containerEl)
-        .setName("Display name")
-        .setDesc(
-          "Your name shown to teammates in permission headers and access lists. " +
-          "Use your first and last name (e.g. \"Jane Smith\")."
-        )
-        .addText((text) => {
-          text
-            .setPlaceholder("Jane Smith")
-            .setValue(session.displayName ?? "")
-            .onChange(() => {
-              // no-op: save on button click
-            });
-
-          const inputEl = text.inputEl;
-          const settingEl = inputEl.closest('.setting-item');
-          if (settingEl) {
-            const controlEl = settingEl.querySelector('.setting-item-control');
-            if (controlEl) {
-              const saveBtn = controlEl.createEl('button', {
-                text: 'Save',
-                cls: 'mod-cta vaultguard-inline-save-btn',
-              });
-              saveBtn.addEventListener('click', async () => {
-                const newName = inputEl.value.trim();
-                if (!newName) {
-                  this.showStatus(containerEl, "Display name cannot be empty.", true);
-                  return;
-                }
-                saveBtn.disabled = true;
-                saveBtn.textContent = "Saving...";
-                try {
-                  await this.plugin.updateUserProfile(session.userId, newName);
-                  this.showStatus(containerEl, "Display name updated.", false);
-                  this.display();
-                } catch (error) {
-                  this.showStatus(
-                    containerEl,
-                    `Failed to update name: ${(error as Error).message}`,
-                    true
-                  );
-                } finally {
-                  saveBtn.disabled = false;
-                  saveBtn.textContent = "Save";
-                }
-              });
-            }
-          }
+            .setPlaceholder("obsidian://vaultguard-invite?org=...&email=...")
+            .setValue("");
+          redeemInput = text.inputEl;
         });
 
-      new Setting(containerEl)
-        .setName("Logout")
-        .setDesc(
-          "Sign out and clear your session from this device."
-        )
-        .addButton((button) =>
+        redeemSetting.addButton((button) =>
           button
-            .setButtonText("Logout")
-            .onClick(async () => {
-              await this.plugin.forceLogout();
-              this.display();
-            })
-        );
-    } else {
-      new Setting(containerEl).setName("Account").setHeading();
-
-      new Setting(containerEl)
-        .setName("Not logged in")
-        .setDesc(
-          isManualMode
-            ? "Sign in with your self-hosted VaultGuard server."
-            : "Sign in with your VaultGuard Cloud account."
-        )
-        .addButton((button) =>
-          button
-            .setButtonText(isManualMode ? "Login" : "Continue with VaultGuard Cloud")
+            .setButtonText("Redeem")
             .setCta()
-            .onClick(() => {
-              this.plugin.triggerLogin();
+            .onClick(async () => {
+              const raw = redeemInput?.value.trim() ?? "";
+              if (!raw) {
+                this.showStatus(body, "Paste your invite link first.", true);
+                return;
+              }
+              const parsed = parseInviteLink(raw);
+              if (!parsed.org) {
+                this.showStatus(
+                  body,
+                  "Could not find an org slug in that link. Make sure you copied the full obsidian://vaultguard-invite URL.",
+                  true
+                );
+                return;
+              }
+              button.setButtonText("Redeeming...");
+              button.setDisabled(true);
+              try {
+                await this.plugin.redeemInvite(parsed);
+                if (redeemInput) redeemInput.value = "";
+                this.showStatus(
+                  body,
+                  `Invite for "${parsed.org}" redeemed. Follow the prompts to set your password.`,
+                  false
+                );
+                this.display();
+              } catch (err) {
+                this.showStatus(
+                  body,
+                  `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+                  true
+                );
+              } finally {
+                button.setButtonText("Redeem");
+                button.setDisabled(false);
+              }
+            })
+        );
+      } else {
+        const serverConfigSetting = new Setting(body)
+          .setName("Server config URL")
+          .setDesc(
+            "Paste your self-hosted server's public config URL, for example https://your-server.com/.well-known/vaultguard.json."
+          );
+
+        let serverConfigInput: HTMLInputElement | null = null;
+        serverConfigSetting.addText((text) => {
+          text
+            .setPlaceholder("https://your-server.com/.well-known/vaultguard.json")
+            .setValue("");
+          serverConfigInput = text.inputEl;
+        });
+
+        serverConfigSetting.addButton((button) =>
+          button
+            .setButtonText("Apply")
+            .setCta()
+            .onClick(async () => {
+              const raw = serverConfigInput?.value.trim() ?? "";
+              if (!raw) {
+                this.showStatus(body, "Paste a server config URL first.", true);
+                return;
+              }
+              button.setButtonText("Applying...");
+              button.setDisabled(true);
+              try {
+                await this.plugin.applyManualServerConfigUrl(raw);
+                if (serverConfigInput) serverConfigInput.value = "";
+                this.showStatus(body, "Self-hosted server configuration applied.", false);
+                this.display();
+              } catch (err) {
+                this.showStatus(
+                  body,
+                  `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+                  true
+                );
+              } finally {
+                button.setButtonText("Apply");
+                button.setDisabled(false);
+              }
             })
         );
 
-      // Single login entry point above. Point self-hosters at the Connection
-      // section (manual configuration) instead of a second login button.
-      if (!isManualMode) {
-        const selfHostNote = containerEl.createDiv({
-          cls: "setting-item-description vaultguard-selfhost-note",
-        });
-        selfHostNote.appendText("Self-hosting your own VaultGuard server? ");
-        const link = selfHostNote.createEl("a", {
-          text: "Configure it in connection settings",
-          href: "#",
-        });
-        link.addEventListener("click", (e) => {
-          e.preventDefault();
-          containerEl
-            .querySelector("#vaultguard-connection-section")
-            ?.scrollIntoView({ behavior: "smooth", block: "start" });
-        });
-        selfHostNote.appendText(" below (switch to manual configuration).");
-      }
-    }
+        new Setting(body)
+          .setName("API endpoint")
+          .setDesc(
+            "VaultGuard REST API or CloudFront base URL. Pasted /settings or /orgs/... URLs are trimmed automatically."
+          )
+          .addText((text) =>
+            text
+              .setPlaceholder("https://d1234567890.cloudfront.net or https://api.example.com")
+              .setValue(this.plugin.settings.apiEndpoint)
+              .onChange(async (value) => {
+                this.plugin.settings.apiEndpoint = value.trim();
+                await this.plugin.saveSettings();
+              })
+          );
 
+        new Setting(body)
+          .setName("Organization ID")
+          .addText((text) =>
+            text
+              .setValue(this.plugin.settings.organizationId)
+              .onChange(async (value) => {
+                this.plugin.settings.organizationId = value.trim();
+                await this.plugin.saveSettings();
+              })
+          );
+
+        new Setting(body)
+          .setName("Cognito user pool ID")
+          .addText((text) =>
+            text
+              .setPlaceholder("eu-central-1_XXXXXXXXX")
+              .setValue(this.plugin.settings.cognitoUserPoolId)
+              .onChange(async (value) => {
+                this.plugin.settings.cognitoUserPoolId = value.trim();
+                await this.plugin.saveSettings();
+              })
+          );
+
+        new Setting(body)
+          .setName("Cognito client ID")
+          .addText((text) =>
+            text
+              .setPlaceholder("1a2b3c4d5e6f7g8h9i0j")
+              .setValue(this.plugin.settings.cognitoClientId)
+              .onChange(async (value) => {
+                this.plugin.settings.cognitoClientId = value.trim();
+                await this.plugin.saveSettings();
+              })
+          );
+      }
+
+    });
+    // ── Account ──
+    this.renderCollapsibleSection(containerEl, "account", "Account", (body) => {
+      if (session) {
+
+        new Setting(body)
+          .setName("Logged in as")
+          .setDesc(`${session.email} (${session.role})`);
+
+        new Setting(body)
+          .setName("Display name")
+          .setDesc(
+            "Your name shown to teammates in permission headers and access lists. " +
+            "Use your first and last name (e.g. \"Jane Smith\")."
+          )
+          .addText((text) => {
+            text
+              .setPlaceholder("Jane Smith")
+              .setValue(session.displayName ?? "")
+              .onChange(() => {
+                // no-op: save on button click
+              });
+
+            const inputEl = text.inputEl;
+            const settingEl = inputEl.closest('.setting-item');
+            if (settingEl) {
+              const controlEl = settingEl.querySelector('.setting-item-control');
+              if (controlEl) {
+                const saveBtn = controlEl.createEl('button', {
+                  text: 'Save',
+                  cls: 'mod-cta vaultguard-inline-save-btn',
+                });
+                saveBtn.addEventListener('click', async () => {
+                  const newName = inputEl.value.trim();
+                  if (!newName) {
+                    this.showStatus(body, "Display name cannot be empty.", true);
+                    return;
+                  }
+                  saveBtn.disabled = true;
+                  saveBtn.textContent = "Saving...";
+                  try {
+                    await this.plugin.updateUserProfile(session.userId, newName);
+                    this.showStatus(body, "Display name updated.", false);
+                    this.display();
+                  } catch (error) {
+                    this.showStatus(
+                      body,
+                      `Failed to update name: ${(error as Error).message}`,
+                      true
+                    );
+                  } finally {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = "Save";
+                  }
+                });
+              }
+            }
+          });
+
+        new Setting(body)
+          .setName("Logout")
+          .setDesc(
+            "Sign out and clear your session from this device."
+          )
+          .addButton((button) =>
+            button
+              .setButtonText("Logout")
+              .onClick(async () => {
+                await this.plugin.forceLogout();
+                this.display();
+              })
+          );
+      } else {
+
+        new Setting(body)
+          .setName("Not logged in")
+          .setDesc(
+            isManualMode
+              ? "Sign in with your self-hosted VaultGuard server."
+              : "Sign in with your VaultGuard Cloud account."
+          )
+          .addButton((button) =>
+            button
+              .setButtonText(isManualMode ? "Login" : "Continue with VaultGuard Cloud")
+              .setCta()
+              .onClick(() => {
+                this.plugin.triggerLogin();
+              })
+          );
+
+        // Single login entry point above. Point self-hosters at the Connection
+        // section (manual configuration) instead of a second login button.
+        if (!isManualMode) {
+          const selfHostNote = body.createDiv({
+            cls: "setting-item-description vaultguard-selfhost-note",
+          });
+          selfHostNote.appendText("Self-hosting your own VaultGuard server? ");
+          const link = selfHostNote.createEl("a", {
+            text: "Configure it in connection settings",
+            href: "#",
+          });
+          link.addEventListener("click", (e) => {
+            e.preventDefault();
+            // Connection is a disclosure now, and it is a sibling of this
+            // section rather than an ancestor — so this resolves from the tab
+            // root, not from `body`, and OPENS the section before scrolling.
+            // Scrolling to a collapsed section would land the user on a closed
+            // summary with nothing to configure.
+            const target = this.containerEl.querySelector<HTMLDetailsElement>(
+              'details[data-vaultguard-settings-section="connection"]',
+            );
+            if (!target) return;
+            target.open = true;
+            target.scrollIntoView({ behavior: "smooth", block: "start" });
+          });
+          selfHostNote.appendText(" below (switch to manual configuration).");
+        }
+      }
+
+    });
     this.renderCurrentVaultSettings(containerEl, session);
 
-    // ── Sync Settings ───────────────────────────────────────────────────────
-    new Setting(containerEl).setName("Synchronization").setHeading();
-    const orgPolicy = this.plugin.getOrgPolicySettings();
-    if (this.plugin.isLocalProjectMemoryModeEnabled()) {
-      new Setting(containerEl)
-        .setName("Local-only")
-        .setDesc(
-          "Remote sync, share links, server vault binding, organization permissions, and team/admin features are disabled while Local Project Memory Mode is active.",
-        );
-    } else if (orgPolicy) {
-      const policyDescription =
-        orgPolicy.syncMode === "manual"
-          ? "Manual sync only"
-          : orgPolicy.syncMode === "realtime"
-            ? "Real-time sync managed by your organization"
-            : `Periodic sync every ${orgPolicy.syncIntervalMinutes} minute${
-                orgPolicy.syncIntervalMinutes === 1 ? "" : "s"
-              }`;
+    // ── Synchronization ──
+    this.renderCollapsibleSection(containerEl, "synchronization", "Synchronization", (body) => {
+      const orgPolicy = this.plugin.getOrgPolicySettings();
+      if (this.plugin.isLocalProjectMemoryModeEnabled()) {
+        new Setting(body)
+          .setName("Local-only")
+          .setDesc(
+            "Remote sync, share links, server vault binding, organization permissions, and team/admin features are disabled while Local Project Memory Mode is active.",
+          );
+      } else if (orgPolicy) {
+        const policyDescription =
+          orgPolicy.syncMode === "manual"
+            ? "Manual sync only"
+            : orgPolicy.syncMode === "realtime"
+              ? "Real-time sync managed by your organization"
+              : `Periodic sync every ${orgPolicy.syncIntervalMinutes} minute${
+                  orgPolicy.syncIntervalMinutes === 1 ? "" : "s"
+                }`;
 
-      new Setting(containerEl)
-        .setName("Sync interval")
-        .setDesc(`Managed by your organization: ${policyDescription}.`);
-    } else {
-      new Setting(containerEl)
-        .setName("Sync interval")
-        .setDesc(
-          "How often to check for remote changes (in seconds). Minimum 10 seconds."
-        )
-        .addSlider((slider) =>
-          slider
-            .setLimits(10, 300, 5)
-            .setValue(this.plugin.settings.syncInterval)
-            .setDynamicTooltip()
-            .onChange(async (value) => {
-              this.plugin.settings.syncInterval = value;
-              await this.plugin.saveSettings();
-              this.plugin.restartSyncTimer();
-            })
-        );
-    }
+        new Setting(body)
+          .setName("Sync interval")
+          .setDesc(`Managed by your organization: ${policyDescription}.`);
+      } else {
+        new Setting(body)
+          .setName("Sync interval")
+          .setDesc(
+            "How often to check for remote changes (in seconds). Minimum 10 seconds."
+          )
+          .addSlider((slider) =>
+            slider
+              .setLimits(10, 300, 5)
+              .setValue(this.plugin.settings.syncInterval)
+              .setDynamicTooltip()
+              .onChange(async (value) => {
+                this.plugin.settings.syncInterval = value;
+                await this.plugin.saveSettings();
+                this.plugin.restartSyncTimer();
+              })
+          );
+      }
 
-    if (!this.plugin.isLocalProjectMemoryModeEnabled()) {
-      new Setting(containerEl)
+      // Excluded paths and the server purge now live in "Protection scope" —
+      // they belong with the whole-vault plaintext toggle they are the narrow
+      // alternative to, and their at-rest effect needed stating alongside it.
+      //
+      // What remains here is sync timing only. Controls the plaintext local-only
+      // mode makes redundant are rendered DISABLED rather than removed: the
+      // previous `if (!isLocalProjectMemoryModeEnabled())` wrapper deleted them
+      // from the DOM, which read as "this setting is gone" instead of "this
+      // setting has nothing to do right now".
+      const localModeActive = this.plugin.isLocalProjectMemoryModeEnabled();
+
+      const conflictSetting = new Setting(body)
         .setName("Default conflict resolution")
         .setDesc(
           "How to handle sync conflicts when both local and remote versions have changed."
@@ -3487,170 +4090,135 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               "Create duplicate file"
             )
             .setValue(this.plugin.settings.defaultConflictResolution)
+            .setDisabled(localModeActive)
             .onChange(async (value) => {
               this.plugin.settings.defaultConflictResolution =
                 value as ConflictResolutionStrategy;
               await this.plugin.saveSettings();
             })
         );
-
-      const configDir = this.app.vault.configDir;
-      const configWorkspacePath = `${configDir}/workspace.json`;
-      const configPluginsPath = `${configDir}/plugins`;
-
-      const excludedPathsSetting = new Setting(containerEl)
-        .setName("Excluded paths (local-only)")
-        .setDesc(
-          "One path per line. Files and folders matching these patterns are never uploaded, " +
-          "downloaded, or deleted on the server — they stay on this device only. Use exact " +
-          `paths (e.g. ${configWorkspacePath}) or folder prefixes (e.g. ${configPluginsPath}). ` +
-          "This setting applies to this device only; it does not change the server vault."
-        )
-        .addTextArea((textArea) => {
-          textArea.inputEl.rows = 6;
-          textArea.inputEl.addClass("vaultguard-mono-textarea");
-          textArea
-            .setPlaceholder(`${configWorkspacePath}\n${configPluginsPath}\n.trash`)
-            .setValue((this.plugin.settings.excludedPaths ?? []).join("\n"))
-            .onChange(async (value) => {
-              this.plugin.settings.excludedPaths = value
-                .split("\n")
-                .map((line) => line.trim())
-                .filter((line) => line.length > 0);
-              await this.plugin.saveSettings();
-            });
-          return textArea;
+      if (localModeActive) {
+        conflictSetting.descEl.createDiv({
+          cls: "setting-item-description vaultguard-setting-disabled-reason",
+          text: "Nothing syncs in this mode, so conflicts cannot occur.",
         });
-      excludedPathsSetting.settingEl.addClass("vaultguard-excluded-paths-setting");
+      }
+    });
+    // ── Access & unlock ──
+    this.renderCollapsibleSection(containerEl, "access-unlock", "Access & unlock", (body) => {
+      // Recomputed rather than captured from the Synchronization closure above:
+      // these are now sibling sections, not one block, so each owns its inputs.
+      const localModeActive = this.plugin.isLocalProjectMemoryModeEnabled();
 
-      this.renderPluginAllowlistSection(containerEl);
-      this.renderVaultLockSection(containerEl);
+      // These two are server- and at-rest-driven respectively, so in plaintext
+      // local-only mode there is no state for them to operate on. Name the
+      // section and say why rather than rendering inert controls a user could
+      // configure to no effect (e.g. enrolling a PIN that unlocks nothing).
+      if (localModeActive) {
+        new Setting(body)
+          .setName("Allowed community plugins")
+          .setDesc(
+            "Not applicable in this mode — the allowlist is pushed by the server vault this folder is not bound to."
+          );
+        new Setting(body)
+          .setName("Vault lock")
+          .setDesc(
+            "Not applicable in this mode — there is no local encryption key to lock. Turn off the plaintext local-only vault above to use a PIN."
+          );
+      } else {
+        this.renderPluginAllowlistSection(body);
+        this.renderVaultLockSection(body);
+      }
+    });
 
-      new Setting(containerEl)
-        .setName("Purge excluded paths from server")
+    // ── Display ──
+    this.renderCollapsibleSection(containerEl, "display", "Display", (body) => {
+
+      new Setting(body)
+        .setName("Show my permission level")
         .setDesc(
-          "Delete every server-side copy of files that match the excluded paths above. " +
-          "Useful after adding a new exclusion: without this, other members on other " +
-          "devices keep pulling the file down. This affects the shared server vault."
+          "Show a colored dot for your own access level (admin / write / read / none) next to each file in the file explorer."
         )
-        .addButton((button) =>
-          button
-            .setButtonText("Purge from server")
-            .setWarning()
-            .onClick(async () => {
-              const patterns = this.plugin.settings.excludedPaths ?? [];
-              if (patterns.length === 0) {
-                this.showStatus(containerEl, "No excluded paths configured.", true);
-                return;
-              }
-              const confirmed = await this.showDestructiveConfirmation(
-                containerEl,
-                "PURGE FROM SERVER",
-                "Delete every matching file from the shared server vault? " +
-                  "Other members will lose these files on their next sync. " +
-                  "Local copies on this device are kept.\n\n" +
-                  `Patterns:\n${patterns.join("\n")}\n\n` +
-                  "Type PURGE FROM SERVER to confirm."
-              );
-              if (!confirmed) return;
-              try {
-                button.setDisabled(true);
-                button.setButtonText("Purging…");
-                const result = await this.plugin.purgeExcludedFromServer();
-                const summary = `Matched ${result.matched}, deleted ${result.deleted}` +
-                  (result.failed > 0 ? `, ${result.failed} failed` : "");
-                this.showStatus(containerEl, summary, result.failed > 0);
-              } catch (err) {
-                this.showStatus(
-                  containerEl,
-                  err instanceof Error ? err.message : "Purge failed.",
-                  true
-                );
-              } finally {
-                button.setDisabled(false);
-                button.setButtonText("Purge from server");
-              }
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.showMyPermissionLevel)
+            .onChange(async (value) => {
+              this.plugin.settings.showMyPermissionLevel = value;
+              await this.plugin.saveSettings();
+              this.plugin.refreshFileExplorerDecorations();
             })
         );
-    }
 
-    // ── Display Settings ────────────────────────────────────────────────────
-    new Setting(containerEl).setName("Display").setHeading();
+      new Setting(body)
+        .setName("Show who else has access")
+        .setDesc(
+          "Show avatar chips for other people and roles that can access a file, next to it in the file explorer."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.showOthersAccess)
+            .onChange(async (value) => {
+              this.plugin.settings.showOthersAccess = value;
+              await this.plugin.saveSettings();
+              this.plugin.refreshFileExplorerDecorations();
+            })
+        );
 
-    new Setting(containerEl)
-      .setName("Show my permission level")
-      .setDesc(
-        "Show a colored dot for your own access level (admin / write / read / none) next to each file in the file explorer."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.showMyPermissionLevel)
-          .onChange(async (value) => {
-            this.plugin.settings.showMyPermissionLevel = value;
-            await this.plugin.saveSettings();
-            this.plugin.refreshFileExplorerDecorations();
-          })
-      );
+      new Setting(body)
+        .setName("Show permission banner in notes")
+        .setDesc(
+          "Show a banner at the top of each open note with your access level and a quick way to manage sharing."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.showPermissionBanner)
+            .onChange(async (value) => {
+              this.plugin.settings.showPermissionBanner = value;
+              await this.plugin.saveSettings();
+              this.plugin.refreshFilePermissionHeader();
+            })
+        );
 
-    new Setting(containerEl)
-      .setName("Show who else has access")
-      .setDesc(
-        "Show avatar chips for other people and roles that can access a file, next to it in the file explorer."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.showOthersAccess)
-          .onChange(async (value) => {
-            this.plugin.settings.showOthersAccess = value;
-            await this.plugin.saveSettings();
-            this.plugin.refreshFileExplorerDecorations();
-          })
-      );
+      new Setting(body)
+        .setName("Show status bar")
+        .setDesc(
+          "Display sync status and connection indicator in the bottom status bar."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.showStatusBar)
+            .onChange(async (value) => {
+              this.plugin.settings.showStatusBar = value;
+              await this.plugin.saveSettings();
+              this.plugin.toggleStatusBar(value);
+            })
+        );
 
-    new Setting(containerEl)
-      .setName("Show permission banner in notes")
-      .setDesc(
-        "Show a banner at the top of each open note with your access level and a quick way to manage sharing."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.showPermissionBanner)
-          .onChange(async (value) => {
-            this.plugin.settings.showPermissionBanner = value;
-            await this.plugin.saveSettings();
-            this.plugin.refreshFilePermissionHeader();
-          })
-      );
+      new Setting(body)
+        .setName("Show quick-access ribbon icons")
+        .setDesc(
+          "Show dedicated left-ribbon icons for AI chat and the permissions graph. The VaultGuard menu icon is always shown. When turned back on, reload Obsidian to bring them back."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.showRibbonIcons !== false)
+            .onChange(async (value) => {
+              this.plugin.settings.showRibbonIcons = value;
+              await this.plugin.saveSettings();
+              this.plugin.applyRibbonIconLayout();
+            })
+        );
 
-    new Setting(containerEl)
-      .setName("Show status bar")
-      .setDesc(
-        "Display sync status and connection indicator in the bottom status bar."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.showStatusBar)
-          .onChange(async (value) => {
-            this.plugin.settings.showStatusBar = value;
-            await this.plugin.saveSettings();
-            this.plugin.toggleStatusBar(value);
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Show quick-access ribbon icons")
-      .setDesc(
-        "Show dedicated left-ribbon icons for AI chat and the permissions graph. The VaultGuard menu icon is always shown. When turned back on, reload Obsidian to bring them back."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.showRibbonIcons !== false)
-          .onChange(async (value) => {
-            this.plugin.settings.showRibbonIcons = value;
-            await this.plugin.saveSettings();
-            this.plugin.applyRibbonIconLayout();
-          })
-      );
+    });
+    // ── Capabilities ────────────────────────────────────────────────────────
+    // Placed after the everyday preferences and immediately before the sections
+    // they gate: these four toggles are what add or remove "AI & automation"
+    // below, so they read as the switchboard for what follows rather than as
+    // more configuration competing with first-run setup at the top.
+    this.renderCollapsibleSection(containerEl, "capabilities", "Optional modules", (body) => {
+      this.renderOptionalModulesSection(body, true);
+      this.renderSemanticDiscoverySection(body);
+    });
 
     // ── Advanced (collapsed) ─────────────────────────────────────────────────
     // Security + Reliability + at-rest maintenance live behind one disclosure.
@@ -3742,8 +4310,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             })
         );
 
-      // ── Local at-rest encryption ─────────────────────────────────────────
-      this.renderAtRestSection(body);
+      // At-rest encryption used to be rendered here. It now lives in the
+      // Protection section at the top of the tab, beside the exclusion rules
+      // that govern the same layer — see `renderProtectionScopeSection`.
+      // Advanced keeps only the tuning knobs: Security and Reliability.
     });
 
     // ── AI & automation (collapsed) ──────────────────────────────────────────
@@ -3770,33 +4340,42 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       );
     }
 
-    // ── Danger Zone ─────────────────────────────────────────────────────────
-    new Setting(containerEl).setName("Danger zone").setHeading();
-    containerEl.createEl("p", {
-      text: "These actions cannot be undone.",
-      cls: "setting-item-description mod-warning",
+    // ── Danger Zone (collapsed) ─────────────────────────────────────────────
+    // Irreversible actions sit behind a disclosure so they cannot be hit while
+    // scrolling past. The type-to-confirm gate on each action is unchanged —
+    // this only stops the buttons sitting permanently open at the end of the
+    // tab. Search still reaches them.
+    this.renderCollapsibleSection(containerEl, "danger-zone", "Danger zone", (body) => {
+      body.createEl("p", {
+        text: "These actions cannot be undone.",
+        cls: "setting-item-description mod-warning",
+      });
+
+      new Setting(body)
+        .setName("Clear local cache")
+        .setDesc(
+          "Remove all locally cached and encrypted vault data. Files will be re-downloaded on next sync."
+        )
+        .addButton((button) =>
+          button
+            .setButtonText("Clear cache")
+            .setWarning()
+            .onClick(async () => {
+              const confirmed = await this.showDestructiveConfirmation(
+                body,
+                "CLEAR CACHE",
+                "Type CLEAR CACHE to confirm. This will delete all locally cached vault data."
+              );
+              if (confirmed) {
+                await this.plugin.clearLocalCache();
+              }
+            })
+        );
     });
 
-    new Setting(containerEl)
-      .setName("Clear local cache")
-      .setDesc(
-        "Remove all locally cached and encrypted vault data. Files will be re-downloaded on next sync."
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Clear cache")
-          .setWarning()
-          .onClick(async () => {
-            const confirmed = await this.showDestructiveConfirmation(
-              containerEl,
-              "CLEAR CACHE",
-              "Type CLEAR CACHE to confirm. This will delete all locally cached vault data."
-            );
-            if (confirmed) {
-              await this.plugin.clearLocalCache();
-            }
-          })
-      );
+    // The filter must run after every section exists, and again on each
+    // re-render, or a toggle inside a filtered view would restore hidden rows.
+    this.applySettingsFilter(containerEl);
   }
 
   /**
@@ -3862,25 +4441,48 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Vault orientation").setHeading();
     const summaryEl = containerEl.createDiv({ cls: "vaultguard-orientation-summary" });
 
+    if (this.latestVaultOrientationSnapshot) {
+      this.renderVaultOrientationSummary(summaryEl, this.latestVaultOrientationSnapshot);
+    } else {
+      summaryEl.createDiv({
+        cls: "setting-item-description",
+        text: "Loading orientation metadata...",
+      });
+    }
+
     const renderSnapshot = async (forceRefresh = false): Promise<VaultOrientationSnapshot | null> => {
-      summaryEl.empty();
-      summaryEl.createDiv({ cls: "setting-item-description", text: "Loading orientation metadata..." });
+      const requestGeneration = ++this.vaultOrientationRequestGeneration;
       try {
         const snapshot = await this.plugin.getVaultOrientationSnapshotForDiagnostics({
           includeKnownVaults: true,
           includeGit: true,
           forceRefresh,
         });
-        if (summaryEl.isConnected === false) return snapshot;
+        if (
+          requestGeneration !== this.vaultOrientationRequestGeneration ||
+          summaryEl.isConnected === false
+        ) {
+          return null;
+        }
+        this.latestVaultOrientationSnapshot = snapshot;
         summaryEl.empty();
         this.renderVaultOrientationSummary(summaryEl, snapshot);
         return snapshot;
       } catch (error) {
-        if (summaryEl.isConnected === false) return null;
+        if (
+          requestGeneration !== this.vaultOrientationRequestGeneration ||
+          summaryEl.isConnected === false
+        ) {
+          return null;
+        }
         summaryEl.empty();
+        if (this.latestVaultOrientationSnapshot) {
+          this.renderVaultOrientationSummary(summaryEl, this.latestVaultOrientationSnapshot);
+        }
+        const failureVerb = this.latestVaultOrientationSnapshot ? "refresh" : "load";
         summaryEl.createDiv({
           cls: "setting-item-description mod-warning",
-          text: `Could not load vault orientation: ${this.errorMessage(error)}`,
+          text: `Could not ${failureVerb} vault orientation: ${this.errorMessage(error)}`,
         });
         return null;
       }
@@ -3945,7 +4547,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     if (this.plugin.isLocalProjectMemoryModeEnabled()) {
       containerEl.createEl("p", {
-        cls: "setting-item-description",
+        cls: "vaultguard-settings-note",
         text:
           "ChatGPT connector sessions are disabled in Local Project Memory Mode. Repo-root project-memory vaults must stay local and plaintext for coding workflows.",
       });
@@ -3954,7 +4556,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     if (Platform.isMobileApp) {
       containerEl.createEl("p", {
-        cls: "setting-item-description",
+        cls: "vaultguard-settings-note",
         text:
           "ChatGPT connector is desktop-only. It needs the local VaultGuard MCP server and an HTTPS/Secure MCP Tunnel path that mobile Obsidian cannot host.",
       });
@@ -3962,7 +4564,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
 
     containerEl.createEl("p", {
-      cls: "setting-item-description",
+      cls: "vaultguard-settings-note",
       text:
         "Developer preview only. This exposes selected read-only VaultGuard tools to ChatGPT through an HTTPS or Secure MCP Tunnel endpoint. Anything returned by a tool can leave this device and be processed by OpenAI. Use narrow scopes, short sessions, and revoke sessions when finished. Never paste Agent Bridge lease tokens, recovery keys, local access keys, OpenAI API keys, or vault secrets into ChatGPT.",
     });
@@ -4018,7 +4620,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Active ChatGPT connector sessions").setHeading();
     if (sessions.length === 0) {
       containerEl.createDiv({
-        cls: "setting-item-description",
+        // `vaultguard-settings-inset` keeps standalone blocks on the tab's
+        // single left content edge; a bare `setting-item-description` is only
+        // inset when it sits inside a `.setting-item`.
+        cls: "setting-item-description vaultguard-settings-inset",
         text: "No active ChatGPT connector sessions.",
       });
       return;
@@ -4035,7 +4640,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     const localProjectMemoryMode = this.plugin.isLocalProjectMemoryModeEnabled();
     if (localProjectMemoryMode) {
       containerEl.createEl("p", {
-        cls: "setting-item-description",
+        cls: "vaultguard-settings-note",
         text:
           "Local Project Memory Mode allows explicitly authorized localhost MCP connections after VaultGuard sign-in. Leases are time-limited, kept only in memory, revoked with the login session or plugin, and cannot use the generic RPC or remote ChatGPT connector surfaces.",
       });
@@ -4047,7 +4652,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // bridge lease" and see a confusing failure later.
     if (Platform.isMobileApp) {
       containerEl.createEl("p", {
-        cls: "setting-item-description",
+        cls: "vaultguard-settings-note",
         text:
           "Agent bridge is desktop-only. It exposes VaultGuard Sync's tools to local MCP clients (Codex, Claudian, Claude Code, Cursor) via a localhost HTTP server, which Obsidian mobile renderers can't host. Manage agent leases from a desktop install of this same vault.",
       });
@@ -4055,7 +4660,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
 
     containerEl.createEl("p", {
-      cls: "setting-item-description",
+      cls: "vaultguard-settings-note",
       text:
         localProjectMemoryMode
           ? "Create a scoped bearer lease for a local MCP client such as Codex, Claudian, Claude Code, or Cursor. The bridge remains on 127.0.0.1 and keeps the existing scope, write-confirmation, hidden-path, and audit gates. A server vault binding is not required."
@@ -4120,7 +4725,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Current leases").setHeading();
 
     if (activeLeases.length === 0) {
-      const empty = containerEl.createDiv({ cls: "setting-item-description" });
+      const empty = containerEl.createDiv({
+        cls: "setting-item-description vaultguard-settings-inset",
+      });
       empty.appendText(
         "No active bridge leases. Create one here or from the command palette when you want to connect an agent."
       );
@@ -4282,7 +4889,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       return;
     }
 
-    const idleInfo = containerEl.createDiv({ cls: "setting-item-description" });
+    const idleInfo = containerEl.createDiv({
+      cls: "setting-item-description vaultguard-settings-inset",
+    });
     idleInfo.appendText("Bridge server is idle. It starts when you create a lease.");
   }
 

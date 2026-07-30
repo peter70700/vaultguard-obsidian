@@ -250,6 +250,24 @@ export interface PermissionStoreFactoryContext {
   setConnectionOffline(): void;
   fetchPermissionLevelFromServer(path: string): Promise<PermissionLevel>;
   isNetworkError(error: unknown): boolean;
+
+  /**
+   * SD-03-F15: true when the org has `allowAdminPerFileRestrictions` on, so the
+   * store's three org-admin fast paths must fall through to the normal
+   * rule/cache/probe path. REQUIRED (not optional) on purpose: `main.ts` is the
+   * only builder of this interface, so requiring the member makes the
+   * typechecker enforce that the store is actually wired to the live policy.
+   */
+  isAdminRestrictionActive(): boolean;
+
+  /**
+   * SD-03-F16: re-fetch rules and re-warm after a server-confirmed permission
+   * change, so the store never re-resolves cached paths against pre-change
+   * rules. Must await any warm cycle already in flight before starting a fresh
+   * one (DESIGN M9) and must never emit('changed') — see the port's doc comment
+   * in `main.ts`. REQUIRED for the same enforcement reason as above.
+   */
+  requestWarmup(): Promise<void>;
 }
 
 export interface PermissionSurfaceContext {
@@ -419,13 +437,68 @@ export interface OfflineQueueOperation {
   // this queued edit was based on, so a replay can detect a conflicting write.
   baseVersionId?: string;
   baseHash?: string;
+  // SD-06-F1 (16-03) / DECISION 9: the mutation intent resolved at ENQUEUE
+  // time, so a create queued offline is still a create after a restart. Rides
+  // inside `ops` in the existing `v: 2` envelope — the version deliberately does
+  // NOT bump. An older build reading a v2-with-intent envelope simply drops the
+  // unknown field and lands in today's lane; bumping to v3 would make that build
+  // skip restore ENTIRELY and strand the user's queued edits (P20).
+  //
+  // Never persisted as `{kind:"unknown"}` — an unknown resolution carries no
+  // information, and omitting it lets the flush re-resolve against a store that
+  // may have learned something in the meantime.
+  intent?: MutationIntent;
 }
 
+/**
+ * SD-06-F1 (phase 16, plan 16-03) — `"converged"` is new.
+ *
+ * It is returned ONLY from a create-flavored conflict (`createConflict: true`)
+ * whose remote copy hashes identical to the local one: two devices created the
+ * same bytes, so there is nothing to resolve. It is a SUCCESS value — every
+ * consumer must treat it like a completed write, never fall into a
+ * conflict/error default. The gate matters: an ungated same-hash short-circuit
+ * would silently change today's update-409 behavior, which still records a
+ * conflict entry even when the hashes match.
+ */
 export type RemoteWriteConflictResolutionResult =
   | "keep-local"
   | "keep-remote"
   | "duplicate"
-  | "pending";
+  | "pending"
+  | "converged";
+
+/**
+ * SD-06-F1 (phase 16) — the mutation intent a small-file write DECLARES to the
+ * server, resolved once from the knowledge this client actually holds.
+ *
+ * `RemoteFileStateStore` has always tracked a tri-state
+ * (`"present" | "absent" | "unknown"`), but `getExpectedVersionId()` — the only
+ * accessor every write path called — collapsed *absent* and *unknown* into the
+ * same `undefined`, and `buildWriteBody` then omitted the guard for both. The
+ * server therefore could not tell "I know this path is unused" from "I have no
+ * idea", so it treated both as an unconditional overwrite and a racing create
+ * silently became the head. This union carries the distinction to the wire.
+ *
+ * Wire mapping — 16-01's SHIPPED contract, quoted from `16-01-SUMMARY.md`
+ * ("The wire contract you must emit, verbatim"):
+ *
+ * | intent kind      | body field                              |
+ * |------------------|-----------------------------------------|
+ * | `expect-version` | `expectedVersionId: "<s3 version id>"`  |
+ * | `must-be-absent` | `mustBeAbsent: true` (boolean LITERAL)  |
+ * | `force`          | `force: true` (boolean LITERAL)         |
+ * | `unknown`        | no intent key at all — today's body      |
+ *
+ * At most ONE of the three keys may appear on a body; two is a server 400
+ * ("Conflicting mutation intents"). `mustBeAbsent`/`force` must be the boolean
+ * literal `true` — `"true"`, `1` and `null` are each a 400.
+ */
+export type MutationIntent =
+  | { kind: "expect-version"; versionId: string }
+  | { kind: "must-be-absent" }
+  | { kind: "force" }
+  | { kind: "unknown" };
 
 export interface AtRestAdapterRuntimeContext {
   app: App;
@@ -441,6 +514,22 @@ export interface AtRestAdapterRuntimeContext {
    * PIN-unwrapped LAK (edge #6).
    */
   isPinLockEnrolled?(): boolean;
+
+  /**
+   * SD-05-F3 / D2: clear PIN enrollment when a recovery-code restore REPLACED
+   * the LAK (the PIN envelope wraps a key this device no longer uses). Optional
+   * so existing ctx-builder test mocks keep compiling; production wires it to
+   * `pinLockManager.disable()`.
+   */
+  disablePinLock?(): Promise<void>;
+
+  /**
+   * True when the org has `allowAdminPerFileRestrictions` on (SD-03-F15), so
+   * `canDeletePath` must consult the server/cache instead of short-circuiting
+   * on the org-admin role. Optional ⇒ absent means false: several existing
+   * suites build this context as a partial object and never supply the member.
+   */
+  isAdminRestrictionActive?(): boolean;
 
   getSession(): UserSession | null;
   getKeyLease(): KeyLease | null;
@@ -497,12 +586,27 @@ export interface AtRestAdapterRuntimeContext {
   ): void;
   getRemoteFileState(path: string): RemoteFileStateEntry | null;
   getExpectedVersionId(path: string): string | undefined;
+  // SD-06-F1: the non-lossy sibling of getExpectedVersionId. Callers use it to
+  // DECLARE what they know; getExpectedVersionId stays for untouched callers
+  // (it is still the offline queue's baseVersionId source).
+  resolveMutationIntent(path: string): MutationIntent;
   recordRemoteFilePresent(path: string, update?: RemoteFileStateUpdate): void;
   recordRemoteFileAbsent(path: string): void;
+  // SD-06-F1 breadcrumb sink for the unknown mutation-intent lane. Device-local
+  // ring buffer, NODE_ENV-gated and DCE-stripped from production builds, so it
+  // may carry the vault path (the opposite constraint from server telemetry).
+  // OPTIONAL so pre-existing ctx-builder test mocks keep working unchanged —
+  // buildWriteBody calls it with `?.` (DECISION 5: degrade, never crash).
+  recordSyncDiagnostic?(event: string, detail?: Record<string, unknown>): void;
+  // SD-06-F1 / DECISION 2: `createConflict` marks a 409 that answered a
+  // DECLARED create (`mustBeAbsent`). It enables the identical-content
+  // auto-converge and the create-flavored ASK_USER copy; without it the
+  // function behaves exactly as it does today.
   handleRemoteWriteConflict(
     path: string,
     localContent: string,
     baseVersionId?: string | null,
+    options?: { createConflict?: boolean },
   ): Promise<RemoteWriteConflictResolutionResult>;
   recordDeletionTombstone(path: string): void;
   clearDeletionTombstone(path: string): void;
@@ -519,6 +623,14 @@ export interface AtRestAdapterRuntimeContext {
   // raw-remove wipe; the vault delete listeners honor it to suppress server DELETEs.
   isResettingLocalCache?(): boolean;
   setResettingLocalCache?(v: boolean): void;
+  /**
+   * SD-07-F4 — called by the reset wipe IMMEDIATELY after each successful raw
+   * remove, so the path is delete-suppressed from that instant. The caller's
+   * post-wipe bulk registration is unreachable once the wipe promise is
+   * orphaned by a hot reload or stopped by the unload abort. Optional so
+   * existing ctx-builder test mocks keep compiling.
+   */
+  recordWipedPathAwaitingRepull?(path: string): void;
 
   encryptContent(content: string): Promise<string>;
   computeHash(content: string): Promise<string>;
@@ -652,6 +764,10 @@ export interface SyncRuntimeContext {
   ): void;
   getRemoteFileState(path: string): RemoteFileStateEntry | null;
   getExpectedVersionId(path: string): string | undefined;
+  // SD-06-F1: see the AtRestAdapterRuntimeContext twin above. Both runtimes
+  // declare the same four store accessors plus this one, wired identically in
+  // main.ts, so intent resolution reads the same store from either seam.
+  resolveMutationIntent(path: string): MutationIntent;
   recordRemoteFilePresent(path: string, update?: RemoteFileStateUpdate): void;
   recordRemoteFileAbsent(path: string): void;
   performInitialReconciliation(): Promise<boolean>;
@@ -659,22 +775,32 @@ export interface SyncRuntimeContext {
   performSync(options?: { userInitiated?: boolean; forceCatchup?: boolean }): Promise<void>;
   buildLocalSyncManifest(): Record<string, string>;
   askReconciliationPlan(plan: ReconciliationPlan): Promise<ReconciliationDecision>;
+  // SD-06-F1 / DECISION 7: `intent` is REQUIRED. This uploader serves creates
+  // (reconciliation / catch-up, whose absence proof comes from a fresh
+  // inventory) and forces (conflict KEEP_LOCAL, artifact heal), and it cannot
+  // tell them apart from the store alone.
   uploadReconciledFile(
     path: string,
     content: string,
-    options?: { noWriteNotice?: string },
-  ): Promise<"uploaded" | "skipped-no-lease" | "skipped-no-permission">;
+    options: { intent: MutationIntent; noWriteNotice?: string },
+  ): Promise<
+    | "uploaded"
+    | "skipped-no-lease"
+    | "skipped-no-permission"
+    | "skipped-create-conflict"
+  >;
   /** Re-encrypts an externally-added plaintext text file in place (no-op for
    * VG1/binary/excluded paths). Fire-and-forget hygiene after catch-up uploads. */
   ensureAtRestEncryptedInPlace(path: string, remoteDurable?: boolean): Promise<boolean>;
-  /** Current permission-store state — used to refuse deleting local-only files
-   * on an unconfirmed (cold/warming/fetch-failed) permission baseline (SY2). */
+  /** Current permission-store state. SD-06-F4: this is a DIAGNOSTIC field
+   * only — it is recorded alongside a held catch-up file and must never gate a
+   * deletion. A "warmed" store proves the permission store finished
+   * initialising; it is not evidence that any local file is redundant. */
   getPermissionStoreState(): PermissionStoreState;
-  removeUnsyncedLocalFile(path: string): Promise<boolean>;
   uploadLocalOnlyFiles(): Promise<{
     uploadedFiles: number;
     uploadedFolders: number;
-    removedLocalFiles: number;
+    heldNoPermissionFiles: number;
     skippedFiles: number;
     failedFiles: number;
     failedFolders: number;
@@ -871,6 +997,13 @@ export interface PluginSettingsRuntimeContext {
   forceLogout(noticeMessage?: string): Promise<void>;
   refreshAccessToken(session: UserSession): Promise<SettingsRuntimeTokenRefreshResult>;
   initializeApiClientFromSession(session: UserSession): void;
+  /**
+   * SD-02-F1 (M10): the plugin's single session-id resolver. The `getSessionId`
+   * callback handed to `VaultGuardApiClient` MUST route through this rather than
+   * reading `ctx.session?.sessionId`, so both production header sites agree on
+   * which id an outbound request carries.
+   */
+  resolveRequestSessionId(): string | null;
   log(message: string): void;
   logError(message: string, error: unknown): void;
 }

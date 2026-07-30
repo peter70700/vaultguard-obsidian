@@ -1,4 +1,4 @@
-// Official Codex client detection for the desktop ChatGPT-subscription
+// OpenAI Codex runtime detection for the desktop ChatGPT-subscription
 // provider. VaultGuard runs only `codex --version` and `codex login status`;
 // it never reads CODEX_HOME, auth.json, keychain entries, or token output.
 
@@ -33,6 +33,7 @@ export interface CodexDetectorDeps {
   isMobile: boolean;
   env: NodeJS.ProcessEnv;
   candidatePaths(): Promise<string[]>;
+  materializeBundledBinary?(binaryPath: string): Promise<string | null>;
   run(
     binaryPath: string,
     args: readonly string[],
@@ -43,6 +44,9 @@ export interface CodexDetectorDeps {
 const CHECK_TIMEOUT_MS = 5_000;
 const CHECK_MAX_BUFFER = 64 * 1024;
 const CONTROL_RE = /[\u0000-\u001F\u007F]/g;
+const CHATGPT_PACKAGE_PREFIX = "OpenAI.Codex_";
+const BUNDLED_RUNTIME_CACHE_DIR = "codex-runtime";
+const bundledRuntimeCopies = new Map<string, Promise<string>>();
 
 function cleanDiagnostic(value: string): string {
   return value
@@ -108,7 +112,7 @@ export function classifyCodexLoginStatus(
     isChatGptSubscription: false,
     error:
       exitCode === 0
-        ? "Codex returned an unrecognized login status. Update the official Codex client and retry."
+        ? "Codex returned an unrecognized login status. Update the ChatGPT app or Codex CLI and retry."
         : "Codex could not verify the current login. Run `codex login` and retry.",
   };
 }
@@ -145,6 +149,38 @@ export async function findCodexBinary(
       // aliases). Continue to the next absolute candidate.
     }
   }
+
+  // Windows Store/MSIX package files can be readable but reject CreateProcess
+  // from a process outside the package (EPERM). The ChatGPT desktop app bundles
+  // a complete Codex CLI, so materialize that exact installed binary into a
+  // user-local VaultGuard runtime cache and try it before reporting "missing".
+  if (deps.materializeBundledBinary) {
+    const materialized = new Set<string>();
+    for (const binaryPath of candidates) {
+      if (signal?.aborted) throw cancelledError();
+      try {
+        const runnablePath = await deps.materializeBundledBinary(binaryPath);
+        if (!runnablePath) continue;
+        const key = process.platform === "win32" ? runnablePath.toLowerCase() : runnablePath;
+        if (materialized.has(key)) continue;
+        materialized.add(key);
+        if (signal?.aborted) throw cancelledError();
+        const result = await deps.run(runnablePath, ["--version"], {
+          timeoutMs: CHECK_TIMEOUT_MS,
+          maxBuffer: CHECK_MAX_BUFFER,
+          signal,
+        });
+        if (result.exitCode === 0) {
+          return {
+            binaryPath: runnablePath,
+            version: parseVersion(`${result.stdout}\n${result.stderr}`),
+          };
+        }
+      } catch {
+        if (signal?.aborted) throw cancelledError();
+      }
+    }
+  }
   return null;
 }
 
@@ -169,7 +205,8 @@ export async function getCodexAuthStatus(
       installed: false,
       loggedIn: false,
       isChatGptSubscription: false,
-      error: "Official Codex client not found.",
+      error:
+        "A usable Codex runtime was not found. Install the ChatGPT desktop app or Codex CLI, then retry.",
     };
   }
 
@@ -217,6 +254,29 @@ function nodeRequire(): NodeRequire | null {
     : null;
 }
 
+export function chatGptBundledCodexPackageName(
+  sourcePath: string,
+  programFilesPath: string,
+): string | null {
+  const normalize = (value: string) =>
+    value.trim().replace(/\//g, "\\").replace(/\\+$/g, "");
+  const source = normalize(sourcePath);
+  const root = `${normalize(programFilesPath)}\\WindowsApps\\`;
+  if (!source.toLowerCase().startsWith(root.toLowerCase())) return null;
+  const parts = source.slice(root.length).split("\\");
+  if (
+    parts.length !== 4 ||
+    !parts[0].startsWith(CHATGPT_PACKAGE_PREFIX) ||
+    !/^OpenAI\.Codex_[A-Za-z0-9._-]+$/.test(parts[0]) ||
+    parts[1].toLowerCase() !== "app" ||
+    parts[2].toLowerCase() !== "resources" ||
+    parts[3].toLowerCase() !== "codex.exe"
+  ) {
+    return null;
+  }
+  return parts[0];
+}
+
 function loadDetectorDeps(): CodexDetectorDeps {
   const req = nodeRequire();
   if (!req) {
@@ -244,8 +304,10 @@ function loadDetectorDeps(): CodexDetectorDeps {
       callback: (error: Error & { code?: number | string }, stdout: string, stderr: string) => void,
     ): { kill(signal?: string): void };
   };
-  const path = req("path") as { join(...parts: string[]): string };
-  const os = req("os") as { homedir(): string };
+  const path = req("path") as typeof import("node:path");
+  const os = req("os") as typeof import("node:os");
+  const fs = req("fs") as typeof import("node:fs");
+  const crypto = req("crypto") as typeof import("node:crypto");
   const env = typeof process !== "undefined" ? process.env : {};
 
   const run: CodexDetectorDeps["run"] = (binaryPath, args, options) =>
@@ -294,9 +356,101 @@ function loadDetectorDeps(): CodexDetectorDeps {
       if (options.signal?.aborted) onAbort();
     });
 
+  const cleanupOldBundledRuntimes = async (
+    cacheRoot: string,
+    currentFileName: string,
+  ): Promise<void> => {
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fs.promises.readdir(cacheRoot, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    await Promise.all(
+      entries
+        .filter(
+          (entry) =>
+            entry.isFile() &&
+            entry.name.startsWith(CHATGPT_PACKAGE_PREFIX) &&
+            entry.name.endsWith(".exe") &&
+            entry.name !== currentFileName,
+        )
+        .map((entry) =>
+          fs.promises
+            .rm(path.join(cacheRoot, entry.name), { force: true })
+            .catch(() => undefined),
+        ),
+    );
+  };
+
+  const materializeBundledBinary = async (sourcePath: string): Promise<string | null> => {
+    if (process.platform !== "win32") return null;
+    const programFiles = env.ProgramFiles ?? env.PROGRAMFILES ?? "";
+    const packageName = chatGptBundledCodexPackageName(sourcePath, programFiles);
+    if (!packageName) return null;
+
+    const sourceKey = sourcePath.toLowerCase();
+    let copy = bundledRuntimeCopies.get(sourceKey);
+    if (!copy) {
+      copy = (async () => {
+        const cacheBase = env.LOCALAPPDATA || os.tmpdir();
+        const cacheRoot = path.join(cacheBase, "VaultGuard", BUNDLED_RUNTIME_CACHE_DIR);
+        const targetFileName = `${packageName}.exe`;
+        const targetPath = path.join(cacheRoot, targetFileName);
+        const sourceStat = await fs.promises.stat(sourcePath);
+        if (!sourceStat.isFile()) {
+          throw new Error("The bundled Codex runtime is not a file.");
+        }
+
+        try {
+          const cachedStat = await fs.promises.stat(targetPath);
+          if (cachedStat.isFile() && cachedStat.size === sourceStat.size) {
+            await cleanupOldBundledRuntimes(cacheRoot, targetFileName);
+            return targetPath;
+          }
+        } catch {
+          // First use of this ChatGPT package version.
+        }
+
+        await fs.promises.mkdir(cacheRoot, { recursive: true });
+        const tempPath = `${targetPath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+        try {
+          await fs.promises.copyFile(sourcePath, tempPath);
+          const copiedStat = await fs.promises.stat(tempPath);
+          if (!copiedStat.isFile() || copiedStat.size !== sourceStat.size) {
+            throw new Error("The bundled Codex runtime copy was incomplete.");
+          }
+          try {
+            await fs.promises.rename(tempPath, targetPath);
+          } catch {
+            try {
+              const racedStat = await fs.promises.stat(targetPath);
+              if (racedStat.isFile() && racedStat.size === sourceStat.size) {
+                await cleanupOldBundledRuntimes(cacheRoot, targetFileName);
+                return targetPath;
+              }
+            } catch {
+              // Replace a partial cache entry below.
+            }
+            await fs.promises.rm(targetPath, { force: true });
+            await fs.promises.rename(tempPath, targetPath);
+          }
+          await cleanupOldBundledRuntimes(cacheRoot, targetFileName);
+          return targetPath;
+        } finally {
+          await fs.promises.rm(tempPath, { force: true }).catch(() => undefined);
+        }
+      })();
+      bundledRuntimeCopies.set(sourceKey, copy);
+      void copy.catch(() => bundledRuntimeCopies.delete(sourceKey));
+    }
+    return copy;
+  };
+
   return {
     isMobile: Platform.isMobileApp,
     env,
+    materializeBundledBinary,
     candidatePaths: async () => {
       const candidates: string[] = [];
       const pathLookup = process.platform === "win32" ? "where.exe" : "which";
@@ -311,6 +465,42 @@ function loadDetectorDeps(): CodexDetectorDeps {
       }
 
       const home = os.homedir();
+      if (process.platform === "win32") {
+        const windowsRoot = env.SystemRoot ?? env.WINDIR;
+        if (windowsRoot) {
+          const powershell = path.join(
+            windowsRoot,
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+          );
+          try {
+            const appx = await run(
+              powershell,
+              [
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-AppxPackage -Name 'OpenAI.Codex' | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty InstallLocation",
+              ],
+              {
+                timeoutMs: CHECK_TIMEOUT_MS,
+                maxBuffer: CHECK_MAX_BUFFER,
+              },
+            );
+            for (const installLocation of appx.stdout.split(/\r?\n/g)) {
+              if (installLocation.trim()) {
+                candidates.push(
+                  path.join(installLocation.trim(), "app", "resources", "codex.exe"),
+                );
+              }
+            }
+          } catch {
+            // The PATH and conventional-path candidates remain available.
+          }
+        }
+      }
       if (env.APPDATA) {
         candidates.push(path.join(env.APPDATA, "npm", "codex.exe"));
         candidates.push(path.join(env.APPDATA, "npm", "codex.cmd"));
@@ -321,6 +511,10 @@ function loadDetectorDeps(): CodexDetectorDeps {
       candidates.push(
         "/usr/local/bin/codex",
         "/opt/homebrew/bin/codex",
+        "/Applications/Codex.app/Contents/Resources/codex",
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+        path.join(home, "Applications", "Codex.app", "Contents", "Resources", "codex"),
+        path.join(home, "Applications", "ChatGPT.app", "Contents", "Resources", "codex"),
         path.join(home, ".local", "bin", "codex"),
         path.join(home, ".npm-global", "bin", "codex"),
       );

@@ -632,10 +632,18 @@ describe('File Protection: Vault Adapter Interception', () => {
 
       await plugin.interceptedWrite('notes.md', 'conflicting edit');
 
+      // REAL UPDATE (SD-06-F1 / 16-03, DECISION 2). handleRemoteWriteConflict
+      // gained a 4th `options` argument. This fixture seeds present('v1'), so
+      // the write declared `expect-version` — an UPDATE — and must therefore
+      // carry `createConflict: false`. Asserting the literal false (rather than
+      // loosening the matcher) turns this into a guard that DECISION 1's disk
+      // write and DECISION 2's auto-converge can never leak into the update
+      // lane: if a create ever mis-routed here, this goes red.
       expect(plugin.handleRemoteWriteConflict).toHaveBeenCalledWith(
         'notes.md',
         'conflicting edit',
-        'v1'
+        'v1',
+        { createConflict: false }
       );
       expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
       expect(plugin.offlineQueue).toHaveLength(0);
@@ -1014,10 +1022,21 @@ describe('File Protection: Vault Adapter Interception', () => {
 
       // The STRING read path ran (proving the legacy branch)…
       expect(plugin.readPlainFromDisk).toHaveBeenCalledWith('notes/new.md');
-      // …and the PUT body is today's { content, hash } shape (no contentType, no
-      // timeout override) — legacy behavior unchanged.
+      // …and the PUT body keeps its legacy SHAPE (no contentType, no timeout
+      // override) — the string lane is unchanged.
+      //
+      // REAL UPDATE (SD-06-F1 / 16-03, DECISION 6): the rename DESTINATION now
+      // declares its intent. This fixture seeds no remoteFileState for
+      // 'notes/new.md', so the store answers `unknown` and the destination is
+      // upgraded to `must-be-absent` on the structural fact that Obsidian
+      // refuses a rename onto an existing local path. Kept as toEqual — NOT
+      // loosened to toMatchObject — so the wire shape stays fully pinned.
       expect(puts).toHaveLength(1);
-      expect(puts[0].body).toEqual({ content: expect.any(String), hash: expect.any(String) });
+      expect(puts[0].body).toEqual({
+        content: expect.any(String),
+        hash: expect.any(String),
+        mustBeAbsent: true,
+      });
       expect(puts[0].body).not.toHaveProperty('contentType');
       expect(puts[0].options).toBeUndefined();
     });
@@ -1040,7 +1059,15 @@ describe('File Protection: Vault Adapter Interception', () => {
       await plugin.interceptedRename('notes/old.md', 'notes/new.md');
 
       expect(puts).toHaveLength(1);
-      expect(puts[0].body).toEqual({ content: expect.any(String), hash: expect.any(String) });
+      // REAL UPDATE (SD-06-F1 / 16-03, DECISION 6) — same cause as the sibling
+      // above: an unknown rename destination now declares `mustBeAbsent`. The
+      // claim this test exists for (a TEXT file uses the string flow: no
+      // contentType, no timeout) is untouched.
+      expect(puts[0].body).toEqual({
+        content: expect.any(String),
+        hash: expect.any(String),
+        mustBeAbsent: true,
+      });
       expect(puts[0].body).not.toHaveProperty('contentType');
       expect(puts[0].options).toBeUndefined();
       // The PUT content decrypts via the STRING decrypt back to the text.
@@ -1634,5 +1661,107 @@ describe('File Protection: at-rest media preview (BIN-A / getResourcePath)', () 
     // decrypted blob is never served — the ciphertext URL comes back instead.
     plugin.session = null;
     expect(runtime.interceptedGetResourcePath('img/pic.png')).toBe('app://host/img/pic.png?42');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SD-03-F15: canDeletePath is the FOURTH client admin fast path (the other
+// three live in PermissionStore). It returned `true` for any org admin with no
+// I/O at all, so a restricted admin could delete a file the server denies.
+// With the org restriction on it now falls through to the EXISTING member
+// path — server check online, cached permission offline — and is byte-identical
+// when the restriction is off.
+//
+// Cache-seeding note (verified against this harness, not assumed):
+// `createTestPlugin()` makes `plugin.permissionCache` the very Map that its
+// `plugin.permissionStore.getCachedPermission` reads, and main.ts's REAL
+// `resolvePermissionFromCache` (which the runtime ctx delegates to) walks the
+// store. So seeding `plugin.permissionCache` reaches the runtime transitively
+// through the store stub — not because the runtime reads that field directly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('SD-03-F15 canDeletePath under admin restriction', () => {
+  let plugin: any;
+  let runtime: any;
+
+  beforeEach(() => {
+    plugin = createTestPlugin();
+    runtime = plugin.ensureAtRestAdapterRuntimeObject();
+    plugin.session = makeSession('admin');
+    plugin.connectionState.status = 'online';
+  });
+
+  // T-F15-C8a — the behavioural flip: the server answer now binds.
+  it('restricted admin is denied by the server answer', async () => {
+    plugin.orgSettings = { allowAdminPerFileRestrictions: true };
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true, data: { allowed: false }, error: null, requestId: 'check',
+    });
+
+    await expect(runtime.canDeletePath('secret/a.md')).resolves.toBe(false);
+
+    expect(plugin.apiRequest).toHaveBeenCalledTimes(1);
+    const [method, endpoint, body] = plugin.apiRequest.mock.calls[0];
+    expect(method).toBe('POST');
+    expect(endpoint).toMatch(/\/permissions\/check$/);
+    expect(body).toEqual(expect.objectContaining({
+      action: 'delete',
+      path: '/secret/a.md',
+    }));
+  });
+
+  // T-F15-C8b — same verdict as pre-fix, but only after a server round trip:
+  // the observable difference is that the call happens at all.
+  it('restricted admin is still allowed when the server allows, via a real round trip', async () => {
+    plugin.orgSettings = { allowAdminPerFileRestrictions: true };
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true, data: { allowed: true }, error: null, requestId: 'check',
+    });
+
+    await expect(runtime.canDeletePath('secret/a.md')).resolves.toBe(true);
+
+    expect(plugin.apiRequest).toHaveBeenCalledTimes(1);
+  });
+
+  // T-F15-C8c — preservation: the default (toggle off) org is byte-identical.
+  it('unrestricted admin short-circuits with no network call', async () => {
+    plugin.orgSettings = null;
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true, data: { allowed: false }, error: null, requestId: 'check',
+    });
+
+    await expect(runtime.canDeletePath('secret/a.md')).resolves.toBe(true);
+
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+  });
+
+  // T-F15-C8d (READ variant) — the behavioural half of the offline fallback:
+  // a restricted admin whose cached level is below ADMIN is denied offline.
+  it('restricted admin offline is denied when the cached level is below ADMIN', async () => {
+    plugin.orgSettings = { allowAdminPerFileRestrictions: true };
+    plugin.connectionState.status = 'offline';
+    plugin.permissionCache.set('secret/a.md', PermissionLevel.READ);
+    plugin.apiRequest = vi.fn();
+
+    await expect(runtime.canDeletePath('secret/a.md')).resolves.toBe(false);
+
+    // Offline, so the absence of a call is expected — it is NOT evidence that
+    // the short-circuit is gone. The cache-driven verdict is what proves that.
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
+  });
+
+  // T-F15-C8d (ADMIN variant) — preservation, NOT a falsification: the verdict
+  // is `true` on both sides. It pins availability (M6): a warmed root/leaf
+  // ADMIN still answers offline, so the gate does not lock a restricted admin
+  // out of their own vault when the network is gone.
+  it('restricted admin offline is still allowed from a warmed ADMIN cache entry', async () => {
+    plugin.orgSettings = { allowAdminPerFileRestrictions: true };
+    plugin.connectionState.status = 'offline';
+    plugin.permissionCache.set('secret/a.md', PermissionLevel.ADMIN);
+    plugin.apiRequest = vi.fn();
+
+    await expect(runtime.canDeletePath('secret/a.md')).resolves.toBe(true);
+
+    expect(plugin.apiRequest).not.toHaveBeenCalled();
   });
 });

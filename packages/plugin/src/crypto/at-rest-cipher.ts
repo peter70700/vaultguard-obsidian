@@ -48,6 +48,12 @@ export type WrappedLakProbe =
   | { kind: "present"; blob: string }
   | { kind: "error"; reason: string };
 
+/** One managed VG1 file's raw on-disk bytes, yielded for candidate-key validation. */
+export interface AtRestCiphertextSample {
+  path: string;
+  bytes: Uint8Array;
+}
+
 export interface AtRestStorage {
   /** Read the wrapped LAK blob (base64 string), or null if not yet provisioned. */
   loadWrappedLak(): Promise<string | null>;
@@ -74,6 +80,16 @@ export interface AtRestStorage {
    * vault to scan).
    */
   hasExistingCiphertext?(): Promise<boolean>;
+  /**
+   * Enumerate EVERY managed VG1-headed file for restore-time validation,
+   * smallest-first (fast refusal). MUST THROW on any enumeration/read error —
+   * the caller treats an error as "cannot verify" and refuses the restore
+   * (fail-closed). Do NOT swallow per-file read failures the way
+   * `hasExistingCiphertext` does (that swallow is tracked as SD-05-F5).
+   * Implementations that omit this hook keep the legacy no-validation restore,
+   * which is safe only for in-memory test mocks with no vault to scan.
+   */
+  listCiphertextForValidation?(): AsyncIterable<AtRestCiphertextSample>;
   /** Persist the wrapped LAK blob (base64). */
   saveWrappedLak(blob: string): Promise<void>;
   /** Remove the wrapped LAK blob entirely (on plugin disable / decrypt-and-leave). */
@@ -103,6 +119,25 @@ export type AtRestStatus =
       reason: string;
     }
   | { kind: "disabled"; reason: string };
+
+/**
+ * SD-05-F3: the outcome of a recovery-code restore. A bare boolean could not
+ * distinguish "that isn't a code" from "that code doesn't open THIS vault" from
+ * "we couldn't check", and the UI has to say something honest about each.
+ */
+export type AtRestRestoreOutcome =
+  | { ok: true; outcome: "restored"; continuity: AtRestRestoreContinuity }
+  | { ok: false; reason: "malformed" }
+  | { ok: false; reason: "key-mismatch" }
+  | { ok: false; reason: "validation-error" }
+  | { ok: false; reason: "needs-confirmation" };
+
+/** How (or whether) the restored key was proven to be this vault's key. */
+export type AtRestRestoreContinuity =
+  | "same-key" // step 1: candidate == live LAK (constant-time). Idempotent re-wrap.
+  | "verified" // step 2: >= 1 existing VG1 sample decrypted under the candidate.
+  | "replaced" // hook present, ZERO samples existed, key differs -> the key was replaced.
+  | "unvalidated"; // hook ABSENT (in-memory test mocks) -> legacy behavior, nothing proven.
 
 /** Prefix that tags a v1 recovery code so we can refuse stranger formats. */
 const RECOVERY_CODE_PREFIX = "VG1";
@@ -644,46 +679,146 @@ export class AtRestCipher {
   }
 
   /**
-   * Restore the LAK from a recovery code, validate the checksum, and
-   * re-wrap it with the local KEK so subsequent loads work normally on
-   * this device.
+   * Restore the LAK from a recovery code: validate the code's checksum, prove
+   * the candidate key actually opens this vault's existing at-rest ciphertext,
+   * and only then re-wrap it with the local KEK.
    *
-   * Returns false on any malformed input so the UI can render a generic
-   * "invalid code" error without leaking which part failed (length /
-   * checksum / prefix). Returns true on success and leaves the cipher
-   * unlocked and ready for read/write.
+   * Nothing is persisted and the live LAK is never touched until validation
+   * passes, so a refusal leaves the previous envelope blob byte-identical and
+   * the cipher in exactly the state it was in.
    *
-   * Idempotent: calling with the *same* code that produced the current
-   * LAK is a no-op success. Calling with a *different* code replaces the
-   * LAK — any files already encrypted with the old key will become
-   * undecodable, which is by design (it's the same as restoring a wrong
-   * backup).
+   * Outcomes (`AtRestRestoreOutcome`):
+   *  - `restored`          — accepted; `continuity` says how it was proven.
+   *  - `malformed`         — prefix/length/hex/checksum failed. Deliberately
+   *                          generic so the UI cannot leak which part failed.
+   *  - `key-mismatch`      — the code is well-formed but at least one existing
+   *                          VG1 file does not decrypt under it. It belongs to a
+   *                          different vault or device. NOTHING was changed.
+   *                          Accepting it would create a mixed-key vault that no
+   *                          single key can open (SD-05-F3, invariant #3).
+   *  - `validation-error`  — the vault's ciphertext could not be enumerated or
+   *                          read, so the question could not be answered. Fail
+   *                          closed: nothing changed, safe to retry.
+   *  - `needs-confirmation`— there is no ciphertext to validate against AND a
+   *                          healthy live key would be replaced. Re-call with
+   *                          `{ confirmReplace: true }` after the user confirms.
+   *
+   * Idempotent: the code that produced the CURRENT LAK re-wraps and succeeds
+   * (this self-heals a damaged envelope) and leaves any PIN enrollment intact.
+   *
+   * Validation requires the storage to implement `listCiphertextForValidation`.
+   * Implementations without it (in-memory test mocks) keep the legacy
+   * restore-anything behavior and report `continuity: "unvalidated"`.
    */
-  async restoreFromRecoveryCode(code: string): Promise<boolean> {
+  async restoreFromRecoveryCode(
+    code: string,
+    opts?: { confirmReplace?: boolean }
+  ): Promise<AtRestRestoreOutcome> {
     const stripped = code.replace(/\s+/g, "").toUpperCase();
-    if (!stripped.startsWith(`${RECOVERY_CODE_PREFIX}-`)) return false;
+    if (!stripped.startsWith(`${RECOVERY_CODE_PREFIX}-`)) {
+      return { ok: false, reason: "malformed" };
+    }
 
     const body = stripped.slice(RECOVERY_CODE_PREFIX.length + 1).replace(/-/g, "");
     const expectedLen = (KEY_LEN + RECOVERY_CHECKSUM_BYTES) * 2;
-    if (body.length !== expectedLen) return false;
-    if (!/^[0-9A-F]+$/.test(body)) return false;
+    if (body.length !== expectedLen) return { ok: false, reason: "malformed" };
+    if (!/^[0-9A-F]+$/.test(body)) return { ok: false, reason: "malformed" };
 
     const lakHex = body.slice(0, KEY_LEN * 2);
     const checksumHex = body.slice(KEY_LEN * 2);
     const candidate = this.hexToBytes(lakHex);
     const expected = await this.recoveryChecksum(candidate);
     if (this.bytesToHex(expected).toUpperCase() !== checksumHex) {
-      return false;
+      return { ok: false, reason: "malformed" };
     }
 
     // Probe safeStorage in case it wasn't probed yet (e.g. the cipher
     // failed init and the caller is restoring directly).
     if (!this.safeStorage) this.safeStorage = probeSafeStorage();
 
+    // ── Step 1: idempotency fast path ────────────────────────────────────────
+    // The code that produced the CURRENT LAK. Nothing about the vault changes,
+    // so skip validation AND the confirm gate; re-wrapping self-heals a damaged
+    // envelope. The live key and any PIN enrollment are left exactly as they are.
+    if (this.lak && this.constantTimeEquals(candidate, this.lak)) {
+      const sameBlob = await this.wrapLakBytes(candidate);
+      await this.storage.saveWrappedLak(sameBlob);
+      candidate.fill(0);
+      this.status = { kind: "unlocked", method: this.method! };
+      return { ok: true, outcome: "restored", continuity: "same-key" };
+    }
+
+    // ── Step 2: prove the candidate opens this vault's existing ciphertext ───
+    const list = this.storage.listCiphertextForValidation;
+    const canValidate = typeof list === "function";
+    let sampleCount = 0;
+    let continuity: AtRestRestoreContinuity = "unvalidated";
+
+    if (canValidate) {
+      let probeKey: CryptoKey;
+      try {
+        probeKey = await crypto.subtle.importKey(
+          "raw",
+          candidate as BufferSource,
+          { name: "AES-GCM" },
+          false,
+          ["decrypt"]
+        );
+      } catch {
+        // Cannot even build the probe key ⇒ cannot answer the question.
+        candidate.fill(0);
+        return { ok: false, reason: "validation-error" };
+      }
+
+      let mismatch = false;
+      try {
+        for await (const sample of list.call(this.storage)) {
+          sampleCount++;
+          try {
+            await this.probeDecryptWithKey(probeKey, sample.bytes);
+          } catch {
+            // Fail fast on the FIRST file this key cannot open. `break` ends the
+            // iterator cleanly, so a later enumeration error can no longer mask
+            // an already-proven mismatch.
+            mismatch = true;
+            break;
+          }
+        }
+      } catch {
+        // Fail closed (DESIGN §3.4): an enumeration/read failure means we could
+        // not answer "does this key open every file?", so we refuse. Nothing has
+        // been persisted and the live key/status are untouched.
+        candidate.fill(0);
+        return { ok: false, reason: "validation-error" };
+      }
+      if (mismatch) {
+        candidate.fill(0);
+        return { ok: false, reason: "key-mismatch" };
+      }
+      continuity = sampleCount > 0 ? "verified" : "replaced";
+    }
+
+    // ── Step 3: healthy-replace confirm gate ─────────────────────────────────
+    // Reachable ONLY when there was no ciphertext to validate against (step 2
+    // proved nothing) and a working live key would be replaced. `confirmReplace`
+    // is read here and nowhere else, so it can never skip step 2.
+    if (
+      canValidate &&
+      sampleCount === 0 &&
+      this.status.kind === "unlocked" &&
+      this.lak !== null &&
+      !opts?.confirmReplace
+    ) {
+      candidate.fill(0);
+      return { ok: false, reason: "needs-confirmation" };
+    }
+
+    // ── Step 4: commit (persisting is the LAST thing that happens) ───────────
     const blob = await this.wrapLakBytes(candidate);
     await this.storage.saveWrappedLak(blob);
 
     if (this.lak) this.lak.fill(0);
+    // `candidate` is adopted by reference from here on — never zero it below.
     this.lak = candidate;
     this.cryptoKey = await crypto.subtle.importKey(
       "raw",
@@ -693,7 +828,36 @@ export class AtRestCipher {
       ["encrypt", "decrypt"]
     );
     this.status = { kind: "unlocked", method: this.method! };
-    return true;
+    return { ok: true, outcome: "restored", continuity };
+  }
+
+  /** Length-checked, branch-free byte compare (no early exit on first mismatch). */
+  private constantTimeEquals(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+  }
+
+  /**
+   * Probe-decrypt one sample under a CANDIDATE key. Throws on a wrong key
+   * (AES-GCM tag failure) or a non-VG1 buffer. The recovered plaintext is
+   * zeroed immediately and never returned, logged, or written anywhere —
+   * this is an authenticity check, not a read.
+   */
+  private async probeDecryptWithKey(key: CryptoKey, input: Uint8Array): Promise<void> {
+    if (!this.isEncrypted(input)) {
+      throw new Error("AtRestCipher: probe sample is not VG1 ciphertext.");
+    }
+    const nonce = input.slice(HEADER_LEN, HEADER_LEN + NONCE_LEN);
+    const body = input.slice(HEADER_LEN + NONCE_LEN);
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: nonce as BufferSource },
+      key,
+      body as BufferSource
+    );
+    // Zero on the success path; a tag failure returns no buffer at all.
+    new Uint8Array(plaintext).fill(0);
   }
 
   /**

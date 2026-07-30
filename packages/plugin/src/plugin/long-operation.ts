@@ -424,6 +424,14 @@ export function createThrottledPublisher<T>(
 export class LongOperationToken {
   private pauseRequested = false;
   private cancelRequested = false;
+  /**
+   * SD-07-F4 — system-level abort (plugin shutdown). DELIBERATELY separate from
+   * `cancelRequested`: that bit is capability-gated (`requestCancel` refuses
+   * under `canCancel: false`) AND cleared by `updateCapabilities`, which every
+   * `manager.update()` calls — so a protected operation that reports progress
+   * per item would have a plain cancel wiped on its very next tick.
+   */
+  private systemAborted = false;
 
   constructor(
     private capabilities: LongOperationCapabilities,
@@ -436,6 +444,10 @@ export class LongOperationToken {
 
   get isCancelRequested(): boolean {
     return this.cancelRequested;
+  }
+
+  get isSystemAborted(): boolean {
+    return this.systemAborted;
   }
 
   requestPause(): boolean {
@@ -456,6 +468,17 @@ export class LongOperationToken {
     return true;
   }
 
+  /**
+   * SD-07-F4 — abort for plugin shutdown. NOT capability-gated: a protected
+   * `canCancel: false` operation (e.g. the at-rest reset wipe, which holds a
+   * live raw adapter `remove`) MUST still stop when the plugin unloads,
+   * otherwise it keeps mutating the vault while a replacement instance boots.
+   * `updateCapabilities` deliberately never clears this bit.
+   */
+  abortForShutdown(): void {
+    this.systemAborted = true;
+  }
+
   updateCapabilities(capabilities: LongOperationCapabilities): void {
     this.capabilities = capabilities;
     if (!capabilities.canPause) {
@@ -464,9 +487,17 @@ export class LongOperationToken {
     if (!capabilities.canCancel) {
       this.cancelRequested = false;
     }
+    // SD-07-F4: `systemAborted` is intentionally NOT touched here. A shutdown
+    // abort must survive every capability update, including the per-item
+    // updates a protected operation issues while it works.
   }
 
   throwIfCancellationRequested(): void {
+    // SD-07-F4: the system abort wins over a user cancel and over the
+    // capability gate — check it first.
+    if (this.systemAborted) {
+      throw new LongOperationAbortedError("Operation aborted for plugin shutdown.");
+    }
     if (this.cancelRequested) {
       throw new LongOperationCancelledError("Operation cancellation requested.");
     }
@@ -485,6 +516,19 @@ export class LongOperationCancelledError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "LongOperationCancelledError";
+  }
+}
+
+/**
+ * SD-07-F4 — thrown at a checkpoint when the plugin is unloading. Subclasses
+ * `LongOperationCancelledError` so any existing/future `instanceof
+ * LongOperationCancelledError` catch keeps working; the distinct `name` lets
+ * callers (and tests) tell a system abort apart from a user cancel.
+ */
+export class LongOperationAbortedError extends LongOperationCancelledError {
+  constructor(message: string) {
+    super(message);
+    this.name = "LongOperationAbortedError";
   }
 }
 
@@ -856,6 +900,29 @@ export class LongOperationManager {
     if (active.cleanupTimer) clearTimeout(active.cleanupTimer);
     this.operations.delete(id);
     this.emit(active.snapshot, "removed");
+  }
+
+  /**
+   * SD-07-F4 — system-level abort for plugin shutdown. Bypasses the `canCancel`
+   * capability gate so PROTECTED operations stop too: the at-rest reset wipe is
+   * `canCancel: false` and holds a live raw adapter `remove`, so leaving it
+   * running past unload lets it keep deleting local files while a replacement
+   * instance boots with empty suppression state.
+   *
+   * Deliberately does NOT `finish()` / `remove()` — `destroy()` owns teardown.
+   * The aborted operation's own `catch` calls `operation.fail(error)`, which is
+   * already a safe no-op once the manager has removed it.
+   *
+   * Returns how many operations were aborted.
+   */
+  abortAllForShutdown(): number {
+    let aborted = 0;
+    for (const active of this.operations.values()) {
+      if (isTerminalState(active.snapshot.lifecycleState)) continue;
+      active.token.abortForShutdown();
+      aborted += 1;
+    }
+    return aborted;
   }
 
   destroy(): void {

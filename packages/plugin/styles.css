@@ -1595,6 +1595,12 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   color: var(--text-accent);
 }
 
+/* Depth 1 stays flush at the tab's single content edge on purpose: the
+ * disclosure triangle and the summary label already say "this is nested", so
+ * indenting the body as well would double-signal it and reintroduce a second
+ * left edge. The summary itself is inset to match (see the settings-tab
+ * alignment block below) — before that it sat at 0px while the headings inside
+ * it sat at 16px, which made the parent read as shallower than its children. */
 .vaultguard-settings-section-body {
   padding-top: 8px;
 }
@@ -1735,16 +1741,161 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 
 /* ─── Settings Tab ──────────────────────────────────────────────────────── */
 
-.vaultguard-settings-tab h3 {
-  margin-top: 24px;
-  margin-bottom: 8px;
-  font-size: 1em;
-  font-weight: 700;
-  color: var(--text-normal);
+/* ONE LEFT CONTENT EDGE FOR THE WHOLE TAB.
+ *
+ * Obsidian 1.11 renders every setting row as a card — `.setting-item` carries
+ * `padding: var(--size-4-4)` (16px) plus a background, and
+ * `.setting-item-heading` matches it with `padding: 0 var(--size-4-4)`. So
+ * anything built with `new Setting()` self-aligns at 16px for free (27
+ * headings + 135 rows in this tab). Anything the plugin renders as a raw
+ * `createDiv` / `createEl` does NOT, and every custom wrapper used to stack
+ * its own pad on top of the card's 16px. Measured against Obsidian's real
+ * app.css, this tab had SEVEN left edges: 0 / 11 / 13 / 15 / 16 / 33 / 42px.
+ * The 0px group was the worst of it — the `<summary>` labels of the
+ * collapsible sections sat at 0px while their own child headings sat at 16px,
+ * so a parent read as shallower than its children.
+ *
+ * Everything below pulls the raw blocks onto this one inset. Depth in this tab
+ * is expressed by GROUPING — section headings, cards, and the disclosures —
+ * never by indentation, which is how Obsidian's own settings panes read.
+ *
+ * `manifest.json` pins `minAppVersion: 1.11.5`, so the card geometry above is
+ * guaranteed; there is no legacy pre-card layout to keep working.
+ *
+ * The one edge deliberately left alone is Obsidian's own `SettingGroup`
+ * (Optional modules), whose rows sit at `--setting-items-padding` (20px)
+ * against a group heading at 16px. That 4px is upstream and theme-facing —
+ * overriding the token would fight themes for a sub-threshold difference. */
+.vaultguard-settings-tab {
+  --vg-settings-inset: var(--size-4-4, 16px);
 }
 
-.vaultguard-settings-tab h3:first-child {
-  margin-top: 0;
+/* Raw (non-`Setting`) blocks: paragraphs, status strips, empty states, and the
+ * disclosure labels. `.vaultguard-settings-inset` is the utility to reach for
+ * when adding a new standalone block to this tab. */
+.vaultguard-settings-tab .vaultguard-settings-lead,
+.vaultguard-settings-tab .vaultguard-settings-note,
+.vaultguard-settings-tab .vaultguard-settings-inset,
+.vaultguard-settings-tab .vaultguard-orientation-summary,
+.vaultguard-settings-tab .vaultguard-destruct-confirm,
+.vaultguard-settings-tab .vaultguard-settings-section-summary {
+  padding-inline: var(--vg-settings-inset);
+}
+
+/* ── Settings search / filtering ──────────────────────────────────────────
+ *
+ * This tab renders 98 rows and over half already sit behind a disclosure, so
+ * the dominant problem is findability, not density. The search box filters
+ * every row — including collapsed ones, which are forced open while a query is
+ * active — so nothing is unreachable.
+ *
+ * Everything here is class-driven; the TS never writes `.style` (CLAUDE.md /
+ * Obsidian community review). */
+.vaultguard-settings-search {
+  margin-bottom: var(--size-4-4, 16px);
+}
+
+.vaultguard-settings-search .search-input-container,
+.vaultguard-settings-search input[type="search"],
+.vaultguard-settings-search input[type="text"] {
+  width: 100%;
+}
+
+/* Rows, headings and whole disclosures the query excluded. */
+.vaultguard-settings-filter-hidden {
+  display: none;
+}
+
+/* While filtering, prose blocks drop out of the result list. They explain a
+ * section that may no longer be on screen, so they would read as orphans
+ * between unrelated matches. They come straight back when the query clears. */
+.vaultguard-settings-filtering .vaultguard-settings-lead,
+.vaultguard-settings-filtering .vaultguard-settings-note,
+.vaultguard-settings-filtering .vaultguard-settings-inset,
+.vaultguard-settings-filtering .vaultguard-orientation-summary,
+.vaultguard-settings-filtering .vaultguard-at-rest-status,
+.vaultguard-settings-filtering .vaultguard-at-rest-tally,
+.vaultguard-settings-filtering .vaultguard-semantic-settings-status {
+  display: none;
+}
+
+/* The search card itself is never a filter target. */
+.vaultguard-settings-filtering .vaultguard-settings-search {
+  display: block;
+}
+
+/* The disclosure triangle goes in the gutter, not in the text column.
+ *
+ * Chromium's UA sheet gives `<summary>` `list-style: disclosure-closed inside`,
+ * so the marker is laid out INSIDE the content box and shoves the label right
+ * by its own width — insetting the summary alone put the box at 16px but the
+ * label text at ~32px, i.e. still off the shared edge, just in the other
+ * direction. `outside` moves the marker into the padding gutter so the LABEL
+ * lands on the same edge as every heading. The tab reserves
+ * `--size-4-12` (48px) of inline-start padding, so the marker has room and is
+ * never clipped. Verified by measuring the label's text node, not its box —
+ * a box measurement cannot see a ::marker offset. */
+.vaultguard-settings-tab .vaultguard-settings-section-summary {
+  list-style-position: outside;
+}
+
+/* Standalone explanatory copy in the settings tab.
+ *
+ * Obsidian's `.setting-item-description` is a CAPTION style meant for one line
+ * of text inside a setting row: `--font-ui-smaller` (12px), tight line height,
+ * and `overflow: hidden` + `text-overflow: ellipsis`. Reusing it for standalone
+ * multi-line paragraphs rendered body copy two steps below the heading above it
+ * and clipped descenders — that mismatch is what made the top of the tab read
+ * as three competing font sizes. These classes are self-contained (they do NOT
+ * layer on `.setting-item-description`) so there is no specificity race with
+ * app.css, but they still read `--text-muted` so themes keep their say.
+ *
+ * Replaces a dead `.vaultguard-settings-tab h3` rule: all 27 headings in the tab
+ * use `Setting.setHeading()`, which renders `.setting-item-heading`, so nothing
+ * in this tab has ever been an <h3> and that normalization never applied. */
+.vaultguard-settings-lead,
+.vaultguard-settings-note {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-normal, 1.5);
+  overflow: visible;
+  text-overflow: clip;
+}
+
+/* Lead paragraph directly under the tab title, before the first heading. */
+.vaultguard-settings-lead {
+  margin: 0 0 var(--size-4-4, 16px);
+}
+
+.vaultguard-settings-note {
+  margin: var(--size-4-1, 4px) 0 var(--size-4-2, 8px);
+}
+
+/* Full-width, stacked textarea rows. Without this a multi-row textarea is
+ * squeezed into Obsidian's narrow right-hand `.setting-item-control` column,
+ * which is unusable for prose-length input. Mirrors the older
+ * `vaultguard-admin-textarea-setting` / `vaultguard-excluded-paths-setting`
+ * blocks below; new textarea settings should use this generic one. */
+.vaultguard-stacked-textarea-setting {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.vaultguard-stacked-textarea-setting .setting-item-info,
+.vaultguard-stacked-textarea-setting .setting-item-control {
+  margin-left: 0;
+  width: 100%;
+}
+
+.vaultguard-stacked-textarea-setting .setting-item-control {
+  margin-top: 10px;
+}
+
+.vaultguard-stacked-textarea-setting textarea {
+  box-sizing: border-box;
+  min-height: 104px;
+  resize: vertical;
+  width: 100%;
 }
 
 .vaultguard-settings-actions {
@@ -1797,6 +1948,34 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   min-height: 132px;
   resize: vertical;
   width: 100%;
+}
+
+/* Wildcard advisory under the excluded-paths textarea. Collapsed to zero
+   height when empty so the layout does not reserve a blank row. */
+.vaultguard-excluded-paths-warning:empty {
+  display: none;
+}
+
+.vaultguard-excluded-paths-warning-active {
+  color: var(--text-warning);
+}
+
+/* One-line "why this control is inert" note appended to a Setting's
+   description when the plaintext local-only vault mode makes it redundant. */
+.vaultguard-setting-disabled-reason {
+  font-style: italic;
+  margin-top: 4px;
+  opacity: 0.85;
+}
+
+/* The auto-enable preference belongs to the mode toggle above it. That used to
+ * be drawn as a rail + indent (margin 12 + border 2 + padding 12, stacking on
+ * the row card's own 16px = 42px, the deepest thing in the tab for the least
+ * important group). The wrapper is kept as a DOM grouping hook only — the
+ * relationship is carried by the "Protection scope" heading and adjacency, so
+ * these rows sit on the same content edge as every other row. */
+.vaultguard-protection-scope-nested {
+  margin-bottom: var(--size-4-2, 8px);
 }
 
 .vaultguard-current-vault-settings {
@@ -4997,35 +5176,49 @@ button .vaultguard-btn-spinner:only-child {
 
 /* ── At-rest encryption ─────────────────────────────────────────────── */
 
+/* Grouping hook only. This used to be a `--background-secondary` card holding
+ * `--background-primary-alt` setting-row cards — a card inside a card, which
+ * pushed its rows to 33px while every other row sat at 16px. The
+ * "Local at-rest encryption" heading directly above it already groups this
+ * block, so the wrapper chrome is redundant; its children now carry the
+ * standard card treatment and land on the shared content edge. */
 .vaultguard-at-rest-panel {
   margin: 10px 0 20px;
-  padding: 14px 16px 4px;
-  background: var(--background-secondary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
 }
 
+/* Peer of a setting row: same background, radius and inset, so the badge reads
+ * as part of the same stack instead of a differently-indented island. The 3px
+ * status rail is subtracted from the inline-start padding so the text still
+ * lands on the shared edge. */
 .vaultguard-at-rest-status {
-  padding: 10px 12px;
-  border-radius: 6px;
+  padding-block: 10px;
+  padding-inline: calc(var(--size-4-4, 16px) - 3px) var(--size-4-4, 16px);
+  border-radius: var(--setting-items-radius, 6px);
   margin-bottom: 10px;
-  font-size: 13px;
+  /* Same 13px at default settings, but scales with the theme's UI font like
+     every neighbouring element now that this badge also renders at the top of
+     the tab next to Protection scope copy. */
+  font-size: var(--font-ui-small);
   line-height: 1.5;
   color: var(--text-muted);
-  background: var(--background-primary);
+  /* `--background-primary-alt`, not `--background-primary`: the badge used to
+     sit inside a `--background-secondary` panel, which is gone. Against the
+     tab's own `--background-primary` it would otherwise vanish. This is the
+     same surface Obsidian gives `.setting-item`. */
+  background: var(--background-primary-alt);
   border: 1px solid var(--background-modifier-border);
   border-left-width: 3px;
 }
 
 .vaultguard-at-rest-status-unlocked {
   color: var(--text-muted);
-  background: var(--background-primary);
+  background: var(--background-primary-alt);
   border-left-color: var(--color-green, var(--text-success));
 }
 
 .vaultguard-at-rest-status-warning {
   color: var(--text-muted);
-  background: var(--background-primary);
+  background: var(--background-primary-alt);
   border-left-color: var(--text-warning);
 }
 
@@ -5079,12 +5272,16 @@ button .vaultguard-btn-spinner:only-child {
   color: var(--text-muted);
 }
 
+/* Same story as the status badge: it lived inside the at-rest panel, so it now
+ * carries setting-row surface + inset and lands on the shared content edge.
+ * The 1px border is subtracted so the text starts at exactly the inset. */
 .vaultguard-at-rest-tally {
   margin: 0 0 4px;
-  padding: 8px 12px;
-  background: var(--background-primary);
+  padding-block: 8px;
+  padding-inline: calc(var(--size-4-4, 16px) - 1px);
+  background: var(--background-primary-alt);
   border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
+  border-radius: var(--setting-items-radius, 6px);
   font-size: 12px;
   font-family: var(--font-monospace);
 }
@@ -5099,15 +5296,11 @@ button .vaultguard-btn-spinner:only-child {
   color: var(--text-error);
 }
 
-.vaultguard-at-rest-action {
-  padding: 12px 0;
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.vaultguard-at-rest-action:last-child {
-  padding-bottom: 0;
-}
-
+/* These are `.setting-item`s. They used to zero their own horizontal padding
+ * and separate with border-top rules because the at-rest panel supplied the
+ * inset around them; with the panel flattened they inherit Obsidian's row card
+ * unchanged, which is what puts them on the shared content edge and lets the
+ * card gaps do the separating. */
 .vaultguard-at-rest-action .setting-item-control {
   justify-content: flex-end;
 }
@@ -5160,14 +5353,19 @@ button .vaultguard-btn-spinner:only-child {
   font-size: 14px;
 }
 
+/* These carry non-`Setting` content (endpoint strings, detail grids, button
+ * rows), so they have to be cards in their own right. They now use the same
+ * surface, radius and inset Obsidian gives `.setting-item`, which puts their
+ * text on the shared content edge — previously `12px 14px` + a 1px border put
+ * it at 15px, one pixel off every neighbouring row, which reads as a wobble
+ * rather than a deliberate step. */
 .vaultguard-agent-bridge-server,
 .vaultguard-agent-bridge-reveal,
 .vaultguard-agent-bridge-lease {
   margin: 12px 0;
-  padding: 12px 14px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
-  background: var(--background-secondary);
+  padding: var(--size-4-3, 12px) var(--size-4-4, 16px);
+  border-radius: var(--setting-items-radius, 8px);
+  background: var(--background-primary-alt);
 }
 
 .vaultguard-agent-bridge-inline-actions,
@@ -5371,10 +5569,6 @@ button .vaultguard-btn-spinner:only-child {
 }
 
 @media (max-width: 640px) {
-  .vaultguard-at-rest-panel {
-    padding: 12px 12px 2px;
-  }
-
   .vaultguard-at-rest-action {
     align-items: stretch;
     flex-direction: column;
@@ -5423,7 +5617,7 @@ button .vaultguard-btn-spinner:only-child {
 
 /* Inline status message under settings actions */
 .vaultguard-status-msg {
-  padding: 8px 12px;
+  padding: 8px var(--size-4-4, 16px);
   margin-bottom: 8px;
   border-radius: 4px;
   font-size: 13px;
@@ -5889,7 +6083,7 @@ button .vaultguard-btn-spinner:only-child {
   align-items: center;
   gap: 4px;
 }
-/* Edit/delete actions sit left of the right-aligned user bubble, on hover */
+/* Message actions sit left of the right-aligned user bubble on hover/focus. */
 .vaultguard-chat-user-actions {
   order: -1;
   display: inline-flex;
@@ -5897,12 +6091,24 @@ button .vaultguard-btn-spinner:only-child {
   opacity: 0;
   transition: opacity 0.1s ease;
 }
-.vaultguard-chat-message-user:hover .vaultguard-chat-user-actions {
+.vaultguard-chat-message-user:hover .vaultguard-chat-user-actions,
+.vaultguard-chat-message-user:focus-within .vaultguard-chat-user-actions {
   opacity: 0.8;
 }
 .vaultguard-chat-user-actions .clickable-icon {
   color: var(--text-muted);
   cursor: pointer;
+}
+.vaultguard-chat-user-actions button.clickable-icon {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: var(--size-2-1, 4px);
+}
+.vaultguard-chat-user-actions button:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 .vaultguard-chat-user-actions svg {
   width: 14px;
@@ -8209,8 +8415,12 @@ button .vaultguard-btn-spinner:only-child {
 }
 
 .vaultguard-secure-search__semantic-status,
+/* The 3px accent rail is a callout affordance, not a depth cue, so the
+ * inline-start padding is reduced by the rail's width to land the text on the
+ * tab's single content edge. */
 .vaultguard-semantic-settings-status {
-  padding: var(--size-2-3) var(--size-4-2);
+  padding-block: var(--size-2-3);
+  padding-inline: calc(var(--size-4-4, 16px) - 3px) var(--size-4-4, 16px);
   border-inline-start: 3px solid var(--interactive-accent);
   color: var(--text-muted);
   background: var(--background-secondary-alt);

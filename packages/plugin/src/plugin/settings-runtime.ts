@@ -439,7 +439,10 @@ export class PluginSettingsRuntime {
           expiresAt: new Date(this.ctx.session.tokenExpiresAt).getTime(),
         };
       },
-      getSessionId: () => this.ctx.session?.sessionId ?? null,
+      // SD-02-F1 (M10): route through the plugin's single session-id resolver so
+      // this site and `main.ts:apiRequest` can never disagree about which id an
+      // outbound request carries. Do not inline `ctx.session?.sessionId` here.
+      getSessionId: () => this.ctx.resolveRequestSessionId(),
       onSubscriptionRequired: () => this.showSubscriptionLapsedNotice(),
     });
 

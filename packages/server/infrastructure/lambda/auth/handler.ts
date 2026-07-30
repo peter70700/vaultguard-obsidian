@@ -20,6 +20,7 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { KMSClient, GenerateDataKeyCommand, DecryptCommand } from '@aws-sdk/client-kms';
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
+import type { QueryCommandInput } from '@aws-sdk/lib-dynamodb';
 import { createHmac, randomInt, timingSafeEqual } from 'crypto';
 import { emitSecurityMetric } from '../shared/metrics';
 import {
@@ -60,6 +61,11 @@ import {
   RECOVERY_ATTEMPTS_TABLE,
   BatchWriteCommand,
   getEffectiveOrgSettings,
+  // SD-02-F1: hoisted to shared/utils so the dormant enforce branch and these
+  // auth endpoints can never enforce different session lifetimes. The local
+  // copies that used to live here are deleted; the call sites are unchanged.
+  assertSessionAgePolicy,
+  getSessionDurationMs,
 } from '../shared/utils';
 import { clampLeaseExpiration } from '../shared/guest-access';
 import { sendEmail } from '../email/handler';
@@ -192,23 +198,10 @@ function assertMfaPolicy(user: UserContext, settings: OrgSettings): void {
   }
 }
 
-function getSessionDurationMs(settings: OrgSettings): number {
-  return Math.max(settings.maxSessionDurationHours, 1) * 60 * 60 * 1000;
-}
-
-function assertSessionAgePolicy(user: UserContext, settings: OrgSettings): void {
-  if (!user.authTime) {
-    return;
-  }
-
-  const authAgeMs = Date.now() - user.authTime * 1000;
-  if (authAgeMs > getSessionDurationMs(settings)) {
-    throw new AuthError(
-      'Session duration limit reached. Please sign in again.',
-      401
-    );
-  }
-}
+// getSessionDurationMs / assertSessionAgePolicy used to be defined here.
+// SD-02-F1 hoisted both verbatim into shared/utils.ts (single definition) and
+// this handler now imports them — see the import block above. The four call
+// sites below are unchanged and still unconditional.
 
 /**
  * Lambda entry point. Routes requests to the appropriate handler function
@@ -1451,6 +1444,85 @@ async function invalidateSession(sessionId: string): Promise<void> {
 }
 
 /**
+ * Runs a Query to exhaustion, following `LastEvaluatedKey`, and returns the
+ * raw items.
+ *
+ * DynamoDB applies a `FilterExpression` AFTER the 1 MiB evaluated page, so a
+ * single un-paginated `Query` can return a `LastEvaluatedKey` while silently
+ * omitting later-page rows that the filter would have matched. A revocation
+ * sweep must be complete: a missed later page leaves a session active or a
+ * lease live while the caller is told the account was fully contained.
+ *
+ * SD-03-F18 lineage: the same bug class was fixed for the permission-rule feed
+ * in phase 14 (`shared/utils.ts:queryAllPages`). This is a LOCAL definition
+ * rather than a reuse of that helper because the shared one is concretely typed
+ * `Promise<PermissionRule[]>`; generic-ising it would touch phase-14 code and
+ * its two dedicated test files for no benefit here.
+ *
+ * No try/catch on purpose — a rejected page must propagate so callers fail
+ * closed rather than acting on a truncated result set.
+ *
+ * @param input - Query input; `ExclusiveStartKey` is supplied by the loop
+ * @returns Every matching item across every page
+ */
+async function queryAllPagesRaw(input: QueryCommandInput): Promise<Record<string, unknown>[]> {
+  const items: Record<string, unknown>[] = [];
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  do {
+    const page = await docClient.send(
+      new QueryCommand({
+        ...input,
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      })
+    );
+    items.push(...((page.Items ?? []) as Record<string, unknown>[]));
+    exclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (exclusiveStartKey);
+  return items;
+}
+
+/**
+ * Marks EVERY active session row of a user inactive, across every org.
+ *
+ * SD-02-F2: password recovery means "assume compromise", so the sweep is keyed
+ * by the victim's own `userId` alone. No org filter — the query is already
+ * scoped to that one user, so dropping it is strictly more complete and opens
+ * no cross-tenant surface (the admin-revoke path keeps its org filter, where
+ * tenant-scoping is a deliberate LA1 guard).
+ *
+ * The synthetic `logout-cutoff#<userId>` row lives in this same table and
+ * carries `userId`, but has no `isActive` attribute, so the filter already
+ * excludes it — stated out loud rather than relied on silently.
+ *
+ * @param userId - The user whose sessions are being terminated
+ * @returns The number of sessions invalidated
+ */
+export async function invalidateAllUserSessions(userId: string): Promise<number> {
+  const sessions = await queryAllPagesRaw({
+    TableName: SESSIONS_TABLE,
+    IndexName: 'userId-index',
+    KeyConditionExpression: 'userId = :uid',
+    FilterExpression: 'isActive = :active',
+    ExpressionAttributeValues: {
+      ':uid': userId,
+      ':active': true,
+    },
+  });
+
+  let invalidated = 0;
+  for (const session of sessions) {
+    const sessionId = session.sessionId;
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      continue;
+    }
+    await invalidateSession(sessionId);
+    invalidated++;
+  }
+
+  return invalidated;
+}
+
+/**
  * Checks whether a user's keys have been revoked by an admin.
  *
  * @param userId - The user to check
@@ -1672,24 +1744,34 @@ async function revokeSessionLeases(
 
 /**
  * Revokes all active leases for a user. Returns the number of leases revoked.
+ *
+ * `orgId` is OPTIONAL. The admin-revoke path (`/auth/revoke`) passes it so a
+ * cross-tenant admin can never reach into another org's leases. The SD-02-F2
+ * password-reset sweep passes none: the query is already keyed by the victim's
+ * own `userId`, so a userId-only sweep is strictly more complete (it also
+ * catches leases the user holds in other orgs) and opens no cross-tenant
+ * surface. DynamoDB rejects unused expression values, so `:orgId` is only bound
+ * when the filter actually references it.
+ *
+ * The query paginates (SD-03-F18 lineage — see `queryAllPagesRaw`): the org and
+ * status scoping live in a `FilterExpression`, which DynamoDB applies after the
+ * 1 MiB evaluated page, so a single-page read could leave later-page leases
+ * live while reporting a complete revocation.
  */
-async function revokeAllUserLeases(userId: string, revokedBy: string, orgId: string): Promise<number> {
-  const result = await docClient.send(
-    new QueryCommand({
-      TableName: LEASES_TABLE,
-      IndexName: 'userId-index',
-      KeyConditionExpression: 'userId = :uid',
-      FilterExpression: '#s = :active AND orgId = :orgId',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: {
-        ':uid': userId,
-        ':active': 'active',
-        ':orgId': orgId,
-      },
-    })
-  );
+export async function revokeAllUserLeases(userId: string, revokedBy: string, orgId?: string): Promise<number> {
+  const activeLeases = await queryAllPagesRaw({
+    TableName: LEASES_TABLE,
+    IndexName: 'userId-index',
+    KeyConditionExpression: 'userId = :uid',
+    FilterExpression: orgId ? '#s = :active AND orgId = :orgId' : '#s = :active',
+    ExpressionAttributeNames: { '#s': 'status' },
+    ExpressionAttributeValues: {
+      ':uid': userId,
+      ':active': 'active',
+      ...(orgId ? { ':orgId': orgId } : {}),
+    },
+  });
 
-  const activeLeases = result.Items || [];
   const now = new Date().toISOString();
 
   for (const lease of activeLeases) {
@@ -2642,6 +2724,63 @@ async function handleForgotPassword(
 const MAX_RESET_ATTEMPTS = 5;
 
 /**
+ * Resolves the Cognito identity behind a password-reset request.
+ *
+ * SD-02-F2: the revocation sweep needs the Cognito `sub` (session and lease
+ * rows are keyed by it, never by email) and `custom:org` (the verified org
+ * attribute name — see `handler.ts:assertTargetInOrg` and
+ * `shared/utils.ts`). Neither is derivable from the reset row.
+ *
+ * Deliberately SEPARATE from `resolveUserIdForEmail`: that helper serves the
+ * MFA recovery-code path, where "user does not exist" is swallowed for
+ * anti-enumeration and the client default region differs. Merging them would
+ * change recovery-code behaviour, so both exist on purpose.
+ *
+ * @param email - The email the reset code was issued for
+ * @returns The identity, or null when the user cannot be identified
+ * @throws Any non-"user not found" Cognito error, so the caller can answer 500
+ *   instead of implying the reset code was wrong (DEVIATION 2)
+ */
+export async function resolveResetIdentity(
+  email: string
+): Promise<{ userId: string; orgId: string | null } | null> {
+  const { CognitoIdentityProviderClient, AdminGetUserCommand } = await import(
+    '@aws-sdk/client-cognito-identity-provider'
+  );
+  const cognitoClient = new CognitoIdentityProviderClient({
+    region: process.env.AWS_REGION || 'eu-central-1',
+  });
+
+  try {
+    const result = await cognitoClient.send(
+      new AdminGetUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: email,
+      })
+    );
+
+    const attributes = result.UserAttributes || [];
+    const userId = attributes.find((attr) => attr.Name === 'sub')?.Value;
+    if (!userId) {
+      // An identity we cannot pin to a `sub` cannot be swept. Treat it exactly
+      // like "not found": the caller answers with the generic 400 and changes
+      // no password, which is also the anti-enumeration-safe reply.
+      return null;
+    }
+
+    const orgId = attributes.find((attr) => attr.Name === 'custom:org')?.Value ?? null;
+    return { userId, orgId };
+  } catch (err) {
+    if (isCognitoUserNotFound(err)) {
+      return null;
+    }
+    // Everything else is operational — a throttle or an InternalErrorException
+    // must not be reported to the user as "your reset code was wrong".
+    throw err;
+  }
+}
+
+/**
  * Confirms a password reset using the code we generated and stored in
  * DynamoDB, then sets the new password via Cognito AdminSetUserPassword.
  *
@@ -2703,8 +2842,34 @@ async function handleConfirmReset(
     return formatError(400, 'Invalid or expired reset code. Please request a new one.', requestId);
   }
 
+  // SD-02-F2: resolve the identity BEFORE the password is set, so an
+  // operational Cognito failure aborts while this request is still a no-op.
+  // The sweep below is keyed by the Cognito `sub` and gated on `custom:org`;
+  // neither is derivable from the reset row.
+  let resolvedIdentity: { userId: string; orgId: string | null } | null;
+  try {
+    resolvedIdentity = await resolveResetIdentity(email);
+  } catch (err: unknown) {
+    // Classified by POSITION, not by isOperationalAwsError: that helper is a
+    // narrow allowlist that misses throttling and InternalErrorException, and
+    // routing those into the generic 400 would tell the user "request a new
+    // code" for a failure that has nothing to do with their code.
+    logPasswordResetFailure('resolve_identity', err);
+    return formatError(500, 'Password reset is temporarily unavailable. Please try again later.', requestId);
+  }
+
+  if (!resolvedIdentity) {
+    // Unknown/unidentifiable account: the SAME generic 400 a wrong code gets,
+    // so the endpoint stays enumeration-safe. Deliberately no reset-row delete
+    // and no attempts increment — the code was valid, the account lookup was
+    // not — and critically NO password is changed.
+    return formatError(400, 'Invalid or expired reset code. Please request a new one.', requestId);
+  }
+
+  const identity = resolvedIdentity;
+
   // Code is valid — set the new password via Cognito
-  const { CognitoIdentityProviderClient, AdminSetUserPasswordCommand } = await import('@aws-sdk/client-cognito-identity-provider');
+  const { CognitoIdentityProviderClient, AdminSetUserPasswordCommand, AdminUserGlobalSignOutCommand } = await import('@aws-sdk/client-cognito-identity-provider');
   const cognitoClient = new CognitoIdentityProviderClient({ region: process.env.AWS_REGION || 'eu-central-1' });
 
   try {
@@ -2724,6 +2889,93 @@ async function handleConfirmReset(
       return formatError(500, 'Password reset is temporarily unavailable. Please try again later.', requestId);
     }
     return formatError(400, 'Password reset failed. Please request a new code and try again.', requestId);
+  }
+
+  // SD-02-F2 — layered revocation sweep. "I forgot my password" is the user
+  // saying *assume compromise*, so every authority a previously-authorized
+  // hostile client could still hold must die before this call returns 200.
+  // The order is fixed; each layer closes a residual the previous one cannot:
+  //   1 AdminUserGlobalSignOut — kills the 30-day refresh-token line. Nothing
+  //     else in this codebase touches Cognito, and it is the layer an attacker
+  //     can least tolerate losing, so it runs first.
+  //   2 logout-cutoff row      — kills already-minted <=60-min access/ID
+  //     tokens. API Gateway's Cognito authorizer accepts a JWT until its
+  //     natural expiry; only this Lambda-layer check can close that window.
+  //   3 session sweep          — kills header-bound callers and server-side
+  //     lease RENEWAL. The cutoff is iat-based; a live session row is a
+  //     separate authority.
+  //   4 lease revocation       — kills the plugin's decryption capability; the
+  //     60 s heartbeat then wipes the client cache (1.2.10+ deny contract).
+  // Any failure returns 500 with the reset row RETAINED, so the same code
+  // re-runs the WHOLE sweep. A half-swept reset reported as 200 is precisely
+  // the failure this finding is about. Deliberately NO RevokedKeys row and no
+  // EventBridge re-encryption: those belong to offboarding and would 403 the
+  // user forever, but self-service recovery must end logged-in-able.
+  let sweepStep = 'global_signout';
+  let invalidatedSessions = 0;
+  let revokedLeases = 0;
+
+  try {
+    // Username: email matches how AdminSetUserPassword addresses this pool
+    // above — in this pool the Cognito username is NOT the sub.
+    await cognitoClient.send(new AdminUserGlobalSignOutCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: email,
+    }));
+
+    // Byte-shape copy of handleLogout's cutoff row. UNITS MATTER: `logoutAt`
+    // is epoch MILLISECONDS (compared against auth_time/iat * 1000) while
+    // `expiresAtTtl` is epoch SECONDS (DynamoDB TTL). Getting them the wrong
+    // way round silently disables this whole layer, so both derive from one
+    // `cutoffNowMs`.
+    sweepStep = 'logout_cutoff';
+    const cutoffNowMs = Date.now();
+    await docClient.send(new PutCommand({
+      TableName: SESSIONS_TABLE,
+      Item: {
+        sessionId: `logout-cutoff#${identity.userId}`,
+        userId: identity.userId,
+        logoutAt: cutoffNowMs,
+        expiresAtTtl: Math.floor(cutoffNowMs / 1000) + 24 * 60 * 60,
+      },
+    }));
+
+    // Layers 3 and 4 are org-gated: session and lease creation both run
+    // through requireOrgId, so an org-less user cannot hold either and running
+    // the queries would be dead work.
+    if (identity.orgId) {
+      sweepStep = 'invalidate_sessions';
+      invalidatedSessions = await invalidateAllUserSessions(identity.userId);
+
+      // Two arguments on purpose — the lease sweep is userId-only. The query
+      // is already keyed by the victim's own userId, so omitting the org
+      // filter is strictly more complete and opens no cross-tenant surface.
+      sweepStep = 'revoke_leases';
+      revokedLeases = await revokeAllUserLeases(identity.userId, 'password-reset');
+    }
+
+    // Recovery is invisible in the audit trail today. An empty orgId is safe:
+    // logAudit guards its settings lookup with `if (entry.orgId)` and
+    // partitions on `entry.orgId || 'system'`.
+    sweepStep = 'audit';
+    await logAudit({
+      userId: identity.userId,
+      userEmail: email,
+      orgId: identity.orgId ?? '',
+      action: 'auth.password-reset',
+      resourcePath: '/auth/confirm-reset',
+      outcome: 'success',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: { invalidatedSessions, revokedLeases, globalSignOut: true },
+    });
+  } catch (err: unknown) {
+    // Position-based classification again: nothing after the password set
+    // carries a user-error class, so every throw here is a 500 and the reset
+    // row survives for the retry. AdminSetUserPassword is idempotent for this
+    // purpose — the retry re-sets the same password the user just chose.
+    logPasswordResetFailure(sweepStep, err);
+    return formatError(500, 'Password reset is temporarily unavailable. Please try again later.', requestId);
   }
 
   // Clean up the used reset code

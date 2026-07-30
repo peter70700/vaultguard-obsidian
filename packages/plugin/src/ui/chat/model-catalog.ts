@@ -327,10 +327,18 @@ function resolveSelection(
 }
 
 function fallbackOptions(provider: ProviderModelCatalogProvider): ReadonlyArray<ChatModelOption> {
-  return provider === "anthropic" ? AI_CHAT_MODELS : OPENAI_CHAT_MODELS;
+  if (provider === "anthropic") return AI_CHAT_MODELS;
+  // A ChatGPT subscription catalog is account- and workspace-specific. Never
+  // present the API-key provider's bundled choices as if Codex reported them.
+  // mergeSelected() still preserves the user's saved value as an explicitly
+  // unverified current selection when live discovery is unavailable.
+  return provider === "codex" ? [] : OPENAI_CHAT_MODELS;
 }
 
 function discoveryWarning(provider: ProviderModelCatalogProvider): string {
-  const label = provider === "openai" ? "OpenAI" : provider === "codex" ? "Codex" : "Anthropic";
+  if (provider === "codex") {
+    return "Could not refresh ChatGPT subscription models; showing only the saved selection.";
+  }
+  const label = provider === "openai" ? "OpenAI" : "Anthropic";
   return `Could not refresh ${label} models; using the current and saved fallback choices.`;
 }

@@ -42,7 +42,7 @@ import { ReadOnlyGuard } from "./readonly-guard";
 import { PermissionStore } from "./permission-store";
 import { UpdateChecker } from "./update-checker";
 import { SyncDiagnostics } from "./sync-diagnostics";
-import type { AtRestCipher } from "../crypto/at-rest-cipher";
+import type { AtRestCipher, AtRestRestoreOutcome } from "../crypto/at-rest-cipher";
 import {
   PinLockManager,
   type PinLockStorage,
@@ -105,6 +105,8 @@ import {
   createAgentBridgeRuntime,
   type AgentBridgeRuntime,
 } from "./agent-bridge-wiring";
+import { resolveAgentPermission } from "./agent-permission";
+import type { MentionAccessContext } from "../ui/chat/mention-candidates";
 import type {
   InstallResult,
   SkillInstallStatus,
@@ -142,6 +144,7 @@ import {
   type AgentBridgeRuntimeContext,
   type LifecycleEventsContext,
   type LocalManifestEntry,
+  type MutationIntent,
   type PermissionStoreFactoryContext,
   type PermissionSurfaceContext,
   type PermissionsGraphRuntimeContext,
@@ -162,6 +165,7 @@ import {
 } from "./settings-runtime";
 import {
   didConnectionBoundaryChange,
+  didExternallyLoadedSettingsChange,
   snapshotConnectionBoundary,
 } from "./external-settings";
 import {
@@ -178,6 +182,16 @@ import {
   type LongOperationHandle,
   type LongOperationStartOptions,
 } from "./long-operation";
+import {
+  acquireResetLease,
+  clearAllWipedPaths,
+  clearWipedPath,
+  deriveWipeSuppressionVaultKey,
+  heartbeatResetLease,
+  isPathWipeSuppressed,
+  recordWipedPath,
+  releaseResetLease,
+} from "./wipe-suppression-registry";
 import {
   LongOperationUiController,
   renderLongOperationStatusBar,
@@ -611,6 +625,27 @@ export default class VaultGuardPlugin extends Plugin {
   /** Current authenticated user session, null if not logged in */
   private session: UserSession | null = null;
 
+  /**
+   * SD-02-F1 (M10): the session id of a PERSISTED session that is currently being
+   * restored, held ONLY for the window of `restoreServerSession`'s first key-lease
+   * request — set immediately before that `await`, cleared in its `finally`.
+   *
+   * Why it exists: during a restore the lease call runs BEFORE `this.session` is
+   * assigned, so the header block below saw `undefined` and the request went out
+   * headerless, with the candidate id travelling only in the query string where no
+   * server-side session check reads it. This field closes that one-request gap.
+   *
+   * Why the window is exactly one await (and not the whole restore): the stale-session
+   * self-heal branch calls `openServerSession` → `POST /auth/session` through the same
+   * `apiRequest`. A stale candidate riding that mint would make the MINT itself 401
+   * (the server validates a session header whenever one is present), breaking the very
+   * self-heal that recovers from a dead session. The candidate must be gone before
+   * either branch of the lease result runs.
+   *
+   * Never persisted, never read outside that window.
+   */
+  private restoreCandidateSessionId: string | null = null;
+
   /** Effective organization policies returned by the backend for the current session */
   private orgSettings: OrgSettingsResponse | null = null;
 
@@ -845,18 +880,23 @@ export default class VaultGuardPlugin extends Plugin {
   private atRestResetInFlight = false;
 
   /**
-   * Path-scoped delete suppression that OUTLIVES the global `resettingLocalCache`
-   * window (HI-01). The global flag is only up across the reset's own window; a
-   * slow/debounced file watcher (network drives, some mobile/sync-folder hosts)
-   * can deliver a wiped file's `vault.on('delete')` event AFTER the reset's
-   * `finally` has dropped that flag — which would then propagate a server DELETE
-   * and strand the file. Every raw-removed path is recorded here for exactly as
-   * long as it is gone: an entry self-clears the moment the path exists again
-   * (reconcile re-pulls it, or the user re-creates it — see the create listener
-   * in `onload`), after which a genuine later delete of that path propagates
-   * normally. It is NOT a timer — the lifetime is "until the path is back".
+   * Memoized key for this vault's entry in the cross-instance wipe-suppression
+   * registry (SD-07-F4, `./wipe-suppression-registry`). The path-scoped
+   * suppression set that used to live here as a private instance field now
+   * lives in that `globalThis`-scoped registry, because instance-local state is
+   * exactly what a hot reload mid-wipe destroys.
    */
-  private wipedPathsAwaitingRepull = new Set<string>();
+  private wipeSuppressionVaultKeyCache: string | null = null;
+
+  /**
+   * Our owner token for the CROSS-INSTANCE at-rest reset lease (SD-07-F4), or
+   * null when this instance does not hold it. Minted by the registry — never by
+   * the plugin — because `lifecycleGeneration` is a per-instance counter that
+   * restarts at 0 in a replacement instance and would therefore collide.
+   * Release is ownership-guarded, so a superseded instance's late `finally`
+   * cannot clobber a newer reset's lease.
+   */
+  private atRestResetLeaseOwnerId: string | null = null;
 
   /**
    * Whether we've already wired up the vault.on('create' | 'delete' | 'rename')
@@ -1030,6 +1070,24 @@ export default class VaultGuardPlugin extends Plugin {
     });
   }
 
+  /**
+   * Shutdown ordering for long operations (SD-07-F4). Abort BEFORE destroy:
+   * `destroy()` empties the operations map, after which there is nothing left to
+   * abort and any in-flight PROTECTED mutation (notably the at-rest reset wipe,
+   * which is `canCancel: false` and holds a live raw adapter `remove`) would
+   * keep running with a live handle while the replacement instance boots.
+   *
+   * The abort is a checkpoint fence, not a join: the wipe loop exits at its next
+   * per-item checkpoint. A `remove()` already awaited when the abort lands still
+   * completes — bounded to one file, and that file registers itself as
+   * delete-suppressed the instant it succeeds.
+   */
+  private shutdownLongOperations(): void {
+    const aborted = this.longOperations.abortAllForShutdown();
+    if (aborted > 0) this.log(`Unload: aborted ${aborted} in-flight long operation(s).`);
+    this.longOperations.destroy();
+  }
+
   getVaultOrientationService(): VaultOrientationService {
     if (!this.vaultOrientationService) {
       this.vaultOrientationService = new VaultOrientationService({
@@ -1091,6 +1149,15 @@ export default class VaultGuardPlugin extends Plugin {
       // Phase 12: the adapter's PIN-lock pre-check keys off this to skip
       // provisioning and land LOCKED on a PIN-enrolled cold start (edge #6).
       isPinLockEnrolled: () => this.pinLockManager?.isEnrolled() ?? false,
+      // SD-05-F3 / D2: a recovery-code restore that REPLACED the LAK must not
+      // leave a PIN envelope wrapping the dead key (same rule as the reset
+      // engine at ~:10899).
+      disablePinLock: async () => {
+        await this.pinLockManager?.disable();
+      },
+      // SD-03-F15: `canDeletePath`'s org-admin short-circuit is gated on this.
+      // Live-read arrow for the same reason as the permission-store context.
+      isAdminRestrictionActive: () => this.isAdminRestrictionActive(),
       getSession: () => this.session,
       getKeyLease: () => this.keyLease,
       isVaultLeaseDenied: () => this.vaultLeaseDenied,
@@ -1130,11 +1197,13 @@ export default class VaultGuardPlugin extends Plugin {
         this.queueOfflineOperation(operation, path, data, options),
       getRemoteFileState: (path) => this.getRemoteFileState(path),
       getExpectedVersionId: (path) => this.getExpectedVersionId(path),
+      resolveMutationIntent: (path) => this.resolveMutationIntent(path),
       recordRemoteFilePresent: (path, update) =>
         this.recordRemoteFilePresent(path, update),
       recordRemoteFileAbsent: (path) => this.recordRemoteFileAbsent(path),
-      handleRemoteWriteConflict: (path, localContent, baseVersionId) =>
-        this.handleRemoteWriteConflict(path, localContent, baseVersionId),
+      recordSyncDiagnostic: (event, detail) => this.syncDiagnostics.record(event, detail),
+      handleRemoteWriteConflict: (path, localContent, baseVersionId, options) =>
+        this.handleRemoteWriteConflict(path, localContent, baseVersionId, options),
       recordDeletionTombstone: (path) => this.recordDeletionTombstone(path),
       clearDeletionTombstone: (path) => this.clearDeletionTombstone(path),
       updateStatusBar: () => this.updateStatusBar(),
@@ -1149,6 +1218,10 @@ export default class VaultGuardPlugin extends Plugin {
       // can consult it if needed. main.ts owns set/clear around the wipe.
       isResettingLocalCache: () => this.isResettingLocalCache(),
       setResettingLocalCache: (v) => this.setResettingLocalCache(v),
+      // SD-07-F4: the wipe registers each path in the CROSS-INSTANCE suppression
+      // registry the instant its raw remove succeeds — the post-wipe bulk
+      // registration below is unreachable once the promise is orphaned.
+      recordWipedPathAwaitingRepull: (path) => this.recordWipedPathAwaitingRepull(path),
       encryptContent: (content) => this.encryptContent(content),
       computeHash: (content) => this.computeHash(content),
       // BIN-A / D-02: byte-crypto pass-throughs beside their string siblings so
@@ -1283,6 +1356,7 @@ export default class VaultGuardPlugin extends Plugin {
         this.setConnectionStatus(status, options),
       getRemoteFileState: (path) => this.getRemoteFileState(path),
       getExpectedVersionId: (path) => this.getExpectedVersionId(path),
+      resolveMutationIntent: (path) => this.resolveMutationIntent(path),
       recordRemoteFilePresent: (path, update) =>
         this.recordRemoteFilePresent(path, update),
       recordRemoteFileAbsent: (path) => this.recordRemoteFileAbsent(path),
@@ -1298,7 +1372,6 @@ export default class VaultGuardPlugin extends Plugin {
           ? this.ensureAtRestEncryptedInPlace(path)
           : this.ensureAtRestEncryptedInPlace(path, remoteDurable),
       getPermissionStoreState: () => this.permissionStore.getStoreState(),
-      removeUnsyncedLocalFile: (path) => this.removeUnsyncedLocalFile(path),
       uploadLocalOnlyFiles: () => this.uploadLocalOnlyFiles(),
       repairMissingRemoteItems: () => this.repairMissingRemoteItems(),
       collectLocalFolderPaths: () => this.collectLocalFolderPaths(),
@@ -1536,6 +1609,12 @@ export default class VaultGuardPlugin extends Plugin {
       setConnectionOffline: () => this.setConnectionStatus("offline"),
       fetchPermissionLevelFromServer: (path) => this.fetchPermissionLevelFromServer(path),
       isNetworkError: (err) => this.isNetworkError(err),
+      // SD-03-F15 / F16. Arrow functions, so both are read LIVE at call time:
+      // this context object is built once during onload, long before any org
+      // settings arrive, and a captured snapshot would pin the policy to
+      // "absent" forever.
+      isAdminRestrictionActive: () => this.isAdminRestrictionActive(),
+      requestWarmup: () => this.requestPermissionWarmupRefresh(),
     };
   }
 
@@ -1943,6 +2022,7 @@ export default class VaultGuardPlugin extends Plugin {
       refreshAccessToken: (session) => this.refreshAccessToken(session),
       initializeApiClientFromSession: (session) =>
         this.initializeApiClientFromSession(session),
+      resolveRequestSessionId: () => this.resolveRequestSessionId(),
       log: (message) => this.log(message),
       logError: (message, error) => this.logError(message, error),
     };
@@ -2194,8 +2274,9 @@ export default class VaultGuardPlugin extends Plugin {
     // HI-01 self-clean: the instant a path re-appears (reconcile re-pulled it,
     // or the user created a new file there), drop its wipe-delete suppression so
     // a genuine later delete of that path propagates. Deliberately UNGATED (no
-    // layoutReady gate) and ordering-independent — it only ever mutates the tiny
-    // wipedPathsAwaitingRepull set and is a no-op unless a reset just ran.
+    // layoutReady gate) and ordering-independent — it only ever mutates this
+    // vault's tiny entry in the cross-instance wipe-suppression registry
+    // (SD-07-F4) and is a no-op unless a reset just ran.
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         this.clearWipeSuppressionForRecreatedPath(file.path);
@@ -2331,6 +2412,13 @@ export default class VaultGuardPlugin extends Plugin {
       this.rebuildApiClient();
     }
 
+    // Obsidian can emit this hook for a file touch or a same-value rewrite.
+    // Avoid rebuilding every settings section (and restarting its async UI)
+    // when the effective settings did not actually change.
+    if (!didExternallyLoadedSettingsChange(before, this.settings)) {
+      return;
+    }
+
     let externalSemanticAlreadyPurged = false;
     if (
       previousModules.secureDiscovery === true &&
@@ -2390,10 +2478,10 @@ export default class VaultGuardPlugin extends Plugin {
     this.refreshFilePermissionHeader();
     this.reloadVaultGuardSidebar();
     this.updateRibbonAuthIndicator();
+    this.vaultOrientationService?.invalidate("external-settings-changed");
     if (this.settingTab?.containerEl?.isConnected) {
       this.settingTab.display();
     }
-    this.vaultOrientationService?.invalidate("external-settings-changed");
   }
 
   private async reconcileOptionalModuleSettings(
@@ -2483,7 +2571,10 @@ export default class VaultGuardPlugin extends Plugin {
     this.longOperationStatusUnsubscribe = null;
     this.longOperationUi?.destroy();
     this.longOperationUi = null;
-    this.longOperations.destroy();
+    // SD-07-F4: abort in-flight operations BEFORE destroying the manager, so a
+    // protected wipe cannot keep mutating the vault while the replacement
+    // instance boots. See shutdownLongOperations().
+    this.shutdownLongOperations();
 
     const agentBridgeRuntime = this.agentBridgeRuntime;
     this.agentBridgeRuntime = null;
@@ -2675,6 +2766,37 @@ export default class VaultGuardPlugin extends Plugin {
    */
   getAgentBridge(): AgentBridgeToolSurface {
     return this.ensureAgentBridgeRuntime().getToolSurface();
+  }
+
+  /**
+   * Permission context for the AI chat `@`-mention picker. The picker is a UI
+   * enumeration surface, so it MUST gate on the same per-path value the Agent
+   * Bridge list/read surface gates on (SD-13-F5): a path the user cannot read
+   * must never be rendered or inserted, because a later `vaultguard_read`
+   * denial cannot retract a disclosed filename.
+   *
+   * Narrower than the bridge list by design: it additionally honours the
+   * metadata side-channel guard. It omits only the lease-scope checks, which
+   * do not exist for a surface with no lease.
+   */
+  getChatMentionAccess(): MentionAccessContext {
+    return {
+      getPermission: (path) =>
+        resolveAgentPermission(
+          {
+            // `getEffectivePermission` is private, so a public structural slot
+            // cannot see it from outside the class. Wrapping both capabilities
+            // in arrows *inside* the class body is the minimal legal bridge and
+            // keeps the predicate itself single-defined in `agent-permission.ts`.
+            isLocalProjectMemoryModeEnabled: () => this.isLocalProjectMemoryModeEnabled(),
+            getEffectivePermission: (p) => this.getEffectivePermission(p),
+          },
+          path,
+        ),
+      isPathVisible: (path) => this.isMentionPathVisible(path),
+      isMetadataSuppressed: (path) =>
+        this.permissionStore?.isMetadataSuppressed(path) ?? false,
+    };
   }
 
   async createAgentBridgeLease(input: AgentBridgeLeaseInput = {}): Promise<AgentBridgeLeaseSecret> {
@@ -4947,6 +5069,17 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * True when this org has `allowAdminPerFileRestrictions` enabled — the single
+   * client-side definition of "per-file deny rules bind admins" (SD-03-F15).
+   * Every consumer (permission store, at-rest adapter runtime, file-permission
+   * header, org-settings flip detection) reads THIS, so the value cannot drift
+   * between surfaces.
+   */
+  private isAdminRestrictionActive(): boolean {
+    return this.orgSettings?.allowAdminPerFileRestrictions === true;
+  }
+
+  /**
    * Refreshes `vaultMemberRole` from the server and pushes the resulting
    * effective role into every live UI surface (file header, file-explorer
    * decorations, sidebar). Also clears the per-file permission cache so the
@@ -5003,7 +5136,16 @@ export default class VaultGuardPlugin extends Plugin {
     if (!this.session || !this.apiClient) {
       return { kind: "ok", rules: [] };
     }
-    if (this.session.role === "admin" || this.session.role === "owner") {
+    // SD-03-F15: only an UNrestricted org admin may warm with no rules at all.
+    // When the org restriction is on, falling through takes the
+    // `isEffectiveAdmin()` branch below — `getPermissions()`, the vault-wide
+    // rule list, which `handleListPermissions` already paginates fully (LF3) —
+    // and `PermissionStore.warm` then filters it through
+    // `ruleAppliesToCurrentUser`.
+    if (
+      !this.isAdminRestrictionActive() &&
+      (this.session.role === "admin" || this.session.role === "owner")
+    ) {
       return { kind: "ok", rules: [] };
     }
     try {
@@ -5196,6 +5338,32 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Re-fetch rules and re-warm AFTER a server-confirmed permission change
+   * (SD-03-F16). Wired into `PermissionStore` as `requestWarmup`.
+   *
+   * Waits for any warm cycle already in flight FIRST: `PermissionStore.warm()`
+   * coalesces on its in-flight promise, so starting a fresh warm while an older
+   * cycle is mid-flight can have the post-change rules silently swallowed and
+   * the PRE-change rule set seeded instead (DESIGN M9). Deliberately unbounded
+   * (unlike `awaitPermissionWarmup`'s 5 s race) because a timeout here would
+   * re-open exactly that stale-rule window; the caller is the `void`-dispatched
+   * permission-change fan-out, which already tolerates slow network work and
+   * wraps this call in try/catch.
+   *
+   * MUST NOT emit('changed') — directly or transitively (PermissionStore
+   * Pitfall 3 re-entrance guard). Verified: the warm path only fires the
+   * lifecycle-only `state-changed` event (markWarming / markFetchFailed /
+   * runWarm's notifyStoreStateChanged).
+   */
+  private async requestPermissionWarmupRefresh(): Promise<void> {
+    const inFlight = this.warmupCyclePromise ?? this.permissionStore.inFlightWarmup;
+    if (inFlight) {
+      await inFlight.catch(() => undefined);
+    }
+    await this.runPermissionWarmup();
+  }
+
+  /**
    * Waits briefly for restored-session permission context to become usable.
    *
    * This is intentionally bounded: if the backend is slow or unreachable,
@@ -5310,7 +5478,9 @@ export default class VaultGuardPlugin extends Plugin {
 
     const found = await findCodexBinary();
     if (!found) {
-      throw new Error("Official Codex client not found. Install it from OpenAI and retry.");
+      throw new Error(
+        "No usable Codex runtime was found. Install or update the ChatGPT desktop app, sign in, and retry.",
+      );
     }
 
     const childProcess = req("child_process") as {
@@ -5541,16 +5711,31 @@ export default class VaultGuardPlugin extends Plugin {
         sessionId: session.sessionId,
         vaultId: this.settings.serverVaultId,
       });
-      leaseResponse = await this.apiRequest<{
-        keyLease: KeyLease;
-        deniedPaths?: LeaseDeniedPath[];
-        orgSettings?: OrgSettingsResponse;
-      }>(
-        "GET",
-        `/auth/key-lease?${params.toString()}`,
-        undefined,
-        session.idToken
-      );
+      // SD-02-F1 (M10): `this.session` is not assigned until below, so without this
+      // the lease request — an AUTHENTICATED request — would go out with no
+      // `X-VaultGuard-Session-Id` and the server's session check would return early.
+      //
+      // The window is deliberately EXACTLY this one await. The else-branch below
+      // calls `openServerSession` → `POST /auth/session` through the same
+      // `apiRequest`; the server validates a session header whenever one is present,
+      // so a stale candidate riding that mint would 401 the mint itself and kill the
+      // stale-session self-heal. The `finally` guarantees the candidate is gone
+      // before either branch of `leaseResponse` runs — on success, failure, or throw.
+      this.restoreCandidateSessionId = session.sessionId;
+      try {
+        leaseResponse = await this.apiRequest<{
+          keyLease: KeyLease;
+          deniedPaths?: LeaseDeniedPath[];
+          orgSettings?: OrgSettingsResponse;
+        }>(
+          "GET",
+          `/auth/key-lease?${params.toString()}`,
+          undefined,
+          session.idToken
+        );
+      } finally {
+        this.restoreCandidateSessionId = null;
+      }
     }
 
     if (leaseResponse?.success && leaseResponse.data) {
@@ -5856,12 +6041,18 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Restore the cipher from a previously-exported recovery code. Returns
-   * false if the code is malformed / has a bad checksum so the UI can
-   * show a generic "couldn't recognise that code" error.
+   * Restore the cipher from a previously-exported recovery code.
+   *
+   * Returns the cipher's rich outcome (SD-05-F3) so the UI can tell a malformed
+   * code from a valid code that doesn't open THIS vault. Pass
+   * `{ confirmReplace: true }` only after the user has explicitly confirmed a
+   * `needs-confirmation` key replacement.
    */
-  async restoreAtRestFromRecoveryCode(code: string): Promise<boolean> {
-    return this.ensureAtRestAdapterRuntimeObject().restoreAtRestFromRecoveryCode(code);
+  async restoreAtRestFromRecoveryCode(
+    code: string,
+    opts?: { confirmReplace?: boolean }
+  ): Promise<AtRestRestoreOutcome> {
+    return this.ensureAtRestAdapterRuntimeObject().restoreAtRestFromRecoveryCode(code, opts);
   }
 
   /**
@@ -6724,7 +6915,9 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private applyOrgSettings(orgSettings?: OrgSettingsResponse | null): void {
+    const restrictionWasActive = this.isAdminRestrictionActive();
     this.orgSettings = orgSettings ?? null;
+    const restrictionIsActive = this.isAdminRestrictionActive();
 
     // Keep the file-permission header in sync with the per-org
     // allowAdminPerFileRestrictions toggle. Without this push, the header
@@ -6732,8 +6925,24 @@ export default class VaultGuardPlugin extends Plugin {
     // and would never pick up a setting change until the next plugin
     // reload.
     this.filePermissionHeader?.setContext({
-      allowAdminPerFileRestrictions: this.orgSettings?.allowAdminPerFileRestrictions === true,
+      allowAdminPerFileRestrictions: restrictionIsActive,
     });
+
+    if (restrictionWasActive !== restrictionIsActive) {
+      // SD-03-F15/F16: the effective per-file policy just changed, so every
+      // cached answer — including the root sentinel — was computed under the
+      // OLD policy. One server-confirmed wildcard emit hands the invalidation
+      // + re-warm + re-resolution to the store's existing machinery. The
+      // assignment above happens FIRST so the fan-out's requestWarmup ->
+      // collectRulesForWarmup reads the NEW policy.
+      //
+      // Only on a FLIP, and symmetric in both directions: turning the toggle
+      // OFF must invalidate too, or a cached restricted NONE would outlive the
+      // policy that produced it. applyOrgSettings also runs on every lease
+      // refresh and session restore, so emitting unconditionally would turn
+      // those into a wildcard storm.
+      this.permissionStore.emit("changed", { serverConfirmed: true });
+    }
 
     if (this.session) {
       this.restartSyncTimer();
@@ -7826,6 +8035,27 @@ export default class VaultGuardPlugin extends Plugin {
     return normalizePath(String(path ?? "").replace(/^\/+/, ""));
   }
 
+  /**
+   * V1–V4 of the chat mention picker's visibility rule: the non-lease part of
+   * the Agent Bridge's `isPathAgentReadable` (`agent-bridge.ts:4222-4239`).
+   * Rejects unnormalizable paths, any `..` segment anywhere (even mid-path),
+   * vault-root hidden entries, and locally-excluded paths.
+   */
+  private isMentionPathVisible(path: string): boolean {
+    const normalized = this.normalizeVaultPath(path);
+    if (!normalized) return false;
+    if (
+      String(path ?? "")
+        .replace(/\\/g, "/")
+        .split("/")
+        .some((segment) => segment === "..")
+    ) {
+      return false;
+    }
+    if (normalized.split("/")[0].startsWith(".")) return false;
+    return !this.isPathExcluded(normalized);
+  }
+
   private vaultConfigPath(...parts: string[]): string {
     return normalizePath([this.app.vault.configDir, ...parts].filter(Boolean).join("/"));
   }
@@ -7960,31 +8190,58 @@ export default class VaultGuardPlugin extends Plugin {
    * user delete — so it must NOT propagate a server DELETE. Two layers, so a
    * wiped path is safe REGARDLESS of watcher timing:
    *
-   *   1. `resettingLocalCache` — the global flag, up only across the reset's own
-   *      window. Covers the common fast-watcher case (events drain in-window).
-   *   2. `wipedPathsAwaitingRepull` — the path-scoped set that OUTLIVES that
-   *      window (HI-01). A wiped path stays here until it exists again, so a
-   *      slow/debounced delete event that fires AFTER the global flag is dropped
-   *      is still suppressed.
+   *   1. `resettingLocalCache` — the global INSTANCE-LOCAL flag, up only across
+   *      this instance's own reset window. Covers the common fast-watcher case
+   *      (events drain in-window).
+   *   2. The CROSS-INSTANCE wipe-suppression registry (SD-07-F4,
+   *      `./wipe-suppression-registry`) — the path-scoped set that OUTLIVES both
+   *      that window (HI-01) and THIS PLUGIN INSTANCE. It is `globalThis`-scoped
+   *      and memory-only, so it survives a hot reload: a wipe orphaned mid-flight
+   *      by a plugin reload keeps registering its paths, and the REPLACEMENT
+   *      instance reads them here instead of mistaking the zombie's late watcher
+   *      deletes for genuine user deletes. A wiped path stays registered until
+   *      it exists again.
    *
    * For a folder delete we ALSO suppress when the folder still CONTAINS a
    * wiped-awaiting-repull descendant: a folder emptied by the wipe and removed
    * late by Obsidian would otherwise prefix-DELETE its (server-authoritative)
    * children. Once reconcile re-pulls those children their entries self-clear,
-   * and a later user delete of the re-created folder propagates normally.
+   * and a later user delete of the re-created folder propagates normally. That
+   * rule moved into the registry — it did not change.
    */
   private isWipeSuppressedDelete(path: string, isFolder: boolean): boolean {
     if (this.resettingLocalCache) return true;
-    if (this.wipedPathsAwaitingRepull.size === 0) return false;
-    const normalized = this.normalizeVaultPath(path);
-    if (this.wipedPathsAwaitingRepull.has(normalized)) return true;
-    if (isFolder) {
-      const prefix = normalized + "/";
-      for (const wiped of this.wipedPathsAwaitingRepull) {
-        if (wiped.startsWith(prefix)) return true;
-      }
+    return isPathWipeSuppressed(
+      this.wipeSuppressionVaultKey(),
+      this.normalizeVaultPath(path),
+      isFolder,
+    );
+  }
+
+  /**
+   * Lazily memoized registry key for this vault (SD-07-F4). `this.app` is set by
+   * the `Plugin` constructor before `onload`, so the first call always sees a
+   * real app.
+   */
+  private wipeSuppressionVaultKey(): string {
+    if (this.wipeSuppressionVaultKeyCache === null) {
+      this.wipeSuppressionVaultKeyCache = deriveWipeSuppressionVaultKey(this.app);
     }
-    return false;
+    return this.wipeSuppressionVaultKeyCache;
+  }
+
+  /**
+   * Register one raw-removed path in the cross-instance suppression registry and
+   * beat the reset lease (SD-07-F4). Called by the wipe the instant each remove
+   * succeeds — progress IS the heartbeat, so no timer is needed and the beat can
+   * never outlive the work it measures.
+   */
+  private recordWipedPathAwaitingRepull(path: string): void {
+    const key = this.wipeSuppressionVaultKey();
+    recordWipedPath(key, this.normalizeVaultPath(path));
+    if (this.atRestResetLeaseOwnerId) {
+      heartbeatResetLease(key, this.atRestResetLeaseOwnerId);
+    }
   }
 
   /**
@@ -7996,8 +8253,7 @@ export default class VaultGuardPlugin extends Plugin {
    * `vault.on('create')` (see `onload`); a no-op unless a reset just ran.
    */
   private clearWipeSuppressionForRecreatedPath(path: string): void {
-    if (this.wipedPathsAwaitingRepull.size === 0) return;
-    this.wipedPathsAwaitingRepull.delete(this.normalizeVaultPath(path));
+    clearWipedPath(this.wipeSuppressionVaultKey(), this.normalizeVaultPath(path));
   }
 
   /** True while `resetLocalAtRestAndResync()` is wiping the local VG1 cache. */
@@ -8089,21 +8345,25 @@ export default class VaultGuardPlugin extends Plugin {
 
   /**
    * Uploads a local-only file to the server vault during reconciliation.
-   * Returns "uploaded" on success, "skipped" when the user lacks WRITE
-   * permission, and throws on any other failure so the caller can count it
-   * accurately. Callers decide whether a skipped local-only file stays local
-   * or is removed as an unsynced ghost.
+   * Returns "uploaded" on success, a "skipped-*" outcome when the upload could
+   * not proceed (no write permission / no key lease), and throws on any other
+   * failure so the caller can count it accurately. SD-06-F4: a skipped
+   * local-only file always stays on disk — no caller may treat any outcome as
+   * licence to delete it.
    */
   private async uploadReconciledFile(
     path: string,
     content: string,
-    options: { noWriteNotice?: string } = {}
-  ): Promise<"uploaded" | "skipped-no-lease" | "skipped-no-permission"> {
+    // SD-06-F1 / DECISION 7: `intent` is required by type and forwarded
+    // verbatim; the runtime supplies the `{kind:"unknown"}` fallback.
+    options: { intent: MutationIntent; noWriteNotice?: string }
+  ): Promise<
+    | "uploaded"
+    | "skipped-no-lease"
+    | "skipped-no-permission"
+    | "skipped-create-conflict"
+  > {
     return this.ensureSyncRuntime().uploadReconciledFile(path, content, options);
-  }
-
-  private async removeUnsyncedLocalFile(path: string): Promise<boolean> {
-    return this.ensureSyncRuntime().removeUnsyncedLocalFile(path);
   }
 
   /**
@@ -8119,7 +8379,7 @@ export default class VaultGuardPlugin extends Plugin {
   private async uploadLocalOnlyFiles(): Promise<{
     uploadedFiles: number;
     uploadedFolders: number;
-    removedLocalFiles: number;
+    heldNoPermissionFiles: number;
     skippedFiles: number;
     failedFiles: number;
     failedFolders: number;
@@ -8484,6 +8744,12 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.session.idToken) {
       headers["Authorization"] = this.session.idToken;
     }
+    // SD-02-F1: the THIRD header-attach site, deliberately NOT routed through
+    // `resolveRequestSessionId()`. This is the connection-diagnostics probe: it is
+    // already guarded by an early return when `this.session` is absent (above), so a
+    // restore candidate could never apply here, and the line it prints is meant to
+    // report the LIVE-SESSION header state. Resolving a candidate here would make
+    // "Session header sent: yes" ambiguous for the user reading the diagnostic.
     const sessionHeaderSent = !!this.session.sessionId;
     if (sessionHeaderSent) {
       headers["X-VaultGuard-Session-Id"] = this.session.sessionId;
@@ -8739,6 +9005,14 @@ export default class VaultGuardPlugin extends Plugin {
     return this.remoteFileState.getExpectedVersionId(this.normalizeVaultPath(path));
   }
 
+  /**
+   * SD-06-F1: the non-lossy sibling of getExpectedVersionId, normalized the
+   * same way so both accessors read the same store entry for the same path.
+   */
+  private resolveMutationIntent(path: string): MutationIntent {
+    return this.remoteFileState.resolveMutationIntent(this.normalizeVaultPath(path));
+  }
+
   private recordRemoteFilePresent(
     path: string,
     update: RemoteFileStateUpdate = {}
@@ -8755,12 +9029,16 @@ export default class VaultGuardPlugin extends Plugin {
   private async handleRemoteWriteConflict(
     path: string,
     localContent: string,
-    baseVersionId?: string | null
+    baseVersionId?: string | null,
+    // SD-06-F1 / DECISION 2: threaded through so the adapter seam can mark a
+    // 409 that answered a declared create.
+    options?: { createConflict?: boolean }
   ): Promise<RemoteWriteConflictResolutionResult> {
     return this.ensureSyncRuntime().handleRemoteWriteConflict(
       path,
       localContent,
-      baseVersionId
+      baseVersionId,
+      options
     );
   }
 
@@ -9875,6 +10153,27 @@ export default class VaultGuardPlugin extends Plugin {
     return `/vaults/${encodeURIComponent(vaultId)}${suffix}`;
   }
 
+  /**
+   * SD-02-F1 (M10): THE SINGLE DEFINITION of "which session id does an outbound
+   * request carry". Both PRODUCTION header-attach sites consume it:
+   *
+   *   1. `src/api/client.ts` — via the `getSessionId` callback wired in
+   *      `src/plugin/settings-runtime.ts` (`VaultGuardApiClient` requests).
+   *   2. `apiRequest` below — every `this.apiRequest(...)` call, which is the path
+   *      the restore's first key-lease request actually takes.
+   *
+   * A live `this.session` always wins; the restore candidate is a fallback that
+   * exists only while `this.session` is not yet assigned. Do NOT reintroduce a
+   * direct `this.session?.sessionId` read at either site — that is exactly the
+   * drift this resolver was created to prevent.
+   *
+   * (The third occurrence of the header, in the connection-diagnostics probe, is
+   * deliberately NOT routed through here — see the comment at its call site.)
+   */
+  private resolveRequestSessionId(): string | null {
+    return this.session?.sessionId ?? this.restoreCandidateSessionId ?? null;
+  }
+
   private async apiRequest<T>(
     method: string,
     endpoint: string,
@@ -9941,8 +10240,31 @@ export default class VaultGuardPlugin extends Plugin {
       // API Gateway Cognito authorizer expects the ID token (no Bearer prefix)
       headers["Authorization"] = idToken;
     }
-    if (this.session?.sessionId) {
-      headers["X-VaultGuard-Session-Id"] = this.session.sessionId;
+    // SD-02-F1 (M10): read through the single resolver, never `this.session`
+    // directly — during a restore the live session is not assigned yet and this
+    // block used to attach nothing. Behavior with a live session is unchanged.
+    const requestSessionId = this.resolveRequestSessionId();
+    if (requestSessionId) {
+      headers["X-VaultGuard-Session-Id"] = requestSessionId;
+    } else if (idToken) {
+      // SD-02-F1: an AUTHENTICATED request going out with no session header. This is
+      // the client-side mirror of the server's `[SESSION_TELEMETRY]` observe-mode
+      // line — the two halves answer the same question from opposite ends, and a
+      // future enforcement flip is only safe once both go quiet.
+      //
+      // After this plan the only expected hit is the `/auth/session` mint itself
+      // (no id exists yet, M12) and a legacy persisted session that carries no
+      // sessionId at all — which this makes visible instead of silent.
+      //
+      // The query string is STRIPPED: the restore lease call puts the session id in
+      // its query string, and this buffer is user-copyable ("Copy sync diagnostics").
+      // A path + method is all the pointer needs to be.
+      // `syncDiagnostics.record` is a no-op in production builds (NODE_ENV guard,
+      // DCE-stripped by esbuild), so this costs nothing on a user's machine.
+      this.syncDiagnostics.record("apiRequest.headerlessAuthenticated", {
+        endpoint: endpoint.split("?")[0],
+        method,
+      });
     }
 
     const startedAt = Date.now();
@@ -10677,7 +10999,7 @@ export default class VaultGuardPlugin extends Plugin {
    */
   startAtRestRecoveryFromRecoveryCode(): void {
     new AtRestRestoreModal(this.app, {
-      onSubmit: (code) => this.restoreAtRestFromRecoveryCode(code),
+      onSubmit: (code, opts) => this.restoreAtRestFromRecoveryCode(code, opts),
       onRestored: () => {
         new Notice(
           "VaultGuard Sync: at-rest key restored. Reopening any notes will now load decrypted content.",
@@ -10740,14 +11062,43 @@ export default class VaultGuardPlugin extends Plugin {
       throw err;
     }
 
+    // CROSS-INSTANCE REENTRANCY (SD-07-F4). The latch above is instance-local,
+    // so it cannot see a wipe orphaned by a hot reload — the exact case where a
+    // second reset is most dangerous, because a still-live zombie wipe holds a
+    // raw `remove`. Take the shared lease FIRST in the COMMIT block: it is the
+    // first statement past the authoritative guards and before any side effect,
+    // so a refusal still changes NOTHING (no flag, no pause, no wipe, no
+    // network). The lease is heartbeat-driven (every successful raw remove) and
+    // goes stale after 60 s, so a dead instance can never block recovery
+    // forever.
+    const wipeSuppressionKey = this.wipeSuppressionVaultKey();
+    const lease = acquireResetLease(wipeSuppressionKey);
+    if (!lease.acquired) {
+      const err = new Error(
+        `VaultGuard Sync: a local at-rest reset from a previous plugin session may still be running (last progress ${lease.ageMs}ms ago). Wait a moment and try again.`
+      );
+      err.name = "AtRestResetGuardError";
+      throw err;
+    }
+    this.atRestResetLeaseOwnerId = lease.ownerId;
+    if (lease.tookOverStaleLease) {
+      this.log(
+        "At-rest reset: took over a stale cross-instance reset lease (no progress for over 60s)."
+      );
+    }
+
     // COMMIT: past the guards, latch the reentrancy flag so any concurrent door
     // refuses above (CR-01), then raise the delete-suppression flag + pause sync.
     this.atRestResetInFlight = true;
     this.setResettingLocalCache(true);
     // Drop any stragglers from a prior reset (HI-01). Safe: a still-gone path
     // can't fire a delete, and a re-created one already self-cleared. The global
-    // flag covers the window until the wipe repopulates this set below.
-    this.wipedPathsAwaitingRepull.clear();
+    // flag covers the window until the wipe repopulates this set below. Still
+    // safe when we just took over a STALE lease from a possibly-live previous
+    // instance: `resettingLocalCache` is up for our entire reset window, which
+    // suppresses everything regardless of the set, and we re-wipe the same file
+    // population, re-registering each path per-remove.
+    clearAllWipedPaths(wipeSuppressionKey);
     this.pauseSyncLoop("at-rest reset");
     try {
       // D2: clear PIN enrollment FIRST. The PIN wrapped the now-dead LAK, so it
@@ -10767,8 +11118,14 @@ export default class VaultGuardPlugin extends Plugin {
       // `finally` drops the global flag — a slow/debounced watcher can deliver
       // the wipe's delete event late. Entries self-clear on re-create (the
       // create listener), so a legitimate later user delete still propagates.
+      //
+      // SD-07-F4: this is idempotent belt-and-braces, NOT the primary
+      // registration any more. Each path was already registered the instant its
+      // raw remove succeeded, because this loop does not run at all when the
+      // wipe throws — or when the wipe promise is orphaned by a hot reload,
+      // which is precisely the case the per-remove callback exists to cover.
       for (const p of wipedPaths) {
-        this.wipedPathsAwaitingRepull.add(this.normalizeVaultPath(p));
+        this.recordWipedPathAwaitingRepull(p);
       }
 
       // Settle Obsidian's TFile index so the wiped paths are gone from
@@ -10787,6 +11144,16 @@ export default class VaultGuardPlugin extends Plugin {
       this.setResettingLocalCache(false);
       this.resumeSyncLoop("at-rest reset complete");
       this.refreshAtRestRecoverySurfaces();
+      // SD-07-F4: release the CROSS-INSTANCE lease, ownership-guarded.
+      // `releaseResetLease` is a no-op unless we still own it, so a late
+      // `finally` from a superseded instance can never clobber a newer reset's
+      // marker. Deliberately does NOT clear the suppression entries — those
+      // outlive the reset window by design (HI-01) and self-clear per path when
+      // the path is back.
+      if (this.atRestResetLeaseOwnerId) {
+        releaseResetLease(this.wipeSuppressionVaultKey(), this.atRestResetLeaseOwnerId);
+        this.atRestResetLeaseOwnerId = null;
+      }
       // Release the reentrancy latch LAST — after the shared flag is down — so a
       // door that fires during this `finally` still refuses (CR-01).
       this.atRestResetInFlight = false;
@@ -11355,6 +11722,10 @@ export default class VaultGuardPlugin extends Plugin {
           contentType?: string;
           baseVersionId?: string;
           baseHash?: string;
+          // SD-06-F1 / DECISION 9: `unknown`, not MutationIntent — this value
+          // comes off disk and is attacker-influenced on a compromised device.
+          // It is validated field-by-field below before it can steer a write.
+          intent?: unknown;
         }>;
       };
       // BIN-A / D-09 / L11: accept BOTH v1 (all-text, older builds) and v2
@@ -11397,6 +11768,44 @@ export default class VaultGuardPlugin extends Plugin {
         // restart still carries its optimistic-concurrency baseline.
         if (typeof op.baseVersionId === "string") entry.baseVersionId = op.baseVersionId;
         if (typeof op.baseHash === "string") entry.baseHash = op.baseHash;
+        // SD-06-F1 / DECISION 9 — typed validation of the persisted intent.
+        //
+        // The policy here is per-FIELD, deliberately UNLIKE the unknown-encoding
+        // drop above, which is per-ENTRY. The asymmetry is the whole point:
+        // ignoring an `encoding` CORRUPTS data (a base64 payload replayed as
+        // text is a mangled server copy), while ignoring an `intent` merely
+        // degrades to today's behavior — the op replays through the flush-time
+        // store fallback and lands in the legacy lane. So a malformed intent
+        // drops the FIELD and KEEPS the op; a malformed encoding drops the op.
+        //
+        // Only the four literal kinds are accepted, and `expect-version`
+        // additionally requires a non-empty string versionId — an
+        // `{kind:"expect-version"}` with a missing/blank version would otherwise
+        // reach buildWriteBody and emit an invalid guard.
+        const rawIntent = op.intent;
+        if (rawIntent !== undefined) {
+          const candidate = rawIntent as { kind?: unknown; versionId?: unknown };
+          const kind =
+            typeof rawIntent === "object" && rawIntent !== null ? candidate.kind : undefined;
+          if (
+            kind === "must-be-absent" ||
+            kind === "force" ||
+            kind === "unknown" ||
+            (kind === "expect-version" &&
+              typeof candidate.versionId === "string" &&
+              candidate.versionId.length > 0)
+          ) {
+            entry.intent =
+              kind === "expect-version"
+                ? { kind, versionId: candidate.versionId as string }
+                : { kind };
+          } else {
+            this.logError(
+              `Dropping the persisted mutation intent on restored offline op ${op.operation} "${op.path}" — malformed value; the op is KEPT and replays through the store fallback`,
+              new Error("malformed offline-queue entry intent")
+            );
+          }
+        }
         restored.push(entry);
       }
       if (restored.length === 0) return;

@@ -1,3 +1,5 @@
+import type { MutationIntent } from "./plugin-runtime-types";
+
 export type RemoteFileStateKind = "present" | "absent" | "unknown";
 
 export interface RemoteFileStateEntry {
@@ -47,6 +49,43 @@ export class RemoteFileStateStore {
     const entry = this.get(path);
     if (!entry || entry.state !== "present") return undefined;
     return entry.versionId;
+  }
+
+  /**
+   * SD-06-F1: resolve what this client actually KNOWS about `path` on the
+   * server, WITHOUT the lossy collapse `getExpectedVersionId` performs (which
+   * returns `undefined` for both "known absent" and "no idea", so every write
+   * path then omitted the guard for both and the server saw one lane).
+   *
+   * | store state                          | result                                |
+   * |--------------------------------------|---------------------------------------|
+   * | `present` WITH a non-empty versionId | `{kind:"expect-version", versionId}`  |
+   * | `present` WITHOUT a versionId        | `{kind:"unknown"}`                    |
+   * | `absent`                             | `{kind:"must-be-absent"}`             |
+   * | state `"unknown"`                    | `{kind:"unknown"}`                    |
+   * | no entry at all (`get()` → null)     | `{kind:"unknown"}`                    |
+   *
+   * The versionless-`present` row is load-bearing. `recordPresent` MERGES
+   * (`versionId: update.versionId ?? previous?.versionId`, below), so a record
+   * that only carried a `baseHash` — or a `load()` whose persisted `versionId`
+   * failed `optionalString` — leaves a `present` entry with
+   * `versionId: undefined`. That means "the server HAS this path, I lost the
+   * version": the LEGACY lane. It must never resolve to `must-be-absent` —
+   * declaring absence for a path that exists would 409 every save of that file.
+   *
+   * It never returns `{kind:"force"}`. Force is always caller-declared (a
+   * user-chosen conflict overwrite) and is never derived from stored state;
+   * deriving it would turn lost-track writes into permanent unconditional
+   * overwrites and blind the telemetry the server-side flip depends on.
+   */
+  resolveMutationIntent(path: string): MutationIntent {
+    const entry = this.get(path);
+    if (!entry) return { kind: "unknown" };
+    if (entry.state === "absent") return { kind: "must-be-absent" };
+    if (entry.state === "present" && entry.versionId) {
+      return { kind: "expect-version", versionId: entry.versionId };
+    }
+    return { kind: "unknown" };
   }
 
   recordPresent(path: string, update: RemoteFileStateUpdate = {}): void {

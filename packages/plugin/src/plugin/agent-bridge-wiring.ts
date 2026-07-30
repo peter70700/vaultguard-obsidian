@@ -40,7 +40,7 @@ import {
 } from "./agent-bridge-codex-skill/installer";
 import { VaultGraph } from "./graph/vault-graph";
 import type { AgentBridgeRuntimeContext } from "./plugin-runtime-types";
-import { PermissionLevel } from "../types";
+import { resolveAgentPermission } from "./agent-permission";
 
 export class AgentBridgeRuntime {
   private bridge: VaultGuardAgentBridge | null = null;
@@ -59,10 +59,7 @@ export class AgentBridgeRuntime {
       fileExists: async (path) => this.ctx.app.vault.adapter.exists(path),
       ensureParentFolders: (path) => this.ctx.ensureParentFoldersForPath(path),
       isPathExcluded: (path) => this.ctx.isPathExcluded(path),
-      getPermission: (path) =>
-        this.ctx.isLocalProjectMemoryModeEnabled()
-          ? Promise.resolve(PermissionLevel.WRITE)
-          : this.ctx.getEffectivePermission(path),
+      getPermission: (path) => resolveAgentPermission(this.ctx, path),
       makeVaultGraph: (graphDeps) => new VaultGraph(this.ctx.app, graphDeps),
       isMetadataSuppressed: (path) => this.ctx.isMetadataSuppressed(path),
       readText: (path) => this.ctx.readText(path),

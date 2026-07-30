@@ -155,16 +155,25 @@ export interface InputControllerCallbacks {
    */
   resolveTemplate?(name: string, arg: string, prefix: PromptCommandPrefix): string | null;
   /**
-   * Resolve note candidates for an `@`-mention query (the view supplies these
-   * from the Obsidian vault file list — metadata only, never file content, so
-   * the at-rest boundary is untouched). Omit to disable @-mentions.
+   * Resolve note candidates for an `@`-mention query. The view supplies these
+   * from the Obsidian vault file list, filtered to the paths the user may
+   * actually read — a suggestion is a disclosure, so the provider gates on the
+   * same predicate as the read path (SD-13-F5). Omit to disable @-mentions.
+   *
+   * The union return type is deliberate: `await` accepts both, so a purely
+   * synchronous provider keeps working unchanged.
    */
-  getMentionCandidates?(query: string): MentionCandidate[];
+  getMentionCandidates?(query: string): MentionCandidate[] | Promise<MentionCandidate[]>;
   /** Slash-command suggestions for the dropdown; built-ins are added by default. */
   getSlashCommands?(): SlashCommandSuggestion[];
 }
 
-const MENTION_LIMIT = 8;
+/**
+ * How many `@`-mention suggestions the popup shows. Exported so the candidate
+ * provider can bound its permission checks to exactly the visible count rather
+ * than resolving a wider set the controller would discard.
+ */
+export const MENTION_LIMIT = 8;
 
 export type ParsedSlash =
   | SlashCommand
@@ -278,6 +287,14 @@ export class InputController {
   private mentionItems: MentionCandidate[] = [];
   private mentionActive = -1;
   private mentionAtIndex = -1;
+  /**
+   * Monotonic token for in-flight mention lookups. Candidate resolution is
+   * async (it consults the permission store), so a slow earlier keystroke can
+   * resolve after a newer one. Every lookup captures the token it started with
+   * and drops its result if the token has moved on; `hideMentions()` bumps it
+   * so a dismissed popup can never be repopulated from a stale lookup.
+   */
+  private mentionQuerySeq = 0;
 
   // Image attachment state (desktop, API-key mode).
   private readonly enableImages: boolean;
@@ -323,7 +340,7 @@ export class InputController {
     this.textarea.addEventListener("input", () => {
       this.autoGrow();
       this.updateSlashCommands();
-      this.updateMentions();
+      void this.updateMentions();
     });
     this.textarea.addEventListener("keydown", (evt) => this.onKeyDown(evt));
     // Defer hide so a mouse click on a suggestion still registers.
@@ -541,7 +558,7 @@ export class InputController {
   }
 
   // Recompute the active `@` token from the caret and refresh the popup.
-  private updateMentions(): void {
+  private async updateMentions(): Promise<void> {
     if (this.busy || !this.callbacks.getMentionCandidates) {
       this.hideMentions();
       return;
@@ -555,9 +572,32 @@ export class InputController {
       this.hideMentions();
       return;
     }
-    this.mentionAtIndex = match.index + match[1].length;
+    const atIndex = match.index + match[1].length;
     const query = match[2];
-    this.mentionItems = this.callbacks.getMentionCandidates(query).slice(0, MENTION_LIMIT);
+    const seq = ++this.mentionQuerySeq;
+
+    let candidates: MentionCandidate[];
+    try {
+      candidates = await this.callbacks.getMentionCandidates(query);
+    } catch {
+      if (seq === this.mentionQuerySeq) this.hideMentions();
+      return;
+    }
+
+    // Stale-query guard: a newer keystroke (or hideMentions) bumped the token
+    // while this lookup was in flight — drop the result rather than rendering
+    // suggestions for a query the user has already moved past.
+    if (seq !== this.mentionQuerySeq) return;
+    // The controller may have gone busy or the popup been dismissed mid-await.
+    if (this.busy) {
+      this.hideMentions();
+      return;
+    }
+
+    // Assigned only after the guard: writing the anchor before the await would
+    // let a stale lookup leave a stale insertion offset behind.
+    this.mentionAtIndex = atIndex;
+    this.mentionItems = candidates.slice(0, MENTION_LIMIT);
     if (this.mentionItems.length === 0) {
       this.hideMentions();
       return;
@@ -614,6 +654,9 @@ export class InputController {
   }
 
   private hideMentions(): void {
+    // Invalidate any in-flight lookup so it cannot repopulate the popup after
+    // Esc, blur, setBusy(true), or an accepted mention.
+    this.mentionQuerySeq += 1;
     this.mentionItems = [];
     this.mentionActive = -1;
     this.mentionAtIndex = -1;

@@ -223,18 +223,22 @@ export function renderUserMessage(
       addCopyButton(tools, () => text, "Copy prompt");
     }
     if (actions) {
-      const editBtn = tools.createSpan({
+      const editBtn = tools.createEl("button", {
         cls: "clickable-icon",
-        attr: { "aria-label": "Edit message", title: "Edit message" },
+        attr: { type: "button", "aria-label": "Edit message", title: "Edit message" },
       });
       setIcon(editBtn, "pencil");
       editBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         actions.onEdit();
       });
-      const delBtn = tools.createSpan({
+      const delBtn = tools.createEl("button", {
         cls: "clickable-icon",
-        attr: { "aria-label": "Delete message", title: "Delete message and everything after" },
+        attr: {
+          type: "button",
+          "aria-label": "Delete message",
+          title: "Delete message and everything after",
+        },
       });
       setIcon(delBtn, "trash");
       delBtn.addEventListener("click", (e) => {

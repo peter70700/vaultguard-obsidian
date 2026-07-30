@@ -67,6 +67,19 @@ export interface PermissionStoreConfig {
   isNetworkError: (err: unknown) => boolean;
   /** Obsidian App handle — needed for metadataCache + workspace leaf access. */
   app: App;
+  /**
+   * True when the current org has `allowAdminPerFileRestrictions` enabled. Optional: when absent
+   * (or false) the org-admin fast paths behave exactly as they did before SD-03-F15 — no probe, no
+   * warm, no behaviour change for orgs that never opted in.
+   */
+  isAdminRestrictionActive?: () => boolean;
+  /**
+   * Re-fetch the current rule set and re-warm the cache. Injected by main.ts. Awaited on a
+   * server-confirmed wildcard change so re-resolution runs against POST-change rules. Optional:
+   * when absent the store still invalidates the root sentinel and falls back to per-path probes.
+   * MUST NOT (transitively) emit('changed') — Pitfall 3 re-entrance guard.
+   */
+  requestWarmup?: () => Promise<void>;
 }
 
 /** Single cache entry. `fetchedAt === 0` is the warm-up-seeded sentinel (D-10). */
@@ -190,6 +203,16 @@ export class PermissionStore extends Events {
     });
   }
 
+  /**
+   * SD-03-F15: the single definition of "this org restricts org-admin per-file access".
+   * All three org-admin fast paths (getPermissionDecision, peekPermissionDecision, runWarm)
+   * gate on THIS helper and nothing else — one definition so the three can never drift.
+   * Absent callback ⇒ false ⇒ byte-identical pre-SD-03-F15 behaviour (14-DESIGN.md M1/M21).
+   */
+  private adminRestrictionActive(): boolean {
+    return this.cfg.isAdminRestrictionActive?.() === true;
+  }
+
   // ── Public read API ────────────────────────────────────────────────────────
 
   /**
@@ -227,7 +250,18 @@ export class PermissionStore extends Events {
     }
 
     // Admin and owner roles always have full access — no server round-trip needed.
-    if (session.role === "admin" || session.role === "owner") {
+    //
+    // SD-03-F15: UNLESS the org enabled `allowAdminPerFileRestrictions`. With the toggle on, a
+    // restricted org admin joins EXACTLY the existing member behaviour class — role baseline at
+    // the root when no applicable globs exist (mirroring the server's own narrowing: an admin is
+    // still allowed where NO rule matches), per-path probes otherwise, and offline-cold =
+    // unknown → NONE just like every member today. No new behaviour class is invented.
+    //
+    // A blanket "fail closed for admins whenever the answer is unknown" was REJECTED: offline with
+    // a cold cache it would hard-lock an admin out of their own vault, which is the 2026-05-31
+    // incident class. See reports/security/SD-03-authorization-permissions.md (F15) and
+    // 14-DESIGN.md §2 [BINDING].
+    if (!this.adminRestrictionActive() && (session.role === "admin" || session.role === "owner")) {
       this.cache.set(path, { level: PermissionLevel.ADMIN, fetchedAt: Date.now() });
       return { kind: "verified", level: PermissionLevel.ADMIN };
     }
@@ -274,7 +308,8 @@ export class PermissionStore extends Events {
     if (!session) {
       return { kind: "verified", level: PermissionLevel.NONE };
     }
-    if (session.role === "admin" || session.role === "owner") {
+    // SD-03-F15 gate — see getPermissionDecision for the rationale.
+    if (!this.adminRestrictionActive() && (session.role === "admin" || session.role === "owner")) {
       return { kind: "verified", level: PermissionLevel.ADMIN };
     }
     return this.resolvePermissionFromCache(normalized) ?? { kind: "unknown" };
@@ -389,7 +424,12 @@ export class PermissionStore extends Events {
     // header / decorations stop showing the skeleton — admins always have
     // the answer locally. Uses the lifecycle-only event so we don't
     // trip handleChanged's wildcard invalidation.
-    if (session.role === "admin" || session.role === "owner") {
+    //
+    // SD-03-F15 gate — see getPermissionDecision for the rationale. Falling through runs the
+    // normal rule-filter + root/literal seeding below, which derives ADMIN for an admin vault
+    // role via deriveDefaultPermissionLevel → deriveSessionVaultRole (a role MAPPING, not a
+    // bypass — deliberately untouched).
+    if (!this.adminRestrictionActive() && (session.role === "admin" || session.role === "owner")) {
       this.state = { kind: "warmed", warmedAt: Date.now() };
       this.notifyStoreStateChanged();
       return;
@@ -402,15 +442,28 @@ export class PermissionStore extends Events {
 
     const defaultLevel = this.deriveDefaultPermissionLevel(session, vaultRole);
     if (defaultLevel !== null) {
+      // SD-03-F16 audit (2026-07-28): `vaultDefaultPermission` is assigned HERE and read
+      // NOWHERE in src/ or tests/ (main.ts:920 is a comment about the removed main.ts field).
+      // It deliberately does NOT get the clear-on-decline treatment below: its meaning is
+      // "the derived vault default", not "the level currently seeded at root" — it is already
+      // set even when hasDynamicRules suppresses seeding. A future consumer must not read it
+      // as root-lifecycle state.
       this.vaultDefaultPermission = defaultLevel;
-      // A root default is only safe when every applicable rule can be
-      // represented by the literal ancestor cache below. Glob rules need
-      // the backend matcher — otherwise a cached viewer READ could bypass
-      // `/secret/**` denies or miss `/editable/**` write grants.
-      if (!hasDynamicRules) {
-        // Sentinel 0 = warm-up seed, exempt from TTL (Pitfall 4).
-        this.cache.set("", { level: defaultLevel, fetchedAt: 0 });
-      }
+    }
+
+    // A root default is only safe when every applicable rule can be
+    // represented by the literal ancestor cache below. Glob rules need
+    // the backend matcher — otherwise a cached viewer READ could bypass
+    // `/secret/**` denies or miss `/editable/**` write grants.
+    if (defaultLevel !== null && !hasDynamicRules) {
+      // Sentinel 0 = warm-up seed, exempt from TTL (Pitfall 4).
+      this.cache.set("", { level: defaultLevel, fetchedAt: 0 });
+    } else {
+      // SD-03-F16: a root sentinel never expires (see isExpired — fetchedAt 0 is exempt), so a
+      // root seeded by an EARLIER warm would otherwise outlive the rule set that justified it
+      // and keep answering the cache walk-up for paths a newly-added glob deny now covers.
+      // Declining to seed is not enough; the stale grant must be deleted.
+      this.cache.delete("");
     }
 
     for (const rule of applicableRules) {
@@ -522,18 +575,24 @@ export class PermissionStore extends Events {
    * (NONE → READ/WRITE) rely on Obsidian's natural indexing — no purge.
    *
    * Wildcard branch (path undefined): snapshot previously-cached paths,
-   * clear only the per-path entries (NOT the root sentinel — the warm-up
-   * seed at `""` is preserved so cache walk-up still answers without a
-   * server round trip), then for each previously-cached non-root path
-   * resolve fresh; for any path that resolves to NONE, call deletePath
+   * clear the per-path entries, then for each previously-cached non-root
+   * path resolve fresh; for any path that resolves to NONE, call deletePath
    * (D-14). noneStreak is preserved per the invalidate() contract (D-15).
    *
-   * Why preserve the root sentinel (WR-04): wiping it forces every
-   * re-resolve to fall through to a per-path server probe (3 API calls
-   * each via fetchPermissionLevelFromServer), turning a single wildcard
-   * emit into 3N HTTP calls for N cached files. Preserving root lets the
-   * walk-up answer the long tail; only paths with explicit cached entries
-   * beyond root might disagree with the root level and need re-probe.
+   * Why preserve the root sentinel on an UNCONFIRMED emit (WR-04): wiping
+   * it forces every re-resolve to fall through to a per-path server probe
+   * (3 API calls each via fetchPermissionLevelFromServer), turning a single
+   * wildcard emit into 3N HTTP calls for N cached files. Preserving root
+   * lets the walk-up answer the long tail; only paths with explicit cached
+   * entries beyond root might disagree with the root level and need
+   * re-probe. Unconfirmed emits are local hints, not server truth, and
+   * offline an emptied cache would turn a legacy member's whole vault into
+   * unknown → NONE for no correctness gain.
+   *
+   * SD-03-F16 — a CONFIRMED emit is different: it is authoritative, so the
+   * root sentinel is stale too and is cleared. WR-04's perf property is
+   * preserved by re-warming FIRST (a fresh root + literal seeds answer the
+   * long tail) rather than leaving every re-resolve to a per-path probe.
    *
    * The leaf-detach branch runs via `sweepLeaves` (called below).
    */
@@ -569,13 +628,41 @@ export class PermissionStore extends Events {
       return;
     }
 
-    // Wildcard: snapshot per-path keys (skipping root), clear only those
-    // entries (preserve the root sentinel so cache walk-up still answers
-    // the long tail without a server probe — WR-04), then re-resolve each.
+    // Wildcard: snapshot per-path keys (skipping root), clear those entries
+    // (on an UNCONFIRMED emit the root sentinel is preserved so cache walk-up
+    // still answers the long tail without a server probe — WR-04), then
+    // re-resolve each.
     const previouslyCachedNonRoot = Array.from(this.cache.keys()).filter((k) => k !== "");
     for (const k of previouslyCachedNonRoot) {
       this.cache.delete(k);
       this.inFlight.delete(k);
+    }
+    if (serverConfirmed) {
+      // SD-03-F16: an authoritative change makes the root sentinel stale too. WR-04's perf
+      // property is preserved by RE-WARMING FIRST (fresh root + literal seeds answer the long
+      // tail) instead of leaving every re-resolve to a 3-call per-path probe. Unconfirmed emits
+      // are hints, not server truth, and deliberately keep the root (offline resilience).
+      //
+      // The root delete is unconditional on `serverConfirmed`, independent of whether
+      // `requestWarmup` is injected: invalidation is the security fix, the re-warm is only the
+      // availability mitigation. A failed or absent re-warm therefore fails CLOSED (per-path
+      // probes, or unknown → NONE when those fail too), never open.
+      //
+      // Pitfall 3 (re-entrance): `requestWarmup` MUST NOT transitively emit('changed').
+      // Verified by inspection of main.ts's warm path — runPermissionWarmup only ever fires the
+      // lifecycle-only `state-changed` (markWarming, markFetchFailed, runWarm's
+      // notifyStoreStateChanged). Any future wiring must keep that property.
+      this.cache.delete("");
+      try {
+        // try/catch is mandatory (WR-05): handleChanged is dispatched as
+        // `void this.handleChanged(...)` from the constructor's self-subscription, so an
+        // unhandled rejection here would escape.
+        await this.cfg.requestWarmup?.();
+      } catch (err) {
+        this.cfg.log(
+          `Permission store: post-change re-warm failed (${(err as Error).message}); falling back to per-path probes.`
+        );
+      }
     }
     for (const cachedPath of previouslyCachedNonRoot) {
       let level: PermissionLevel;

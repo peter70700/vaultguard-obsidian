@@ -16,6 +16,12 @@ export function createPermissionStore(ctx: PermissionStoreFactoryContext): Permi
     onOfflineDetected: () => ctx.setConnectionOffline(),
     fetchPermissionLevelFromServer: (path) => ctx.fetchPermissionLevelFromServer(path),
     isNetworkError: (err) => ctx.isNetworkError(err),
+    // SD-03-F15 / F16: both read through the ctx arrow at CALL time, so the
+    // store sees the live org policy and the live warm-cycle state rather than
+    // whatever was true when this factory ran (the store is constructed during
+    // onload, long before any org settings arrive).
+    isAdminRestrictionActive: () => ctx.isAdminRestrictionActive(),
+    requestWarmup: () => ctx.requestWarmup(),
     app: ctx.app,
   });
 }

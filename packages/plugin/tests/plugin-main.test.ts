@@ -552,15 +552,29 @@ describe("VaultGuardPlugin uploadReconciledBinaryFile (BIN-A / D-07)", () => {
     );
 
     const runtime = plugin.ensureSyncRuntime();
+    // REAL UPDATE (SD-06-F1 / 16-03, DECISION 7) — updated DELIBERATELY, not
+    // because it went red. `tests/` is not typechecked and the uploader's
+    // runtime fallback is `{kind:"unknown"}`, so leaving this as a two-argument
+    // call would have kept the assertion GREEN while proving nothing: the
+    // JSON-lane bypass site (which hand-built its body and could carry no guard
+    // at all) would look untested. Passing the create intent is what exercises
+    // the guard this plan added there.
     const outcome = await runtime.uploadReconciledBinaryFile(
       "attachments/photo.png",
-      BINARY_BYTES.buffer
+      BINARY_BYTES.buffer,
+      { intent: { kind: "must-be-absent" } }
     );
 
     expect(outcome).toBe("uploaded");
-    // Vault-scoped path, body extended with contentType only.
+    // Vault-scoped path, body extended with contentType — plus the declared
+    // create, which this bypass site could never express before.
     expect(put.path).toContain("/files/");
-    expect(Object.keys(put.body).sort()).toEqual(["content", "contentType", "hash"]);
+    expect(Object.keys(put.body).sort()).toEqual([
+      "content",
+      "contentType",
+      "hash",
+      "mustBeAbsent",
+    ]);
     expect(put.body.contentType).toBe("image/png");
     expect(put.options).toEqual({ timeoutMs: 120000 });
     // The ciphertext round-trips to the original bytes; hash matches computeHashBytes.
@@ -4081,7 +4095,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.permissionCache.size).toBe(0);
   });
 
-  it("removes server-missing local files when the user cannot upload them (permission store warmed)", async () => {
+  it("KEEPS a server-missing local file when the user cannot upload it, even on a warmed permission store (SD-06-F4)", async () => {
     const plugin = makePlugin();
     const localOnlyPath = "Welcome (conflict 2026-04-29T15-16-30-016Z).md";
     const remove = vi.fn().mockResolvedValue(undefined);
@@ -4119,23 +4133,37 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       throw new Error(`Unexpected API call: ${method} ${path}`);
     });
 
-    // SY2: removal of a never-uploaded local file only happens on a CONFIRMED
-    // (warmed) permission baseline.
+    // A WARMED store is the case that used to delete. SD-06-F4: "the permission
+    // store finished initialising" was never evidence that the local content is
+    // redundant, and this file has never reached the server, so the local copy
+    // is the only copy. It must be HELD.
     await plugin.permissionStore.warm();
 
     const result = await plugin.uploadLocalOnlyFiles();
 
+    // The invariant first: nothing was deleted.
+    expect(remove).not.toHaveBeenCalled();
     expect(result?.skippedFiles).toBe(1);
-    expect(result?.removedLocalFiles).toBe(1);
-    expect(remove).toHaveBeenCalledWith(localOnlyPath);
+    expect(result?.heldNoPermissionFiles).toBe(1);
     expect(plugin.apiRequest).not.toHaveBeenCalledWith(
       "PUT",
       expect.any(String),
       expect.anything()
     );
+
+    // The Notice must not claim a removal, and must not claim the server vault
+    // lacks the path (POST /files/sync is read-permission filtered server-side,
+    // so absence from the inventory proves nothing).
+    const notices = mockNotice.mock.calls.map(([message]) => String(message));
+    expect(notices.some((m) => m.includes(localOnlyPath))).toBe(true);
+    expect(notices.some((m) => /removed/i.test(m))).toBe(false);
+    expect(notices.some((m) => /does not contain it/i.test(m))).toBe(false);
+    expect(
+      notices.some((m) => m.includes("Kept local-only") && m.includes("Nothing was deleted"))
+    ).toBe(true);
   });
 
-  it("does NOT remove a server-missing local file when the permission store has not warmed (SY2)", async () => {
+  it("also KEEPS a server-missing local file when the permission store has not warmed (SD-06-F4 / SY2)", async () => {
     const plugin = makePlugin();
     const localOnlyPath = "Welcome (conflict 2026-04-29T15-16-30-016Z).md";
     const remove = vi.fn().mockResolvedValue(undefined);
@@ -4163,15 +4191,18 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       throw new Error(`Unexpected API call: ${method} ${path}`);
     });
 
-    // Permission store stays "cold" (fetch never landed). A NONE baseline here
-    // is unconfirmed and must NOT trigger a permanent local delete.
+    // Permission store stays "cold" (fetch never landed). Post-SD-06-F4 the
+    // store state is only a diagnostic field, so the file is held here for the
+    // SAME reason it is held on a warmed store — the sibling test above proves
+    // the warmed case is identical. That equivalence is the point: there is no
+    // longer any store state in which catch-up deletes.
     plugin.permissionStore.markFetchFailed(503);
 
     const result = await plugin.uploadLocalOnlyFiles();
 
-    expect(result?.skippedFiles).toBe(1);
-    expect(result?.removedLocalFiles).toBe(0);
     expect(remove).not.toHaveBeenCalled();
+    expect(result?.skippedFiles).toBe(1);
+    expect(result?.heldNoPermissionFiles).toBe(1);
   });
 
   // AR1: 0x80–0xFF bytes are invalid as a UTF-8 lead sequence, so a real
@@ -4220,7 +4251,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     // Counted as an UPLOAD, not skipped (D-11 truthfulness).
     expect(result?.uploadedFiles).toBe(1);
     expect(result?.skippedFiles).toBe(0);
-    expect(result?.removedLocalFiles).toBe(0);
+    expect(result?.heldNoPermissionFiles).toBe(0);
     // The byte PUT fired with a real contentType + the large-body timeout, and
     // the ciphertext round-trips to the original bytes.
     expect(put).not.toBeNull();
@@ -4230,6 +4261,109 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(new Uint8Array(decrypted)).toEqual(AR1_BINARY_BYTES);
     // Post-upload at-rest hygiene fires ONLY after "uploaded" (CR-1/D-01).
     expect(plugin.ensureAtRestEncryptedInPlace).toHaveBeenCalledWith("attachments/photo.png");
+  });
+
+  it("KEEPS a server-missing local BINARY when the user cannot upload it, on a warmed store (SD-06-F4)", async () => {
+    const plugin = makePlugin();
+    const localOnlyPath = "attachments/photo.png";
+    const remove = vi.fn().mockResolvedValue(undefined);
+
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    // Below WRITE → the byte sibling returns skipped-no-permission.
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.READ);
+    plugin.originalAdapterMethods = {
+      read: vi.fn(),
+      readBinary: vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer),
+      write: null,
+      list: null,
+      remove, // capability OPEN — pre-fix this is what destroyed the attachment
+      rename: null,
+    };
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: localOnlyPath }]);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.ensureAtRestEncryptedInPlace = vi.fn(async () => true);
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    await plugin.permissionStore.warm();
+
+    const result = await plugin.uploadLocalOnlyFiles();
+
+    expect(remove).not.toHaveBeenCalled();
+    expect(result?.skippedFiles).toBe(1);
+    expect(result?.heldNoPermissionFiles).toBe(1);
+    expect(plugin.apiRequest).not.toHaveBeenCalledWith(
+      "PUT",
+      expect.any(String),
+      expect.anything()
+    );
+    // Nothing uploaded → the post-upload at-rest hygiene must stay unfired.
+    expect(plugin.ensureAtRestEncryptedInPlace).not.toHaveBeenCalled();
+  });
+
+  it("KEEPS the SOLE on-disk VG1 at-rest ciphertext of an un-uploadable local-only file (SD-06-F4 headline regression)", async () => {
+    const plugin = makePlugin();
+    const localOnlyPath = "Private/secret.md";
+    // The ONLY copy of this note anywhere: never uploaded, and on disk it is
+    // at-rest ciphertext (VG1 magic 0x56 0x47 0x31 0x00 — at-rest-cipher.ts).
+    const vg1Bytes = new Uint8Array([
+      0x56, 0x47, 0x31, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+      0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+    ]);
+    const disk = new Map<string, ArrayBuffer>([[localOnlyPath, vg1Bytes.buffer]]);
+    const remove = vi.fn(async (path: string) => {
+      disk.delete(path);
+    });
+
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.session = { ...makeSession(), role: "member", roles: ["member"] };
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.getEffectivePermission = vi.fn().mockResolvedValue(PermissionLevel.READ);
+    plugin.originalAdapterMethods = {
+      read: vi.fn(async (path: string) =>
+        new TextDecoder().decode(new Uint8Array(disk.get(path) ?? new ArrayBuffer(0)))
+      ),
+      readBinary: vi.fn(async (path: string) => disk.get(path)),
+      write: null,
+      list: null,
+      remove,
+      rename: null,
+    };
+    // The decrypt path is not what this test proves — the survival of the
+    // on-disk ciphertext is. Stub the at-rest read so the sync layer sees the
+    // plaintext while the disk map keeps the VG1 bytes.
+    plugin.readPlainFromDisk = vi.fn().mockResolvedValue("# Secret note\n");
+    plugin.readPlainBinaryFromDisk = vi
+      .fn()
+      .mockResolvedValue(new TextEncoder().encode("# Secret note\n").buffer);
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: localOnlyPath }]);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.ensureAtRestEncryptedInPlace = vi.fn(async () => true);
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return { success: true, data: { deltas: [] }, error: null, requestId: "req-sync" };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    await plugin.permissionStore.warm();
+
+    const result = await plugin.uploadLocalOnlyFiles();
+
+    // The sole ciphertext is still on disk, byte-identical.
+    expect(disk.has(localOnlyPath)).toBe(true);
+    expect(new Uint8Array(disk.get(localOnlyPath)!)).toEqual(vg1Bytes);
+    expect(remove).not.toHaveBeenCalled();
+    expect(result?.skippedFiles).toBe(1);
+    expect(result?.heldNoPermissionFiles).toBe(1);
   });
 
   it("uploadLocalOnlyFiles on a legacy adapter (no readBinary) keeps a binary-extension file on the text path, never the byte path (AR2/D-10)", async () => {
@@ -4614,10 +4748,16 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
 
     // The STRING sibling handled it (byte-identical to pre-BIN-A legacy behavior).
+    //
+    // REAL UPDATE (SD-06-F1 / 16-03, DECISION 7): the uploader's third argument
+    // is no longer optional — reconciliation's localOnly branch declares a
+    // CREATE, and its absence proof is `!serverPaths.has(path)` against the
+    // fresh inventory this very test stubs. The claim under test (the STRING
+    // sibling ran, not the byte one) is unchanged.
     expect(plugin.uploadReconciledFile).toHaveBeenCalledWith(
       "attachments/photo.png",
       "legacy text",
-      undefined
+      { intent: { kind: "must-be-absent" } }
     );
     expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
     expect(plugin.readPlainBinaryFromDisk).not.toHaveBeenCalled();
@@ -5096,9 +5236,16 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     await plugin.syncFileRenameToServer("attachments/old.png", "attachments/new.png");
 
     const put = calls.find((c) => c.method === "PUT");
-    // String PUT body (no contentType) — byte-identical to pre-BIN-A behavior.
+    // String PUT body (no contentType) — the legacy string lane is unchanged.
+    //
+    // REAL UPDATE (SD-06-F1 / 16-03, DECISION 6): the rename DESTINATION
+    // declares its intent. No remoteFileState is seeded for the destination
+    // here, so the store answers `unknown` and it upgrades to `must-be-absent`
+    // on the structural rename fact. The claim under test — a legacy adapter
+    // keeps the STRING PUT path and never touches readPlainBinaryFromDisk — is
+    // unchanged.
     expect(put).toBeDefined();
-    expect(Object.keys(put.body).sort()).toEqual(["content", "hash"]);
+    expect(Object.keys(put.body).sort()).toEqual(["content", "hash", "mustBeAbsent"]);
     expect(put.body.contentType).toBeUndefined();
     expect(plugin.readPlainBinaryFromDisk).not.toHaveBeenCalled();
   });
@@ -6389,5 +6536,274 @@ describe("VaultGuardPlugin automatic Local Project Memory Mode", () => {
       ).not.toHaveBeenCalled();
       expect(plugin.enableLocalProjectMemoryMode, `startup ${startup}`).not.toHaveBeenCalled();
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SD-03-F15 / F16: the permission-store wiring. Plan 14-02 gave PermissionStore
+// two OPTIONAL config hooks (isAdminRestrictionActive, requestWarmup) that were
+// inert until something injected them. These cases pin the injection site — the
+// members exist on the factory context, they read the policy LIVE rather than
+// from a snapshot, and the re-warm port serialises against an in-flight cycle.
+//
+// Falsification note: pre-fix, `createPermissionStoreContext()` returned an
+// object with NEITHER member, so every case here failed as
+// `TypeError: ctx.<member> is not a function` — the capability-absent
+// signature. The SUMMARY records the non-vacuity proof for each.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SD-03-F15/F16 permission-store wiring", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  /** Flush a handful of microtask ticks without advancing any timer. */
+  async function flushMicrotasks(): Promise<void> {
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  }
+
+  // T-F15-C9a — the injected policy getter is LIVE, not a captured snapshot.
+  it("injects a live org-policy getter (not a snapshot taken at context build time)", () => {
+    const plugin = makePlugin();
+    // The context is built ONCE during onload, long before org settings land —
+    // so it is built here first and read three times afterwards.
+    const ctx = plugin.createPermissionStoreContext();
+
+    plugin.orgSettings = null;
+    expect(ctx.isAdminRestrictionActive()).toBe(false);
+
+    plugin.orgSettings = { allowAdminPerFileRestrictions: true };
+    expect(ctx.isAdminRestrictionActive()).toBe(true);
+
+    plugin.orgSettings = { allowAdminPerFileRestrictions: false };
+    expect(ctx.isAdminRestrictionActive()).toBe(false);
+  });
+
+  // T-F15-C9b — DESIGN M9: warm coalescing must not serve pre-change rules.
+  it("re-warm port waits for an in-flight warm cycle before starting a fresh one", async () => {
+    const plugin = makePlugin();
+    const ctx = plugin.createPermissionStoreContext();
+    plugin.runPermissionWarmup = vi.fn().mockResolvedValue(undefined);
+
+    let resolveInFlight: () => void = () => undefined;
+    plugin.warmupCyclePromise = new Promise<void>((resolve) => {
+      resolveInFlight = resolve;
+    });
+
+    const p = ctx.requestWarmup();
+    await flushMicrotasks();
+    // Still blocked on the older cycle — a fresh warm started here could have
+    // its post-change rule fetch swallowed by the store's coalescing.
+    expect(plugin.runPermissionWarmup).not.toHaveBeenCalled();
+
+    resolveInFlight();
+    await p;
+    expect(plugin.runPermissionWarmup).toHaveBeenCalledTimes(1);
+  });
+
+  // T-F15-C9c — a rejected in-flight cycle must not block (or poison) the
+  // fresh warm: the port's `.catch(() => undefined)` swallows it.
+  it("re-warm port survives a rejected in-flight cycle and still warms once", async () => {
+    const plugin = makePlugin();
+    const ctx = plugin.createPermissionStoreContext();
+    plugin.runPermissionWarmup = vi.fn().mockResolvedValue(undefined);
+
+    let rejectInFlight: (err: unknown) => void = () => undefined;
+    const inFlight = new Promise<void>((_resolve, reject) => {
+      rejectInFlight = reject;
+    });
+    // Pre-attach a no-op handler so the pre-fix run (where requestWarmup does
+    // not exist and the port never attaches one) does not raise an unhandled
+    // rejection. This cannot rescue the port: if the port awaited `inFlight`
+    // WITHOUT its own catch, `await p` below would still reject.
+    inFlight.catch(() => undefined);
+    plugin.warmupCyclePromise = inFlight;
+
+    const p = ctx.requestWarmup();
+    await flushMicrotasks();
+    expect(plugin.runPermissionWarmup).not.toHaveBeenCalled();
+
+    rejectInFlight(new Error("previous warm cycle blew up"));
+    await expect(p).resolves.toBeUndefined();
+    expect(plugin.runPermissionWarmup).toHaveBeenCalledTimes(1);
+  });
+
+  // T-F15-C9d — nothing in flight ⇒ straight to a fresh warm.
+  it("re-warm port runs a fresh warm immediately when no cycle is in flight", async () => {
+    const plugin = makePlugin();
+    const ctx = plugin.createPermissionStoreContext();
+    plugin.runPermissionWarmup = vi.fn().mockResolvedValue(undefined);
+
+    plugin.warmupCyclePromise = null;
+    // The shared store fixture deliberately does not define inFlightWarmup, so
+    // the `??` tail is undefined here — the port must treat that as "nothing in
+    // flight" rather than awaiting a non-promise.
+    expect(plugin.permissionStore.inFlightWarmup).toBeUndefined();
+
+    await ctx.requestWarmup();
+
+    expect(plugin.runPermissionWarmup).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SD-03-F15: collectRulesForWarmup used to hand back an empty rule set for
+// EVERY org admin, so a restricted admin warmed with nothing — the store then
+// derived an ADMIN root baseline with no literal denies, locally wider than the
+// server. The early return is now gated on the org policy.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SD-03-F15 collectRulesForWarmup under admin restriction", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  const ruleA = { ruleId: "rule-a", pathPattern: "/secret.md", actions: ["read"], effect: "deny" };
+  const ruleB = { ruleId: "rule-b", pathPattern: "/**", actions: ["read"], effect: "allow" };
+
+  function makeWarmupRulesPlugin(role: "admin" | "member") {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), role, roles: [role] };
+    plugin.apiClient = {
+      getPermissions: vi.fn().mockResolvedValue([ruleA]),
+      getUserPermissions: vi.fn().mockResolvedValue([ruleB]),
+    };
+    return plugin;
+  }
+
+  // T-F15-C6a — the behavioural flip.
+  it("restricted org admin fetches the vault rule list instead of returning []", async () => {
+    const plugin = makeWarmupRulesPlugin("admin");
+    plugin.orgSettings = { allowAdminPerFileRestrictions: true };
+
+    const result = await plugin.collectRulesForWarmup();
+
+    expect(result).toEqual({ kind: "ok", rules: [ruleA] });
+    expect(plugin.apiClient.getPermissions).toHaveBeenCalledTimes(1);
+    expect(plugin.apiClient.getUserPermissions).not.toHaveBeenCalled();
+  });
+
+  // T-F15-C6b — preservation: the default (toggle off) org is unchanged.
+  it("unrestricted org admin still short-circuits with no rules and no API call", async () => {
+    const plugin = makeWarmupRulesPlugin("admin");
+    plugin.orgSettings = null;
+
+    const result = await plugin.collectRulesForWarmup();
+
+    expect(result).toEqual({ kind: "ok", rules: [] });
+    expect(plugin.apiClient.getPermissions).not.toHaveBeenCalled();
+    expect(plugin.apiClient.getUserPermissions).not.toHaveBeenCalled();
+  });
+
+  // T-F15-C6c — preservation: the gate only guards the ADMIN early return.
+  it("non-admin path is unchanged with the restriction on", async () => {
+    const plugin = makeWarmupRulesPlugin("member");
+    plugin.orgSettings = { allowAdminPerFileRestrictions: true };
+
+    const result = await plugin.collectRulesForWarmup();
+
+    expect(result).toEqual({ kind: "ok", rules: [ruleB] });
+    expect(plugin.apiClient.getUserPermissions).toHaveBeenCalledTimes(1);
+    expect(plugin.apiClient.getPermissions).not.toHaveBeenCalled();
+  });
+
+  // The 1.0.31 contract survives the gate: a failed fetch is never downgraded
+  // to an empty rule set (that was the 2026-05-31 silent-poison vector).
+  it("keeps the fetch-failed contract for a restricted admin", async () => {
+    const plugin = makeWarmupRulesPlugin("admin");
+    plugin.orgSettings = { allowAdminPerFileRestrictions: true };
+    const err: Error & { statusCode?: number } = new Error("server");
+    err.statusCode = 503;
+    plugin.apiClient.getPermissions = vi.fn().mockRejectedValue(err);
+
+    const result = await plugin.collectRulesForWarmup();
+
+    expect(result.kind).toBe("fetch-failed");
+    expect(result.statusCode).toBe(503);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SD-03-F15/F16: applyOrgSettings pushed the toggle to the file header only —
+// it never touched the store and never compared old vs new, so flipping the
+// toggle mid-session changed nothing locally. It now emits exactly ONE
+// server-confirmed wildcard on an effective flip, in either direction, and
+// nothing at all otherwise (it also runs on every lease refresh).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SD-03-F15/F16 applyOrgSettings toggle-flip invalidation", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  function makeOrgSettingsPlugin(initial: unknown) {
+    const plugin = makePlugin();
+    plugin.orgSettings = initial;
+    plugin.restartSyncTimer = vi.fn();
+    plugin.scheduleAutoLockTimer = vi.fn();
+    plugin.stopAutoLockTimer = vi.fn();
+    const emitSpy = vi.spyOn(plugin.permissionStore, "emit");
+    return { plugin, emitSpy };
+  }
+
+  // T-F15-C7a — false → true.
+  it("emits exactly one server-confirmed wildcard when the toggle flips on", () => {
+    const { plugin, emitSpy } = makeOrgSettingsPlugin(null);
+
+    plugin.applyOrgSettings({ allowAdminPerFileRestrictions: true });
+
+    expect(emitSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith("changed", { serverConfirmed: true });
+  });
+
+  // T-F15-C7b — true → false. Symmetric: a cached restricted NONE must not
+  // outlive the policy that produced it.
+  it("emits exactly one server-confirmed wildcard when the toggle flips off", () => {
+    const { plugin, emitSpy } = makeOrgSettingsPlugin({
+      allowAdminPerFileRestrictions: true,
+    });
+
+    plugin.applyOrgSettings({ allowAdminPerFileRestrictions: false });
+
+    expect(emitSpy).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith("changed", { serverConfirmed: true });
+  });
+
+  // T-F15-C7c — preservation: lease refreshes re-apply identical settings.
+  it("emits nothing when an identical settings object is re-applied", () => {
+    const { plugin, emitSpy } = makeOrgSettingsPlugin({
+      allowAdminPerFileRestrictions: true,
+    });
+
+    plugin.applyOrgSettings({ allowAdminPerFileRestrictions: true });
+
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  // T-F15-C7d — preservation: unrelated settings churn must not invalidate.
+  it("emits nothing when unrelated settings change", () => {
+    const { plugin, emitSpy } = makeOrgSettingsPlugin({
+      allowAdminPerFileRestrictions: false,
+      syncMode: "periodic",
+    });
+
+    plugin.applyOrgSettings({
+      allowAdminPerFileRestrictions: false,
+      syncMode: "realtime",
+    });
+
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  // T-F15-C7e — preservation: absent org settings (Community edition, M21).
+  it("emits nothing when null settings are applied over null settings", () => {
+    const { plugin, emitSpy } = makeOrgSettingsPlugin(null);
+
+    plugin.applyOrgSettings(null);
+
+    expect(emitSpy).not.toHaveBeenCalled();
   });
 });

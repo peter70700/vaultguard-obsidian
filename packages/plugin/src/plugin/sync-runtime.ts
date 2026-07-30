@@ -1,6 +1,7 @@
 import { Notice, TFile } from "obsidian";
 import type {
   LocalManifestEntry,
+  MutationIntent,
   OfflineQueueOperation,
   RemoteFileContentResponse,
   RemoteFileWriteResponse,
@@ -40,22 +41,36 @@ export interface LocalSyncManifestInput {
 }
 
 /**
- * Discriminated outcome of a reconciliation upload. The distinction matters for
- * data safety (SY2): only `skipped-no-permission` — and only once the
- * permission store has actually warmed — may lead a caller to remove a
- * local-only file. `skipped-no-lease` is transient (a lease may still return)
- * and must never trigger deletion.
+ * Discriminated outcome of a reconciliation upload.
+ *
+ * SD-06-F4: **no** outcome may cause the removal of a local-only file. A file
+ * that reaches these callers is by construction one the server has never
+ * received, so deleting it destroys the only copy. `skipped-no-permission`
+ * means the file is un-syncable *for now* (the user lacks write permission) and
+ * the local copy is HELD; `skipped-no-lease` is transient (a lease may still
+ * return) and is likewise held. The permission-store state is a diagnostic log
+ * field, never a delete gate.
  */
 export type UploadReconciledOutcome =
   | "uploaded"
   | "skipped-no-lease"
-  | "skipped-no-permission";
+  | "skipped-no-permission"
+  // SD-06-F1 (16-03): the upload DECLARED `mustBeAbsent` — its caller had
+  // proven absence from a fresh inventory — and the server answered 409, so
+  // another device created the path in between. A lost create RACE, not a
+  // failure: the loop must continue, the local file must stay, and the outcome
+  // must be visibly non-"uploaded". It belongs in the SKIPPED bucket, never a
+  // delete (SY2 / SD-06-F4). Reconciliation's conflict classification resolves
+  // the divergence on the next pass.
+  | "skipped-create-conflict";
 
 /**
- * Byte-upload outcome. Every text outcome (SY2) plus `pending-large`, returned
- * when an above-JSON-threshold direct transfer could not complete. A caller must
- * never delete or overwrite the local file on this outcome; only
- * `skipped-no-permission` (on a warmed store) may lead to local removal.
+ * Byte-upload outcome. Every text outcome plus `pending-large`, returned when
+ * an above-JSON-threshold direct transfer could not complete.
+ *
+ * SD-06-F4: as with the text sibling, no outcome may delete or overwrite the
+ * local file. `pending-large` and `skipped-no-lease` are transient (retry later),
+ * `skipped-no-permission` is held indefinitely — held always means intact.
  *
  * This is a superset SIBLING of UploadReconciledOutcome rather than a widening
  * of it, so the string uploadReconciledFile contract (and its ctx forwarding)
@@ -130,22 +145,104 @@ export class SyncRuntime {
     return this.ctx.getSettings().localProjectMemoryMode === true;
   }
 
+  /**
+   * SD-06-F1 — `ctx.resolveMutationIntent` with 16-02's DECISION 5 runtime
+   * guard. `tests/` is not typechecked, so a hand-built ctx that predates the
+   * accessor must DEGRADE to today's behavior rather than throw. Returning
+   * `undefined` (not `{kind:"unknown"}`) is deliberate: an undefined intent
+   * leaves buildWriteBody on its legacy `expectedVersionId` derivation, so the
+   * call site keeps whatever guard it passes today; a supplied `unknown` would
+   * skip that derivation and silently DROP the guard.
+   */
+  private resolveIntentSafely(path: string): MutationIntent | undefined {
+    const resolve = this.ctx.resolveMutationIntent;
+    if (typeof resolve !== "function") return undefined;
+    return resolve.call(this.ctx, path) ?? undefined;
+  }
+
+  /**
+   * SD-06-F1 / DECISION 6 — the intent a RENAME DESTINATION declares.
+   *
+   * Resolve from the store first, then upgrade an `unknown` to
+   * `must-be-absent`. The upgrade is justified by a STRUCTURAL fact, not a
+   * probe: Obsidian refuses a rename onto an existing local path, so a rename
+   * destination is by definition a locally-new path.
+   *
+   * Resolving first is strictly better than a blanket `mustBeAbsent`: a rename
+   * back onto a path this client previously deleted resolves to
+   * `must-be-absent` from the store anyway, and a rename onto a path the store
+   * knows is `present(v)` resolves to `expect-version` — self-correcting, and
+   * it is what keeps the P18 anchor (both paths seeded present) byte-identical.
+   */
+  private resolveRenameDestIntent(destPath: string): MutationIntent | undefined {
+    const intent = this.resolveIntentSafely(destPath);
+    if (intent === undefined) return undefined;
+    return intent.kind === "unknown" ? { kind: "must-be-absent" } : intent;
+  }
+
   private buildWriteBody(
     path: string,
     encryptedContent: string,
     hash: string,
-    options: { forceOverwrite?: boolean; expectedVersionId?: string | null } = {}
+    options: {
+      forceOverwrite?: boolean;
+      expectedVersionId?: string | null;
+      intent?: MutationIntent;
+      lane?: string;
+    } = {},
   ): Record<string, unknown> {
     const body: Record<string, unknown> = {
       content: encryptedContent,
       hash,
     };
-    const expectedVersionId =
+    // SD-06-F1 — DECISION 3 precedence. THIS FUNCTION IS DUPLICATED: the copy in
+    // sync-runtime.ts and the copy in at-rest-adapter-runtime.ts are kept
+    // TEXTUALLY IDENTICAL. Diff both bodies after any edit — drift here means
+    // one runtime silently stops declaring intent while the other still does.
+    //
+    //   1. `forceOverwrite: true` wins outright: it is how the conflict
+    //      KEEP_LOCAL path already declares a deliberate unconditional write.
+    //   2. else an explicitly supplied `options.intent`.
+    //   3. else — and ONLY when `intent` was not supplied at all — today's
+    //      derivation from `options.expectedVersionId` / the store lookup, so
+    //      every untouched call site keeps its exact current body.
+    //
+    // The legacy branch PRESERVES the pre-existing `undefined`-vs-`null`
+    // distinction exactly: `undefined` means "option not supplied, look the
+    // version up in the store"; `null` means "force-omit the guard, do NOT look
+    // anything up" (the reconciliation JSON lane depends on that). Collapsing
+    // the two would start sending `expectedVersionId` on catch-up re-uploads.
+    const legacyExpectedVersionId =
       options.expectedVersionId === undefined
         ? this.ctx.getExpectedVersionId(path)
         : options.expectedVersionId ?? undefined;
-    if (!options.forceOverwrite && expectedVersionId) {
-      body.expectedVersionId = expectedVersionId;
+    const intent: MutationIntent = options.forceOverwrite
+      ? { kind: "force" }
+      : (options.intent ??
+        (legacyExpectedVersionId
+          ? { kind: "expect-version", versionId: legacyExpectedVersionId }
+          : { kind: "unknown" }));
+    // Field names are 16-01's SHIPPED wire contract, verbatim (16-01-SUMMARY.md
+    // — "The wire contract you must emit, verbatim"): `expectedVersionId` is a
+    // string, `mustBeAbsent` / `force` are the boolean LITERAL `true`, and at
+    // most one of the three may appear or the server answers 400.
+    if (intent.kind === "expect-version") {
+      body.expectedVersionId = intent.versionId;
+    } else if (intent.kind === "must-be-absent") {
+      body.mustBeAbsent = true;
+    } else if (intent.kind === "force") {
+      body.force = true;
+    } else {
+      // Unknown lane: TODAY's exact body (no intent key at all) plus ONE
+      // device-local breadcrumb, so the residual is measurable before anyone
+      // flips server enforcement. Never map unknown to `force` — that would
+      // make every lost-track write an explicit unconditional overwrite forever
+      // and permanently blind the telemetry the flip depends on. Never map it
+      // to `must-be-absent` either: not knowing is not knowing.
+      this.ctx.recordSyncDiagnostic?.("mutationIntent.unknown", {
+        path,
+        lane: options.lane ?? "unspecified",
+      });
     }
     return body;
   }
@@ -529,7 +626,7 @@ export class SyncRuntime {
 
     let totalFilesUploaded = 0;
     let totalFoldersUploaded = 0;
-    let totalFilesRemoved = 0;
+    let totalFilesHeld = 0;
     let totalFilesDownloaded = 0;
     let totalFoldersDownloaded = 0;
     let totalRepairFailures = 0;
@@ -588,9 +685,13 @@ export class SyncRuntime {
         if (result) {
           totalFilesUploaded += result.uploadedFiles;
           totalFoldersUploaded += result.uploadedFolders;
-          totalFilesRemoved += result.removedLocalFiles;
-          catchupChanges =
-            result.uploadedFiles + result.uploadedFolders + result.removedLocalFiles;
+          totalFilesHeld += result.heldNoPermissionFiles;
+          // SD-06-F4: held files are deliberately NOT a catch-up "change".
+          // Holding alters neither local nor server state, so counting it here
+          // would suppress the cursor short-circuit below forever. (The old
+          // term was correct only because the outcome used to be a deletion,
+          // which did change local state.)
+          catchupChanges = result.uploadedFiles + result.uploadedFolders;
           // SY7: only mark catch-up complete when nothing failed. A transient
           // upload/folder failure previously still flipped the flag true, so
           // catch-up never re-ran (until forceCatchup) and the affected files
@@ -789,8 +890,8 @@ export class SyncRuntime {
       if (totalFoldersUploaded > 0) {
         summaryParts.push(`${totalFoldersUploaded} folders preserved`);
       }
-      if (totalFilesRemoved > 0) {
-        summaryParts.push(`${totalFilesRemoved} local-only files removed`);
+      if (totalFilesHeld > 0) {
+        summaryParts.push(`${totalFilesHeld} local-only files kept (no write permission)`);
       }
       if (totalFilesDownloaded > 0) {
         summaryParts.push(`${totalFilesDownloaded} files downloaded`);
@@ -945,6 +1046,25 @@ export class SyncRuntime {
     const normalizedPath = this.ctx.normalizeVaultPath(path);
     const response = await this.ctx.fetchRemoteFileContent(normalizedPath);
     if (!response.success || !response.data) {
+      // SD-06-F1: a STRICT 404/410 is authoritative absence — the cheapest
+      // absence knowledge the client has, and today it is thrown away. The
+      // predicate is copied VERBATIM from the conflict re-fetch in
+      // handleRemoteWriteConflict so all three sites agree exactly.
+      //
+      // Deliberately NOT recorded for statusCode 0 (offline), any 5xx, 401/403,
+      // or a decrypt/shape failure: a permission or network failure is not
+      // evidence of absence, and recording it would make the user's next save
+      // declare mustBeAbsent and 409 against a file that exists. That is the
+      // F1-adjacent denial-of-service trap (T-16-11).
+      //
+      // The throw below is unchanged — same control flow, same message, same
+      // thrown type.
+      if (
+        !response.success &&
+        (response.error?.statusCode === 404 || response.error?.statusCode === 410)
+      ) {
+        this.ctx.recordRemoteFileAbsent(normalizedPath);
+      }
       throw new Error(
         response.error?.message ?? `Failed to read ${normalizedPath} from the server.`
       );
@@ -1048,6 +1168,17 @@ export class SyncRuntime {
 
     const response = await this.ctx.fetchRemoteFileContent(normalizedPath);
     if (!response.success || !response.data) {
+      // SD-06-F1: same strict 404/410 absence recording as readRemotePlaintext,
+      // same verbatim predicate, same traps excluded (0 / 5xx / 401 / 403 are
+      // NOT absence). Control flow, message and thrown type are unchanged. The
+      // large/direct branch above is deliberately untouched — it preserves the
+      // local copy and notifies, and the direct lane is already race-safe (P3).
+      if (
+        !response.success &&
+        (response.error?.statusCode === 404 || response.error?.statusCode === 410)
+      ) {
+        this.ctx.recordRemoteFileAbsent(normalizedPath);
+      }
       throw new Error(
         response.error?.message ?? `Failed to read ${normalizedPath} from the server.`
       );
@@ -1367,6 +1498,11 @@ export class SyncRuntime {
     // timeout L2), string body for text (byte-identical to pre-BIN-A). Both carry
     // the optimistic version guard (expectedVersionId) via buildWriteBody.
     const baseVersionId = this.ctx.getExpectedVersionId(newNormalized);
+    // SD-06-F1 / DECISION 6: the DESTINATION's intent. Obsidian refuses a
+    // rename onto an existing local path, so this destination is by definition
+    // locally new — an `unknown` store answer is upgraded to `must-be-absent`
+    // on that structural fact, while a `present(v)` answer still wins.
+    const destIntent = this.resolveRenameDestIntent(newNormalized);
     let hash: string;
     let putResp;
     if (binaryBytes !== null) {
@@ -1374,6 +1510,8 @@ export class SyncRuntime {
       hash = await this.ctx.computeHashBytes(binaryBytes);
       const body = this.buildWriteBody(newNormalized, encrypted, hash, {
         expectedVersionId: baseVersionId,
+        intent: destIntent,
+        lane: "rename-dest",
       });
       body.contentType = contentTypeForPath(newNormalized);
       putResp = await this.ctx.apiRequest<RemoteFileWriteResponse>(
@@ -1390,14 +1528,41 @@ export class SyncRuntime {
       putResp = await this.ctx.apiRequest<RemoteFileWriteResponse>(
         "PUT",
         this.ctx.vaultPath(`/files/${encodeURIComponent(newNormalized)}`),
-        this.buildWriteBody(newNormalized, encrypted, hash, { expectedVersionId: baseVersionId })
+        this.buildWriteBody(newNormalized, encrypted, hash, {
+          expectedVersionId: baseVersionId,
+          intent: destIntent,
+          lane: "rename-dest",
+        })
       );
     }
     if (!putResp.success) {
       // Text 409 → interactive conflict resolution (handleRemoteWriteConflict is
-      // text-only). Binary 409 falls through to the SY3 requeue path below.
+      // text-only). Returns BEFORE the DELETE below, so the old server copy
+      // survives — verified per-function for 16-03.
       if (putResp.error?.statusCode === 409 && content !== null) {
         await this.handleRemoteWriteConflict(newNormalized, content, baseVersionId);
+        return;
+      }
+      // SD-06-F1 / DECISION 4 — the BINARY destination 409.
+      //
+      // This used to fall through to the SY3 branch below, which queues a write
+      // for the new path AND a DELETE for the old one. Under `mustBeAbsent`
+      // that queued write can never succeed, so either it jams the flush queue
+      // or — once it drops — the delete destroys the surviving old copy and the
+      // server holds NEITHER version. Both outcomes are data loss.
+      //
+      // Correct handling: hold loudly, queue NOTHING, leave the old server copy
+      // exactly where it is. The local file is untouched, so reconciliation
+      // surfaces the divergence as a binaryBoth conflict on the next pass.
+      if (putResp.error?.statusCode === 409) {
+        this.ctx.logError(
+          `Rename sync: destination "${newNormalized}" already exists on the server (HTTP 409); old path preserved, nothing queued`,
+          new Error(putResp.error?.message ?? "rename destination conflict")
+        );
+        new Notice(
+          `VaultGuard Sync: "${newNormalized}" already exists on the server — the rename is on hold and your local file is kept. Run sync to reconcile.`,
+          10000
+        );
         return;
       }
       // SY3: the new-path PUT failed (5xx/403/offline). We must NOT delete the
@@ -1996,11 +2161,22 @@ export class SyncRuntime {
         const normalized = this.ctx.normalizeVaultPath(path);
         // BIN-A / D-05 + D-11: a local-only in-size binary uploads via the BYTE
         // path and counts as an upload, exactly like a text file.
+        // SD-06-F1 / DECISION 7 — CREATE. Absence is PROVEN, not guessed: this
+        // path reached `localOnly` because `!serverPaths.has(path)` against a
+        // fresh full server inventory built earlier in this same pass.
         const outcome =
           entry.kind === "binary"
-            ? await this.uploadReconciledBinaryFile(normalized, entry.bytes)
-            : await this.ctx.uploadReconciledFile(normalized, entry.content);
+            ? await this.uploadReconciledBinaryFile(normalized, entry.bytes, {
+                intent: { kind: "must-be-absent" },
+              })
+            : await this.ctx.uploadReconciledFile(normalized, entry.content, {
+                intent: { kind: "must-be-absent" },
+              });
         if (outcome === "uploaded") uploaded += 1;
+        // "skipped-create-conflict" is counted as SKIPPED, deliberately and
+        // explicitly: another device won the create race. It must never reach a
+        // delete branch and must never be counted as a failure.
+        else if (outcome === "skipped-create-conflict") uploadSkipped += 1;
         else uploadSkipped += 1;
       } catch (err) {
         this.ctx.logError(`Reconciliation: upload failed for "${path}"`, err);
@@ -2028,11 +2204,19 @@ export class SyncRuntime {
     // never a deletion (SY2 extended).
     for (const heal of healBinary) {
       try {
+        // SD-06-F1 / DECISION 7 — FORCE. This is the L7 heal of a pre-BIN-A
+        // LOSSY server artifact: the server copy is known-corrupt and the local
+        // bytes are the only faithful copy. The user confirmed the plan before
+        // this loop runs, which is what sanctions an unconditional overwrite.
         const outcome = await this.uploadReconciledBinaryFile(
           this.ctx.normalizeVaultPath(heal.path),
-          heal.bytes
+          heal.bytes,
+          { intent: { kind: "force" } }
         );
         if (outcome === "uploaded") uploaded += 1;
+        // A force lane cannot produce "skipped-create-conflict" (the server
+        // never 409s a declared force), but the skipped bucket is the correct
+        // sink if it ever did.
         else uploadSkipped += 1;
       } catch (err) {
         this.ctx.logError(`Reconciliation: heal upload failed for "${heal.path}"`, err);
@@ -2191,11 +2375,30 @@ export class SyncRuntime {
     }
   }
 
+  /**
+   * SD-06-F1 / DECISION 7 — `options.intent` is REQUIRED BY TYPE.
+   *
+   * This uploader serves three mutually exclusive intents (reconciliation
+   * create, catch-up create, conflict KEEP_LOCAL / lossy-artifact heal) and
+   * could not tell them apart. Its create-callers hold PROVEN absence from a
+   * fresh full inventory; that proof was being discarded. The parameter is how
+   * the proof reaches the wire — the store cannot supply it, because inventory
+   * knowledge is deliberately never mass-recorded (P6).
+   *
+   * At runtime the intent falls back to `{kind:"unknown"}` (= today's exact
+   * body plus a breadcrumb), because `tests/` is not typechecked and a missed
+   * call site must degrade rather than throw.
+   *
+   * P8 resolved: both lanes now derive from THIS intent. The JSON lane's
+   * hard-coded `expectedVersionId: null` and the large lane's independent
+   * `getExpectedVersionId(path)` lookup are both gone.
+   */
   async uploadReconciledFile(
     path: string,
     content: string,
-    options: { noWriteNotice?: string } = {}
+    options: { intent: MutationIntent; noWriteNotice?: string }
   ): Promise<UploadReconciledOutcome> {
+    const intent: MutationIntent = options?.intent ?? { kind: "unknown" };
     if (this.isLocalProjectMemoryMode()) {
       this.ctx.log(`Reconciliation: skipping "${path}" — Local Project Memory Mode is local-only.`);
       return "skipped-no-lease";
@@ -2214,7 +2417,7 @@ export class SyncRuntime {
     if (permission < PermissionLevel.WRITE) {
       this.ctx.log(`Reconciliation: skipping "${path}" — no write permission.`);
       new Notice(
-        options.noWriteNotice ??
+        options?.noWriteNotice ??
           `VaultGuard Sync: Skipped upload of "${path}" — you do not have write permission. The file stays in this folder but is not synced.`
       );
       return "skipped-no-permission";
@@ -2231,7 +2434,12 @@ export class SyncRuntime {
           path,
           textBytes,
           "text/markdown",
-          this.ctx.getExpectedVersionId(path),
+          // C18: uploadLargeEncryptedFile's signature is UNCHANGED — it takes a
+          // plain `string | undefined`. The direct/large lane is already
+          // absence-safe server-side (it PUTs with its own S3 request
+          // condition), so it needs no mustBeAbsent equivalent; it only needs
+          // the version when one was declared.
+          intent.kind === "expect-version" ? intent.versionId : undefined,
         );
         this.recordDirectWrite(path, hash, result);
         await this.ctx.clearPendingLargeFile(path);
@@ -2256,14 +2464,42 @@ export class SyncRuntime {
     const response = await this.ctx.apiRequest<RemoteFileWriteResponse>(
       "PUT",
       this.ctx.vaultPath(`/files/${encodeURIComponent(path)}`),
-      this.buildWriteBody(path, encrypted, hash, { expectedVersionId: null })
+      this.buildWriteBody(path, encrypted, hash, { intent, lane: "reconciled-text" })
     );
     if (!response.success) {
+      if (response.error?.statusCode === 409 && intent.kind === "must-be-absent") {
+        return this.reportLostCreateRace(path, response.error?.message);
+      }
       throw new Error(response.error?.message ?? `Upload of "${path}" failed.`);
     }
     this.recordSuccessfulWrite(path, hash, response);
     await this.ctx.emitAuditEvent("file.write", path, { reconciliation: true });
     return "uploaded";
+  }
+
+  /**
+   * SD-06-F1 — the shared tail for a reconciliation/catch-up upload that
+   * DECLARED a create and lost the race.
+   *
+   * Deliberately NOT a throw. Both uploaders run inside loops whose catch
+   * blocks count a FAILURE, and a failure is the wrong classification: nothing
+   * is broken, another device simply got there first. Returning a skip outcome
+   * keeps the loop running, leaves the local file exactly where it is, and
+   * lands in the skipped bucket that SY2's "never delete on a skip" rule
+   * already governs. The divergence is resolved on the next reconciliation
+   * pass, which classifies it as a conflict and asks the user.
+   */
+  private reportLostCreateRace(
+    path: string,
+    message?: string
+  ): "skipped-create-conflict" {
+    this.ctx.log(
+      `Reconciliation: "${path}" was created on another device first (HTTP 409) — local copy kept, conflict resolution deferred to the next pass.${
+        message ? ` Server said: ${message}` : ""
+      }`
+    );
+    this.ctx.recordSyncDiagnostic("upload.create-conflict", { path });
+    return "skipped-create-conflict";
   }
 
   /**
@@ -2278,8 +2514,11 @@ export class SyncRuntime {
   private async uploadReconciledBinaryFile(
     path: string,
     bytes: ArrayBuffer,
-    options: { noWriteNotice?: string } = {}
+    // SD-06-F1 / DECISION 7: required by type, `{kind:"unknown"}` at runtime —
+    // same contract as the string sibling.
+    options: { intent: MutationIntent; noWriteNotice?: string }
   ): Promise<UploadReconciledBinaryOutcome> {
+    const intent: MutationIntent = options?.intent ?? { kind: "unknown" };
     if (!this.hasValidKeyLease()) {
       this.ctx.log(`Reconciliation: skipping "${path}" — no encryption key lease available.`);
       new Notice(
@@ -2293,7 +2532,7 @@ export class SyncRuntime {
     if (permission < PermissionLevel.WRITE) {
       this.ctx.log(`Reconciliation: skipping "${path}" — no write permission.`);
       new Notice(
-        options.noWriteNotice ??
+        options?.noWriteNotice ??
           `VaultGuard Sync: Skipped upload of "${path}" — you do not have write permission. The file stays in this folder but is not synced.`
       );
       return "skipped-no-permission";
@@ -2306,7 +2545,9 @@ export class SyncRuntime {
           path,
           bytes,
           contentTypeForPath(path),
-          this.ctx.getExpectedVersionId(path),
+          // C18, same rule as the string sibling: unchanged signature, and the
+          // large lane is already absence-safe server-side.
+          intent.kind === "expect-version" ? intent.versionId : undefined,
         );
         this.recordDirectWrite(path, hash, result);
         await this.ctx.clearPendingLargeFile(path);
@@ -2336,18 +2577,27 @@ export class SyncRuntime {
     }
 
     const encrypted = await this.ctx.encryptContentBytes(bytes);
+    // SD-06-F1 / P7: this used to be a hand-built body that could carry NO
+    // guard of any kind — one of the two bypass sites. It now goes through
+    // buildWriteBody like every other lane, so the declared intent reaches the
+    // wire here too.
+    const byteHash = await this.ctx.computeHashBytes(bytes);
+    const body = this.buildWriteBody(path, encrypted, byteHash, {
+      intent,
+      lane: "reconciled-binary",
+    });
+    body.contentType = contentTypeForPath(path);
     const response = await this.ctx.apiRequest(
       "PUT",
       this.ctx.vaultPath(`/files/${encodeURIComponent(path)}`),
-      {
-        content: encrypted,
-        hash: await this.ctx.computeHashBytes(bytes),
-        contentType: contentTypeForPath(path),
-      },
+      body,
       undefined,
       { timeoutMs: BINARY_PUT_TIMEOUT_MS }
     );
     if (!response.success) {
+      if (response.error?.statusCode === 409 && intent.kind === "must-be-absent") {
+        return this.reportLostCreateRace(path, response.error?.message);
+      }
       throw new Error(response.error?.message ?? `Upload of "${path}" failed.`);
     }
     await this.ctx.emitAuditEvent("file.write", path, { reconciliation: true });
@@ -2446,26 +2696,21 @@ export class SyncRuntime {
     return uploaded;
   }
 
-  async removeUnsyncedLocalFile(path: string): Promise<boolean> {
-    if (!this.ctx.hasOriginalAdapterRemove()) {
-      this.ctx.log(`Catch-up: could not remove local-only "${path}" — adapter remove unavailable.`);
-      return false;
-    }
-
-    try {
-      await this.ctx.removeLocalPath(path);
-      this.ctx.emitPermissionChanged({ path });
-      return true;
-    } catch (err) {
-      this.ctx.logError(`Catch-up: failed to remove local-only "${path}"`, err);
-      return false;
-    }
-  }
-
+  /**
+   * Walks the local vault and uploads everything the server inventory does not
+   * already list.
+   *
+   * SD-06-F4 invariant: this loop may NEVER remove a local file. Every file it
+   * touches is one the server has never received, so the local copy is the only
+   * copy. A file that cannot be uploaded is HELD (counted in
+   * `heldNoPermissionFiles`, logged, and surfaced in the sync summary), never
+   * deleted. Trash/quarantine after an explicit user decision is a separate,
+   * later concern.
+   */
   async uploadLocalOnlyFiles(): Promise<{
     uploadedFiles: number;
     uploadedFolders: number;
-    removedLocalFiles: number;
+    heldNoPermissionFiles: number;
     skippedFiles: number;
     failedFiles: number;
     failedFolders: number;
@@ -2517,7 +2762,7 @@ export class SyncRuntime {
       approximatePercent: true,
     });
     let uploaded = 0;
-    let removedLocal = 0;
+    let heldNoPermission = 0;
     let failed = 0;
     let skipped = 0;
     let localFileIndex = 0;
@@ -2534,10 +2779,12 @@ export class SyncRuntime {
           // Binaries ride the byte path. JSON-size files use the original API;
           // larger files use direct transfer and remain pending on failure.
           // Legacy adapters never reach here; readForSync returns text for them.
+          // SD-06-F1 / DECISION 7 — CREATE. Proven absence: this file is only
+          // reached because `!serverFilePaths.has(lookupKey)` against the full
+          // inventory fetched at the top of this catch-up.
           const outcome = await this.uploadReconciledBinaryFile(normalized, result.bytes, {
-            noWriteNotice:
-              `VaultGuard Sync: Removed local-only "${normalized}" because this server vault ` +
-              "does not contain it and you do not have write permission to add it.",
+            intent: { kind: "must-be-absent" },
+            noWriteNotice: this.heldNoPermissionNotice(normalized),
           });
           if (outcome === "uploaded") {
             uploaded += 1;
@@ -2562,29 +2809,28 @@ export class SyncRuntime {
               "Catch-up: key lease unavailable mid-catch-up — stopping; local-only files left intact for retry."
             );
             break;
-          } else {
-            // skipped-no-permission: IDENTICAL removal rule to the text path —
-            // remove ONLY on a warmed store, never on pending-large /
-            // skipped-no-lease (SY2 extended).
+          } else if (outcome === "skipped-create-conflict") {
+            // SD-06-F1: another device created this path between the inventory
+            // fetch and the PUT. Per-file and NOT transient-for-everyone, so the
+            // loop CONTINUES (unlike skipped-no-lease). The bytes stay on disk
+            // and reconciliation classifies the divergence next pass.
             skipped += 1;
-            const storeState = this.ctx.getPermissionStoreState();
-            if (storeState.kind === "warmed") {
-              if (await this.ctx.removeUnsyncedLocalFile(normalized)) {
-                removedLocal += 1;
-              }
-            } else {
-              this.ctx.log(
-                `Catch-up: leaving local-only "${normalized}" in place — no write permission but the permission store is "${storeState.kind}", not warmed; refusing to delete on an unconfirmed baseline.`
-              );
-            }
+          } else {
+            // skipped-no-permission: IDENTICAL hold rule to the text path
+            // (SD-06-F4). The bytes stay on disk — for a VG1 at-rest file this
+            // is the sole ciphertext copy.
+            skipped += 1;
+            heldNoPermission += 1;
+            this.logHeldNoPermission(normalized);
           }
           continue;
         }
         const content = result.text;
+        // SD-06-F1 / DECISION 7 — CREATE, same proof as the binary branch
+        // above (`!serverFilePaths.has(lookupKey)` on the fresh inventory).
         const outcome = await this.ctx.uploadReconciledFile(normalized, content, {
-          noWriteNotice:
-            `VaultGuard Sync: Removed local-only "${normalized}" because this server vault ` +
-            "does not contain it and you do not have write permission to add it.",
+          intent: { kind: "must-be-absent" },
+          noWriteNotice: this.heldNoPermissionNotice(normalized),
         });
         if (outcome === "uploaded") {
           uploaded += 1;
@@ -2609,23 +2855,22 @@ export class SyncRuntime {
             "Catch-up: key lease unavailable mid-catch-up — stopping; local-only files left intact for retry."
           );
           break;
+        } else if (outcome === "skipped-create-conflict") {
+          // SD-06-F1: lost the create race. Per-file, not transient-for-all —
+          // continue the loop, keep the local copy, defer to reconciliation.
+          // Explicitly branched so it can never be mislabelled as the
+          // no-permission hold below (which logs a permission diagnostic).
+          skipped += 1;
         } else {
           // outcome === "skipped-no-permission": the user genuinely lacks write
-          // permission, so the file cannot be added to this vault. Only remove
-          // it once the permission store has actually WARMED — a cold or
-          // fetch-failed store can report a spurious NONE/viewer baseline, and
-          // deleting on that is the exact data-loss class we must avoid.
+          // permission, so the file cannot be ADDED to this vault. That says
+          // nothing about whether the user wants to KEEP it, and this file has
+          // never reached the server, so the local copy is the only copy
+          // (SD-06-F4). Hold it — unconditionally, on any permission-store
+          // state.
           skipped += 1;
-          const storeState = this.ctx.getPermissionStoreState();
-          if (storeState.kind === "warmed") {
-            if (await this.ctx.removeUnsyncedLocalFile(normalized)) {
-              removedLocal += 1;
-            }
-          } else {
-            this.ctx.log(
-              `Catch-up: leaving local-only "${normalized}" in place — no write permission but the permission store is "${storeState.kind}", not warmed; refusing to delete on an unconfirmed baseline.`
-            );
-          }
+          heldNoPermission += 1;
+          this.logHeldNoPermission(normalized);
         }
       } catch (err) {
         failed += 1;
@@ -2637,7 +2882,7 @@ export class SyncRuntime {
           processedItems: localFileIndex,
           totalItems: localFiles.length,
           approximatePercent: true,
-          message: `${uploaded} uploaded, ${removedLocal} removed, ${skipped} skipped, ${failed} failed.`,
+          message: `${uploaded} uploaded, ${heldNoPermission} kept (no write permission), ${skipped} skipped, ${failed} failed.`,
         });
         if (localFileIndex % DEFAULT_LONG_OPERATION_BATCH_SIZE === 0) {
           await yieldToEventLoop();
@@ -2680,11 +2925,13 @@ export class SyncRuntime {
     }
 
     const totalChanges =
-      uploaded + removedLocal + skipped + failed + foldersUploaded + foldersFailed;
+      uploaded + heldNoPermission + skipped + failed + foldersUploaded + foldersFailed;
     if (totalChanges > 0) {
       const parts: string[] = [];
       if (uploaded > 0) parts.push(`${uploaded} files uploaded`);
-      if (removedLocal > 0) parts.push(`${removedLocal} local-only files removed`);
+      if (heldNoPermission > 0) {
+        parts.push(`${heldNoPermission} kept (no write permission)`);
+      }
       if (foldersUploaded > 0) parts.push(`${foldersUploaded} folders preserved`);
       if (skipped > 0) parts.push(`${skipped} skipped (no write permission)`);
       if (failed > 0) parts.push(`${failed} files failed`);
@@ -2695,11 +2942,45 @@ export class SyncRuntime {
     return {
       uploadedFiles: uploaded,
       uploadedFolders: foldersUploaded,
-      removedLocalFiles: removedLocal,
+      heldNoPermissionFiles: heldNoPermission,
       skippedFiles: skipped,
       failedFiles: failed,
       failedFolders: foldersFailed,
     };
+  }
+
+  /**
+   * SD-06-F4: the user-facing Notice for a catch-up file that could not be
+   * uploaded for want of write permission. It must state that the file was KEPT
+   * and must not claim the server lacks the path — `POST /files/sync` is
+   * read-permission filtered server-side, so absence from the inventory is not
+   * evidence of absence from the vault.
+   */
+  private heldNoPermissionNotice(path: string): string {
+    return (
+      `VaultGuard Sync: Kept local-only "${path}" on this device — you do not have ` +
+      "write permission to sync it to this vault. Nothing was deleted; the file " +
+      "stays in your folder but will not be uploaded."
+    );
+  }
+
+  /**
+   * SD-06-F4: log + diagnostic for a held catch-up file. The permission-store
+   * state is recorded as a diagnostic FIELD only; it is never a gate, because
+   * "the store finished warming" was never evidence that the local content is
+   * redundant.
+   */
+  private logHeldNoPermission(path: string): void {
+    this.ctx.log(
+      `Catch-up: kept local-only "${path}" on this device — no write permission to sync it, ` +
+        "so nothing was uploaded and nothing was deleted. The server inventory is " +
+        "read-permission filtered, so its absence from that inventory is not proof the " +
+        "server vault lacks this path."
+    );
+    this.ctx.recordSyncDiagnostic("catchup.held-no-permission", {
+      path,
+      permissionStore: this.ctx.getPermissionStoreState().kind,
+    });
   }
 
   async repairMissingRemoteItems(): Promise<{
@@ -2863,9 +3144,36 @@ export class SyncRuntime {
         content: markerBase64,
         contentType: "application/x-vaultguard-folder-marker",
         hash,
+        // SD-06-F1 / DECISION 8 + P7: the second bypass site. This body is
+        // hand-built (it is a zero-byte sentinel, not vault content) and could
+        // carry no guard at all. A marker upload is ALWAYS a create — the
+        // caller only reaches here for a folder the server inventory does not
+        // have — so the intent is unconditional, and stating it here is why
+        // this body does not need buildWriteBody's resolution machinery.
+        mustBeAbsent: true,
       }
     );
     if (!response.success) {
+      // DECISION 8 — ENSURE-EXISTS semantics. A 409 means the marker is already
+      // there, which IS the goal state ("this folder is represented on the
+      // server"). The marker is a zero-byte sentinel with identical content on
+      // every device: there is nothing to lose, nothing to merge and nothing a
+      // user could choose between, so this is success, not a conflict.
+      if (response.error?.statusCode === 409) {
+        // ORCHESTRATOR AMENDMENT 2 — kept with an HONEST rationale. This does
+        // NOT change the marker flow: the body above is unconditionally
+        // `mustBeAbsent`, so the next marker attempt declares a create again
+        // and treats its 409 as success again. What the record IS for is OTHER
+        // write paths that may target this exact path — `deleteFolderMarker`'s
+        // queued retry and the offline flush both resolve intent from the
+        // store, and leaving the store ignorant of a marker we have just proven
+        // exists would send them down the unknown lane.
+        this.ctx.recordRemoteFilePresent(markerPath, {});
+        this.ctx.log(
+          `Folder marker for "${normalized}" already exists on the server (HTTP 409) — goal state reached.`
+        );
+        return true;
+      }
       throw new Error(
         response.error?.message ?? `Folder marker upload for "${normalized}" failed.`
       );
@@ -3011,13 +3319,26 @@ export class SyncRuntime {
     switch (strategy) {
       case ConflictResolutionStrategy.KEEP_LOCAL: {
         if (!entry) return;
+        // SD-06-F1 / DECISION 7 — FORCE, both branches. The USER chose
+        // KEEP_LOCAL for this reconciliation conflict, which is the sanctioned
+        // "force only after a conflict choice" lane. Declaring it explicitly is
+        // what makes a deliberate overwrite distinguishable from a lost-track
+        // one on the wire.
+        //
+        // The outcome is intentionally not inspected here (unchanged): every
+        // outcome of this uploader leaves the local file intact, and a force
+        // lane cannot produce "skipped-create-conflict".
         if (entry.kind === "binary") {
           // BIN-A / L4: KEEP_LOCAL byte-uploads the local bytes (never the
           // string uploader — that would lossily UTF-8-encode them). The byte
           // uploader's outcome union is respected; no skip leads to a deletion.
-          await this.uploadReconciledBinaryFile(normalizedPath, entry.bytes);
+          await this.uploadReconciledBinaryFile(normalizedPath, entry.bytes, {
+            intent: { kind: "force" },
+          });
         } else {
-          await this.ctx.uploadReconciledFile(normalizedPath, entry.content);
+          await this.ctx.uploadReconciledFile(normalizedPath, entry.content, {
+            intent: { kind: "force" },
+          });
         }
         return;
       }
@@ -3048,10 +3369,25 @@ export class SyncRuntime {
     }
   }
 
+  /**
+   * SD-06-F1 / DECISION 2 + DECISION 3 — `options.createConflict`.
+   *
+   * Set it ONLY when the 409 answered a write that DECLARED `mustBeAbsent`.
+   * It changes two things and nothing else:
+   *
+   *  1. identical remote content auto-converges (returns `"converged"`, records
+   *     no conflict entry, shows no Notice, emits no `sync.conflict` event);
+   *  2. the ASK_USER copy names a concurrent CREATE instead of a modification.
+   *
+   * The gate exists because the conflict entry is pushed BEFORE any hash
+   * comparison, so an ungated short-circuit would silently retire today's
+   * update-409 behavior (a conflict IS recorded even when the hashes match).
+   */
   async handleRemoteWriteConflict(
     path: string,
     localContent: string,
-    baseVersionId?: string | null
+    baseVersionId?: string | null,
+    options: { createConflict?: boolean } = {}
   ): Promise<RemoteWriteConflictResolutionResult> {
     const normalizedPath = this.ctx.normalizeVaultPath(path);
     const priorState = this.ctx.getRemoteFileState(normalizedPath);
@@ -3083,6 +3419,36 @@ export class SyncRuntime {
       remoteModified = response.data.lastModified ?? remoteModified;
       remoteVersionId = response.data.versionId ?? null;
       this.recordRemoteReadState(normalizedPath, response.data, remoteHash);
+    }
+
+    // SD-06-F1 / DECISION 2 — identical-content convergence, create lane ONLY.
+    // Two devices created the same bytes (an empty note, the same template, the
+    // same daily-note stub). There is no divergence to resolve and nothing a
+    // user could choose between, so this must NOT become a conflict entry, a
+    // Notice or a `sync.conflict` audit event — that is the empty-note /
+    // template-storm false-positive class. Placed BEFORE the conflict object is
+    // constructed and pushed, because that push is unconditional today.
+    //
+    // The store is left holding the FETCHED version, so the next divergent
+    // write on this path is guarded by `expectedVersionId` rather than
+    // re-declaring a create — which is what keeps T-16-23 (a real conflict
+    // hiding behind a coincidental match) out of reach: after convergence the
+    // path is `present`, not `absent`.
+    //
+    // DEVIATION from DECISION 2's letter, recorded deliberately: the plan asked
+    // for an explicit `recordRemoteFilePresent(path, {versionId, baseHash})`
+    // here. It would be a redundant duplicate — convergence is only reachable
+    // when `!remoteDeleted`, and that branch has ALREADY run
+    // `recordRemoteReadState` with the same fetched versionId and hash plus the
+    // checksum/lastModified/size this call could not supply. Adding a second,
+    // strictly poorer write would imply the first one does not happen. The
+    // guarantee is asserted directly instead (C9 checks the post-converge
+    // resolution is `expect-version` on the FETCHED version).
+    if (options.createConflict && !remoteDeleted && remoteHash === localHash) {
+      this.ctx.log(
+        `Sync: concurrent create of "${normalizedPath}" produced identical content — converged, no conflict raised.`
+      );
+      return "converged";
     }
 
     const conflict: SyncConflict = {
@@ -3161,9 +3527,18 @@ export class SyncRuntime {
       case ConflictResolutionStrategy.ASK_USER:
       default:
         syncState.status = "error";
-        syncState.lastError = `Sync conflict detected for "${normalizedPath}".`;
+        // SD-06-F1 / DECISION 3: same workflow, create-flavored copy. Telling a
+        // user their brand-new note "has a sync conflict" when nothing was ever
+        // modified is unactionable; naming the concurrent create is. Both
+        // copies are HELD — the local bytes are already on disk (DECISION 1)
+        // and the remote copy is untouched.
+        syncState.lastError = options.createConflict
+          ? `Concurrent create detected for "${normalizedPath}".`
+          : `Sync conflict detected for "${normalizedPath}".`;
         new Notice(
-          `VaultGuard Sync: Sync conflict detected for "${normalizedPath}". Use View Permissions to resolve.`
+          options.createConflict
+            ? `VaultGuard Sync: "${normalizedPath}" was created on another device at the same time. Both versions are kept; use View Permissions to resolve.`
+            : `VaultGuard Sync: Sync conflict detected for "${normalizedPath}". Use View Permissions to resolve.`
         );
         return "pending";
     }
@@ -3679,6 +4054,10 @@ export class SyncRuntime {
       contentType?: string;
       baseVersionId?: string;
       baseHash?: string;
+      // SD-06-F1 / DECISION 9: an explicit override. Left unset by all 25
+      // upstream call sites — the central default below covers them, which is
+      // the entire point of capturing here rather than at each caller.
+      intent?: MutationIntent;
     } = {}
   ): void {
     const normalizedPath = this.ctx.normalizeVaultPath(path);
@@ -3705,12 +4084,47 @@ export class SyncRuntime {
     if (options.contentType !== undefined) {
       entry.contentType = options.contentType;
     }
+    // SD-06-F1 / DECISION 9 — intent capture, at the ONE central enqueue site.
+    // Every queueing path in both runtimes funnels through here (verified: 11
+    // call sites in this file, 14 in at-rest-adapter-runtime.ts, no bypass), so
+    // a create queued offline stays a create across a restart without touching
+    // a single caller.
+    //
+    // Deliberately NO local-new probe here: the enqueue site has no reliable
+    // pre-write signal, and store resolution is the conservative answer.
+    // An `unknown` resolution is NOT stored — see the type's comment.
+    const capturedIntent = options.intent ?? this.resolveIntentSafely(normalizedPath);
+    if (capturedIntent !== undefined && capturedIntent.kind !== "unknown") {
+      entry.intent = capturedIntent;
+    }
 
     this.ctx.setOfflineQueue([...this.ctx.getOfflineQueue(), entry]);
 
     this.ctx.log(
       `Queued offline operation: ${operation} "${normalizedPath}" (queue size: ${this.ctx.getOfflineQueue().length})`
     );
+  }
+
+  /**
+   * SD-06-F1 / DECISION 9 — map a queued op back to the intent its replay
+   * should DECLARE.
+   *
+   * Two rules, both load-bearing:
+   *
+   * 1. **Explicit union check, never a truthiness test.** `op.intent` is an
+   *    object, so `op.intent ? … : …` is true for *any* shape — including a
+   *    future/foreign one — and would silently hand an unvalidated value to the
+   *    wire. The resolution is read from the discriminant instead.
+   * 2. **`unknown` degrades to "no intent supplied" (`undefined`), not to a
+   *    supplied `{kind:"unknown"}`.** A *supplied* intent skips buildWriteBody's
+   *    legacy derivation entirely; for a queue restored from an envelope written
+   *    by an older build that would DROP the `expectedVersionId` guard
+   *    `op.baseVersionId` still provides. 16-02's DECISION 5 rule applies:
+   *    degrade to today's exact behavior, never to something weaker.
+   */
+  private resolveFlushIntent(op: OfflineQueueOperation): MutationIntent | undefined {
+    const intent = op.intent ?? this.resolveIntentSafely(op.path);
+    return intent === undefined || intent.kind === "unknown" ? undefined : intent;
   }
 
   /**
@@ -3778,8 +4192,11 @@ export class SyncRuntime {
                 const hash = await this.ctx.computeHashBytes(byteBuffer);
                 const expectedVersionId =
                   op.baseVersionId ?? this.ctx.getExpectedVersionId(op.path);
+                const flushIntent = this.resolveFlushIntent(op);
                 const body = this.buildWriteBody(op.path, encrypted, hash, {
                   expectedVersionId,
+                  intent: flushIntent,
+                  lane: "offline-flush-binary",
                 });
                 body.contentType = op.contentType ?? contentTypeForPath(op.path);
                 const response = await this.ctx.apiRequest<RemoteFileWriteResponse>(
@@ -3789,6 +4206,38 @@ export class SyncRuntime {
                   undefined,
                   { timeoutMs: BINARY_PUT_TIMEOUT_MS }
                 );
+                // SD-06-F1 / DECISION 5 — a DECLARED create that lost the race
+                // can NEVER succeed on retry: the path is occupied, so every
+                // replay 409s again. Requeueing it (which is what
+                // assertOfflineFlushResponse's write-409 throw triggers via the
+                // catch below) would jam this op AND everything behind it
+                // forever. Same philosophy the permanent-4xx branch already
+                // states: "the server will never accept this op — drop it
+                // instead of jamming the flush queue forever."
+                //
+                // The local file is untouched; reconciliation classifies the
+                // divergence as `binaryBoth` and routes it to a user-chosen
+                // strategy on the next pass, so nothing is lost by dropping.
+                //
+                // GATED ON THE DECLARED INTENT. An `expect-version` (or legacy
+                // intent-less) binary 409 is a STALE UPDATE, which a later
+                // replay could still win once the store catches up — it keeps
+                // today's throw/requeue/break behavior untouched.
+                if (
+                  !response.success &&
+                  response.error?.statusCode === 409 &&
+                  flushIntent?.kind === "must-be-absent"
+                ) {
+                  this.ctx.logError(
+                    `Dropping queued write for "${op.path}" — it declared a create but the path was taken on another device (HTTP 409)`,
+                    new Error(response.error?.message ?? "Offline create conflict.")
+                  );
+                  new Notice(
+                    `VaultGuard Sync: "${op.path}" was created on another device before this queued upload ran. Your local copy is kept — run sync to reconcile the two.`,
+                    10000
+                  );
+                  break;
+                }
                 this.assertOfflineFlushResponse(response, op);
                 this.recordSuccessfulWrite(op.path, hash, response);
               } else {
@@ -3796,18 +4245,61 @@ export class SyncRuntime {
                 const hash = await this.ctx.computeHash(op.data);
                 const expectedVersionId =
                   op.baseVersionId ?? this.ctx.getExpectedVersionId(op.path);
+                // SD-06-F1 / DECISION 9: the intent this op captured at enqueue
+                // time, falling back to a fresh store resolution for a queue
+                // restored from an envelope written before this build.
+                // `expectedVersionId` stays computed regardless — it is still
+                // handed to handleRemoteWriteConflict below and to
+                // buildDeleteBody in the delete case.
+                const flushIntent = this.resolveFlushIntent(op);
+                const declaredCreate = flushIntent?.kind === "must-be-absent";
                 const response = await this.ctx.apiRequest<RemoteFileWriteResponse>(
                   "PUT",
                   this.ctx.vaultPath(`/files/${encodeURIComponent(op.path)}`),
-                  this.buildWriteBody(op.path, encrypted, hash, { expectedVersionId })
+                  this.buildWriteBody(op.path, encrypted, hash, {
+                    expectedVersionId,
+                    intent: flushIntent,
+                    lane: "offline-flush-text",
+                  })
                 );
                 if (!response.success && response.error?.statusCode === 409) {
                   const resolution = await this.handleRemoteWriteConflict(
                     op.path,
                     op.data,
-                    expectedVersionId
+                    expectedVersionId,
+                    { createConflict: declaredCreate }
                   );
+                  // SD-06-F1 / DECISION 2 consumer audit: every resolution other
+                  // than `"pending"` — INCLUDING the new `"converged"` — is a
+                  // settled outcome, so the op is consumed and the loop moves on.
                   if (resolution === "pending") {
+                    // DECISION 5, EXTENDED TO THE TEXT LANE (deviation, recorded).
+                    //
+                    // DECISION 5 addressed only the binary flush because the text
+                    // lane already intercepts 409 before assertOfflineFlushResponse.
+                    // But this phase makes a CREATE-409 reachable here, and a
+                    // `mustBeAbsent` op can never succeed on retry: throwing would
+                    // requeue it and everything behind it on every flush, forever.
+                    // That is exactly the jam the scope ceiling forbids ("No
+                    // create-409 may jam the offline flush queue").
+                    //
+                    // Dropping is safe precisely BECAUSE the resolution was
+                    // `"pending"`: handleRemoteWriteConflict has already recorded
+                    // the SyncConflict entry and raised the Notice, and the local
+                    // file is on disk (it was written when the op was queued). The
+                    // content survives in both places; only the doomed replay is
+                    // discarded.
+                    //
+                    // Gated on the declared create, so a stale UPDATE conflict —
+                    // which a later replay CAN still win — keeps today's exact
+                    // throw/requeue/break behavior.
+                    if (declaredCreate) {
+                      this.ctx.logError(
+                        `Dropping queued write for "${op.path}" — it declared a create, the path was taken on another device, and the conflict is now recorded for the user to resolve`,
+                        new Error(response.error?.message ?? "Offline create conflict.")
+                      );
+                      break;
+                    }
                     throw new Error(
                       response.error?.message ?? `Conflict for "${op.path}" requires resolution.`
                     );

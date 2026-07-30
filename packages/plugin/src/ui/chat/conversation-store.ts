@@ -188,11 +188,13 @@ export class ConversationStore {
   }
 
   /** Delete a conversation envelope. Idempotent; fail soft. */
-  async delete(id: string): Promise<void> {
+  async delete(id: string): Promise<boolean> {
     try {
       await this.adapter.remove(this.fileName(id));
+      return true;
     } catch (err) {
       console.warn(`${LOG_PREFIX} Failed to delete conversation ${id}:`, err);
+      return false;
     }
   }
 

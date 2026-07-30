@@ -301,6 +301,13 @@ data "aws_iam_policy_document" "auth_lambda" {
       # the next Cognito login routes through MFA_SETUP and the user can
       # enroll a fresh authenticator.
       "cognito-idp:AdminSetUserMFAPreference",
+      # SD-02-F2: the password-reset sweep kills the victim's refresh-token
+      # line on recovery ("I forgot my password" = assume compromise). Without
+      # this grant layer 1 throws AccessDeniedException, and confirm-reset
+      # refuses loudly with a 500 (reset row retained) rather than
+      # half-completing — so this grant must land in the SAME apply as the
+      # Lambda that uses it.
+      "cognito-idp:AdminUserGlobalSignOut",
     ]
     resources = [var.cognito_user_pool_arn]
   }

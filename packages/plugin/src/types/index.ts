@@ -706,7 +706,7 @@ export interface VaultGuardSettings {
   aiChatEffort: AnthropicEffort;
   /** OpenAI Responses API model id for the AI Chat panel (default "gpt-5.5"). */
   openAiModel: string;
-  /** ChatGPT subscription model id requested through the official Codex client. */
+  /** ChatGPT subscription model id requested through the OpenAI Codex runtime. */
   codexModel: string;
   /** Reasoning effort for OpenAI Responses API turns (default "medium"). */
   openAiReasoningEffort: OpenAiReasoningEffort;
@@ -742,7 +742,7 @@ export interface VaultGuardSettings {
    *      subscription token). Vault access stays MCP-only via AgentBridge.
    *   "apiKey" — call the Anthropic Messages API with the user's stored key.
    *   "openai" — call the OpenAI Responses API with the user's stored key.
-   *   "codex" — drive the official local Codex client with the user's ChatGPT
+   *   "codex" — drive the official local Codex runtime with the user's ChatGPT
    *      subscription login (desktop only; no OpenAI API key). Vault access is
    *      limited to the dedicated VaultGuard loopback MCP chat lease.
    * Defaults to "apiKey". The user's explicit choice is persisted.

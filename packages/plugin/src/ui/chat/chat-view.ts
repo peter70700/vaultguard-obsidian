@@ -56,6 +56,7 @@ import { OpenAiChatRuntime } from "./openai-runtime";
 import { buildOpenAiSystemInstructions } from "./openai-system-prompt";
 import {
   InputController,
+  MENTION_LIMIT,
   RESERVED_SLASH_COMMAND_NAMES,
   type ImageAttachment,
   type MentionCandidate,
@@ -63,6 +64,7 @@ import {
   type SlashCommand,
   type SlashCommandSuggestion,
 } from "./input-controller";
+import { resolveMentionCandidates } from "./mention-candidates";
 import {
   OBSIDIAN_CHAT_SKILLS,
   expandBuiltInSkill,
@@ -101,6 +103,7 @@ import {
 } from "./conversation-store";
 import { generateTitle } from "./title-generator";
 import {
+  buildSubscriptionRebasePrompt,
   isUserPrompt,
   sliceBeforeUserTurn,
   userPromptImages,
@@ -160,6 +163,11 @@ interface ChatConversationTab {
 export class VaultGuardChatView extends ItemView {
   private listEl: HTMLElement | null = null;
   private inputController: InputController | null = null;
+  /**
+   * Once-per-view (not once-per-query) guard for mention permission-evaluation
+   * failures. A permanently broken path would otherwise log on every keystroke.
+   */
+  private mentionPermissionErrorLogged = false;
   private statusPanel: StatusPanel | null = null;
   private inputNavRowEl: HTMLElement | null = null;
   private tabsEl: HTMLElement | null = null;
@@ -198,6 +206,10 @@ export class VaultGuardChatView extends ItemView {
   // Obsidian's own load() throw "Cannot read properties of null (setText)".
   private convoTitleEl: HTMLElement | null = null;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  // Edit/delete mutations bypass the debounce and serialize encrypted writes.
+  // View close waits on this chain so a last-second mutation cannot be lost or
+  // an older pending save resurrect a deleted conversation envelope.
+  private mutationPersistence: Promise<void> = Promise.resolve();
   // True once a generated (or restored) title is in place, so we don't
   // regenerate on later turns.
   private titleGenerated = false;
@@ -455,6 +467,7 @@ export class VaultGuardChatView extends ItemView {
     this.cancelActiveUserQuestion("VaultGuard Chat closed before the question was answered.");
     this.disposeProviderSession();
     const bridgeCleanup = this.bridgeCleanup;
+    const mutationPersistence = this.mutationPersistence;
     this.bridgeCleanup = Promise.resolve();
     this.pendingToolCards = [];
     this.activeAssistantBubble = null;
@@ -472,11 +485,14 @@ export class VaultGuardChatView extends ItemView {
     this.convoTitleEl = null;
 
     const summary = await settleCleanupTasks(
-      [{ name: "chat-agent-bridge", promise: bridgeCleanup }],
+      [
+        { name: "chat-agent-bridge", promise: bridgeCleanup },
+        { name: "chat-message-persistence", promise: mutationPersistence },
+      ],
       600,
     );
     if (summary.rejected.length > 0 || summary.timedOut.length > 0) {
-      console.warn("[VaultGuard Chat] Bridge cleanup did not settle before the view-close deadline.");
+      console.warn("[VaultGuard Chat] View cleanup did not settle before the close deadline.");
     }
   }
 
@@ -1000,7 +1016,11 @@ export class VaultGuardChatView extends ItemView {
     this.listEl.querySelector(`.${EMPTY_CLS}`)?.remove();
     if (!this.convo) this.startConversation(text);
 
-    renderUserMessage(this.listEl, text);
+    const turnIndex = this.userTurnCount();
+    const needsContextRebase = !this.cliClient || this.cliTransport !== transport;
+    const retainedMessages = needsContextRebase ? [...(this.convo?.messages ?? [])] : [];
+
+    renderUserMessage(this.listEl, text, this.userMessageActions(turnIndex));
     this.scrollToBottom();
 
     // Subscription turns keep no Anthropic message array (the CLI owns its own
@@ -1046,10 +1066,13 @@ export class VaultGuardChatView extends ItemView {
     // delta and re-renders markdown once on finalize (mirrors the API-key
     // streaming path). Subscription mode is desktop-only, so streaming is safe.
     this.streamController = this.makeStreamController();
+    const providerText = needsContextRebase
+      ? buildSubscriptionRebasePrompt(retainedMessages, text)
+      : text;
 
     try {
       await client.runTurn(
-        text,
+        providerText,
         {
           onTextDelta: (t) => {
             // Record the delta for the synthetic transcript, then stream it into
@@ -1286,7 +1309,13 @@ export class VaultGuardChatView extends ItemView {
     setIcon(icon, "message-square");
 
     if (status.classification === "not-installed") {
-      empty.createEl("p", { text: "Install the official Codex client to use ChatGPT subscription chat." });
+      empty.createEl("p", { text: "Install or update ChatGPT to use subscription chat." });
+      empty.createEl("p", {
+        cls: "vaultguard-chat-empty-hint",
+        text:
+          "VaultGuard automatically uses the Codex runtime bundled with the ChatGPT desktop app " +
+          "to start a private app-server and discover this account's models.",
+      });
     } else if (status.classification === "logged-in-other") {
       empty.createEl("p", { text: "Codex is not signed in with ChatGPT." });
       empty.createEl("p", {
@@ -1804,10 +1833,15 @@ export class VaultGuardChatView extends ItemView {
   private scheduleSave(): void {
     if (!this.store || !this.convo) return;
     if (this.saveTimer) clearTimeout(this.saveTimer);
-    const snapshot = this.convo;
+    const store = this.store;
+    const snapshot = JSON.parse(JSON.stringify(this.convo)) as Conversation;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
-      void this.store?.save(snapshot);
+      this.mutationPersistence = this.mutationPersistence
+        .catch(() => undefined)
+        .then(async () => {
+          await store.save(snapshot);
+        });
     }, 400);
   }
 
@@ -2116,6 +2150,43 @@ export class VaultGuardChatView extends ItemView {
       allowShareManagement: true,
       allowMembershipWrites: true,
     });
+  }
+
+  private cancelScheduledSave(): void {
+    if (!this.saveTimer) return;
+    clearTimeout(this.saveTimer);
+    this.saveTimer = null;
+  }
+
+  private queueMutationSave(): void {
+    if (!this.store || !this.convo) return;
+    this.cancelScheduledSave();
+    const store = this.store;
+    const snapshot = JSON.parse(JSON.stringify(this.convo)) as Conversation;
+    this.mutationPersistence = this.mutationPersistence
+      .catch(() => undefined)
+      .then(async () => {
+        if (!(await store.save(snapshot))) {
+          new Notice(
+            "VaultGuard Chat: the message changed in this session but could not be saved.",
+          );
+        }
+      });
+  }
+
+  private queueMutationDelete(id: string): void {
+    if (!this.store) return;
+    this.cancelScheduledSave();
+    const store = this.store;
+    this.mutationPersistence = this.mutationPersistence
+      .catch(() => undefined)
+      .then(async () => {
+        if (!(await store.delete(id))) {
+          new Notice(
+            "VaultGuard Chat: the conversation was cleared here but its saved history could not be deleted.",
+          );
+        }
+      });
   }
 
   private disposeProviderSession(): void {
@@ -3012,13 +3083,9 @@ export class VaultGuardChatView extends ItemView {
     return c;
   }
 
-  // Edit/delete need a replayable message array; CLI subscription providers
-  // keep their own context, so the actions are API-key-only.
+  // Every provider exposes the same local message controls. Subscription
+  // providers rebuild their opaque CLI context after a mutation below.
   private userMessageActions(turnIndex: number) {
-    if (
-      this.plugin.settings.aiChatProvider === "subscription" ||
-      this.plugin.settings.aiChatProvider === "codex"
-    ) return undefined;
     return {
       onEdit: () => this.editUserTurn(turnIndex),
       onDelete: () => this.deleteUserTurn(turnIndex),
@@ -3043,38 +3110,54 @@ export class VaultGuardChatView extends ItemView {
     this.pendingRestoreMessages = res.kept.length ? res.kept : null;
     if (this.convo) {
       this.convo.messages = res.kept;
+      this.convo.pendingUserQuestion = null;
+      this.convo.pendingConfirmations = null;
       this.convo.updatedAt = Date.now();
+    }
+    this.cancelActiveUserQuestion("Question cancelled because conversation history changed.");
+    this.pendingConfirmCard?.root.remove();
+    this.pendingConfirmCard = null;
+    this.queuedPausedAnswer = null;
+    this.queuedConfirmDecision = null;
+    this.pendingIndicator?.setWaiting(false);
+    if (
+      this.plugin.settings.aiChatProvider === "subscription" ||
+      this.plugin.settings.aiChatProvider === "codex"
+    ) {
+      this.disposeProviderSession();
     }
     return res;
   }
 
   private editUserTurn(turnIndex: number): void {
-    if (!this.listEl || this.inputController?.isBusy()) return;
+    if (!this.listEl || !this.inputController || this.inputController.isBusy()) return;
     const res = this.truncateFromUserTurn(turnIndex);
     if (!res) return;
     this.listEl.empty();
     this.renderMessages(res.kept);
     // Seed the input with the original prompt so the user can revise + resend.
-    this.inputController?.setText(res.removedText);
-    this.inputController?.focus();
-    if (this.convo) this.scheduleSave();
+    this.inputController.setText(res.removedText);
+    this.inputController.focus();
+    if (this.convo) {
+      this.queueMutationSave();
+    }
   }
 
   private deleteUserTurn(turnIndex: number): void {
-    if (!this.listEl || this.inputController?.isBusy()) return;
+    if (!this.listEl || !this.inputController || this.inputController.isBusy()) return;
     const res = this.truncateFromUserTurn(turnIndex);
     if (!res) return;
     if (res.kept.length === 0) {
       // Whole conversation removed — delete the persisted envelope so it can't
       // resurrect on the next restore, then fall back to a clean New chat.
       const id = this.convo?.id;
-      if (id) void this.store?.delete(id);
+      if (id) this.queueMutationDelete(id);
       this.resetConversation();
       return;
     }
     this.listEl.empty();
     this.renderMessages(res.kept);
-    if (this.convo) this.scheduleSave();
+    if (this.convo) this.queueMutationSave();
   }
 
   // Expand a prompt template or built-in `$` skill. The returned text is what
@@ -3133,27 +3216,33 @@ export class VaultGuardChatView extends ItemView {
 
   // Candidate notes for an `@`-mention. Reads ONLY the vault file list (TFile
   // metadata via the Obsidian API) — never file content — so the at-rest
-  // boundary is untouched. The actual read still goes through the permission-
-  // gated vaultguard_read tool when the model resolves the injected [[path]].
-  private mentionCandidates(query: string): MentionCandidate[] {
-    const files = this.app.vault.getMarkdownFiles();
-    const q = query.toLowerCase();
-    const scored = files
-      .map((f) => {
-        const name = f.basename.toLowerCase();
-        const path = f.path.toLowerCase();
-        let rank = -1;
-        if (!q) rank = 2;
-        else if (name.startsWith(q)) rank = 0;
-        else if (name.includes(q)) rank = 1;
-        else if (path.includes(q)) rank = 2;
-        return { f, rank };
-      })
-      .filter((e) => e.rank >= 0)
-      .sort((a, b) => a.rank - b.rank || a.f.basename.localeCompare(b.f.basename))
-      .slice(0, 20)
-      .map((e) => ({ path: e.f.path, name: e.f.basename }));
-    return scored;
+  // boundary is untouched.
+  //
+  // Suggesting a path IS a disclosure: it is rendered in the popup and inserted
+  // as `[[path]]` into provider-bound conversation context, and a later
+  // `vaultguard_read` denial cannot retract a filename the user has already
+  // seen (SD-13-F5). Candidates are therefore gated by the SAME per-path
+  // predicate the Agent Bridge list/read surface gates on — a path the user
+  // cannot read never appears here. Unknown/cold-cache collapses to NONE and is
+  // excluded; a failed evaluation excludes that path and is logged once.
+  private async mentionCandidates(query: string): Promise<MentionCandidate[]> {
+    const files = this.app.vault
+      .getMarkdownFiles()
+      .map((f) => ({ path: f.path, basename: f.basename }));
+    const result = await resolveMentionCandidates(
+      files,
+      query,
+      this.plugin.getChatMentionAccess(),
+      { limit: MENTION_LIMIT },
+    );
+    if (result.error !== undefined && !this.mentionPermissionErrorLogged) {
+      this.mentionPermissionErrorLogged = true;
+      console.error(
+        `[VaultGuard] Chat mention picker: ${result.errorCount} path(s) excluded — permission evaluation failed.`,
+        result.error,
+      );
+    }
+    return result.candidates;
   }
 
   // ─── Pending "thinking…" indicator ─────────────────────────────────────────
