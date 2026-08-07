@@ -136,6 +136,10 @@ module "lambda" {
   # `var.turnstile_secret_arn` (default "") lets non-prod stages or test
   # tfvars override this without editing main.tf.
   turnstile_secret_arn = var.turnstile_secret_arn != "" ? var.turnstile_secret_arn : ""
+  # Meta Conversions API. Both default to "" — Meta events stay off until an
+  # operator sets them. See docs/META-CAPI-SETUP.md.
+  meta_dataset_id      = var.meta_dataset_id
+  meta_capi_secret_arn = var.meta_capi_secret_arn
   sender_email         = var.sender_email
   sender_domain        = var.sender_domain
   domain_name          = var.domain_name

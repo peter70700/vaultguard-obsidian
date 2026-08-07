@@ -118,18 +118,34 @@ export class LockCurtain implements LockCurtainController {
       const svg = anyDoc.createElementNS(SVG_NS, "svg");
       svg.setAttribute("width", "48");
       svg.setAttribute("height", "48");
-      svg.setAttribute("viewBox", "0 0 24 24");
+      svg.setAttribute("viewBox", "0 0 96 96");
       svg.setAttribute("fill", "none");
       svg.setAttribute("stroke", "currentColor");
-      svg.setAttribute("stroke-width", "1.5");
-      svg.setAttribute("stroke-linecap", "round");
       svg.setAttribute("stroke-linejoin", "round");
-      const p1 = anyDoc.createElementNS(SVG_NS, "path");
-      p1.setAttribute("d", "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z");
-      const p2 = anyDoc.createElementNS(SVG_NS, "path");
-      p2.setAttribute("d", "m9 12 2 2 4-4");
-      svg.appendChild(p1);
-      svg.appendChild(p2);
+      // The approved Mineral Governance mark at 48px. Geometry and stroke
+      // weights are kept BYTE-IDENTICAL to `createShieldIcon` in ../icons —
+      // this curtain renders at the same size and is meant to read as the same
+      // mark, it only rebuilds it against the injected `doc` instead of the
+      // global one. Change one, change both.
+      for (const [d, width] of [
+        ["M48 4 87 19v28c0 23-15 38-39 47C24 85 9 70 9 47V19L48 4Z", "2.24"],
+        ["M48 11 80 23v23c0 20-12 33-32 42-20-9-32-22-32-42V23l32-12Z", "3.52"],
+        ["M48 26 65 34v15c0 11-6 19-17 25-11-6-17-14-17-25V34l17-8Z", "2.72"],
+      ]) {
+        const path = anyDoc.createElementNS(SVG_NS, "path");
+        path.setAttribute("d", d);
+        path.setAttribute("stroke-width", width);
+        svg.appendChild(path);
+      }
+      const lock = anyDoc.createElementNS(SVG_NS, "rect");
+      lock.setAttribute("x", "42");
+      lock.setAttribute("y", "41");
+      lock.setAttribute("width", "12");
+      lock.setAttribute("height", "12");
+      lock.setAttribute("rx", "2");
+      lock.setAttribute("fill", "currentColor");
+      lock.setAttribute("stroke", "none");
+      svg.appendChild(lock);
       iconWrap.appendChild(svg);
     }
     card.appendChild(iconWrap);

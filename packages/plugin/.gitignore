@@ -2,6 +2,9 @@
 main.js
 *.js.map
 dist/
+# Staged copies of landing/public/brand for the asset-library upload.
+# Derived output, rebuilt by `npm run brand:export` — the source is tracked.
+landing/brand-export/
 .build/
 build/
 *.log

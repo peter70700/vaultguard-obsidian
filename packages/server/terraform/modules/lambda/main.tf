@@ -54,6 +54,16 @@ variable "turnstile_secret_arn" {
   default     = ""
   description = "Secrets Manager ARN for Cloudflare Turnstile secret key. Leave empty to disable Turnstile (CE fail-open)."
 }
+variable "meta_dataset_id" {
+  type        = string
+  default     = ""
+  description = "Meta dataset / pixel ID for the Conversions API. Empty (the default, and the required value for Community Edition) makes every Meta event a silent no-op."
+}
+variable "meta_capi_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Secrets Manager ARN holding {\"accessToken\":\"...\"} for the Meta Conversions API. Empty disables all Meta events. Gates the secretsmanager:GetSecretValue grant on the signup and billing roles."
+}
 variable "vaultguard_edition" {
   type        = string
   description = "Runtime feature edition reported by GET /orgs/{slug}/config and enforced by Pro-only handlers."
@@ -791,6 +801,20 @@ data "aws_iam_policy_document" "billing_lambda" {
       resources = [var.stripe_secret_arn]
     }
   }
+  # Secrets Manager — retrieve the Meta Conversions API access token for the
+  # StartTrial and Purchase events. Skipped when meta_capi_secret_arn = ""
+  # (the default, and always on Community Edition).
+  #
+  # Without this grant the module's error is SWALLOWED by design, so a missing
+  # statement looks exactly like a healthy deployment that simply never sends.
+  # Check CloudWatch for `[meta-capi]` if events stop arriving.
+  dynamic "statement" {
+    for_each = var.meta_capi_secret_arn != "" ? [1] : []
+    content {
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.meta_capi_secret_arn]
+    }
+  }
   # KMS — decrypt the secret (encrypted with project master key)
   statement {
     actions   = ["kms:Decrypt"]
@@ -854,6 +878,10 @@ resource "aws_lambda_function" "billing" {
       STRIPE_SECRET_ARN           = var.stripe_secret_arn
       STRIPE_WEBHOOK_EVENTS_TABLE = var.stripe_webhook_events_table_name
       BASE_URL                    = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
+      # Meta Conversions API — StartTrial and Purchase. Both empty by default,
+      # which makes every Meta call a no-op. See docs/META-CAPI-SETUP.md.
+      META_DATASET_ID      = var.meta_dataset_id
+      META_CAPI_SECRET_ARN = var.meta_capi_secret_arn
     })
   }
 
@@ -905,6 +933,17 @@ data "aws_iam_policy_document" "signup_lambda" {
     content {
       actions   = ["secretsmanager:GetSecretValue"]
       resources = [var.turnstile_secret_arn]
+    }
+  }
+  # Secrets Manager — retrieve the Meta Conversions API access token for the
+  # CompleteRegistration event. Skipped when meta_capi_secret_arn = "" (the
+  # default, and always on Community Edition). See the billing Lambda's copy of
+  # this statement for why a missing grant fails silently.
+  dynamic "statement" {
+    for_each = var.meta_capi_secret_arn != "" ? [1] : []
+    content {
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.meta_capi_secret_arn]
     }
   }
   # DynamoDB — create org, permissions, audit, default vault + membership
@@ -977,6 +1016,12 @@ resource "aws_lambda_function" "signup" {
       VAULTGUARD_ALLOW_PUBLIC_SIGNUP = tostring(var.allow_public_signup)
       BILLING_EXEMPT_DOMAINS         = var.billing_exempt_domains
       TURNSTILE_SECRET_ARN           = var.turnstile_secret_arn
+      # Meta Conversions API — CompleteRegistration. Both empty by default,
+      # which makes every Meta call a no-op. BASE_URL is the fallback
+      # event_source_url when the browser did not supply one.
+      META_DATASET_ID      = var.meta_dataset_id
+      META_CAPI_SECRET_ARN = var.meta_capi_secret_arn
+      BASE_URL             = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
     })
   }
 

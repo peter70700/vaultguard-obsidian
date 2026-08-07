@@ -46,6 +46,7 @@ import {
   isReservedGroupName,
 } from '../shared/utils';
 import { EDITION, FEATURES } from '../shared/edition';
+import { sendMetaEvent } from '../shared/meta-capi';
 import { sendEmail } from '../email/handler';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -54,6 +55,11 @@ const REGION = process.env.AWS_REGION || 'eu-central-1';
 const USER_POOL_ID = process.env.USER_POOL_ID!;
 const CLIENT_ID = process.env.CLIENT_ID!;
 const TURNSTILE_SECRET_ARN = process.env.TURNSTILE_SECRET_ARN || '';
+
+// Fallback `event_source_url` for Meta events when the browser did not send one
+// (older admin-panel build, or a direct API call). Meta requires the field on
+// website events, so it must never be empty.
+const ADMIN_BASE_URL = process.env.BASE_URL || 'https://admin.example.com';
 
 // Email domains flagged as internal/company accounts. LA6: a domain match is
 // NOT proof of mailbox ownership (signup never verifies email), so it no
@@ -211,6 +217,16 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
  * 4. Create Cognito admin user
  * 5. Seed a default vault (owner added as admin)
  */
+/**
+ * Read an optional client-supplied string, bounded. Returns '' for anything
+ * that is not a usable string so callers can treat empty as absent.
+ */
+function readOptionalString(value: unknown, maxLength: number): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  return trimmed.length > maxLength ? '' : trimmed;
+}
+
 async function handleSignup(
   event: APIGatewayProxyEvent,
   requestId: string
@@ -264,6 +280,18 @@ async function handleSignup(
   const email = (body.email as string).trim().toLowerCase();
   const password = body.password as string;
   const displayName = (body.displayName as string).trim();
+
+  // Meta ad attribution, all optional and all attacker-controlled — they are
+  // marketing metadata only and never influence auth, tier, or provisioning.
+  // Bounded so a hostile client cannot bloat the org record.
+  const metaAttribution = {
+    eventId: readOptionalString(body.metaEventId, 128),
+    fbp: readOptionalString(body.metaFbp, 256),
+    fbc: readOptionalString(body.metaFbc, 512),
+    sourceUrl: readOptionalString(body.metaSourceUrl, 1024),
+    clientIp: getClientIp(event),
+    clientUserAgent: getUserAgent(event),
+  };
 
   // Validate slug format: alphanumeric + hyphens, 3-48 chars
   if (!/^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$/.test(orgSlug)) {
@@ -437,6 +465,21 @@ async function handleSignup(
     status: 'active',
   };
 
+  // Persist Meta ad attribution captured in the browser. StartTrial and Purchase
+  // fire from Stripe webhooks days later with no browser in the picture, so
+  // these are the only match keys those events will ever have. Only non-empty
+  // values are written — DynamoDB stores an empty string fine, but an empty
+  // match key sent to Meta counts as present-but-unmatchable.
+  for (const [field, value] of Object.entries({
+    metaFbp: metaAttribution.fbp,
+    metaFbc: metaAttribution.fbc,
+    metaSignupIp: metaAttribution.clientIp,
+    metaSignupUserAgent: metaAttribution.clientUserAgent,
+    metaSignupUrl: metaAttribution.sourceUrl,
+  })) {
+    if (value) orgRecord[field] = value;
+  }
+
   // LA5: make slug uniqueness atomic. The Step-1 Get check is a TOCTOU — two
   // concurrent signups for the same slug both pass it, then the second Put
   // overwrites the first org's record (orgId/owner/tier), so the first owner's
@@ -551,6 +594,24 @@ async function handleSignup(
     orgName: orgName,
     orgSlug: orgSlug,
     adminName: displayName || email.split('@')[0],
+  });
+
+  // Server half of CompleteRegistration. The browser fires the same event with
+  // the same event_id and Meta collapses the pair; the redundancy covers ad
+  // blockers on one side and request failures on the other. sendMetaEvent never
+  // throws — a marketing event must not fail a completed signup.
+  await sendMetaEvent({
+    eventName: 'CompleteRegistration',
+    eventId: metaAttribution.eventId || `reg-${orgId}`,
+    eventSourceUrl: metaAttribution.sourceUrl || `${ADMIN_BASE_URL}/#/signup`,
+    userData: {
+      email,
+      externalId: orgId,
+      fbp: metaAttribution.fbp,
+      fbc: metaAttribution.fbc,
+      clientIp: metaAttribution.clientIp,
+      clientUserAgent: metaAttribution.clientUserAgent,
+    },
   });
 
   return formatSuccess(

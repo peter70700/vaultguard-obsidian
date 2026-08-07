@@ -138,6 +138,20 @@ variable "turnstile_secret_arn" {
   default     = ""
 }
 
+# ─── Meta advertising (Conversions API) ──────────────────────────────────────
+
+variable "meta_dataset_id" {
+  description = "Meta dataset / pixel ID used by the Conversions API. Public value (it also ships in landing/index.html). Empty — the default — makes every server-side Meta event a silent no-op, which is the required state for Community Edition and self-hosted deploys."
+  type        = string
+  default     = ""
+}
+
+variable "meta_capi_secret_arn" {
+  description = "Secrets Manager ARN holding {\"accessToken\":\"...\"} for the Meta Conversions API. MUST be encrypted with the AWS-managed aws/secretsmanager key, NOT the project CMK: the signup Lambda's kms:Decrypt grant is pinned to kms:ViaService = dynamodb, so a CMK-encrypted secret is undecryptable there and the failure is swallowed silently. Empty disables all Meta events and drops the secretsmanager:GetSecretValue grant from both roles."
+  type        = string
+  default     = ""
+}
+
 # ─── Google Workspace (inbound mail) ─────────────────────────────────────────
 # Google Workspace site-verification TXT and DKIM TXT are managed manually
 # in the Route 53 console; they are intentionally NOT modelled as terraform

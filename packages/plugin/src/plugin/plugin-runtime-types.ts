@@ -53,8 +53,24 @@ import type {
 } from "./long-operation";
 import type { VaultOrientationService } from "./vault-orientation";
 
-// Shield icon SVG for the ribbon.
-export const VAULTGUARD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>`;
+// The VaultGuard mark for the ribbon — the approved Mineral Governance folded
+// shield, geometry copied verbatim from
+// `landing/public/brand/logo/vaultguard-mark.svg`. Do not redraw it.
+//
+// Reduced for ribbon size, the same way `landing/public/favicon.svg` is reduced
+// for tab size: the canonical mark's outer hairline edge and its spine are
+// dropped and the lock is solid, because at 16-18px those merge into a blob. A
+// rendered size matrix against the stock lucide icons this sits beside
+// (`message-square`, `git-fork`) put the strokes at x3.6 on the canonical
+// weights — 2.2 -> 7.92 and 1.7 -> 6.12 — which is where the mark carries the
+// same optical weight as its neighbours. Heavier (x3.8+) and the two folds
+// close up; lighter (x3.2) and it reads faint next to them.
+//
+// Monochrome `currentColor` on purpose: this renders inside the user's theme,
+// so it inherits the ribbon's ink and its hover/active states like every other
+// icon there. The brand's brass and verdigris are NOT applied here — they are
+// drawn for the landing's warm paper and would fight an arbitrary theme.
+export const VAULTGUARD_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" fill="none" stroke="currentColor" stroke-linejoin="round"><path d="M48 11 80 23v23c0 20-12 33-32 42-20-9-32-22-32-42V23l32-12Z" stroke-width="7.92"/><path d="M48 26 65 34v15c0 11-6 19-17 25-11-6-17-14-17-25V34l17-8Z" stroke-width="6.12"/><rect x="42" y="41" width="12" height="12" rx="2" fill="currentColor" stroke="none"/></svg>`;
 
 // The AI Chat ribbon button and view tab use Obsidian's stock lucide
 // `message-square` icon. Stock icons are pre-registered by Obsidian, so the

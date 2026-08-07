@@ -11,22 +11,71 @@ function svgEl<K extends keyof SVGElementTagNameMap>(
   return el;
 }
 
+/**
+ * The VaultGuard mark at modal size — the approved Mineral Governance folded
+ * shield, geometry copied verbatim from
+ * `landing/public/brand/logo/vaultguard-mark.svg`. Do not redraw it.
+ *
+ * Rendered at 48px by `.vaultguard-login-icon svg` and
+ * `.vaultguard-pin-modal-icon svg`, which is above the 44px floor share-bridge
+ * measured for the folded layers, so this keeps the canonical outer edge — the
+ * ribbon mark (`VAULTGUARD_ICON`) drops it because 18px cannot hold it.
+ *
+ * Two deliberate departures from the canonical asset, both because this renders
+ * in ONE colour where the asset uses three:
+ *  - The spine is dropped. In the asset it is verdigris over a brass fold; at a
+ *    single colour it crosses the lock plate and reads as an artifact.
+ *  - The lock is solid rather than an outlined plate with a boss, matching the
+ *    ribbon mark so the two stay one family.
+ * Strokes are the canonical weights at x1.6, which a rendered size matrix put at
+ * the point where the outer edge still reads as a finer contour than the fold it
+ * frames instead of a third competing ring.
+ *
+ * Monochrome `currentColor` on purpose — both call sites set
+ * `color: var(--interactive-accent)`, so the mark follows the user's theme. The
+ * brand's brass and verdigris are NOT applied here; they are drawn for the
+ * landing's warm paper and would fight an arbitrary theme.
+ */
 export function createShieldIcon(parent: HTMLElement): SVGSVGElement {
   const svg = svgEl("svg", {
     xmlns: SVG_NS,
     width: "48",
     height: "48",
-    viewBox: "0 0 24 24",
+    viewBox: "0 0 96 96",
     fill: "none",
     stroke: "currentColor",
-    "stroke-width": "1.5",
-    "stroke-linecap": "round",
     "stroke-linejoin": "round",
   });
+  // outer edge → ward → keep, then the lock
   svg.appendChild(
-    svgEl("path", { d: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" })
+    svgEl("path", {
+      d: "M48 4 87 19v28c0 23-15 38-39 47C24 85 9 70 9 47V19L48 4Z",
+      "stroke-width": "2.24",
+    })
   );
-  svg.appendChild(svgEl("path", { d: "m9 12 2 2 4-4" }));
+  svg.appendChild(
+    svgEl("path", {
+      d: "M48 11 80 23v23c0 20-12 33-32 42-20-9-32-22-32-42V23l32-12Z",
+      "stroke-width": "3.52",
+    })
+  );
+  svg.appendChild(
+    svgEl("path", {
+      d: "M48 26 65 34v15c0 11-6 19-17 25-11-6-17-14-17-25V34l17-8Z",
+      "stroke-width": "2.72",
+    })
+  );
+  svg.appendChild(
+    svgEl("rect", {
+      x: "42",
+      y: "41",
+      width: "12",
+      height: "12",
+      rx: "2",
+      fill: "currentColor",
+      stroke: "none",
+    })
+  );
   parent.appendChild(svg);
   return svg;
 }
