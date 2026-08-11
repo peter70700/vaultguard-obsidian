@@ -47,7 +47,8 @@ import {
   generateId,
   AuthError,
   ValidationError,
-  recordVaultActivity,
+  beginVaultMutationIntent,
+  commitVaultMutationIntent,
   PutCommand,
   DeleteCommand,
   UpdateCommand,
@@ -55,6 +56,7 @@ import {
   UserContext,
   VaultRecord,
   VaultMemberRecord,
+  VaultMutationIntent,
   VaultMemberRole,
   VaultKind,
   PluginAllowlistEntry,
@@ -135,6 +137,35 @@ const VALID_KINDS: VaultKind[] = ['team', 'personal', 'shared'];
 const VALID_ROLES: VaultMemberRole[] = ['viewer', 'editor', 'admin'];
 const MAX_NAME_LENGTH = 80;
 const MAX_DESCRIPTION_LENGTH = 500;
+
+async function performMemberRoleMutation<T>(
+  params: { orgId: string; vaultId: string; actorUserId: string },
+  mutation: () => Promise<T>,
+): Promise<T> {
+  const intent: VaultMutationIntent = await beginVaultMutationIntent({
+    ...params,
+    action: 'permission_changed',
+    path: '/**',
+    verification: { kind: 'permission-state' },
+  });
+  // A failed SDK response can be ambiguous, so leave the durable intent for
+  // reconciliation instead of deleting it on the error path.
+  const result = await mutation();
+  try {
+    await commitVaultMutationIntent(intent);
+  } catch {
+    console.error('[VAULTS] member-role mutation requires activity reconciliation', {
+      vaultId: params.vaultId,
+      intentId: intent.intentId,
+    });
+    throw new AuthError(
+      'Member role changed, but peer synchronization requires reconciliation. Retry shortly.',
+      503,
+      'ACTIVITY_RECONCILIATION_REQUIRED',
+    );
+  }
+  return result;
+}
 const DEFAULT_MEMBER_RULE_PRIORITY = 0;
 const DEFAULT_MEMBER_RULE_SK = 'RULE';
 const DEFAULT_MEMBER_RULE_SOURCE = 'vault-member-default';
@@ -607,23 +638,34 @@ async function handleUpdateMember(
     );
   }
 
-  await docClient.send(
-    new UpdateCommand({
-      TableName: VAULT_MEMBERS_TABLE,
-      Key: { vaultId, userId: targetUserId },
-      UpdateExpression: 'SET #role = :role',
-      ExpressionAttributeNames: { '#role': 'role' },
-      ExpressionAttributeValues: { ':role': role },
-    })
-  );
+  const persistRole = async (): Promise<void> => {
+    await docClient.send(
+      new UpdateCommand({
+        TableName: VAULT_MEMBERS_TABLE,
+        Key: { vaultId, userId: targetUserId },
+        UpdateExpression: 'SET #role = :role',
+        ExpressionAttributeNames: { '#role': 'role' },
+        ExpressionAttributeValues: { ':role': role },
+      })
+    );
 
-  await upsertDefaultMemberPermission(
-    vault,
-    targetUserId,
-    role,
-    user.userId,
-    new Date().toISOString()
-  );
+    await upsertDefaultMemberPermission(
+      vault,
+      targetUserId,
+      role,
+      user.userId,
+      new Date().toISOString()
+    );
+  };
+
+  if (existing.role !== role) {
+    await performMemberRoleMutation(
+      { orgId: vault.orgId, vaultId, actorUserId: user.userId },
+      persistRole,
+    );
+  } else {
+    await persistRole();
+  }
 
   let revokedLeases = 0;
   if (existing.role !== role) {
@@ -637,16 +679,6 @@ async function handleUpdateMember(
       user.userId
     );
 
-    // Signal member clients to clear local permission caches and re-evaluate
-    // their file set. The default member rule is `/**`, so the whole vault can
-    // be affected by a role change.
-    await recordVaultActivity({
-      orgId: vault.orgId,
-      vaultId,
-      action: 'permission_changed',
-      path: '/**',
-      actorUserId: user.userId,
-    });
   }
 
   await logAudit({

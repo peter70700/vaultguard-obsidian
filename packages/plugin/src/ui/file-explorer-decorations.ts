@@ -17,6 +17,7 @@ import {
   UserListEntry,
   VaultMemberRecord,
 } from "../api/client";
+import type { PermissionStoreState } from "../plugin/permission-store";
 import { PermissionLevel } from "../types";
 import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials } from "./access-user-utils";
 
@@ -24,6 +25,7 @@ import { buildAccessUserMap, getAccessUserDisplayName, getAccessUserNameInitials
 
 const DECORATION_CLS = "vaultguard-fe-decoration";
 const HIDDEN_CLS = "vaultguard-fe-hidden";
+const STATUS_CLS = "vaultguard-fe-status";
 const CACHE_TTL_MS = 120_000; // 2 minutes
 const PARTIAL_CACHE_TTL_MS = 15_000; // retry principal summaries quickly when only dots are known
 const DEBOUNCE_MS = 300; // debounce observer-triggered repaints
@@ -33,6 +35,7 @@ const BATCH_PATH_LIMIT = 100; // matches backend cap
 // ─── Types ─────────────────────────────────────────────────────────────────
 
 type DecorationLevel = PermissionAccessLevel | "unknown";
+type ExplorerStatus = "loading" | "unavailable";
 
 interface DecorationCacheEntry {
   level: DecorationLevel;
@@ -48,6 +51,7 @@ export interface FileExplorerDecorationsConfig {
   currentUserId: string;
   currentUserRole: string;
   isReady?: () => boolean;
+  getPermissionStoreState?: () => PermissionStoreState;
   getPermissionLevel?: (path: string) => Promise<PermissionLevel>;
 }
 
@@ -112,8 +116,24 @@ export class FileExplorerDecorations {
     this.cache.clear();
     this.inFlightPaths.clear();
     if (this.enabled) {
+      this.hideCurrentUndecidedRows();
       this.scheduleDecorate();
     }
+  }
+
+  /**
+   * Reconcile the explorer's status with the canonical permission-store
+   * lifecycle without invalidating already-fetched per-path decorations.
+   */
+  syncPermissionState(): void {
+    if (!this.enabled) return;
+    const container = this.observedContainer ?? this.getFileExplorerContainer();
+    if (!container) {
+      this.observeFileExplorer();
+      return;
+    }
+    this.hideUndecidedRows(container);
+    this.scheduleDecorate();
   }
 
   /**
@@ -134,6 +154,7 @@ export class FileExplorerDecorations {
       this.clearUserDirectory();
     }
     if (this.enabled) {
+      this.hideCurrentUndecidedRows();
       this.scheduleDecorate();
     }
   }
@@ -158,6 +179,7 @@ export class FileExplorerDecorations {
       this.clearUserDirectory();
     }
     if (this.enabled) {
+      this.hideCurrentUndecidedRows();
       this.scheduleDecorate();
     }
   }
@@ -165,8 +187,8 @@ export class FileExplorerDecorations {
   /**
    * Toggles which indicators the decorator renders: the dot reflects the
    * current user's own level, the avatar stack reflects others' access. The
-   * decorator itself stays active while either is on — the inaccessible-file
-   * hiding behavior is bundled with the decorator running, not with either dot.
+   * decorator itself stays active independently of both visual preferences:
+   * inaccessible-file hiding is a permission boundary, not an indicator.
    */
   setDisplayOptions(opts: { showMyLevel: boolean; showOthersAccess: boolean }): void {
     this.showMyLevel = opts.showMyLevel;
@@ -204,6 +226,7 @@ export class FileExplorerDecorations {
     this.observer = new MutationObserver(() => {
       // If we caused the mutation ourselves, ignore it
       if (this.isDecorating) return;
+      this.hideUndecidedRows(explorerEl);
       this.scheduleDecorate();
     });
 
@@ -211,6 +234,7 @@ export class FileExplorerDecorations {
       childList: true,
       subtree: true,
     });
+    this.hideUndecidedRows(explorerEl);
   }
 
   private stopObserver(): void {
@@ -321,9 +345,29 @@ export class FileExplorerDecorations {
       }
     }
 
+    // Fail closed before the first await. Without this synchronous pending
+    // pass, Obsidian can render a newly discovered filename while directory
+    // and permission requests are still in flight.
+    let hasPendingItems = false;
+    this.isDecorating = true;
+    try {
+      for (const { item, path } of itemPaths) {
+        if (!this.hasAuthoritativeDecision(this.cache.get(path))) {
+          this.setItemHidden(item, true);
+          hasPendingItems = true;
+        }
+      }
+      this.setExplorerStatus(
+        container,
+        this.resolveExplorerStatus(hasPendingItems ? "loading" : null)
+      );
+    } finally {
+      this.isDecorating = false;
+    }
+
     // Kick off backend fetches (user directory + path access summaries). If
-    // those calls fail, rows still get a role-based fallback decoration below
-    // so the native explorer never looks like VaultGuard forgot to render.
+    // those calls fail, rows retain a neutral decoration but stay hidden until
+    // a real permission decision is available.
     await this.loadPrincipalDirectoryIfNeeded();
     if (pathsToFetch.length > 0) {
       await this.fetchAccessForPaths(pathsToFetch);
@@ -335,6 +379,8 @@ export class FileExplorerDecorations {
     const foldersWithAccessibleDescendant = this.collectFoldersWithAccessibleDescendant(itemPaths);
 
     // Guard: set flag so observer ignores our own DOM mutations
+    let hasUnresolvedItems = false;
+    let hasUnresolvedRequestInFlight = false;
     this.isDecorating = true;
     try {
       for (const { item, path, isFile } of itemPaths) {
@@ -346,15 +392,28 @@ export class FileExplorerDecorations {
         // can see grants access — Obsidian only renders expanded descendants
         // into the DOM, so the descendant guard keeps an expanded subtree
         // visible while still collapsing a folder the user genuinely can't
-        // enter. Requiring a backend-sourced level keeps a cold/offline cache
-        // from making the whole tree disappear.
-        const shouldHide = cachedEntry
+        // enter. A missing/fallback entry is pending and remains hidden rather
+        // than turning cache absence into filename visibility.
+        const shouldHide = this.hasAuthoritativeDecision(cachedEntry)
           ? this.shouldHideItem(isFile, cachedEntry, foldersWithAccessibleDescendant.has(path))
-          : false;
+          : true;
         this.setItemHidden(item, shouldHide);
+        if (!this.hasAuthoritativeDecision(cachedEntry)) {
+          hasUnresolvedItems = true;
+          hasUnresolvedRequestInFlight ||= this.inFlightPaths.has(path);
+        }
 
         this.applyDecoration(item, entry);
       }
+      const unresolvedStatus = hasUnresolvedItems
+        ? hasUnresolvedRequestInFlight
+          ? "loading"
+          : "unavailable"
+        : null;
+      this.setExplorerStatus(
+        container,
+        this.resolveExplorerStatus(unresolvedStatus)
+      );
     } finally {
       this.isDecorating = false;
     }
@@ -514,6 +573,7 @@ export class FileExplorerDecorations {
       for (const item of hidden) {
         item.classList.remove(HIDDEN_CLS);
       }
+      this.setExplorerStatus(container, null);
     } finally {
       this.isDecorating = false;
     }
@@ -531,6 +591,124 @@ export class FileExplorerDecorations {
     // cache resolves folders to a non-backend "none", so this never makes the
     // whole tree vanish before the backend has actually answered.
     return entry.source === "backend" && !hasAccessibleDescendant;
+  }
+
+  /**
+   * Hides cache-cold rows synchronously. MutationObserver callbacks run before
+   * the next paint, so doing this before the debounced fetch closes the brief
+   * filename window without blocking the UI on network I/O.
+   */
+  private hideUndecidedRows(container: HTMLElement): void {
+    if (
+      !this.enabled ||
+      !this.isReady() ||
+      typeof container.querySelectorAll !== "function"
+    ) return;
+
+    let hasUndecidedItems = false;
+    this.isDecorating = true;
+    try {
+      for (const item of this.getExplorerItems(container)) {
+        const path = this.getItemPath(item);
+        if (path && !this.hasAuthoritativeDecision(this.cache.get(path))) {
+          this.setItemHidden(item, true);
+          hasUndecidedItems = true;
+        }
+      }
+      this.setExplorerStatus(
+        container,
+        this.resolveExplorerStatus(hasUndecidedItems ? "loading" : null)
+      );
+    } finally {
+      this.isDecorating = false;
+    }
+  }
+
+  /**
+   * Explains why native explorer rows are temporarily hidden. The indicator is
+   * only present when real rows are awaiting an access decision, so a genuinely
+   * empty vault keeps Obsidian's normal empty state.
+   */
+  private setExplorerStatus(container: HTMLElement, status: ExplorerStatus | null): void {
+    if (typeof container.querySelector !== "function") return;
+    const existing = container.querySelector<HTMLElement>(`.${STATUS_CLS}`);
+    if (!status) {
+      existing?.remove();
+      return;
+    }
+    if (existing?.dataset.vaultguardState === status) return;
+    existing?.remove();
+
+    const scrollingHost = container.querySelector<HTMLElement>(".nav-files-container");
+    const host = scrollingHost?.parentElement ?? container;
+    if (typeof host.appendChild !== "function") return;
+
+    const statusEl = createDiv({
+      cls: `${STATUS_CLS} vaultguard-fe-status-${status}`,
+    });
+    statusEl.dataset.vaultguardState = status;
+    statusEl.setAttribute("role", "status");
+    statusEl.setAttribute("aria-live", "polite");
+    statusEl.setAttribute("aria-atomic", "true");
+
+    const icon = statusEl.createSpan({
+      cls: status === "loading" ? "vaultguard-sb-spinner" : "vaultguard-fe-status-icon",
+    });
+    setIcon(icon, status === "loading" ? "loader" : "circle-alert");
+    statusEl.createSpan({
+      text: status === "loading"
+        ? "Loading files…"
+        : "Files couldn’t be loaded. Check your connection.",
+    });
+    if (scrollingHost && typeof host.insertBefore === "function") {
+      host.insertBefore(statusEl, scrollingHost);
+    } else {
+      host.appendChild(statusEl);
+    }
+  }
+
+  private resolveExplorerStatus(rowStatus: ExplorerStatus | null): ExplorerStatus | null {
+    const lifecycleStatus = this.getPermissionLifecycleStatus();
+    if (rowStatus === "loading" || lifecycleStatus === "loading") return "loading";
+    return rowStatus ?? lifecycleStatus;
+  }
+
+  /**
+   * Covers the short post-login window where the permission store is loading
+   * but Obsidian has not materialized file-explorer rows yet. Local vault
+   * contents distinguish that state from a genuinely empty vault.
+   */
+  private getPermissionLifecycleStatus(): ExplorerStatus | null {
+    const state = this.config.getPermissionStoreState?.();
+    if (!state || !this.hasLocalVaultFiles()) return null;
+    if (state.kind === "cold" || state.kind === "warming") return "loading";
+    if (state.kind === "fetch-failed") return "unavailable";
+    return null;
+  }
+
+  private hasLocalVaultFiles(): boolean {
+    const vault = this.config.app.vault;
+    if (!vault || typeof vault.getFiles !== "function") return false;
+    try {
+      return vault.getFiles().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private hideCurrentUndecidedRows(): void {
+    const container = this.observedContainer ?? this.getFileExplorerContainer();
+    if (container) this.hideUndecidedRows(container);
+  }
+
+  private hasAuthoritativeDecision(
+    entry: DecorationCacheEntry | undefined
+  ): entry is DecorationCacheEntry {
+    return Boolean(
+      entry &&
+      entry.level !== "unknown" &&
+      (entry.source === "backend" || entry.source === "level-only")
+    );
   }
 
   private fallbackEntry(): DecorationCacheEntry {

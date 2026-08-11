@@ -12,7 +12,7 @@ import type { SkillInstallerDeps } from "../agent-bridge-skill/installer";
 
 export const VAULTGUARD_CODEX_SKILL_NAME = "vaultguard-obsidian";
 
-const CODEX_SKILL_VERSION = 1;
+const CODEX_SKILL_VERSION = 2;
 const MANAGED_MARKER_REGEX =
   /vaultguard-managed:\s*true[\s\S]{0,300}?vaultguard-client:\s*codex[\s\S]{0,300}?vaultguard-schema:\s*(\d+)/m;
 

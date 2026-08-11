@@ -111,6 +111,7 @@ export function initFileExplorerDecorations(
     currentUserId: ctx.session?.userId ?? "",
     currentUserRole: ctx.getEffectiveUiRole(),
     isReady: () => ctx.isFileExplorerDecorationDataReady(),
+    getPermissionStoreState: () => ctx.permissionStore.getStoreState(),
     getPermissionLevel: (path) => ctx.getEffectivePermission(path),
   });
 
@@ -122,6 +123,12 @@ export function initFileExplorerDecorations(
     ctx.permissionStore.on("changed", (...args: unknown[]) => {
       const payload = (args[0] as { path?: string } | undefined) ?? {};
       fileExplorerDecorations.invalidate(payload.path);
+    })
+  );
+
+  ctx.registerEvent(
+    ctx.permissionStore.on("state-changed", () => {
+      fileExplorerDecorations.syncPermissionState();
     })
   );
 

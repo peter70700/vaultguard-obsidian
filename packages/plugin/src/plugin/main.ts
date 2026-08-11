@@ -15,6 +15,7 @@
 import { Modal, Notice, Plugin, Platform, TFile, TFolder, Menu, normalizePath, requestUrl, RequestUrlResponse, requireApiVersion } from "obsidian";
 import { VaultGuardSettingTab, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "./settings";
 import { LoginModal, LoginCredentials } from "./login-modal";
+import { completePluginHumanVerification } from "./auth-human-verification";
 import type { ConversationStore } from "../ui/chat/conversation-store";
 import { BindingReconciliationModal, ReconciliationDecision, ReconciliationPlan } from "./binding-reconciliation-modal";
 import { ShareManagementModal } from "./share-management-modal";
@@ -54,6 +55,8 @@ import {
   createAtRestAdapterRuntime,
   type AtRestDecryptAndDisableResult,
   type AtRestAdapterRuntime,
+  type GitRepositoryDetectionResult,
+  type GitRepositoryPlaintextTransitionResult,
 } from "./at-rest-adapter-runtime";
 import { AtRestRecoveryCodeModal, AtRestRestoreModal } from "./at-rest-modals";
 import { AtRestRecoveryModal } from "../ui/at-rest-recovery-modal";
@@ -66,6 +69,10 @@ import {
   writeAutomaticLocalProjectMemoryModePreference,
   type AutomaticLocalProjectMemoryModeDecision,
 } from "./local-project-memory-mode";
+import {
+  readDetectGitRepoFolderPreference,
+  writeDetectGitRepoFolderPreference,
+} from "./git-repository-plaintext";
 import { PathPermissionsModal } from "../ui/path-permissions-modal";
 import { FileExplorerDecorations } from "../ui/file-explorer-decorations";
 import { VaultGuardSidebarView, VAULTGUARD_VIEW_TYPE } from "../ui/vaultguard-sidebar-view";
@@ -236,6 +243,7 @@ import {
   ApiResponse,
   PendingLargeFileRecord,
   OptionalModuleId,
+  type StatusBarMode,
 } from "../types";
 
 export { VAULTGUARD_CHAT_ICON_ID };
@@ -533,6 +541,54 @@ export default class VaultGuardPlugin extends Plugin {
     return { kind: "enabled" };
   }
 
+  isDetectGitRepoFolderEnabled(): boolean {
+    try {
+      return readDetectGitRepoFolderPreference(this.app);
+    } catch (error) {
+      this.logError("Reading the Git repository folder detection preference failed", error);
+      return false;
+    }
+  }
+
+  setDetectGitRepoFolderEnabled(enabled: boolean): void {
+    writeDetectGitRepoFolderPreference(this.app, enabled);
+  }
+
+  async refreshDetectedGitRepositoryRoots(): Promise<GitRepositoryDetectionResult> {
+    try {
+      return await this.ensureAtRestAdapterRuntimeObject().refreshDetectedGitRepositoryRoots({
+        enabled: this.isDetectGitRepoFolderEnabled(),
+        mobile: Platform.isMobileApp,
+      });
+    } catch (error) {
+      this.logError("Git repository folder detection failed", error);
+      return {
+        roots: [],
+        scannedEntries: 0,
+        complete: false,
+        reason: "listing-failed",
+      };
+    }
+  }
+
+  async convertDetectedGitRepositoryCiphertext(): Promise<GitRepositoryPlaintextTransitionResult> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      return { decrypted: 0, alreadyPlaintext: 0, failed: 0, failures: [] };
+    }
+    try {
+      return await this.ensureAtRestAdapterRuntimeObject()
+        .convertDetectedGitRepositoryCiphertext();
+    } catch (error) {
+      this.logError("Converting detected Git repository files to plaintext failed", error);
+      return {
+        decrypted: 0,
+        alreadyPlaintext: 0,
+        failed: 1,
+        failures: [{ path: "", error: error instanceof Error ? error.message : String(error) }],
+      };
+    }
+  }
+
   async enableLocalProjectMemoryMode(
     source: "manual" | "automatic" = "manual",
   ): Promise<void> {
@@ -559,6 +615,21 @@ export default class VaultGuardPlugin extends Plugin {
     this.settings.localProjectMemoryMode = false;
     this.settings.localProjectMemoryModeAutoEnableSuppressed = true;
     await this.saveSettings();
+    const repositoryDetection = await this.refreshDetectedGitRepositoryRoots();
+    if (!repositoryDetection.complete) {
+      new Notice(
+        `VaultGuard Sync: Git repository folder detection was incomplete after leaving Local Project Memory Mode after ${repositoryDetection.scannedEntries} entries. Undiscovered folders keep normal local encryption.`,
+        10000,
+      );
+    }
+    await this.initAtRestCipher();
+    const repositoryTransition = await this.convertDetectedGitRepositoryCiphertext();
+    if (repositoryTransition.failed > 0) {
+      new Notice(
+        `VaultGuard Sync: ${repositoryTransition.failed} detected repository file(s) could not be converted to plaintext after leaving Local Project Memory Mode and remain protected. Review the console before using external Git tools.`,
+        12000,
+      );
+    }
     this.restartSyncTimer();
     this.updateStatusBar();
   }
@@ -993,11 +1064,17 @@ export default class VaultGuardPlugin extends Plugin {
   /** SY5: debounce handle for persisting the offline queue envelope. */
   private offlineQueuePersistTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Serializes envelope writes so a reset deletion cannot be followed by an older write. */
+  private offlineQueuePersistTail: Promise<void> = Promise.resolve();
+
   /** Per-file server version state used for optimistic write guards. */
   private remoteFileState = new RemoteFileStateStore();
 
   /** Debounce handle for the encrypted remote-file-state envelope. */
   private remoteFileStatePersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Serializes remote-state writes with user-confirmed reset deletion. */
+  private remoteFileStatePersistTail: Promise<void> = Promise.resolve();
 
   /** Per-file permission header injected into markdown views */
   private filePermissionHeader: FilePermissionHeader | null = null;
@@ -1510,6 +1587,10 @@ export default class VaultGuardPlugin extends Plugin {
       getServerVaultId: () => this.settings.serverVaultId,
       isLocalProjectMemoryModeEnabled: () => this.isLocalProjectMemoryModeEnabled(),
       getApiClient: () => this.apiClient,
+      getSettings: () => this.settings,
+      getSyncState: () => this.syncState,
+      getConnectionState: () => this.connectionState,
+      getOfflineQueueLength: () => this.offlineQueue.length,
       getAtRestCipher: () => this.getAtRestCipher(),
       getVaultOrientationService: () => this.getVaultOrientationService(),
       getAdapterReadBinary: () =>
@@ -2070,6 +2151,11 @@ export default class VaultGuardPlugin extends Plugin {
 
     // Load persisted settings
     await this.loadSettings();
+    // Ribbon nodes are registered before the first await so Obsidian sees them
+    // during its initial layout snapshot. Re-apply visibility after settings
+    // load so persisted per-icon choices take effect without destroying those
+    // node references.
+    this.applyRibbonIconLayout();
 
     this.longOperationUi = new LongOperationUiController(this.app, this.longOperations);
     this.longOperationUi.start();
@@ -2084,11 +2170,8 @@ export default class VaultGuardPlugin extends Plugin {
     this.settingTab = new VaultGuardSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
 
-    // Initialize status bar
-    if (this.settings.showStatusBar) {
-      this.statusBarEl = this.addStatusBarItem();
-      this.updateStatusBar();
-    }
+    // Initialize the status bar from the canonical presentation mode.
+    this.applyStatusBarMode();
 
     // Create API client (tokens are set later during session restore or login)
     this.rebuildApiClient();
@@ -2175,10 +2258,21 @@ export default class VaultGuardPlugin extends Plugin {
     // `cipherInitPromise` until init settles.
     this.interceptVaultAdapter();
 
-    // Evaluate the shared Git-repository default only after raw adapter methods
-    // are captured for a fail-closed protection inspection and before the
-    // at-rest runtime can provision or unlock local protection.
+    // Evaluate the shared repo-root default after raw adapter methods are
+    // captured for its fail-closed protection inspection and before local
+    // at-rest initialization can provision or unlock protection.
     await this.maybeAutoEnableLocalProjectMemoryMode();
+
+    // Discover Git repository plaintext boundaries only after raw adapter
+    // delegates are captured, and before local at-rest initialization can
+    // encrypt a repository write. This never changes Local Project Memory Mode.
+    const startupRepositoryDetection = await this.refreshDetectedGitRepositoryRoots();
+    if (!startupRepositoryDetection.complete) {
+      new Notice(
+        `VaultGuard Sync: Git repository folder detection was incomplete during startup after ${startupRepositoryDetection.scannedEntries} entries. Undiscovered folders keep normal local encryption.`,
+        10000,
+      );
+    }
 
     // BIN-A preview: pre-decrypt an opened media file into the resource-preview
     // blob cache so standalone image/PDF views get a synchronous getResourcePath
@@ -2206,6 +2300,13 @@ export default class VaultGuardPlugin extends Plugin {
     // provisioning/needs-recovery when a PIN owns the LAK (edge #6).
     this.initPinLockManager();
     await this.initAtRestCipher();
+    const startupRepositoryTransition = await this.convertDetectedGitRepositoryCiphertext();
+    if (startupRepositoryTransition.failed > 0) {
+      new Notice(
+        `VaultGuard Sync: ${startupRepositoryTransition.failed} detected repository file(s) could not be converted to plaintext during startup and remain protected. Review the console before using external Git tools.`,
+        12000,
+      );
+    }
 
     // SY5: restore queued offline operations (LAK-encrypted envelope) so
     // limited-access/offline edits survive a restart instead of evaporating
@@ -2392,7 +2493,10 @@ export default class VaultGuardPlugin extends Plugin {
     const previousSemanticEmbeddingEndpoint = before.semanticEmbeddingEndpoint;
     const previousSemanticEmbeddingModel = before.semanticEmbeddingModel;
     const previousSyncInterval = before.syncInterval;
-    const previousShowStatusBar = before.showStatusBar;
+    const previousStatusBarMode = this.getStatusBarMode();
+    const previousAiChatRibbonVisibility = this.shouldShowAiChatRibbonIcon();
+    const previousPermissionsGraphRibbonVisibility =
+      this.shouldShowPermissionsGraphRibbonIcon();
     const previousConnection = snapshotConnectionBoundary(before);
 
     await this.getSettingsRuntime().loadSettings("external");
@@ -2468,10 +2572,17 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.settings.syncInterval !== previousSyncInterval && this.session) {
       this.restartSyncTimer();
     }
-    if (this.settings.showStatusBar !== previousShowStatusBar) {
-      this.toggleStatusBar(this.settings.showStatusBar);
+    if (this.getStatusBarMode() !== previousStatusBarMode) {
+      this.applyStatusBarMode();
     } else {
       this.updateStatusBar();
+    }
+    if (
+      this.shouldShowAiChatRibbonIcon() !== previousAiChatRibbonVisibility ||
+      this.shouldShowPermissionsGraphRibbonIcon() !==
+        previousPermissionsGraphRibbonVisibility
+    ) {
+      this.applyRibbonIconLayout();
     }
 
     this.refreshFileExplorerDecorations();
@@ -2545,14 +2656,17 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.offlineQueuePersistTimer) {
       clearTimeout(this.offlineQueuePersistTimer);
       this.offlineQueuePersistTimer = null;
-      cleanupTasks.push({ name: "offline-queue-persist", promise: this.persistOfflineQueue() });
+      cleanupTasks.push({
+        name: "offline-queue-persist",
+        promise: this.enqueueOfflineQueuePersist(() => this.persistOfflineQueue()),
+      });
     }
     if (this.remoteFileStatePersistTimer) {
       clearTimeout(this.remoteFileStatePersistTimer);
       this.remoteFileStatePersistTimer = null;
       cleanupTasks.push({
         name: "remote-file-state-persist",
-        promise: this.persistRemoteFileState(),
+        promise: this.enqueueRemoteFileStatePersist(() => this.persistRemoteFileState()),
       });
     }
 
@@ -2814,6 +2928,8 @@ export default class VaultGuardPlugin extends Plugin {
     }
     const lease = this.ensureAgentBridgeRuntime().createLease({
       ...input,
+      // Public/external leases never receive private Obsidian command authority.
+      allowAutomation: false,
       // The current storage mode is plugin-owned. External callers cannot use
       // this input flag to bypass the normal server-vault prerequisite.
       localProjectMemoryMode,
@@ -3015,6 +3131,7 @@ export default class VaultGuardPlugin extends Plugin {
           this.settings.serverVaultId &&
           !this.isVaultLocked,
         ),
+      getDefaultResultLimit: () => this.settings.discoveryResultLimit,
       search: async (request) => (await this.ensureDiscoveryRuntime()).search(request),
       cancel: () => this.discoveryRuntime?.cancel(),
       openLocalPath: (path) => this.openDiscoveryLocalPath(path),
@@ -3448,6 +3565,7 @@ export default class VaultGuardPlugin extends Plugin {
               name: this.settings.serverVaultName || "Bound vault",
             }
           : null,
+      getDefaultResultLimit: () => this.settings.discoveryResultLimit,
       getSemanticStatus: () => {
         const status = this.getSemanticSearchStatus();
         return {
@@ -3510,6 +3628,11 @@ export default class VaultGuardPlugin extends Plugin {
       persistent: false,
       expiresWithSession: true,
       localProjectMemoryMode,
+      // Governed command aliases are private-API-backed and therefore only
+      // available to the trusted desktop chat lease. Public lease callers can
+      // never widen themselves into this capability.
+      allowAutomation:
+        Platform.isDesktopApp === true && input.allowAutomation === true,
     });
     this.vaultOrientationService?.invalidate("agent-bridge-lease-created");
     return lease;
@@ -3858,6 +3981,7 @@ export default class VaultGuardPlugin extends Plugin {
     cognitoUserPoolId: string;
     cognitoClientId: string;
     organizationId: string;
+    loginVerificationMode: "disabled" | "observe" | "enforce";
   } {
     return this.getSettingsRuntime().getEffectiveConfig();
   }
@@ -4226,11 +4350,8 @@ export default class VaultGuardPlugin extends Plugin {
     requireOrgSlug?: boolean;
   }): void {
     const manualMode = this.settings.manualConfig === true;
-    const hasBundledCloudAuth =
-      Boolean(SAAS_DEFAULTS.cognitoUserPoolId) &&
-      Boolean(SAAS_DEFAULTS.cognitoClientId);
     const requireOrgSlug =
-      options?.requireOrgSlug ?? (!manualMode && !hasBundledCloudAuth);
+      options?.requireOrgSlug ?? !manualMode;
 
     const modal = new LoginModal(
       this.app,
@@ -4314,7 +4435,41 @@ export default class VaultGuardPlugin extends Plugin {
         // Clear any stale challenge so the next login starts from the
         // password step and Cognito routes the user to MFA_SETUP.
         this.pendingChallengeSession = null;
-      }
+      },
+      manualMode
+        ? undefined
+        : async (
+            organization,
+            email,
+            generation,
+            isGenerationCurrent,
+            onVerificationRequired,
+          ) => {
+            const slug = organization.trim().toLowerCase();
+            if (!slug) {
+              throw new Error("Organization configuration could not be resolved. Check the slug and try again.");
+            }
+            if (slug !== this.settings.orgSlug || !this.serverFeatures) {
+              await this.resolveOrgConfig(slug);
+            }
+            const cfg = this.getEffectiveConfig();
+            if (!cfg.apiEndpoint || !cfg.cognitoClientId) {
+              throw new Error("Human verification is temporarily unavailable. Please try again.");
+            }
+            if (cfg.loginVerificationMode === "disabled") {
+              return { mode: "disabled" } as const;
+            }
+            onVerificationRequired();
+            const binding = await completePluginHumanVerification({
+              apiBaseUrl: cfg.apiEndpoint,
+              organization: slug,
+              email,
+              clientId: cfg.cognitoClientId,
+              generation,
+              isGenerationCurrent,
+            });
+            return { mode: cfg.loginVerificationMode, binding };
+          }
     );
     modal.open();
   }
@@ -4431,20 +4586,13 @@ export default class VaultGuardPlugin extends Plugin {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         if (isExpiredChallengeSessionError(message)) {
-          // PL5: the challenge session died while the user typed. Clear it and
-          // re-authenticate with the (temporary) password to mint a fresh
-          // NEW_PASSWORD_REQUIRED challenge — handleAuthResult re-drives the
-          // modal's set-password form with the new session.
+          // A fresh InitiateAuth would run Cognito PreAuthentication again.
+          // The prior human-verification permit was consumed by the original
+          // attempt, so restart the journey and require a new proof instead of
+          // silently retrying without metadata or replaying the old permit.
           this.pendingChallengeSession = null;
           this.pendingNewPasswordChallenge = false;
-          const freshAuth = await cognitoLogin(
-            cfg.cognitoUserPoolId,
-            cfg.cognitoClientId,
-            credentials.email,
-            credentials.password
-          );
-          await this.handleAuthResult(freshAuth, credentials);
-          return;
+          throw new Error("AUTH_RESTART_REQUIRED");
         }
         if (/invalidpassword|conform to policy|password.*(policy|requirement)/i.test(message)) {
           throw new Error(
@@ -4480,28 +4628,12 @@ export default class VaultGuardPlugin extends Plugin {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         if (isExpiredChallengeSessionError(message)) {
-          // PL5: the ~3-minute challenge session expired while the user typed
-          // the code. Replaying it fails forever — clear it, re-authenticate,
-          // and surface a routed MFA prompt carrying the fresh session.
+          // A new InitiateAuth requires a fresh, one-time human-verification
+          // permit. Return to credentials so the modal invalidates the old
+          // challenge generation and obtains a new browser proof.
           this.pendingChallengeSession = null;
-          const freshAuth = await cognitoLogin(
-            cfg.cognitoUserPoolId,
-            cfg.cognitoClientId,
-            credentials.email,
-            credentials.password
-          );
-          try {
-            await this.handleAuthResult(freshAuth, credentials);
-          } catch (freshErr) {
-            const freshMsg = freshErr instanceof Error ? freshErr.message : String(freshErr);
-            if (freshMsg === "MFA code required") {
-              // Keep the modal on the MFA step ("mfa" routes there) but tell
-              // the user why their previous code did nothing.
-              throw new Error("Your MFA code expired — enter a fresh code to sign in.");
-            }
-            throw freshErr;
-          }
-          return;
+          this.pendingNewPasswordChallenge = false;
+          throw new Error("AUTH_RESTART_REQUIRED");
         }
         throw err;
       }
@@ -4512,7 +4644,8 @@ export default class VaultGuardPlugin extends Plugin {
         cfg.cognitoUserPoolId,
         cfg.cognitoClientId,
         credentials.email,
-        credentials.password
+        credentials.password,
+        credentials.loginPermitMetadata,
       );
     }
 
@@ -5557,7 +5690,13 @@ export default class VaultGuardPlugin extends Plugin {
       roles: string[];
       expiresAt: string;
       orgSettings?: OrgSettingsResponse;
-    }>("POST", "/auth/session", { vaultId: this.settings.serverVaultId || undefined }, idToken);
+    }>(
+      "POST",
+      "/auth/session",
+      { vaultId: this.settings.serverVaultId || undefined },
+      idToken,
+      { suppressSessionHeader: true }
+    );
 
     if (!response.success || !response.data) {
       throw new Error(response.error?.message ?? "VaultGuard Sync: Failed to create a server session.");
@@ -5711,9 +5850,10 @@ export default class VaultGuardPlugin extends Plugin {
         sessionId: session.sessionId,
         vaultId: this.settings.serverVaultId,
       });
-      // SD-02-F1 (M10): `this.session` is not assigned until below, so without this
-      // the lease request — an AUTHENTICATED request — would go out with no
-      // `X-VaultGuard-Session-Id` and the server's session check would return early.
+      // SD-02-F1 (M10): direct callers may reach this method before assigning
+      // `this.session`, so the candidate guarantees this authenticated lease
+      // request still carries `X-VaultGuard-Session-Id`. Normal startup already
+      // assigned the restored session, and the resolver returns the same id.
       //
       // The window is deliberately EXACTLY this one await. The else-branch below
       // calls `openServerSession` → `POST /auth/session` through the same
@@ -9056,7 +9196,11 @@ export default class VaultGuardPlugin extends Plugin {
    * failure — callers should treat null as "I don't know whether anything
    * changed" and fall through to a full sync rather than skipping.
    */
-  private async fetchSyncCursor(): Promise<{ revision: number; lastChangedAt: string } | null> {
+  private async fetchSyncCursor(): Promise<{
+    revision: number;
+    lastChangedAt: string;
+    reconciliationRequired: boolean;
+  } | null> {
     return this.ensureSyncRuntime().fetchSyncCursor();
   }
 
@@ -10162,8 +10306,8 @@ export default class VaultGuardPlugin extends Plugin {
    *   2. `apiRequest` below — every `this.apiRequest(...)` call, which is the path
    *      the restore's first key-lease request actually takes.
    *
-   * A live `this.session` always wins; the restore candidate is a fallback that
-   * exists only while `this.session` is not yet assigned. Do NOT reintroduce a
+    * A live `this.session` always wins; the restore candidate is a fallback for
+    * direct restore callers that have not assigned it yet. Do NOT reintroduce a
    * direct `this.session?.sessionId` read at either site — that is exactly the
    * drift this resolver was created to prevent.
    *
@@ -10182,7 +10326,7 @@ export default class VaultGuardPlugin extends Plugin {
     // L2 (BIN-A): optional per-request timeout override. Large binary PUTs pass a
     // longer timeout (BINARY_PUT_TIMEOUT_MS) so a slow uplink is not misread as a
     // network failure; omitted → the 30 s default in requestWithTimeout is unchanged.
-    options?: { timeoutMs?: number }
+    options?: { timeoutMs?: number; suppressSessionHeader?: boolean }
   ): Promise<ApiResponse<T>> {
     if (!idTokenOverride && this.session) {
       if (this.isSessionTokenExpiring(this.session)) {
@@ -10243,7 +10387,12 @@ export default class VaultGuardPlugin extends Plugin {
     // SD-02-F1 (M10): read through the single resolver, never `this.session`
     // directly — during a restore the live session is not assigned yet and this
     // block used to attach nothing. Behavior with a live session is unchanged.
-    const requestSessionId = this.resolveRequestSessionId();
+    // Session creation is the one authenticated bootstrap that must never carry
+    // a restored/stale server-session id. `openServerSession` opts out explicitly;
+    // every other protected request keeps using the single resolver.
+    const requestSessionId = options?.suppressSessionHeader
+      ? null
+      : this.resolveRequestSessionId();
     if (requestSessionId) {
       headers["X-VaultGuard-Session-Id"] = requestSessionId;
     } else if (idToken) {
@@ -10628,7 +10777,10 @@ export default class VaultGuardPlugin extends Plugin {
     const showMyLevel = this.settings.showMyPermissionLevel;
     const showOthersAccess = this.settings.showOthersAccess;
 
-    if ((showMyLevel || showOthersAccess) && this.isFileExplorerDecorationDataReady()) {
+    // Visual indicator preferences must not disable permission-aware filename
+    // hiding. Keep the observer/evaluator active whenever its authenticated
+    // vault context is ready, even when both badges are intentionally hidden.
+    if (this.isFileExplorerDecorationDataReady()) {
       decorations.setDisplayOptions?.({ showMyLevel, showOthersAccess });
       decorations.enable?.();
       if (refresh) {
@@ -10659,6 +10811,35 @@ export default class VaultGuardPlugin extends Plugin {
   // UI Methods
   // ─────────────────────────────────────────────────────────────────────────
 
+  private getStatusBarMode(): StatusBarMode {
+    const mode = this.settings.statusBarMode;
+    if (mode === "full" || mode === "compact" || mode === "hidden") {
+      return mode;
+    }
+    return this.settings.showStatusBar === false ? "hidden" : "full";
+  }
+
+  private shouldShowAiChatRibbonIcon(): boolean {
+    return typeof this.settings.showAiChatRibbonIcon === "boolean"
+      ? this.settings.showAiChatRibbonIcon
+      : this.settings.showRibbonIcons !== false;
+  }
+
+  private shouldShowPermissionsGraphRibbonIcon(): boolean {
+    return typeof this.settings.showPermissionsGraphRibbonIcon === "boolean"
+      ? this.settings.showPermissionsGraphRibbonIcon
+      : this.settings.showRibbonIcons !== false;
+  }
+
+  private setRibbonIconVisibility(el: HTMLElement | null, visible: boolean): void {
+    if (!el) return;
+    if (visible) {
+      el.removeClass("vaultguard-ribbon-hidden");
+    } else {
+      el.addClass("vaultguard-ribbon-hidden");
+    }
+  }
+
   private setGlobalAuthChromeState(loggedIn: boolean): void {
     const doc = getActiveObsidianDocument();
     if (!doc) {
@@ -10669,21 +10850,13 @@ export default class VaultGuardPlugin extends Plugin {
 
   /**
    * Enforce the VaultGuard ribbon icon presentation once the layout is ready:
-   * when the user has turned the quick-access icons off, remove the AI-chat and
-   * permissions-graph icons; otherwise force them into a stable
-   * shield -> chat -> graph group, overriding whatever per-vault ribbon order
-   * Obsidian may have persisted. The shield (VaultGuard menu) icon is always kept.
-   * Public so the settings toggle can re-apply it live.
+   * force the permanent shield plus retained AI-chat and permissions-graph
+   * nodes into a stable shield -> chat -> graph group, then apply each icon's
+   * independent visibility class. Retaining the nodes makes hide/show changes
+   * symmetric and immediate; no Obsidian reload is needed.
    */
   applyRibbonIconLayout(): void {
     try {
-      if (this.settings.showRibbonIcons === false) {
-        this.vaultGuardChatRibbonEl?.remove();
-        this.vaultGuardChatRibbonEl = null;
-        this.vaultGuardGraphRibbonEl?.remove();
-        this.vaultGuardGraphRibbonEl = null;
-        return;
-      }
       const shield = this.vaultGuardRibbonEl;
       if (shield && this.vaultGuardChatRibbonEl) {
         shield.insertAdjacentElement("afterend", this.vaultGuardChatRibbonEl);
@@ -10692,6 +10865,14 @@ export default class VaultGuardPlugin extends Plugin {
       if (anchor && this.vaultGuardGraphRibbonEl) {
         anchor.insertAdjacentElement("afterend", this.vaultGuardGraphRibbonEl);
       }
+      this.setRibbonIconVisibility(
+        this.vaultGuardChatRibbonEl,
+        this.shouldShowAiChatRibbonIcon(),
+      );
+      this.setRibbonIconVisibility(
+        this.vaultGuardGraphRibbonEl,
+        this.shouldShowPermissionsGraphRibbonIcon(),
+      );
     } catch (error) {
       this.logError("Applying VaultGuard ribbon icon layout failed", error);
     }
@@ -10766,6 +10947,10 @@ export default class VaultGuardPlugin extends Plugin {
     this.statusBarEl.setAttr("role", "status");
     this.statusBarEl.setAttr("aria-live", "polite");
     this.statusBarEl.setAttr("aria-atomic", "true");
+    // A compact routine state has its own descriptive label below. Clear it
+    // before higher-priority branches so an alarm or auth message can never
+    // inherit a stale "connected" label.
+    this.statusBarEl.removeAttribute?.("aria-label");
 
     const longOperation = this.longOperations.getPrimarySnapshot();
     if (longOperation) {
@@ -10825,7 +11010,13 @@ export default class VaultGuardPlugin extends Plugin {
       ? this.i18n.t("status.connected")
       : this.i18n.t("status.offline");
 
-    this.statusBarEl.setText(`VaultGuard Sync ${connectionIcon} ${statusText}`);
+    const fullStatusText = `VaultGuard Sync ${connectionIcon} ${statusText}`;
+    if (this.getStatusBarMode() === "compact") {
+      this.statusBarEl.setText(`VaultGuard ${connectionIcon}`);
+      this.statusBarEl.setAttr("aria-label", fullStatusText);
+    } else {
+      this.statusBarEl.setText(fullStatusText);
+    }
     this.statusBarEl.setAttr(
       "title",
       `VaultGuard Sync: ${statusText}${
@@ -10835,10 +11026,12 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Toggles the status bar visibility.
-   * @param show - Whether to show or hide the status bar
+   * Apply the canonical status-bar mode. Changing between full and compact
+   * reuses the existing element; hidden removes it from Obsidian's status bar.
    */
-  toggleStatusBar(show: boolean): void {
+  applyStatusBarMode(): void {
+    const show = this.getStatusBarMode() !== "hidden";
+    this.settings.showStatusBar = show;
     if (show && !this.statusBarEl) {
       this.statusBarEl = this.addStatusBarItem();
       // Clickable recovery affordance — but ONLY act while needs-recovery, so a
@@ -10852,7 +11045,25 @@ export default class VaultGuardPlugin extends Plugin {
     } else if (!show && this.statusBarEl) {
       this.statusBarEl.remove();
       this.statusBarEl = null;
+    } else if (show) {
+      this.updateStatusBar();
     }
+  }
+
+  /**
+   * Backward-compatible boolean adapter for callers from older settings UI.
+   * New code should set `settings.statusBarMode` and call
+   * `applyStatusBarMode()` instead.
+   */
+  toggleStatusBar(show: boolean): void {
+    const currentMode = this.getStatusBarMode();
+    this.settings.showStatusBar = show;
+    this.settings.statusBarMode = show
+      ? currentMode === "hidden"
+        ? "full"
+        : currentMode
+      : "hidden";
+    this.applyStatusBarMode();
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -11484,17 +11695,65 @@ export default class VaultGuardPlugin extends Plugin {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Clears all locally cached vault data.
-   * Used for security wipe or manual cache reset.
+   * Resets this device's persisted and in-memory synchronization state without
+   * deleting vault files. Used by the user-confirmed recovery control.
    */
   async clearLocalCache(): Promise<void> {
+    const queuedOperationsBeforeReset = [...this.offlineQueue];
+    const remoteFileStateBeforeReset = this.remoteFileState.snapshot();
+
+    if (this.offlineQueuePersistTimer) {
+      clearTimeout(this.offlineQueuePersistTimer);
+      this.offlineQueuePersistTimer = null;
+    }
+    if (this.remoteFileStatePersistTimer) {
+      clearTimeout(this.remoteFileStatePersistTimer);
+      this.remoteFileStatePersistTimer = null;
+    }
+
+    this.offlineQueue = [];
+    this.remoteFileState.clear();
+
+    try {
+      // Reset is a user-confirmed destructive action, so do not use the normal
+      // one-second debounce. Queue deletion behind every older persistence task
+      // before reporting success, so an in-flight writer cannot resurrect stale
+      // state after reset. Mutations that begin after these tasks are enqueued
+      // remain ordered after the reset boundary and persist normally.
+      const [remoteDeletion, queueDeletion] = await Promise.allSettled([
+        this.enqueueRemoteFileStatePersist(() =>
+          this.removePersistedEnvelope(this.remoteFileStateEnvelopePath())
+        ),
+        this.enqueueOfflineQueuePersist(() =>
+          this.removePersistedEnvelope(this.offlineQueueEnvelopePath())
+        ),
+      ]);
+      if (remoteDeletion.status === "rejected") throw remoteDeletion.reason;
+      if (queueDeletion.status === "rejected") throw queueDeletion.reason;
+    } catch (error) {
+      // Keep the in-memory state aligned with the still-authoritative persisted
+      // state and schedule a best-effort rewrite if one envelope was already
+      // removed before the other operation failed. Preserve any new mutations
+      // that arrived after the reset boundary as well as the pre-reset state.
+      this.offlineQueue = [...queuedOperationsBeforeReset, ...this.offlineQueue];
+      const remoteFileStateAfterResetStarted = this.remoteFileState.snapshot();
+      const restoredRemoteEntries = new Map(
+        remoteFileStateBeforeReset.entries.map((entry) => [entry.path, entry])
+      );
+      for (const entry of remoteFileStateAfterResetStarted.entries) {
+        restoredRemoteEntries.set(entry.path, entry);
+      }
+      this.remoteFileState.load(Array.from(restoredRemoteEntries.values()));
+      this.scheduleOfflineQueuePersist();
+      this.scheduleRemoteFileStatePersist();
+      this.logError("Failed to reset persisted local sync state", error);
+      throw error;
+    }
+
     // Phase 9: SILENT — teardown path, surfaces will be torn down
     // immediately by surrounding lifecycle code. No subscribers to notify.
     this.permissionStore.invalidate();
     this.readOnlyGuard?.refreshAll();
-    this.offlineQueue = [];
-    this.remoteFileState.clear();
-    this.scheduleRemoteFileStatePersist();
     this.syncState = {
       lastSync: null,
       pendingChanges: 0,
@@ -11504,8 +11763,8 @@ export default class VaultGuardPlugin extends Plugin {
       bytesDownloaded: 0,
       lastError: null,
     };
-    new Notice("VaultGuard Sync: Local cache cleared.");
-    this.log("Local cache cleared.");
+    new Notice("VaultGuard Sync: Local sync state reset. Vault files were not deleted.");
+    this.log("Local sync state reset.");
   }
 
   /**
@@ -11664,17 +11923,27 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.offlineQueuePersistTimer) clearTimeout(this.offlineQueuePersistTimer);
     this.offlineQueuePersistTimer = setTimeout(() => {
       this.offlineQueuePersistTimer = null;
-      void this.persistOfflineQueue();
+      void this.enqueueOfflineQueuePersist(() => this.persistOfflineQueue());
     }, 1_000);
+  }
+
+  private enqueueOfflineQueuePersist(task: () => Promise<void>): Promise<void> {
+    const run = this.offlineQueuePersistTail.then(task);
+    this.offlineQueuePersistTail = run.catch(() => undefined);
+    return run;
+  }
+
+  private async removePersistedEnvelope(path: string): Promise<void> {
+    if (await this.app.vault.adapter.exists(path)) {
+      await this.app.vault.adapter.remove(path);
+    }
   }
 
   private async persistOfflineQueue(): Promise<void> {
     const path = this.offlineQueueEnvelopePath();
     try {
       if (this.offlineQueue.length === 0) {
-        if (await this.app.vault.adapter.exists(path)) {
-          await this.app.vault.adapter.remove(path);
-        }
+        await this.removePersistedEnvelope(path);
         return;
       }
       // Fail closed: never write queued plaintext unencrypted. If the cipher
@@ -11832,17 +12101,21 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.remoteFileStatePersistTimer) clearTimeout(this.remoteFileStatePersistTimer);
     this.remoteFileStatePersistTimer = setTimeout(() => {
       this.remoteFileStatePersistTimer = null;
-      void this.persistRemoteFileState();
+      void this.enqueueRemoteFileStatePersist(() => this.persistRemoteFileState());
     }, 1_000);
+  }
+
+  private enqueueRemoteFileStatePersist(task: () => Promise<void>): Promise<void> {
+    const run = this.remoteFileStatePersistTail.then(task);
+    this.remoteFileStatePersistTail = run.catch(() => undefined);
+    return run;
   }
 
   private async persistRemoteFileState(): Promise<void> {
     const path = this.remoteFileStateEnvelopePath();
     try {
       if (this.remoteFileState.isEmpty()) {
-        if (await this.app.vault.adapter.exists(path)) {
-          await this.app.vault.adapter.remove(path);
-        }
+        await this.removePersistedEnvelope(path);
         return;
       }
       if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.writeBinary) {

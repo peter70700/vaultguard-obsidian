@@ -17,6 +17,7 @@
       "!**/*.min.js",
       "!**/*.min.css",
       "!.planning/**",
+      "!.claude/**",
       "!admin-panel/**",
       "!landing/**",
       "!share-bridge/**",

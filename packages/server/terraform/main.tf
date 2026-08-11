@@ -63,11 +63,19 @@ module "cognito" {
 
   production_hardening = var.production_hardening
 
-  stage            = var.stage
-  is_prod          = local.is_prod
-  callback_urls    = var.cognito_callback_urls
-  logout_urls      = var.cognito_logout_urls
-  ses_sender_email = var.sender_email
+  stage                  = var.stage
+  is_prod                = local.is_prod
+  callback_urls          = var.cognito_callback_urls
+  logout_urls            = var.cognito_logout_urls
+  ses_sender_email       = var.sender_email
+  mfa_configuration      = var.cognito_mfa_configuration
+  advanced_security_mode = var.cognito_advanced_security_mode
+  login_verification_mode       = var.login_verification_mode
+  login_verification_client_ids = var.login_verification_client_ids
+  sessions_table_name           = module.dynamodb.sessions_table_name
+  sessions_table_arn            = module.dynamodb.sessions_table_arn
+  kms_key_arn                    = module.kms.key_arn
+  turnstile_secret_arn          = var.turnstile_secret_arn != "" ? var.turnstile_secret_arn : ""
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,6 +133,10 @@ module "lambda" {
   super_admin_emails               = var.super_admin_emails
   key_lease_duration_seconds       = var.key_lease_duration_seconds
   session_duration_seconds         = var.session_duration_seconds
+  session_enforcement_mode         = var.session_enforcement_mode
+  login_verification_mode          = var.login_verification_mode
+  login_verification_browser_url   = var.login_verification_browser_url
+  turnstile_expected_hostnames     = join(",", var.turnstile_expected_hostnames)
   max_file_size_bytes              = var.max_file_size_bytes
   vaultguard_edition               = var.vaultguard_edition
   allow_public_signup              = var.vaultguard_allow_public_signup

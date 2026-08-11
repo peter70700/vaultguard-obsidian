@@ -59,6 +59,8 @@ jobs:
             package-lock.json
             infrastructure/package-lock.json
             admin-panel/package-lock.json
+            landing/package-lock.json
+            share-bridge/package-lock.json
 
       - name: Install root dependencies
         run: npm ci --no-audit --no-fund
@@ -68,6 +70,18 @@ jobs:
 
       - name: Verify private repo
         run: npm run verify
+
+      - name: Build infrastructure workspace
+        run: npm --prefix infrastructure run build
+
+      - name: Build admin panel workspace
+        run: npm --prefix admin-panel run build
+
+      - name: Build landing workspace
+        run: npm --prefix landing run build
+
+      - name: Build share bridge workspace
+        run: npm --prefix share-bridge run build
 
   build-test-lint:
     # The job body targets the public monorepo's packages/{plugin,server}/
@@ -113,7 +127,7 @@ jobs:
       # local install inside packages/server/infrastructure to populate them.
       - name: Install server (infrastructure) deps
         working-directory: packages/server/infrastructure
-        run: npm install --ignore-scripts --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Typecheck (server)
         run: npx tsc -p packages/server/infrastructure/tsconfig.json --noEmit

@@ -190,6 +190,44 @@
     var(--background-primary);
 }
 
+/* ── Settings reconciliation additions ──────────────────────────────────── */
+
+.vaultguard-settings-status-host:empty,
+.vaultguard-settings-status-host[aria-hidden="true"] {
+  display: none;
+}
+
+.vaultguard-settings-status-host {
+  margin-block: var(--size-4-3);
+}
+
+.vaultguard-plaintext-warning-setting {
+  border-inline-start: 3px solid var(--text-error);
+}
+
+.vaultguard-plaintext-warning-setting .setting-item-name {
+  color: var(--text-error);
+}
+
+.vaultguard-settings-section-summary:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.vaultguard-ribbon-hidden {
+  display: none;
+}
+
+@media (forced-colors: active) {
+  .vaultguard-plaintext-warning-setting {
+    border-color: CanvasText;
+  }
+
+  .vaultguard-settings-section-summary:focus-visible {
+    outline-color: Highlight;
+  }
+}
+
 .modal.vaultguard-long-operation-modal .modal-content {
   padding: 0;
   overflow: hidden;
@@ -1579,9 +1617,9 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
    no hardcoded colors so dark/light mode both read correctly. */
 
 .vaultguard-settings-section {
-  margin-bottom: 18px;
-  border-top: 1px solid var(--background-modifier-border);
-  padding-top: 12px;
+  margin-block-end: 18px;
+  border-block-start: 1px solid var(--background-modifier-border);
+  padding-block-start: 12px;
 }
 
 .vaultguard-settings-section-summary {
@@ -1602,7 +1640,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
  * alignment block below) — before that it sat at 0px while the headings inside
  * it sat at 16px, which made the parent read as shallower than its children. */
 .vaultguard-settings-section-body {
-  padding-top: 8px;
+  padding-block-start: 8px;
 }
 
 /* ─── MFA Setup Modal ──────────────────────────────────────────────────── */
@@ -1903,7 +1941,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 }
 
 .vaultguard-number-setting input[type="number"] {
-  width: 96px;
+  inline-size: 96px;
 }
 
 .vaultguard-admin-textarea-setting {
@@ -2089,7 +2127,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 .modal.vaultguard-login-modal .modal-content,
 .vaultguard-login-modal-content {
   --vaultguard-login-styles-ready: 1;
-  padding: 32px 28px 24px;
+  padding: 38px 32px 30px;
   overflow-x: hidden;
   overflow-y: auto;
   max-height: calc(100vh - 64px);
@@ -2112,7 +2150,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 .vaultguard-login-icon {
   display: flex;
   justify-content: center;
-  margin-bottom: 12px;
+  margin-bottom: 16px;
   color: var(--interactive-accent);
   line-height: 1;
 }
@@ -2125,7 +2163,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 
 .vaultguard-login-title {
   text-align: center;
-  margin: 0 0 4px;
+  margin: 0 0 8px;
   font-size: 1.35em;
   font-weight: 700;
   line-height: 1.25;
@@ -2135,7 +2173,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   text-align: center;
   color: var(--text-muted);
   font-size: 0.88em;
-  margin: 0 0 24px;
+  margin: 0 0 30px;
   line-height: 1.4;
 }
 
@@ -2154,8 +2192,14 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 .vaultguard-login-form {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 20px;
   min-width: 0;
+}
+
+.vaultguard-login-credentials-step {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
 }
 
 .vaultguard-field-group {
@@ -2308,7 +2352,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 
 .vaultguard-forgot-link {
   text-align: right;
-  margin-top: -8px;
+  margin-top: -4px;
 }
 
 .vaultguard-forgot-link a {
@@ -2401,7 +2445,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 /* ─── Login footer / setup-guide docs link ───────────────────────────── */
 
 .vaultguard-login-footer {
-  margin-top: 14px;
+  margin-top: 18px;
   text-align: center;
 }
 
@@ -2419,7 +2463,7 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 @media (max-width: 420px) {
   .modal.vaultguard-login-modal .modal-content,
   .vaultguard-login-modal-content {
-    padding: 28px 20px 20px;
+    padding: 30px 22px 24px;
   }
 
   .vaultguard-login-actions {
@@ -4376,6 +4420,31 @@ body.is-phone .vaultguard-fh-popover-inner {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ─── Decoration Container ────────────────────────────────────────────── */
+
+.vaultguard-fe-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 16px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  text-align: center;
+}
+
+.vaultguard-fe-status-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.vaultguard-fe-status-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.vaultguard-fe-status-unavailable {
+  color: var(--text-error);
+}
 
 .vaultguard-fe-decoration {
   display: inline-flex;
@@ -6640,6 +6709,7 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-chat-input-bar {
   position: relative;
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   gap: 8px;
   padding: 8px 12px;
@@ -6756,63 +6826,133 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-chat-input:disabled {
   opacity: 0.6;
 }
-/* Image attach button + pending-attachment thumbnails */
+/* Chat attachment menu + pending image/document chips */
 .vaultguard-chat-attach-btn {
   flex: 0 0 auto;
-  align-self: stretch;
+  align-self: flex-end;
   display: flex;
   align-items: center;
-  padding: 0 8px;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
   border: none;
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
 }
-.vaultguard-chat-attach-btn:hover {
+.vaultguard-chat-attach-btn:hover:not(:disabled) {
   color: var(--text-normal);
+}
+.vaultguard-chat-attach-btn:disabled {
+  cursor: default;
+  opacity: 0.45;
 }
 .vaultguard-chat-attach-btn svg {
   width: 18px;
   height: 18px;
 }
 .vaultguard-chat-attachments {
-  position: absolute;
-  bottom: calc(100% - 4px);
-  left: 12px;
-  right: 12px;
+  position: static;
+  order: -1;
+  flex: 1 0 100%;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  max-height: 168px;
+  overflow-y: auto;
   padding: 6px;
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
-  z-index: 19;
 }
-.vaultguard-chat-attachment {
-  position: relative;
+.vaultguard-chat-attachment,
+.vaultguard-chat-document-pin {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: min(100%, 260px);
+  padding: 4px 6px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 7px;
+}
+.vaultguard-chat-document-pin.is-unavailable {
+  border-color: var(--color-red);
 }
 .vaultguard-chat-attachment-thumb {
-  width: 48px;
-  height: 48px;
+  flex: 0 0 auto;
+  width: 42px;
+  height: 42px;
   object-fit: cover;
-  border-radius: 6px;
+  border-radius: 5px;
   display: block;
 }
-.vaultguard-chat-attachment-remove {
-  position: absolute;
-  top: -6px;
-  right: -6px;
-  background: var(--background-secondary);
-  border-radius: 50%;
-  cursor: pointer;
+.vaultguard-chat-document-pin-icon {
+  flex: 0 0 auto;
+  display: flex;
+  color: var(--text-muted);
+}
+.vaultguard-chat-document-pin.is-unavailable .vaultguard-chat-document-pin-icon {
+  color: var(--color-red);
+}
+.vaultguard-chat-attachment-details {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+.vaultguard-chat-attachment-name,
+.vaultguard-chat-attachment-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vaultguard-chat-attachment-name {
   color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+}
+.vaultguard-chat-attachment-meta {
+  color: var(--text-muted);
+  font-size: var(--font-smallest);
+}
+.vaultguard-chat-attachment-remove {
+  position: static;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.vaultguard-chat-attachment-remove:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
 }
 .vaultguard-chat-attachment-remove svg {
   width: 12px;
   height: 12px;
 }
+.vaultguard-chat-attach-btn:focus-visible,
+.vaultguard-chat-attachment-remove:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
 
+@media (forced-colors: active) {
+  .vaultguard-chat-attachment,
+  .vaultguard-chat-document-pin,
+  .vaultguard-chat-attachment-remove {
+    border: 1px solid CanvasText;
+  }
+}
 /* Image thumbnails inside a sent user bubble */
 .vaultguard-chat-bubble-images {
   display: flex;

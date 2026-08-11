@@ -80,6 +80,32 @@ describe("cognito-auth", () => {
     });
   });
 
+  it("sends the one-time permit only as initial Cognito client metadata", async () => {
+    mockRequestUrl.mockResolvedValueOnce(
+      jsonResponse(200, {
+        ChallengeName: "SOFTWARE_TOKEN_MFA",
+        Session: "challenge-session",
+      }),
+    );
+
+    await cognitoLogin(
+      "eu-central-1_pool",
+      "client-123",
+      "user@example.com",
+      "Password123!",
+      { attemptId: "attempt-1", permit: "one-time-permit" },
+    );
+
+    expect(JSON.parse(mockRequestUrl.mock.calls[0]![0].body as string)).toMatchObject({
+      AuthFlow: "USER_PASSWORD_AUTH",
+      ClientMetadata: {
+        vaultguardAttemptId: "attempt-1",
+        vaultguardLoginPermit: "one-time-permit",
+        vaultguardClientSurface: "plugin",
+      },
+    });
+  });
+
   it("returns challenge metadata when Cognito requires MFA or password reset", async () => {
     mockRequestUrl.mockResolvedValueOnce(
       jsonResponse(200, {

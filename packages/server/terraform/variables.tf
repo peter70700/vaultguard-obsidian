@@ -30,11 +30,73 @@ variable "production_hardening" {
 
     Set to false ONLY for genuinely disposable stacks (ephemeral CI, throwaway
     local test envs) that must be torn down freely. Does NOT change any
-    authentication posture — Cognito MFA and advanced-security remain gated on
-    the stage name so enabling hardening never forces MFA on existing users.
+    authentication posture — Cognito MFA and advanced-security use their own
+    explicit inputs so enabling durability hardening never changes login policy.
   EOT
   type        = bool
   default     = true
+}
+
+variable "session_enforcement_mode" {
+  description = "Server-session header policy for authenticated Lambdas. Keep observe until bootstrap/logout telemetry is reviewed, then select enforce explicitly."
+  type        = string
+  default     = "observe"
+
+  validation {
+    condition     = contains(["observe", "enforce"], var.session_enforcement_mode)
+    error_message = "session_enforcement_mode must be either observe or enforce."
+  }
+}
+
+variable "cognito_mfa_configuration" {
+  description = "Explicit Cognito MFA posture. OPTIONAL is migration-safe; ON requires an operator-approved enrollment rollout."
+  type        = string
+  default     = "OPTIONAL"
+
+  validation {
+    condition     = contains(["OFF", "OPTIONAL", "ON"], var.cognito_mfa_configuration)
+    error_message = "cognito_mfa_configuration must be OFF, OPTIONAL, or ON."
+  }
+}
+
+variable "cognito_advanced_security_mode" {
+  description = "Explicit Cognito threat-protection posture. AUDIT/ENFORCED can incur cost and require operator approval; the safe local default is OFF."
+  type        = string
+  default     = "OFF"
+
+  validation {
+    condition     = contains(["OFF", "AUDIT", "ENFORCED"], var.cognito_advanced_security_mode)
+    error_message = "cognito_advanced_security_mode must be OFF, AUDIT, or ENFORCED."
+  }
+}
+
+variable "login_verification_mode" {
+  description = "One-time login-permit posture. Keep disabled until the Cognito/Turnstile live feasibility gate is completed; observe and enforce require explicit operator selection."
+  type        = string
+  default     = "disabled"
+
+  validation {
+    condition     = contains(["disabled", "observe", "enforce"], var.login_verification_mode)
+    error_message = "login_verification_mode must be disabled, observe, or enforce."
+  }
+}
+
+variable "login_verification_client_ids" {
+  description = "Explicit Cognito app-client IDs subject to login-permit observation/enforcement. Populate only after the managed client ID is known and before selecting observe/enforce."
+  type        = list(string)
+  default     = []
+}
+
+variable "login_verification_browser_url" {
+  description = "Managed browser completion page for Obsidian human-verification handoff."
+  type        = string
+  default     = "https://auth.example.com/complete"
+}
+
+variable "turnstile_expected_hostnames" {
+  description = "Exact Turnstile hostnames accepted for login/signup purpose-bound proofs."
+  type        = list(string)
+  default     = ["admin.example.com", "auth.example.com"]
 }
 
 variable "api_data_trace_enabled" {

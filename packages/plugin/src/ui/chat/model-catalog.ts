@@ -25,6 +25,7 @@ export interface ResolveModelCatalogInput {
   apiKey: string | null;
   codexBinaryPath?: string | null;
   selectedModel: string;
+  preferNewest?: boolean;
   forceRefresh?: boolean;
   signal?: AbortSignal;
 }
@@ -117,7 +118,7 @@ export class ProviderModelCatalogService {
     ) {
       return {
         provider: input.provider,
-        ...resolveSelection(selectedModel, cached),
+        ...resolveSelection(selectedModel, cached, input.preferNewest === true),
         source: "cache",
         fetchedAt: cached.fetchedAt,
       };
@@ -154,7 +155,7 @@ export class ProviderModelCatalogService {
       }
       return {
         provider: input.provider,
-        ...resolveSelection(selectedModel, options),
+        ...resolveSelection(selectedModel, options, input.preferNewest === true),
         source: "live",
         fetchedAt: this.cache.get(input.provider)?.fetchedAt,
       };
@@ -241,7 +242,9 @@ function normalizeAnthropicModels(models: ReadonlyArray<AnthropicModelInfo>): Ch
 function normalizeCodexModels(
   models: ReadonlyArray<CodexSubscriptionModelInfo>,
 ): LoadedCatalog {
-  const valid = models.filter(isCodexModelRecord);
+  const valid = models
+    .filter(isCodexModelRecord)
+    .sort(compareCodexModelRecency);
   const options = dedupeOptions(
     valid.map((model) => ({
       id: normalizeModelId(model.model),
@@ -251,10 +254,29 @@ function normalizeCodexModels(
           : humanizeModelId(model.model),
     })),
   );
-  const defaultModel = valid.find(
-    (model) => model.isDefault === true && options.some((option) => option.id === model.model.trim()),
-  )?.model.trim();
+  const defaultModel = options[0]?.id;
   return { options, ...(defaultModel ? { defaultModel } : {}) };
+}
+
+function compareCodexModelRecency(
+  left: CodexSubscriptionModelInfo,
+  right: CodexSubscriptionModelInfo,
+): number {
+  const leftVersion = parseGptVersion(left.model);
+  const rightVersion = parseGptVersion(right.model);
+  if (!leftVersion) return rightVersion ? 1 : 0;
+  if (!rightVersion) return -1;
+  const length = Math.max(leftVersion.length, rightVersion.length);
+  for (let index = 0; index < length; index++) {
+    const difference = (rightVersion[index] ?? 0) - (leftVersion[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+function parseGptVersion(model: string): number[] | null {
+  const match = /^gpt-(\d+(?:\.\d+)*)(?:-|$)/i.exec(model.trim());
+  return match ? match[1].split(".").map((part) => Number.parseInt(part, 10)) : null;
 }
 
 function isCodexModelRecord(value: unknown): value is CodexSubscriptionModelInfo {
@@ -314,15 +336,20 @@ function mergeSelected(
 function resolveSelection(
   selectedModel: string,
   catalog: Pick<LoadedCatalog, "options" | "defaultModel">,
+  preferNewest = false,
 ): { options: ReadonlyArray<ChatModelOption>; selectedModel: string } {
   const selectedAvailable = catalog.options.some((option) => option.id === selectedModel);
   const defaultAvailable =
     !!catalog.defaultModel && catalog.options.some((option) => option.id === catalog.defaultModel);
-  const resolved = selectedAvailable
-    ? selectedModel
-    : defaultAvailable
-      ? catalog.defaultModel!
-      : selectedModel;
+  const newestAvailable = catalog.options[0]?.id;
+  const resolved =
+    preferNewest && newestAvailable
+      ? newestAvailable
+      : selectedAvailable
+        ? selectedModel
+        : defaultAvailable
+          ? catalog.defaultModel!
+          : selectedModel;
   return { options: mergeSelected(resolved, catalog.options), selectedModel: resolved };
 }
 

@@ -48,6 +48,7 @@ export interface FilePermissionPanelConfig {
 }
 
 const PANEL_CLS = "vaultguard-fp-panel";
+let panelInstanceSequence = 0;
 
 export interface EffectiveAccessPrincipal {
   id: string;
@@ -82,15 +83,27 @@ export class FilePermissionPanel {
   private draftSelectedUserId: string | null = null;
   private draftLevel = "write";
   private isDestroyed = false;
+  private readonly titleId = `vaultguard-fp-title-${++panelInstanceSequence}`;
+  private readonly returnFocusEl: HTMLElement | null;
   private readonly handleViewportChange = () => this.positionPanel();
   private readonly handleKeyDown = (event: KeyboardEvent) => {
     if (event.key === "Escape") {
+      event.preventDefault();
       this.destroy();
+      return;
+    }
+    if (event.key === "Tab") {
+      this.trapFocus(event);
     }
   };
 
   constructor(cfg: FilePermissionPanelConfig) {
     this.cfg = cfg;
+    const activeElement = document.activeElement;
+    this.returnFocusEl =
+      activeElement instanceof HTMLElement && activeElement !== document.body
+        ? activeElement
+        : cfg.anchorEl;
     this.rules = [...cfg.rules];
     this.users = sortAccessUsers(cfg.initialUsers ?? []);
     this.userMap = buildAccessUserMap(this.users);
@@ -107,12 +120,17 @@ export class FilePermissionPanel {
     // Render the panel into the body so it is not trapped inside the header's
     // stacking context. This keeps the menu clickable.
     this.panelEl = document.body.createDiv({ cls: PANEL_CLS });
+    this.panelEl.setAttribute("role", "dialog");
+    this.panelEl.setAttribute("aria-modal", "true");
+    this.panelEl.setAttribute("aria-labelledby", this.titleId);
+    this.panelEl.tabIndex = -1;
     this.render();
     this.positionPanel();
 
     window.addEventListener("resize", this.handleViewportChange);
     window.addEventListener("scroll", this.handleViewportChange, true);
     document.addEventListener("keydown", this.handleKeyDown);
+    this.focusFirstControl();
 
     if (this.cfg.isAdmin) {
       void this.loadUsers();
@@ -130,6 +148,12 @@ export class FilePermissionPanel {
     this.panelEl.remove();
     this.backdropEl.remove();
     this.cfg.onClose();
+    const focusTarget = this.returnFocusEl?.isConnected
+      ? this.returnFocusEl
+      : this.cfg.anchorEl.isConnected
+        ? this.cfg.anchorEl
+        : null;
+    focusTarget?.focus();
   }
 
   setRules(rules: PermissionRule[]): void {
@@ -157,25 +181,33 @@ export class FilePermissionPanel {
   // ─── Rendering ─────────────────────────────────────────────────────
 
   private render(): void {
+    const activeElement = document.activeElement;
+    const previousFocusIndex =
+      activeElement instanceof HTMLElement && this.panelEl.contains(activeElement)
+        ? this.getFocusableElements().indexOf(activeElement)
+        : -1;
     this.panelEl.empty();
+    this.panelEl.setAttribute("aria-busy", String(this.usersLoading));
 
     // Panel header
     const header = this.panelEl.createDiv({ cls: "vaultguard-fp-header" });
     header.createEl("h4", {
       text: this.canManageAccess() ? "Manage Access" : "Who Has Access",
+      attr: { id: this.titleId },
     });
     const closeBtn = header.createEl("button", {
       cls: "vaultguard-icon-btn",
-      attr: { type: "button" },
+      attr: { type: "button", "aria-label": "Close access panel" },
     });
     setIcon(closeBtn, "x");
     closeBtn.addEventListener("click", () => this.destroy());
 
     // File path context
-    this.panelEl.createDiv({
+    const filePath = this.panelEl.createDiv({
       cls: "vaultguard-fp-filepath",
       text: this.cfg.file.path,
     });
+    filePath.setCssStyles({ overflowWrap: "anywhere" });
 
     // Divider
     this.panelEl.createEl("hr", { cls: "vaultguard-fp-divider" });
@@ -187,6 +219,11 @@ export class FilePermissionPanel {
     if (this.canManageAccess()) {
       this.panelEl.createEl("hr", { cls: "vaultguard-fp-divider" });
       this.renderAddRuleSection(this.panelEl);
+    }
+
+    if (previousFocusIndex >= 0) {
+      const focusable = this.getFocusableElements();
+      focusable[Math.min(previousFocusIndex, focusable.length - 1)]?.focus();
     }
   }
 
@@ -259,7 +296,10 @@ export class FilePermissionPanel {
 
     const levelEl = row.createDiv({ cls: "vaultguard-fp-row-level" });
     if (this.canEditEffectivePrincipal(principal)) {
-      const select = levelEl.createEl("select", { cls: "vaultguard-fp-level-select" });
+      const select = levelEl.createEl("select", {
+        cls: "vaultguard-fp-level-select",
+        attr: { "aria-label": `Access level for ${principal.label}` },
+      });
       const options: { value: string; label: string }[] = [
         { value: "admin", label: "Admin" },
         { value: "write", label: "Write" },
@@ -324,7 +364,10 @@ export class FilePermissionPanel {
     const levelEl = row.createDiv({ cls: "vaultguard-fp-row-level" });
 
     if (this.canManageAccess()) {
-      const select = levelEl.createEl("select", { cls: "vaultguard-fp-level-select" });
+      const select = levelEl.createEl("select", {
+        cls: "vaultguard-fp-level-select",
+        attr: { "aria-label": `Access level for ${this.principalLabel(rule)}` },
+      });
       const options: { value: string; label: string }[] = [
         { value: "admin", label: "Admin" },
         { value: "write", label: "Write" },
@@ -382,7 +425,10 @@ export class FilePermissionPanel {
     const form = section.createDiv({ cls: "vaultguard-fp-add-form" });
 
     // Type selector
-    const typeSelect = form.createEl("select", { cls: "vaultguard-fp-add-input" });
+    const typeSelect = form.createEl("select", {
+      cls: "vaultguard-fp-add-input",
+      attr: { "aria-label": "Principal type" },
+    });
     typeSelect.createEl("option", { text: "User", attr: { value: "user" } });
     typeSelect.createEl("option", { text: "Role", attr: { value: "role" } });
     typeSelect.value = this.draftPrincipalType;
@@ -395,6 +441,7 @@ export class FilePermissionPanel {
         placeholder: this.draftPrincipalType === "user"
           ? "Search teammates or enter a user ID"
           : "Role name",
+        "aria-label": "User",
       },
     }) as HTMLInputElement;
     principalInput.value = this.draftPrincipalValue;
@@ -405,6 +452,7 @@ export class FilePermissionPanel {
     const ROLE_VALUES = ["viewer", "editor", "admin"];
     const roleSelect = form.createEl("select", {
       cls: "vaultguard-fp-add-input vaultguard-fp-add-role",
+      attr: { "aria-label": "Role" },
     }) as HTMLSelectElement;
     roleSelect.createEl("option", { text: "Viewer", attr: { value: "viewer" } });
     roleSelect.createEl("option", { text: "Editor", attr: { value: "editor" } });
@@ -414,7 +462,10 @@ export class FilePermissionPanel {
       : "viewer";
 
     // Level selector
-    const levelSelect = form.createEl("select", { cls: "vaultguard-fp-add-input" });
+    const levelSelect = form.createEl("select", {
+      cls: "vaultguard-fp-add-input",
+      attr: { "aria-label": "Access level" },
+    });
     levelSelect.createEl("option", { text: "Read", attr: { value: "read" } });
     levelSelect.createEl("option", { text: "Write", attr: { value: "write" } });
     levelSelect.createEl("option", { text: "Admin", attr: { value: "admin" } });
@@ -438,11 +489,19 @@ export class FilePermissionPanel {
     // Add button
     const addBtn = form.createEl("button", {
       cls: "vaultguard-fp-add-btn",
-      attr: { type: "button" },
+      attr: { type: "button", "aria-label": "Add access rule" },
     });
     setIcon(addBtn, "plus");
 
-    const quickListEl = section.createDiv({ cls: "vaultguard-access-picker" });
+    const quickListEl = section.createDiv({
+      cls: "vaultguard-access-picker",
+      attr: {
+        role: "status",
+        "aria-live": "polite",
+        "aria-atomic": "true",
+        "aria-busy": String(this.usersLoading),
+      },
+    });
 
     const updateQuickList = (): void => {
       this.draftPrincipalType = typeSelect.value as "user" | "role";
@@ -1194,6 +1253,67 @@ export class FilePermissionPanel {
     return this.cfg.canManageAccess ?? this.cfg.isAdmin;
   }
 
+  private getFocusableElements(): HTMLElement[] {
+    const selector = [
+      "button",
+      "[href]",
+      "input:not([type='hidden'])",
+      "select",
+      "textarea",
+      "[tabindex]",
+    ].join(",");
+
+    return Array.from(this.panelEl.querySelectorAll<HTMLElement>(selector)).filter((element) => {
+      if (element.matches(":disabled") || element.tabIndex < 0) return false;
+      let current: HTMLElement | null = element;
+      while (current && this.panelEl.contains(current)) {
+        const style = window.getComputedStyle(current);
+        if (
+          current.hidden ||
+          current.getAttribute("aria-hidden") === "true" ||
+          style.display === "none" ||
+          style.visibility === "hidden"
+        ) {
+          return false;
+        }
+        if (current === this.panelEl) break;
+        current = current.parentElement;
+      }
+      return true;
+    });
+  }
+
+  private focusFirstControl(): void {
+    (this.getFocusableElements()[0] ?? this.panelEl).focus();
+  }
+
+  private trapFocus(event: KeyboardEvent): void {
+    const focusable = this.getFocusableElements();
+    if (focusable.length === 0) {
+      event.preventDefault();
+      this.panelEl.focus();
+      return;
+    }
+
+    const activeElement = document.activeElement;
+    const activeIndex = activeElement instanceof HTMLElement
+      ? focusable.indexOf(activeElement)
+      : -1;
+    if (activeIndex === -1) {
+      event.preventDefault();
+      (event.shiftKey ? focusable[focusable.length - 1] : focusable[0]).focus();
+      return;
+    }
+
+    if (event.shiftKey && activeIndex === 0) {
+      event.preventDefault();
+      focusable[focusable.length - 1].focus();
+    } else if (!event.shiftKey && activeIndex === focusable.length - 1) {
+      event.preventDefault();
+      focusable[0].focus();
+    }
+  }
+
   private canEditEffectivePrincipal(principal: EffectiveAccessPrincipal): boolean {
     if (!this.canManageAccess()) return false;
     if (principal.type !== "user") return false;
@@ -1232,7 +1352,7 @@ export class FilePermissionPanel {
     const viewportMargin = 12;
     const gap = 8;
     const anchorRect = this.cfg.anchorEl.getBoundingClientRect();
-    const availableWidth = Math.max(280, window.innerWidth - viewportMargin * 2);
+    const availableWidth = Math.max(0, window.innerWidth - viewportMargin * 2);
     const panelWidth = Math.min(380, availableWidth);
 
     this.panelEl.setCssStyles({ width: `${panelWidth}px` });

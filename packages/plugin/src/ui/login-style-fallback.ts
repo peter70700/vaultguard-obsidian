@@ -29,7 +29,7 @@ const CONTENT_FALLBACK_STYLES: CssStyleMap = {
   flexDirection: "column",
   boxSizing: "border-box",
   margin: "0",
-  padding: "32px 28px 24px",
+  padding: "38px 32px 30px",
   overflowX: "hidden",
   overflowY: "auto",
 };
@@ -42,7 +42,7 @@ const DESCENDANT_FALLBACK_STYLES: ReadonlyArray<
     {
       display: "flex",
       justifyContent: "center",
-      marginBottom: "12px",
+      marginBottom: "16px",
       color: "var(--interactive-accent)",
       lineHeight: "1",
     },
@@ -51,7 +51,7 @@ const DESCENDANT_FALLBACK_STYLES: ReadonlyArray<
     ".vaultguard-login-title",
     {
       textAlign: "center",
-      margin: "0 0 4px",
+      margin: "0 0 8px",
       fontSize: "1.35em",
       fontWeight: "700",
       lineHeight: "1.25",
@@ -61,7 +61,7 @@ const DESCENDANT_FALLBACK_STYLES: ReadonlyArray<
     ".vaultguard-login-subtitle",
     {
       textAlign: "center",
-      margin: "0 0 24px",
+      margin: "0 0 30px",
       fontSize: "0.88em",
       lineHeight: "1.4",
       color: "var(--text-muted)",
@@ -72,8 +72,16 @@ const DESCENDANT_FALLBACK_STYLES: ReadonlyArray<
     {
       display: "flex",
       flexDirection: "column",
-      gap: "16px",
+      gap: "20px",
       minWidth: "0",
+    },
+  ],
+  [
+    ".vaultguard-login-credentials-step",
+    {
+      display: "flex",
+      flexDirection: "column",
+      gap: "20px",
     },
   ],
   [
@@ -130,7 +138,7 @@ const DESCENDANT_FALLBACK_STYLES: ReadonlyArray<
     ".vaultguard-forgot-link",
     {
       textAlign: "right",
-      marginTop: "-8px",
+      marginTop: "-4px",
     },
   ],
   [
@@ -157,7 +165,7 @@ const DESCENDANT_FALLBACK_STYLES: ReadonlyArray<
   [
     ".vaultguard-login-footer",
     {
-      marginTop: "14px",
+      marginTop: "18px",
       textAlign: "center",
     },
   ],
@@ -187,12 +195,22 @@ export function applyLoginStyleFallbackIfNeeded(
   contentEl.setCssStyles({
     ...CONTENT_FALLBACK_STYLES,
     ...(styleWindow && styleWindow.innerWidth <= 420
-      ? { padding: "28px 20px 20px" }
+      ? { padding: "30px 22px 24px" }
       : {}),
   });
 
   for (const [selector, styles] of DESCENDANT_FALLBACK_STYLES) {
     contentEl.querySelectorAll<StyleableElement>(selector).forEach((element) => {
+      // Obsidian's HTMLElement.hide() uses an inline display:none, while
+      // native callers may use the hidden attribute. Never let the layout
+      // recovery path overwrite either visibility boundary. Applying the
+      // non-display properties is still useful when a challenge is shown
+      // later, but visibility remains owned by the authentication journey.
+      if ((element.hidden || element.style.display === "none") && styles.display) {
+        const { display: _display, ...nonVisibilityStyles } = styles;
+        element.setCssStyles(nonVisibilityStyles);
+        return;
+      }
       element.setCssStyles(styles);
     });
   }

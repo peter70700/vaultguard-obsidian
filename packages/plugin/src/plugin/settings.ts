@@ -29,7 +29,6 @@ import { AgentBridgeLeaseModal } from "./agent-bridge-modal";
 import type VaultGuardPlugin from "./main";
 import {
   VaultGuardSettings,
-  CacheEncryptionStrength,
   ConflictResolutionStrategy,
   UserSession,
 } from "../types";
@@ -71,6 +70,12 @@ import type {
 } from "./agent-bridge";
 import type { VaultOrientationSnapshot } from "./vault-orientation";
 import {
+  AUTOMATION_REGISTRY_SCHEMA_VERSION,
+  normalizeAutomationRegistry,
+  normalizeAutomationVaultPath,
+  type AutomationRegistrySettings,
+} from "./agent-automation-registry";
+import {
   buildCodexAgentsGuidance,
   buildCodexConfigToml,
   buildCodexTempWorkspaceLaunchCommand,
@@ -106,6 +111,121 @@ export function saasDefaultsHostLabel(): string {
   }
 }
 
+const MAX_AGENT_TEMPLATE_ALLOWLIST_ENTRIES = 64;
+const MAX_AUTOMATION_POLICY_JSON_CHARACTERS = 128 * 1024;
+const TEMPLATE_PATTERN_CHARACTERS = /[*?[\]{}]/;
+
+/**
+ * Tolerant persisted-settings parser for agent template trust. Only exact,
+ * vault-relative Markdown paths survive; malformed input narrows to an empty or
+ * smaller allowlist and can never widen agent access.
+ */
+export function normalizeAgentTemplateAllowlist(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const output: string[] = [];
+  for (const candidate of value.slice(0, MAX_AGENT_TEMPLATE_ALLOWLIST_ENTRIES)) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (!trimmed || trimmed.startsWith("/") || TEMPLATE_PATTERN_CHARACTERS.test(trimmed)) {
+      continue;
+    }
+    const normalized = normalizeAutomationVaultPath(trimmed);
+    if (!normalized || !normalized.toLocaleLowerCase().endsWith(".md")) continue;
+    if (!output.includes(normalized)) output.push(normalized);
+  }
+  return output;
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  const members = Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort((left, right) => left.localeCompare(right))
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`);
+  return `{${members.join(",")}}`;
+}
+
+export type AutomationPolicyJsonImportResult =
+  | { ok: true; registry: AutomationRegistrySettings }
+  | { ok: false; error: string };
+
+/**
+ * Strict human import lane. Persisted settings remain tolerant, but the editor
+ * rejects the whole draft when normalization would drop or rewrite any policy.
+ * The JSON is an entries array only, so it cannot alter the separate master
+ * enable switch.
+ */
+export function parseAutomationPolicyJsonImport(
+  value: string,
+  masterEnabled: boolean,
+): AutomationPolicyJsonImportResult {
+  if (!value || value.length > MAX_AUTOMATION_POLICY_JSON_CHARACTERS) {
+    return { ok: false, error: "Policy JSON is empty or exceeds the 128 KB limit." };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return { ok: false, error: "Policy JSON is not valid JSON." };
+  }
+  if (!Array.isArray(parsed)) {
+    return {
+      ok: false,
+      error: "Policy JSON must be an array. The master switch is managed separately.",
+    };
+  }
+  const normalized = normalizeAutomationRegistry({
+    schemaVersion: AUTOMATION_REGISTRY_SCHEMA_VERSION,
+    enabled: masterEnabled,
+    entries: parsed,
+  });
+  if (
+    normalized.entries.length !== parsed.length ||
+    stableJson(normalized.entries) !== stableJson(parsed)
+  ) {
+    return {
+      ok: false,
+      error:
+        "No policies were imported. Every entry must be canonical, unique, and outside VaultGuard's hard-denied command classes.",
+    };
+  }
+  return {
+    ok: true,
+    registry: {
+      ...normalized,
+      enabled: masterEnabled,
+    },
+  };
+}
+
+export type AgentTemplateAllowlistImportResult =
+  | { ok: true; paths: string[] }
+  | { ok: false; error: string };
+
+/** Strict editor lane: reject the whole draft instead of silently dropping a line. */
+export function parseAgentTemplateAllowlistImport(
+  value: string,
+): AgentTemplateAllowlistImportResult {
+  const requested = value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const normalized = normalizeAgentTemplateAllowlist(requested);
+  if (
+    requested.length !== normalized.length ||
+    requested.some((path, index) => path !== normalized[index])
+  ) {
+    return {
+      ok: false,
+      error:
+        "No template paths were saved. Use unique, exact vault-relative .md paths without hidden, traversal, absolute, or wildcard segments.",
+    };
+  }
+  return { ok: true, paths: normalized };
+}
+
 /**
  * Default plugin settings applied on first installation or when
  * individual settings are missing from persisted data.
@@ -122,6 +242,7 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   organizationId: "",
   cognitoUserPoolId: "",
   cognitoClientId: "",
+  loginVerificationMode: "disabled",
   syncInterval: 30,
   cacheEncryptionStrength: "standard",
   offlineKeyLeaseDuration: 24,
@@ -134,6 +255,9 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   maxRetryAttempts: 3,
   showStatusBar: true,
   showRibbonIcons: true,
+  statusBarMode: "full",
+  showAiChatRibbonIcon: true,
+  showPermissionsGraphRibbonIcon: true,
   localProjectMemoryMode: false,
   localProjectMemoryModeAutoEnableSuppressed: false,
   optionalModules: {
@@ -149,11 +273,18 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   semanticEmbeddingEndpoint: "http://127.0.0.1:11434",
   semanticEmbeddingModel: "embeddinggemma",
   discoveryResultLimit: 50,
+  automationRegistry: {
+    schemaVersion: AUTOMATION_REGISTRY_SCHEMA_VERSION,
+    enabled: false,
+    entries: [],
+  },
+  agentTemplateAllowlist: [],
   excludedPaths: [...DEFAULT_EXCLUDED_PATHS],
   aiChatModel: "claude-opus-4-8",
   aiChatEffort: "high",
   openAiModel: "gpt-5.5",
   codexModel: "gpt-5.5",
+  codexAutoSelectLatest: true,
   openAiReasoningEffort: "medium",
   openAiVerbosity: "medium",
   openAiMaxOutputTokens: 8192,
@@ -259,14 +390,14 @@ interface ChatGptConnectorReveal {
   copiedToClipboard: boolean;
 }
 
-/**
- * Every top-level section is a disclosure. The ones a user meets first default
- * to OPEN so the tab looks unchanged on arrival — the point is that they can now
- * be collapsed, not that they start collapsed. The rare, heavy, or destructive
- * ones default to CLOSED.
- */
+interface SettingsStatusMessage {
+  id: number;
+  message: string;
+  isError: boolean;
+}
+
+/** Every top-level Settings section is an independently tracked disclosure. */
 type SettingsCollapsibleSectionId =
-  // default open
   | "protection"
   | "connection"
   | "account"
@@ -275,24 +406,14 @@ type SettingsCollapsibleSectionId =
   | "access-unlock"
   | "display"
   | "capabilities"
-  // default closed
   | "manage-vaults-members"
   | "encryption-maintenance"
   | "advanced"
   | "ai-automation"
   | "danger-zone";
 
-/** Sections that start expanded. Everything else starts collapsed. */
-const DEFAULT_OPEN_SECTIONS: readonly SettingsCollapsibleSectionId[] = [
-  "protection",
-  "connection",
-  "account",
-  "vault",
-  "synchronization",
-  "access-unlock",
-  "display",
-  "capabilities",
-];
+/** Settings always loads with every section collapsed. */
+const DEFAULT_OPEN_SECTIONS: readonly SettingsCollapsibleSectionId[] = [];
 
 /** Marks the tab while a search is active, so non-`Setting` blocks (lead copy,
  *  notes, status panels) can drop out of a result list via CSS alone. */
@@ -331,6 +452,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   /** Current search text. Survives `display()` re-renders so a filtered view is
    *  not thrown away when a toggle triggers a re-render. Cleared by `hide()`. */
   private settingsFilterQuery = "";
+  private latestSettingsStatus: SettingsStatusMessage | null = null;
+  private settingsStatusSequence = 0;
+  private settingsStatusTimer: number | null = null;
   /** Set while the filter opens disclosures programmatically. Without it the
    *  native `toggle` listener would record those forced opens as user intent and
    *  permanently mark every section as open once someone searched. */
@@ -467,6 +591,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // Reopening Settings should start from the configured defaults, not from
     // whatever someone last typed into the search box.
     this.settingsFilterQuery = "";
+    this.latestSettingsStatus = null;
+    if (this.settingsStatusTimer !== null) {
+      window.clearTimeout(this.settingsStatusTimer);
+      this.settingsStatusTimer = null;
+    }
     super.hide();
   }
 
@@ -550,15 +679,54 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private showStatus(containerEl: HTMLElement, message: string, isError: boolean): void {
-    const existing = containerEl.querySelector('.vaultguard-status-msg');
-    if (existing) existing.remove();
-    const el = containerEl.createDiv({ cls: 'vaultguard-status-msg' });
-    el.addClass(isError ? 'is-error' : 'is-success');
-    el.setAttribute("role", isError ? "alert" : "status");
-    el.setAttribute("aria-live", isError ? "assertive" : "polite");
+    const status: SettingsStatusMessage = {
+      id: ++this.settingsStatusSequence,
+      message,
+      isError,
+    };
+    this.latestSettingsStatus = status;
+    if (this.settingsStatusTimer !== null) {
+      window.clearTimeout(this.settingsStatusTimer);
+    }
+
+    const sharedHost = this.containerEl.querySelector<HTMLElement>(
+      ".vaultguard-settings-status-host",
+    );
+    if (sharedHost) {
+      this.renderSettingsStatus(sharedHost);
+    } else {
+      // A few focused render helpers are exercised independently in tests and
+      // modal flows. Preserve useful local feedback when the shared shell is
+      // not mounted yet.
+      const localHost = containerEl.createDiv({ cls: "vaultguard-settings-status-host" });
+      this.renderSettingsStatus(localHost);
+    }
+
+    this.settingsStatusTimer = window.setTimeout(() => {
+      if (this.latestSettingsStatus?.id !== status.id) return;
+      this.latestSettingsStatus = null;
+      this.settingsStatusTimer = null;
+      const currentHost = this.containerEl.querySelector<HTMLElement>(
+        ".vaultguard-settings-status-host",
+      );
+      if (currentHost) this.renderSettingsStatus(currentHost);
+    }, 6000);
+  }
+
+  private renderSettingsStatus(host: HTMLElement): void {
+    host.empty();
+    const status = this.latestSettingsStatus;
+    if (!status) {
+      host.setAttribute("aria-hidden", "true");
+      return;
+    }
+    host.removeAttribute("aria-hidden");
+    const el = host.createDiv({ cls: "vaultguard-status-msg" });
+    el.addClass(status.isError ? "is-error" : "is-success");
+    el.setAttribute("role", status.isError ? "alert" : "status");
+    el.setAttribute("aria-live", status.isError ? "assertive" : "polite");
     el.setAttribute("aria-atomic", "true");
-    el.setText(message);
-    window.setTimeout(() => el.remove(), 6000);
+    el.setText(status.message);
   }
 
   /** `nested` suppresses the section's own heading when an enclosing disclosure
@@ -662,6 +830,26 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .setName(this.i18n.t("discovery.semantic.heading"))
       .setDesc(this.i18n.t("discovery.semantic.trust"))
       .setHeading();
+
+    new Setting(containerEl)
+      .setName("Default search result limit")
+      .setDesc(
+        "Maximum number of Secure Discovery results shown by default. Individual searches remain bounded to 100 results."
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("10", "10 results")
+          .addOption("25", "25 results")
+          .addOption("50", "50 results")
+          .addOption("100", "100 results")
+          .setValue(String(this.plugin.settings.discoveryResultLimit))
+          .onChange(async (value) => {
+            const parsed = Number.parseInt(value, 10);
+            if (![10, 25, 50, 100].includes(parsed)) return;
+            this.plugin.settings.discoveryResultLimit = parsed;
+            await this.plugin.saveSettings();
+          })
+      );
 
     if (Platform.isDesktopApp !== true) {
       containerEl.createEl("p", {
@@ -943,6 +1131,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     this.renderServerExcludedPathsSetting(containerEl);
     this.renderAlwaysExcludedSetting(containerEl);
     this.renderPurgeExcludedPathsSetting(containerEl, enabled);
+    this.renderGitRepositoryDetectionSetting(containerEl, enabled);
     this.renderPlaintextVaultModeSetting(containerEl, enabled);
     // Promoted out of the collapsed Advanced disclosure — see
     // `renderRecoveryCodeSetting`. It belongs with the at-rest status badge this
@@ -963,6 +1152,72 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       "Encryption maintenance",
       (body) => this.renderAtRestSection(body),
     );
+  }
+
+  private renderGitRepositoryDetectionSetting(
+    containerEl: HTMLElement,
+    localModeEnabled: boolean,
+  ): void {
+    const desktopUnavailable = Platform.isDesktopApp !== true;
+    const setting = new Setting(containerEl)
+      .setName("Detect Git repo folder")
+      .setDesc(
+        desktopUnavailable
+          ? "Desktop-only profile preference. Configure it from desktop Obsidian. When enabled there, folders containing .git stay plaintext on local disk; cloud encryption, sync, permissions, and sharing remain separate."
+          : "Keep detected Git repository folders plaintext on local disk so normal Git tools can read them. Cloud encryption, sync, permissions, and sharing remain active.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.isDetectGitRepoFolderEnabled())
+          .setDisabled(desktopUnavailable)
+          .onChange(async (value) => {
+            if (desktopUnavailable) return;
+            try {
+              this.plugin.setDetectGitRepoFolderEnabled(value);
+              const detection = await this.plugin.refreshDetectedGitRepositoryRoots();
+              if (!detection.complete) {
+                new Notice(
+                  `VaultGuard Sync: Git repository folder detection stopped after ${detection.scannedEntries} entries. Undiscovered folders keep normal local encryption.`,
+                  10000,
+                );
+              }
+              if (value && !this.plugin.isLocalProjectMemoryModeEnabled()) {
+                const transition = await this.plugin.convertDetectedGitRepositoryCiphertext();
+                if (transition.failed > 0) {
+                  new Notice(
+                    `VaultGuard Sync: ${transition.failed} detected repository file(s) could not be converted to plaintext and remain protected. Review the console before using external Git tools.`,
+                    12000,
+                  );
+                } else if (detection.complete) {
+                  const repositorySummary = detection.roots.length === 0
+                    ? "no repository folders found; normal local encryption remains active."
+                    : `${detection.roots.length} repository folder(s) now stay plaintext locally; ${transition.decrypted} existing file(s) converted and ${transition.alreadyPlaintext} already plaintext.`;
+                  new Notice(
+                    `VaultGuard Sync: Git repository detection complete: ${repositorySummary} Cloud protections remain active.`,
+                    8000,
+                  );
+                }
+              }
+              this.display();
+            } catch (error) {
+              this.showStatus(
+                containerEl,
+                error instanceof Error
+                  ? error.message
+                  : "Git repository folder detection update failed.",
+                true,
+              );
+            }
+          }),
+      );
+    setting.settingEl.addClass("vaultguard-plaintext-warning-setting");
+
+    if (localModeEnabled && this.plugin.isDetectGitRepoFolderEnabled()) {
+      this.renderSettingsNote(
+        containerEl,
+        "Git repo detection remains saved for this desktop profile, but the plaintext local-only vault setting currently supersedes it because the whole vault is already plaintext.",
+      );
+    }
   }
 
   /**
@@ -1147,7 +1402,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * the originating use case.
    */
   private renderPlaintextVaultModeSetting(containerEl: HTMLElement, enabled: boolean): void {
-    new Setting(containerEl)
+    const setting = new Setting(containerEl)
       .setName("Plaintext local-only vault")
       .setDesc(
         "For vaults that are a code repository. Keeps every file plaintext on disk and turns off cloud sync, " +
@@ -1174,6 +1429,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             }
           }),
       );
+    setting.settingEl.addClass("vaultguard-plaintext-warning-setting");
 
     // Nested under the mode toggle it modifies. The scope that used to be
     // buried mid-description ("global desktop preference") is now in the name,
@@ -1221,7 +1477,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                 containerEl,
                 err instanceof Error
                   ? err.message
-                  : "Automatic Local Project Memory Mode preference update failed.",
+                  : "Git repository folder detection update failed.",
                 true,
               );
             }
@@ -1684,6 +1940,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         dropdown
           .onChange(async (value) => {
             this.plugin.settings.codexModel = value;
+            this.plugin.settings.codexAutoSelectLatest = false;
             await this.plugin.saveSettings();
           });
       });
@@ -1767,6 +2024,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     );
   }
 
+  private isCurrentSettingsOwner(ownerEl: HTMLElement): boolean {
+    return ownerEl.isConnected !== false;
+  }
+
   private async refreshCodexModelSelect(
     selectEl: HTMLSelectElement | null,
     statusEl: HTMLElement,
@@ -1801,6 +2062,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         apiKey: null,
         codexBinaryPath: status.binaryPath,
         selectedModel: this.plugin.settings.codexModel,
+        preferNewest: this.plugin.settings.codexAutoSelectLatest !== false,
         signal: controller.signal,
       });
       if (
@@ -1994,9 +2256,12 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     try {
       status = await getClaudeAuthStatus();
     } catch (e) {
+      if (!this.isCurrentSettingsOwner(statusSetting.settingEl)) return;
       statusSetting.setDesc(`Could not check Claude Code: ${(e as Error).message}`);
       return;
     }
+
+    if (!this.isCurrentSettingsOwner(statusSetting.settingEl)) return;
 
     // Clear any prior action buttons before repopulating.
     statusSetting.clear();
@@ -2068,9 +2333,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     try {
       await this.plugin.startClaudeCliLogin();
     } catch (e) {
+      if (!this.isCurrentSettingsOwner(statusSetting.settingEl)) return;
       statusSetting.setDesc(`Could not start Claude Code sign-in: ${(e as Error).message}`);
       return;
     }
+    if (!this.isCurrentSettingsOwner(statusSetting.settingEl)) return;
     // Re-check after the login subprocess finishes.
     await this.refreshClaudeStatus(statusSetting);
   }
@@ -2083,11 +2350,23 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     try {
       status = await getCodexAuthStatus(undefined, controller.signal);
     } catch (error) {
-      if (controller.signal.aborted) return;
+      if (
+        controller.signal.aborted ||
+        !this.isCurrentSettingsOwner(statusSetting.settingEl)
+      ) {
+        return;
+      }
       statusSetting.setDesc(`Could not check Codex: ${(error as Error).message}`);
       return;
     } finally {
       if (this.codexStatusAbort === controller) this.codexStatusAbort = null;
+    }
+
+    if (
+      controller.signal.aborted ||
+      !this.isCurrentSettingsOwner(statusSetting.settingEl)
+    ) {
+      return;
     }
 
     statusSetting.clear();
@@ -2141,18 +2420,22 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     try {
       await this.plugin.startCodexCliLogin();
     } catch (error) {
+      if (!this.isCurrentSettingsOwner(statusSetting.settingEl)) return;
       statusSetting.setDesc(`Could not start Codex sign-in: ${(error as Error).message}`);
       return;
     }
+    if (!this.isCurrentSettingsOwner(statusSetting.settingEl)) return;
     providerModelCatalog.invalidate("codex");
     await this.refreshCodexStatus(statusSetting);
+    if (!this.isCurrentSettingsOwner(statusSetting.settingEl)) return;
     this.display();
   }
 
   /**
    * Wraps a group of settings in a native <details>/<summary> disclosure so
-   * heavy, rarely-touched sections can default to collapsed and reduce the
-   * settings-tab scroll. The summary is a plain-text label (NOT a setHeading —
+   * heavy, rarely-touched sections can default to collapsed without becoming
+   * unreachable to in-place search. Bodies are rendered eagerly; the summary
+   * is a plain-text label (NOT a setHeading —
    * a <summary> cannot host an Obsidian Setting); the builder writes into the
    * body div, where the existing render* helpers keep emitting their own
    * setHeading() labels unchanged. Each disclosure defaults to closed when the
@@ -2171,10 +2454,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       cls: "vaultguard-settings-section",
     });
     details.dataset.vaultguardSettingsSection = sectionId;
-    // Seed the default the FIRST time a section is rendered in a Settings
-    // session, then defer to tracked state. Without the seen-set a default-open
-    // section would spring back open on every `display()` re-render, undoing a
-    // collapse the moment the user touched any toggle.
+    // Seed the default only the FIRST time a section is rendered in a Settings
+    // session, then defer to tracked state so user changes survive re-renders.
     if (!this.collapsibleSectionSeenIds.has(sectionId)) {
       this.collapsibleSectionSeenIds.add(sectionId);
       if (DEFAULT_OPEN_SECTIONS.includes(sectionId)) {
@@ -3615,6 +3896,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // description paragraph instead.
     this.renderSettingsNote(containerEl, this.i18n.t("settings.intro"), "lead");
     this.renderSettingsSearch(containerEl);
+    const statusHost = containerEl.createDiv({ cls: "vaultguard-settings-status-host" });
+    this.renderSettingsStatus(statusHost);
 
     // ── Protection ──────────────────────────────────────────────────────────
     // First, and deliberately ahead of Connection / Account / Vault.
@@ -4013,7 +4296,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             target.open = true;
             target.scrollIntoView({ behavior: "smooth", block: "start" });
           });
-          selfHostNote.appendText(" below (switch to manual configuration).");
+          selfHostNote.appendText(" after switching to manual configuration.");
         }
       }
 
@@ -4180,30 +4463,57 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         );
 
       new Setting(body)
-        .setName("Show status bar")
+        .setName("Status bar detail")
         .setDesc(
-          "Display sync status and connection indicator in the bottom status bar."
+          "Choose the normal sync indicator. Recovery, authentication, permission-loading, and long-operation messages always keep their full text."
         )
-        .addToggle((toggle) =>
-          toggle
-            .setValue(this.plugin.settings.showStatusBar)
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("full", "Full")
+            .addOption("compact", "Compact")
+            .addOption("hidden", "Hidden")
+            .setValue(this.plugin.settings.statusBarMode)
             .onChange(async (value) => {
-              this.plugin.settings.showStatusBar = value;
+              if (value !== "full" && value !== "compact" && value !== "hidden") return;
+              this.plugin.settings.statusBarMode = value;
+              this.plugin.settings.showStatusBar = value !== "hidden";
               await this.plugin.saveSettings();
-              this.plugin.toggleStatusBar(value);
+              this.plugin.applyStatusBarMode();
             })
         );
 
       new Setting(body)
-        .setName("Show quick-access ribbon icons")
+        .setName("Show AI Chat shortcut")
         .setDesc(
-          "Show dedicated left-ribbon icons for AI chat and the permissions graph. The VaultGuard menu icon is always shown. When turned back on, reload Obsidian to bring them back."
+          "Show the dedicated AI Chat icon in Obsidian's left ribbon. The VaultGuard shield stays visible."
         )
         .addToggle((toggle) =>
           toggle
-            .setValue(this.plugin.settings.showRibbonIcons !== false)
+            .setValue(this.plugin.settings.showAiChatRibbonIcon)
             .onChange(async (value) => {
-              this.plugin.settings.showRibbonIcons = value;
+              this.plugin.settings.showAiChatRibbonIcon = value;
+              this.plugin.settings.showRibbonIcons =
+                value && this.plugin.settings.showPermissionsGraphRibbonIcon;
+              await this.plugin.saveSettings();
+              this.plugin.applyRibbonIconLayout();
+            })
+        );
+
+      new Setting(body)
+        .setName("Show Permissions Graph shortcut")
+        .setDesc(
+          Platform.isMobileApp
+            ? "The Permissions Graph shortcut is available in desktop Obsidian."
+            : "Show the dedicated Permissions Graph icon in Obsidian's left ribbon. The VaultGuard shield stays visible."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.showPermissionsGraphRibbonIcon)
+            .setDisabled(Platform.isMobileApp)
+            .onChange(async (value) => {
+              this.plugin.settings.showPermissionsGraphRibbonIcon = value;
+              this.plugin.settings.showRibbonIcons =
+                value && this.plugin.settings.showAiChatRibbonIcon;
               await this.plugin.saveSettings();
               this.plugin.applyRibbonIconLayout();
             })
@@ -4223,60 +4533,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // ── Advanced (collapsed) ─────────────────────────────────────────────────
     // Security + Reliability + at-rest maintenance live behind one disclosure.
     this.renderCollapsibleSection(containerEl, "advanced", "Advanced", (body) => {
-      // ── Security ────────────────────────────────────────────────────────
-      new Setting(body).setName("Security").setHeading();
-
-      new Setting(body)
-        .setName("Cache encryption strength")
-        .setDesc(
-          "Encryption level for locally cached files. Higher levels are more secure but slower."
-        )
-        .addDropdown((dropdown) =>
-          dropdown
-            .addOption("standard", "Standard (AES-256-GCM)")
-            .addOption("high", "High (AES-256-GCM + key stretching)")
-            .addOption(
-              "maximum",
-              "Maximum (AES-256-GCM + Argon2 key derivation)"
-            )
-            .setValue(this.plugin.settings.cacheEncryptionStrength)
-            .onChange(async (value) => {
-              this.plugin.settings.cacheEncryptionStrength =
-                value as CacheEncryptionStrength;
-              await this.plugin.saveSettings();
-            })
-        );
-
-      new Setting(body)
-        .setName("Offline key lease duration")
-        .setDesc(
-          "How long encryption keys remain valid when offline (in hours). After expiry, files cannot be decrypted until reconnection."
-        )
-        .addSlider((slider) =>
-          slider
-            .setLimits(1, 168, 1)
-            .setValue(this.plugin.settings.offlineKeyLeaseDuration)
-            .setDynamicTooltip()
-            .onChange(async (value) => {
-              this.plugin.settings.offlineKeyLeaseDuration = value;
-              await this.plugin.saveSettings();
-            })
-        );
-
-      new Setting(body)
-        .setName("Auto-wipe on auth failure")
-        .setDesc(
-          "Automatically clear all cached vault data if authentication fails repeatedly. This prevents unauthorized access but may cause data loss for unsynced changes."
-        )
-        .addToggle((toggle) =>
-          toggle
-            .setValue(this.plugin.settings.autoWipeOnAuthFailure)
-            .onChange(async (value) => {
-              this.plugin.settings.autoWipeOnAuthFailure = value;
-              await this.plugin.saveSettings();
-            })
-        );
-
       // ── Reliability (formerly the top-level "Advanced" heading) ──────────
       new Setting(body).setName("Reliability").setHeading();
 
@@ -4331,6 +4587,13 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           if (this.plugin.isOptionalModuleEnabled("agentAccess")) {
             this.renderVaultOrientationSection(body);
             this.renderAgentBridgeSection(body);
+          }
+          // Governed automation is intentionally in-app-chat-only at runtime,
+          // so its human policy controls remain available when AI Chat is on
+          // even if external Agent Access is off. When Agent Bridge is enabled,
+          // this stays directly beside its management section.
+          this.renderGovernedAutomationSection(body);
+          if (this.plugin.isOptionalModuleEnabled("agentAccess")) {
             this.renderChatGptConnectorSection(body);
           }
           if (this.plugin.isOptionalModuleEnabled("aiChat")) {
@@ -4352,22 +4615,35 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       });
 
       new Setting(body)
-        .setName("Clear local cache")
+        .setName("Reset local sync state")
         .setDesc(
-          "Remove all locally cached and encrypted vault data. Files will be re-downloaded on next sync."
+          "Clear cached permission, remote-file, queued offline, and sync-reconciliation state held by VaultGuard on this device. This does not delete vault files. Queued offline work that has not been reconciled will be discarded."
         )
         .addButton((button) =>
           button
-            .setButtonText("Clear cache")
+            .setButtonText("Reset sync state")
             .setWarning()
             .onClick(async () => {
               const confirmed = await this.showDestructiveConfirmation(
                 body,
-                "CLEAR CACHE",
-                "Type CLEAR CACHE to confirm. This will delete all locally cached vault data."
+                "RESET SYNC STATE",
+                "Type RESET SYNC STATE to confirm. Vault files stay on disk, but cached permission, remote-file, queued offline, and sync-reconciliation state will be cleared."
               );
               if (confirmed) {
-                await this.plugin.clearLocalCache();
+                try {
+                  await this.plugin.clearLocalCache();
+                  this.showStatus(
+                    body,
+                    "Local sync state reset. Vault files were not deleted.",
+                    false,
+                  );
+                } catch {
+                  this.showStatus(
+                    body,
+                    "Local sync state could not be reset. Queued offline work was retained; retry after checking disk access.",
+                    true,
+                  );
+                }
               }
             })
         );
@@ -4393,19 +4669,34 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       if (existing) existing.remove();
 
       const dialog = containerEl.createDiv({ cls: "vaultguard-destruct-confirm" });
-      dialog.createEl("p", { text: message, cls: "setting-item-description mod-warning" });
+      dialog.setAttribute("role", "alertdialog");
+      dialog.setAttribute("aria-label", "Confirm destructive action");
+      const descriptionId = `vaultguard-destruct-confirm-${Date.now()}`;
+      dialog.setAttribute("aria-describedby", descriptionId);
+      dialog.createEl("p", {
+        text: message,
+        cls: "setting-item-description mod-warning",
+        attr: { id: descriptionId },
+      });
 
       const input = dialog.createEl("input", {
         cls: "vaultguard-confirm-input",
-        attr: { type: "text", placeholder: confirmPhrase },
+        attr: {
+          type: "text",
+          placeholder: confirmPhrase,
+          "aria-label": `Type ${confirmPhrase} to confirm`,
+        },
       });
 
       const btnRow = dialog.createDiv({ cls: "vaultguard-confirm-buttons" });
-      const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
+      const cancelBtn = btnRow.createEl("button", {
+        text: "Cancel",
+        attr: { type: "button" },
+      });
       const confirmBtn = btnRow.createEl("button", {
         text: "Confirm",
         cls: "mod-warning",
-        attr: { disabled: "true" },
+        attr: { type: "button", disabled: "true" },
       });
 
       input.addEventListener("input", () => {
@@ -4419,6 +4710,18 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       cancelBtn.addEventListener("click", () => {
         dialog.remove();
         resolve(false);
+      });
+
+      dialog.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          dialog.remove();
+          resolve(false);
+        } else if (event.key === "Enter" && input.value === confirmPhrase) {
+          event.preventDefault();
+          dialog.remove();
+          resolve(true);
+        }
       });
 
       confirmBtn.addEventListener("click", () => {
@@ -4632,6 +4935,195 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     for (const session of sessions) {
       this.renderChatGptConnectorSessionRow(containerEl, session);
     }
+  }
+
+  private renderGovernedAutomationSection(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Governed automation (desktop only.)").setHeading();
+
+    const desktopUnavailable = Platform.isDesktopApp !== true;
+    const registry = normalizeAutomationRegistry(this.plugin.settings.automationRegistry);
+    const activePolicyCount = registry.entries.filter((entry) => entry.enabled).length;
+    containerEl.createEl("p", {
+      cls: "vaultguard-settings-note mod-warning",
+      text:
+        "Governance is not a sandbox. An approved third-party command runs with that plugin's ordinary Obsidian authority. VaultGuard keeps this master switch off by default, exposes only semantic aliases to agents, always confirms side effects, and refuses hard-denied command classes.",
+    });
+
+    if (desktopUnavailable) {
+      containerEl.createEl("p", {
+        cls: "vaultguard-settings-note",
+        text:
+          "Governed command automation is unavailable on mobile or runtimes without the required desktop command APIs. Manage this registry from desktop Obsidian.",
+      });
+    }
+
+    new Setting(containerEl)
+      .setName("Enable governed automation")
+      .setDesc(
+        `Master switch only. ${activePolicyCount} ${activePolicyCount === 1 ? "policy is" : "policies are"} individually enabled. Turning this on never enables a disabled or invalid policy, and automation remains limited to eligible in-app chat sessions.`,
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(registry.enabled)
+          .setDisabled(desktopUnavailable)
+          .onChange(async (value) => {
+            if (desktopUnavailable) return;
+            const previous = this.plugin.settings.automationRegistry;
+            this.plugin.settings.automationRegistry = {
+              ...normalizeAutomationRegistry(previous),
+              enabled: value,
+            };
+            try {
+              await this.plugin.saveSettings();
+              this.showStatus(
+                containerEl,
+                value
+                  ? "Governed automation master switch enabled. Only separately enabled, runtime-eligible policies can run."
+                  : "Governed automation disabled. Approved policies remain stored but cannot run.",
+                false,
+              );
+            } catch {
+              this.plugin.settings.automationRegistry = previous;
+              toggle.setValue(previous.enabled);
+              this.showStatus(
+                containerEl,
+                "The governed automation setting could not be saved.",
+                true,
+              );
+            }
+          }),
+      );
+
+    let policyDraft = JSON.stringify(registry.entries, null, 2);
+    let policyTextArea: { setValue(value: string): unknown } | null = null;
+    const policySetting = new Setting(containerEl)
+      .setName("Approved automation policies (JSON)")
+      .setDesc(
+        "Human-only canonical policy array. Raw command IDs and private path rules stay in Settings and are never disclosed to agents. Drafts do not save while you type; JSON cannot change the master switch, and the entire import is rejected if any entry is invalid, duplicate, unsafe, or noncanonical.",
+      )
+      .addTextArea((textArea) => {
+        policyTextArea = textArea;
+        textArea.inputEl.rows = 14;
+        textArea.inputEl.spellcheck = false;
+        textArea.inputEl.addClass("vaultguard-mono-textarea");
+        textArea
+          .setPlaceholder("[]")
+          .setValue(policyDraft)
+          .setDisabled(desktopUnavailable)
+          .onChange((value) => {
+            policyDraft = value;
+          });
+      });
+    policySetting.settingEl.addClass("vaultguard-stacked-textarea-setting");
+
+    new Setting(containerEl)
+      .setName("Import policy draft")
+      .setDesc(
+        "Validates every entry as one transaction. Use [] to clear all policies; the master switch keeps its current state.",
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Validate and import policies")
+          .setCta()
+          .setDisabled(desktopUnavailable)
+          .onClick(async () => {
+            const result = parseAutomationPolicyJsonImport(
+              policyDraft,
+              this.plugin.settings.automationRegistry.enabled,
+            );
+            if (!result.ok) {
+              this.showStatus(containerEl, result.error, true);
+              return;
+            }
+            const previous = this.plugin.settings.automationRegistry;
+            button.setDisabled(true).setButtonText("Importing...");
+            try {
+              this.plugin.settings.automationRegistry = result.registry;
+              await this.plugin.saveSettings();
+              policyDraft = JSON.stringify(
+                this.plugin.settings.automationRegistry.entries,
+                null,
+                2,
+              );
+              policyTextArea?.setValue(policyDraft);
+              this.showStatus(
+                containerEl,
+                `${result.registry.entries.length} governed automation ${result.registry.entries.length === 1 ? "policy" : "policies"} imported. The master switch was not changed.`,
+                false,
+              );
+            } catch {
+              this.plugin.settings.automationRegistry = previous;
+              this.showStatus(
+                containerEl,
+                "The governed automation policies could not be saved.",
+                true,
+              );
+            } finally {
+              button
+                .setDisabled(desktopUnavailable)
+                .setButtonText("Validate and import policies");
+            }
+          }),
+      );
+
+    let templateDraft = (this.plugin.settings.agentTemplateAllowlist ?? []).join("\n");
+    let templateTextArea: { setValue(value: string): unknown } | null = null;
+    const templateSetting = new Setting(containerEl)
+      .setName("Trusted agent templates")
+      .setDesc(
+        "One exact vault-relative .md template path per line. Empty means no template is trusted. Hidden paths, absolute paths, traversal, patterns, duplicates, and non-Markdown files are rejected as one transaction.",
+      )
+      .addTextArea((textArea) => {
+        templateTextArea = textArea;
+        textArea.inputEl.rows = 6;
+        textArea.inputEl.spellcheck = false;
+        textArea.inputEl.addClass("vaultguard-mono-textarea");
+        textArea
+          .setPlaceholder("Templates/Daily note.md")
+          .setValue(templateDraft)
+          .setDisabled(desktopUnavailable)
+          .onChange((value) => {
+            templateDraft = value;
+          });
+      });
+    templateSetting.settingEl.addClass("vaultguard-stacked-textarea-setting");
+
+    new Setting(containerEl)
+      .setName("Save trusted templates")
+      .setDesc("Validates the complete allowlist before replacing the stored paths.")
+      .addButton((button) =>
+        button
+          .setButtonText("Validate and save templates")
+          .setCta()
+          .setDisabled(desktopUnavailable)
+          .onClick(async () => {
+            const result = parseAgentTemplateAllowlistImport(templateDraft);
+            if (!result.ok) {
+              this.showStatus(containerEl, result.error, true);
+              return;
+            }
+            const previous = this.plugin.settings.agentTemplateAllowlist;
+            button.setDisabled(true).setButtonText("Saving...");
+            try {
+              this.plugin.settings.agentTemplateAllowlist = result.paths;
+              await this.plugin.saveSettings();
+              templateDraft = this.plugin.settings.agentTemplateAllowlist.join("\n");
+              templateTextArea?.setValue(templateDraft);
+              this.showStatus(
+                containerEl,
+                `${result.paths.length} trusted agent template ${result.paths.length === 1 ? "path" : "paths"} saved.`,
+                false,
+              );
+            } catch {
+              this.plugin.settings.agentTemplateAllowlist = previous;
+              this.showStatus(containerEl, "The trusted template paths could not be saved.", true);
+            } finally {
+              button
+                .setDisabled(desktopUnavailable)
+                .setButtonText("Validate and save templates");
+            }
+          }),
+      );
   }
 
   private renderAgentBridgeSection(containerEl: HTMLElement): void {

@@ -721,7 +721,7 @@ export class SyncRuntime {
           if (Number.isFinite(cursorMs) && cursorMs > 0) {
             syncState.lastObservedActivityAt = cursorMs;
           }
-          if (cursor.revision === syncState.lastSeenRevision) {
+          if (!cursor.reconciliationRequired && cursor.revision === syncState.lastSeenRevision) {
             syncState.status = "idle";
             syncState.lastError = null;
             syncState.pendingChanges = this.ctx.getOfflineQueueLength();
@@ -755,6 +755,7 @@ export class SyncRuntime {
         revision?: number;
         mode?: string;
         permissionsChanged?: boolean;
+        reconciliationRequired?: boolean;
       }>("POST", this.ctx.vaultPath("/files/sync"), {
         lastSyncTimestamp: syncState.lastSync ?? new Date(0).toISOString(),
         fileChecksums: this.ctx.buildLocalSyncManifest(),
@@ -770,6 +771,11 @@ export class SyncRuntime {
           serverConfirmed: true,
           semanticAuthorityChanged: true,
         });
+      }
+      if (response.data.reconciliationRequired) {
+        this.ctx.log(
+          "Sync: a durable server mutation is awaiting activity reconciliation; full-scan results remain authoritative."
+        );
       }
 
       deltaCount = response.data.deltas.length;
@@ -952,18 +958,24 @@ export class SyncRuntime {
    * failure so callers fall through to full sync instead of incorrectly
    * skipping.
    */
-  async fetchSyncCursor(): Promise<{ revision: number; lastChangedAt: string } | null> {
+  async fetchSyncCursor(): Promise<{
+    revision: number;
+    lastChangedAt: string;
+    reconciliationRequired: boolean;
+  } | null> {
     if (!this.ctx.getSession() || !this.ctx.getSettings().serverVaultId) return null;
     try {
       const response = await this.ctx.apiRequest<{
         revision: number;
         lastChangedAt: string;
+        reconciliationRequired?: boolean;
         serverTime: string;
       }>("GET", this.ctx.vaultPath("/sync-cursor"));
       if (!response.success || !response.data) return null;
       return {
         revision: response.data.revision,
         lastChangedAt: response.data.lastChangedAt,
+        reconciliationRequired: response.data.reconciliationRequired === true,
       };
     } catch (err) {
       this.ctx.logError("Sync cursor fetch failed", err);
@@ -1396,6 +1408,7 @@ export class SyncRuntime {
           this.queueOfflineOperation("write", newNormalized, base64, {
             encoding: "base64",
             contentType: contentTypeForPath(newNormalized),
+            intent: { kind: "must-be-absent" },
           });
         } else {
           const view = new TextEncoder().encode(result.text);
@@ -1413,7 +1426,9 @@ export class SyncRuntime {
             );
             return;
           }
-          this.queueOfflineOperation("write", newNormalized, result.text);
+          this.queueOfflineOperation("write", newNormalized, result.text, {
+            intent: { kind: "must-be-absent" },
+          });
         }
       } catch (err) {
         this.ctx.logError(
@@ -1579,10 +1594,16 @@ export class SyncRuntime {
           "write",
           newNormalized,
           uint8ToBase64Chunked(new Uint8Array(binaryBytes)),
-          { encoding: "base64", contentType: contentTypeForPath(newNormalized) }
+          {
+            encoding: "base64",
+            contentType: contentTypeForPath(newNormalized),
+            intent: { kind: "must-be-absent" },
+          }
         );
       } else {
-        this.queueOfflineOperation("write", newNormalized, content as string);
+        this.queueOfflineOperation("write", newNormalized, content as string, {
+          intent: { kind: "must-be-absent" },
+        });
       }
       this.queueOfflineOperation("delete", oldNormalized);
       return;
@@ -4066,14 +4087,14 @@ export class SyncRuntime {
       this.ctx.getOfflineQueue().filter((op) => op.path !== normalizedPath)
     );
 
+    const remoteState = this.ctx.getRemoteFileState(normalizedPath);
     const entry: OfflineQueueOperation = {
       operation,
       path: normalizedPath,
       data,
       baseVersionId:
         options.baseVersionId ?? this.ctx.getExpectedVersionId(normalizedPath),
-      baseHash:
-        options.baseHash ?? this.ctx.getRemoteFileState(normalizedPath)?.baseHash,
+      baseHash: options.baseHash ?? remoteState?.baseHash,
       timestamp: new Date().toISOString(),
     };
     // BIN-A / D-09: stamp binary payloads (base64 + MIME) so the flush fork

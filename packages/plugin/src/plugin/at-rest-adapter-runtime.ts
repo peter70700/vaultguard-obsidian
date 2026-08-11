@@ -43,6 +43,11 @@ import {
   isLocalProjectMemoryModeEnabled,
   isLocalProjectMemoryPlaintextPath,
 } from "./local-project-memory-mode";
+import {
+  compactGitRepositoryRoots,
+  isPathInDetectedGitRepository,
+  normalizeGitRepositoryRoot,
+} from "./git-repository-plaintext";
 // SD-07-F5: cross-generation adapter ownership — unwrap-at-capture plus the
 // detached-delegate error. See adapter-ownership.ts for why the marker is a
 // plain string and not a Symbol.
@@ -51,6 +56,11 @@ import {
   markAdapterWrapper,
   resolveAdapterMethodBase,
 } from "./adapter-ownership";
+import {
+  AtRestProtectionStateStore,
+  classifyAtRestPayload,
+  type AtRestPayloadClassification,
+} from "./at-rest-protection-state";
 
 function getActiveObsidianDocument(): Document | null {
   if (typeof activeDocument !== "undefined") {
@@ -118,14 +128,57 @@ export interface AutomaticLocalProjectMemoryModeInspectionBudget {
 }
 
 /**
- * Budgets for the pre-activation ciphertext sweep. Generous enough for a real
- * repository vault, small enough that a pathological one (a vault rooted on a
- * checkout with `node_modules`, build output or large media) fails closed
- * instead of holding plugin startup open.
+ * Budgets for the pre-activation ciphertext sweep. Large repositories fail
+ * closed instead of holding plugin startup open or enabling on partial proof.
  */
 export const AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_FILES = 20_000;
 export const AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_BYTES = 256 * 1024 * 1024;
 export const AUTO_LOCAL_PROJECT_MEMORY_INSPECTION_MAX_MS = 10_000;
+
+export const GIT_REPOSITORY_DISCOVERY_MAX_ENTRIES = 20_000;
+export const GIT_REPOSITORY_DISCOVERY_MAX_MS = 10_000;
+export const GIT_REPOSITORY_TRANSITION_FAILURE_DETAIL_LIMIT = 20;
+
+export interface GitRepositoryDetectionOptions {
+  enabled: boolean;
+  mobile: boolean;
+  maxEntries?: number;
+  maxElapsedMs?: number;
+}
+
+function arrayBuffersEqual(left: ArrayBuffer, right: ArrayBuffer): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  const leftBytes = new Uint8Array(left);
+  const rightBytes = new Uint8Array(right);
+  for (let index = 0; index < leftBytes.length; index += 1) {
+    if (leftBytes[index] !== rightBytes[index]) return false;
+  }
+  return true;
+}
+
+function boundedErrorMessage(error: unknown, maxLength = 240): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length <= maxLength ? message : `${message.slice(0, maxLength - 1)}…`;
+}
+
+export interface GitRepositoryDetectionResult {
+  roots: string[];
+  scannedEntries: number;
+  complete: boolean;
+  reason?:
+    | "disabled"
+    | "mobile"
+    | "adapter-unavailable"
+    | "budget-exhausted"
+    | "listing-failed";
+}
+
+export interface GitRepositoryPlaintextTransitionResult {
+  decrypted: number;
+  alreadyPlaintext: number;
+  failed: number;
+  failures: Array<{ path: string; error: string }>;
+}
 
 export class AtRestAdapterRuntime {
   private originalAdapterMethods: VaultAdapterOriginalMethods = emptyAdapterMethods();
@@ -154,6 +207,10 @@ export class AtRestAdapterRuntime {
    */
   private capturedAdapterMethodNames: Set<keyof VaultAdapterOriginalMethods> = new Set();
   private atRestCipher: AtRestCipher | null = null;
+  /** Durable, path-hashed memory of files that must remain valid VG1. */
+  private atRestProtectionState: AtRestProtectionStateStore | null = null;
+  /** Current vault-relative repository roots; replaced atomically on every refresh. */
+  private detectedGitRepositoryRoots: string[] = [];
   /**
    * Phase 12 (vault idle-lock): fail-closed content gate. When true the LAK is
    * evicted and every VG1 read short-circuits with a clean "vault locked" error
@@ -265,6 +322,264 @@ export class AtRestAdapterRuntime {
     return isLocalProjectMemoryPlaintextPath(path, this.app.vault.configDir);
   }
 
+  getDetectedGitRepositoryRoots(): string[] {
+    return [...this.detectedGitRepositoryRoots];
+  }
+
+  isDetectedGitRepositoryPath(path: string): boolean {
+    return isPathInDetectedGitRepository(path, this.detectedGitRepositoryRoots);
+  }
+
+  /**
+   * Discover vault-root and nested Git repositories without executing Git or
+   * reading repository configuration. The current root set is always replaced,
+   * including on failure, so a moved/deleted repository cannot remain a stale
+   * plaintext boundary.
+   */
+  async refreshDetectedGitRepositoryRoots(
+    options: GitRepositoryDetectionOptions,
+  ): Promise<GitRepositoryDetectionResult> {
+    this.detectedGitRepositoryRoots = [];
+    if (!options.enabled) {
+      return { roots: [], scannedEntries: 0, complete: true, reason: "disabled" };
+    }
+    if (options.mobile) {
+      return { roots: [], scannedEntries: 0, complete: true, reason: "mobile" };
+    }
+
+    const list = this.originalAdapterMethods.list;
+    if (!list) {
+      return {
+        roots: [],
+        scannedEntries: 0,
+        complete: false,
+        reason: "adapter-unavailable",
+      };
+    }
+
+    const maxEntries = options.maxEntries ?? GIT_REPOSITORY_DISCOVERY_MAX_ENTRIES;
+    const maxElapsedMs = options.maxElapsedMs ?? GIT_REPOSITORY_DISCOVERY_MAX_MS;
+    const startedAt = Date.now();
+    const queue: string[] = [""];
+    const roots: string[] = [];
+    let scannedEntries = 0;
+
+    const finish = (
+      complete: boolean,
+      reason?: GitRepositoryDetectionResult["reason"],
+    ): GitRepositoryDetectionResult => {
+      this.detectedGitRepositoryRoots = compactGitRepositoryRoots(roots);
+      return {
+        roots: this.getDetectedGitRepositoryRoots(),
+        scannedEntries,
+        complete,
+        ...(reason ? { reason } : {}),
+      };
+    };
+
+    while (queue.length > 0) {
+      if (Date.now() - startedAt > maxElapsedMs) {
+        this.log(
+          `Git repository folder detection stopped after ${scannedEntries} entries: time budget exhausted.`,
+        );
+        return finish(false, "budget-exhausted");
+      }
+
+      const current = queue.shift()!;
+      let listing: { files: string[]; folders: string[] };
+      try {
+        listing = await list(current || "/");
+      } catch (error) {
+        this.logError("Git repository folder detection could not list a vault folder", error);
+        return finish(false, "listing-failed");
+      }
+
+      scannedEntries += listing.files.length + listing.folders.length;
+      if (scannedEntries > maxEntries) {
+        this.log(
+          `Git repository folder detection stopped after ${scannedEntries} entries: entry budget exhausted.`,
+        );
+        return finish(false, "budget-exhausted");
+      }
+
+      const entries = [...listing.files, ...listing.folders];
+      const markerFound = entries.some((entry) => {
+        const normalized = normalizeGitRepositoryRoot(entry);
+        return normalized?.split("/").pop() === ".git";
+      });
+      if (markerFound) {
+        roots.push(current);
+        continue;
+      }
+
+      for (const folder of listing.folders) {
+        const normalized = normalizeGitRepositoryRoot(folder);
+        if (normalized === null) continue;
+        const child =
+          current && normalized !== current && !normalized.startsWith(`${current}/`)
+            ? `${current}/${normalized}`
+            : normalized;
+        const configDir = normalizeGitRepositoryRoot(this.app.vault.configDir);
+        if (
+          child === ".trash" ||
+          child.startsWith(".trash/") ||
+          (configDir !== null && (child === configDir || child.startsWith(`${configDir}/`)))
+        ) {
+          continue;
+        }
+        queue.push(child);
+      }
+    }
+
+    return finish(true);
+  }
+
+  /**
+   * Rewrite residual VG1 files inside detected repositories to plaintext.
+   *
+   * The repository boundary is local-at-rest only: this pass deliberately
+   * leaves Local Project Memory Mode, sync exclusions, cloud encryption, and
+   * permission state untouched. Each write is verified and a failed write is
+   * rolled back to the exact original bytes on a best-effort basis.
+   */
+  async convertDetectedGitRepositoryCiphertext(): Promise<GitRepositoryPlaintextTransitionResult> {
+    const targets = this.app.vault
+      .getFiles()
+      .filter((file) => this.isDetectedGitRepositoryPath(file.path));
+    if (targets.length === 0 || this.isLocalProjectMemoryModeEnabled()) {
+      return { decrypted: 0, alreadyPlaintext: 0, failed: 0, failures: [] };
+    }
+
+    const readBinary = this.originalAdapterMethods.readBinary;
+    const writeBinary = this.originalAdapterMethods.writeBinary;
+    const cipher = this.atRestCipher;
+    if (this.locked || !cipher?.isReady() || !readBinary || !writeBinary) {
+      const reason = this.locked
+        ? "Vault is locked; existing encrypted content was preserved."
+        : !cipher?.isReady()
+          ? "Local at-rest encryption is not ready; existing encrypted content was preserved."
+          : !readBinary
+            ? "Vault adapter binary reads are unavailable; existing content was preserved."
+            : "Vault adapter binary writes are unavailable; existing content was preserved.";
+      return {
+        decrypted: 0,
+        alreadyPlaintext: 0,
+        failed: targets.length,
+        failures: targets
+          .slice(0, GIT_REPOSITORY_TRANSITION_FAILURE_DETAIL_LIMIT)
+          .map((file) => ({ path: file.path, error: reason })),
+      };
+    }
+    let decrypted = 0;
+    let alreadyPlaintext = 0;
+    let failed = 0;
+    let processed = 0;
+    let processedBytes = 0;
+    const failures: Array<{ path: string; error: string }> = [];
+    const workload = summarizeFileLikeWorkload(targets);
+    const guard = evaluateWorkloadGuard(workload);
+    const operation = this.ctx.beginLongOperation({
+      kind: "vault-decrypt",
+      operationName: "Decrypt detected Git repositories",
+      phase: "Preparing detected repository plaintext pass",
+      placement: "protected",
+      totalItems: targets.length,
+      totalBytes: workload.totalBytes,
+      warning: guard.warnings.join(" ") || undefined,
+      capabilities: {
+        protectedPhase: true,
+        canCancel: false,
+        canPause: false,
+      },
+      conflictsWith: ["vault-encrypt", "sync", "background-sync", "initial-reconciliation"],
+      stalledAfterMs: DEFAULT_STALLED_OPERATION_MS,
+    });
+
+    if (!guard.ok) {
+      const error = new Error(
+        guard.error ?? "VaultGuard workload guard blocked detected repository decryption.",
+      );
+      operation.fail(error);
+      throw error;
+    }
+
+    try {
+      await processInBatches(
+        targets,
+        async (file) => {
+          let originalBytes: ArrayBuffer | null = null;
+          try {
+            originalBytes = await readBinary(file.path);
+            if (!this.looksLikeCiphertextBytes(originalBytes)) {
+              alreadyPlaintext += 1;
+              return;
+            }
+            if (this.locked || !cipher.isReady()) {
+              throw new Error("Local at-rest encryption is not ready; existing encrypted content was preserved.");
+            }
+
+            const plaintext = await cipher.decryptBinary(originalBytes);
+            try {
+              await writeBinary(file.path, plaintext);
+              const storedBytes = await readBinary(file.path);
+              if (!arrayBuffersEqual(storedBytes, plaintext)) {
+                throw new Error("Plaintext write verification failed.");
+              }
+              await this.forgetAtRestProtected(file.path);
+            } catch (writeError) {
+              let rollbackVerified = false;
+              try {
+                await writeBinary(file.path, originalBytes);
+                rollbackVerified = arrayBuffersEqual(await readBinary(file.path), originalBytes);
+              } catch (rollbackError) {
+                this.logError(
+                  `Detected Git repository plaintext rollback failed for "${file.path}"`,
+                  rollbackError,
+                );
+              }
+              const reason = writeError instanceof Error ? writeError.message : String(writeError);
+              throw new Error(
+                rollbackVerified
+                  ? `${reason} Original encrypted bytes were restored.`
+                  : `${reason} Original-byte rollback could not be verified.`,
+              );
+            }
+            decrypted += 1;
+          } catch (error) {
+            failed += 1;
+            const message = boundedErrorMessage(error);
+            failures.push({ path: file.path, error: message });
+            this.logError(
+              `Detected Git repository plaintext conversion failed for "${file.path}"`,
+              error,
+            );
+          } finally {
+            processed += 1;
+            processedBytes += file.stat?.size ?? originalBytes?.byteLength ?? 0;
+            operation.update({
+              phase: "Decrypting detected repository files",
+              processedItems: processed,
+              processedBytes,
+              message: `${decrypted} decrypted, ${alreadyPlaintext} already plaintext, ${failed} failed.`,
+            });
+          }
+        },
+        {
+          batchSize: DEFAULT_LONG_OPERATION_BATCH_SIZE,
+          token: operation.token,
+        },
+      );
+    } catch (error) {
+      operation.fail(error);
+      throw error;
+    }
+
+    operation.complete(
+      `${decrypted} decrypted, ${alreadyPlaintext} already plaintext, ${failed} failed.`,
+    );
+    return { decrypted, alreadyPlaintext, failed, failures };
+  }
+
   async tallyAtRestState(): Promise<{
     plaintext: number;
     encrypted: number;
@@ -292,7 +607,11 @@ export class AtRestAdapterRuntime {
       }
       try {
         const bytes = await readBin(file.path);
-        if (cipher.isEncrypted(bytes)) encrypted += 1;
+        const classification = await this.classifyAtRestBytes(file.path, bytes);
+        if (classification.kind === "encrypted") {
+          encrypted += 1;
+          await this.rememberAtRestProtected(file.path);
+        } else if (classification.kind === "corrupt-protected") failed += 1;
         else plaintext += 1;
       } catch {
         failed += 1;
@@ -319,7 +638,11 @@ export class AtRestAdapterRuntime {
     for (const file of files) {
       try {
         const bytes = await readBin(file.path);
-        if (this.hasVg1MagicBytes(bytes)) encrypted += 1;
+        const classification = await this.classifyAtRestBytes(file.path, bytes);
+        if (classification.kind === "encrypted") {
+          encrypted += 1;
+          await this.rememberAtRestProtected(file.path);
+        } else if (classification.kind === "corrupt-protected") failed += 1;
         else plaintext += 1;
       } catch {
         failed += 1;
@@ -563,6 +886,7 @@ export class AtRestAdapterRuntime {
       contentType?: string;
       baseVersionId?: string;
       baseHash?: string;
+      intent?: MutationIntent;
     },
   ): void {
     this.ctx.queueOfflineOperation(operation, path, data, options);
@@ -810,14 +1134,8 @@ export class AtRestAdapterRuntime {
 
   /**
    * Read-only, fail-closed inspection used before automatically entering Local
-   * Project Memory Mode. Raw reads stay in this at-rest helper so the caller
-   * cannot accidentally inspect decrypted adapter output. No file is changed.
-   *
-   * The caller awaits this inline during `onload`, and a Git-root vault indexes
-   * everything that is not dot-hidden (`node_modules` included), so the sweep
-   * is budgeted. Exhausting any budget reports `inspection-failed` — the
-   * existing fail-closed outcome, already surfaced to the user — rather than
-   * auto-enabling on partial evidence or blocking startup indefinitely.
+   * Project Memory Mode. Raw adapter reads ensure existing VG1 ciphertext is
+   * detected before the whole-vault plaintext mode can be enabled.
    */
   async inspectAutomaticLocalProjectMemoryModeSafety(
     budget: Partial<AutomaticLocalProjectMemoryModeInspectionBudget> = {},
@@ -1031,6 +1349,24 @@ export class AtRestAdapterRuntime {
     const pluginId = this.manifest?.id ?? "vaultguard-sync";
     const envelopePath = this.vaultConfigPath("plugins", pluginId, "lak.envelope");
     const adapter = this.app.vault.adapter;
+    const protectionStatePath = this.vaultConfigPath(
+      "plugins",
+      pluginId,
+      "at-rest-path-state.v1.json",
+    );
+    this.atRestProtectionState = new AtRestProtectionStateStore({
+      read: async () => {
+        if (!(await adapter.exists(protectionStatePath))) return null;
+        return adapter.read(protectionStatePath);
+      },
+      write: async (serialized) => {
+        await adapter.write(protectionStatePath, serialized);
+      },
+    });
+    // Force validation now. A malformed/corrupt protection index makes the
+    // plaintext-vs-ciphertext decision ambiguous, so cipher initialization
+    // must stop before any managed note is read.
+    await this.atRestProtectionState.isProtected("__vaultguard_state_probe__");
 
     // Durable home for the device-local fallback KEK (the key that wraps the LAK
     // when the OS keychain / safeStorage is unavailable — the normal case on
@@ -1181,14 +1517,32 @@ export class AtRestAdapterRuntime {
       // (excluded) paths are skipped — they were never at-rest encrypted.
       hasExistingCiphertext: async () => {
         const readBin = this.originalAdapterMethods.readBinary;
-        if (!readBin) return false;
-        for (const file of this.app.vault.getFiles()) {
-          if (this.isAtRestExcluded(file.path)) continue;
+        const managedFiles = this.app.vault
+          .getFiles()
+          .filter((file) => !this.isAtRestExcluded(file.path));
+        if (managedFiles.length === 0) return false;
+        if (!readBin) {
+          throw new Error(
+            "VaultGuard Sync: cannot prove that no encrypted files remain because the vault adapter has no binary reader.",
+          );
+        }
+        for (const file of managedFiles) {
           try {
             const bytes = await readBin(file.path);
-            if (this.looksLikeCiphertextBytes(bytes)) return true;
-          } catch {
-            // Unreadable file — can't confirm ciphertext here; keep scanning.
+            const classification = await this.classifyAtRestBytes(file.path, bytes);
+            if (classification.kind === "corrupt-protected") {
+              throw new Error(
+                `VaultGuard Sync: protected file "${file.path}" has an invalid VG1 envelope (${classification.reason}).`,
+              );
+            }
+            if (classification.kind === "encrypted") {
+              await this.rememberAtRestProtected(file.path);
+              return true;
+            }
+          } catch (error) {
+            throw new Error(
+              `VaultGuard Sync: cannot prove that no encrypted files remain because "${file.path}" could not be inspected: ${boundedErrorMessage(error)}`,
+            );
           }
         }
         return false;
@@ -1206,6 +1560,7 @@ export class AtRestAdapterRuntime {
           }
         } catch (err) {
           this.logError(`Removing at-rest envelope at ${envelopePath} failed`, err);
+          throw err;
         }
       },
       loadFallbackKek: async () => {
@@ -1284,8 +1639,10 @@ export class AtRestAdapterRuntime {
         // file (survives mobile localStorage eviction). The file is what makes
         // the KEK — and therefore the LAK and the persisted session — outlive a
         // background kill.
+        let cachedInRenderer = false;
         try {
           this.app.saveLocalStorage(fallbackKekLsKey, kekBase64);
+          cachedInRenderer = true;
         } catch (err) {
           this.logError("Persisting fallback KEK to localStorage failed", err);
         }
@@ -1293,13 +1650,29 @@ export class AtRestAdapterRuntime {
           await adapter.write(fallbackKekPath, kekBase64);
         } catch (err) {
           this.logError(`Persisting durable fallback KEK at ${fallbackKekPath} failed`, err);
+          // The adapter file is the restart-survival boundary. A renderer-only
+          // copy may be evicted on mobile, so never report provisioning success
+          // when this write failed. Best-effort removal also avoids leaving a
+          // cache entry for a KEK whose wrapped LAK was never durably committed.
+          if (cachedInRenderer) {
+            try {
+              this.app.saveLocalStorage(fallbackKekLsKey, null);
+            } catch (cleanupError) {
+              this.logError("Rolling back the renderer fallback KEK failed", cleanupError);
+            }
+          }
+          throw new Error(
+            `VaultGuard Sync: durable fallback KEK persistence failed at ${fallbackKekPath}.`,
+          );
         }
       },
       clearFallbackKek: async () => {
+        const failures: unknown[] = [];
         try {
           this.app.saveLocalStorage(fallbackKekLsKey, null);
-        } catch {
-          // Storage may be unavailable in tests / restricted renderer contexts.
+        } catch (err) {
+          failures.push(err);
+          this.logError("Removing the renderer fallback KEK failed", err);
         }
         try {
           if (await adapter.exists(fallbackKekPath)) {
@@ -1313,9 +1686,16 @@ export class AtRestAdapterRuntime {
           // loadFallbackKek returns null → getOrCreateFallbackKek mints fresh).
           try {
             await adapter.write(fallbackKekPath, "");
-          } catch {
-            // best-effort — the localStorage copy is already cleared above
+          } catch (wipeErr) {
+            failures.push(wipeErr);
+            this.logError(`Neutralizing durable fallback KEK at ${fallbackKekPath} failed`, wipeErr);
           }
+          failures.push(err);
+        }
+        if (failures.length > 0) {
+          throw new Error(
+            `VaultGuard Sync: fallback KEK cleanup failed on ${failures.length} storage operation(s).`,
+          );
         }
       },
     };
@@ -1436,6 +1816,17 @@ export class AtRestAdapterRuntime {
       }
       const method = status.kind === "unlocked" ? status.method : "unknown";
       this.log(`AtRestCipher ready (${method}).`);
+      try {
+        await this.seedAtRestProtectionState();
+      } catch (error) {
+        this.logError("Seeding durable at-rest protection state failed", error);
+        this.app.workspace.onLayoutReady(() => {
+          new Notice(
+            "VaultGuard Sync: protected-file integrity state could not be fully updated. Encrypted bytes were preserved; restart after checking vault storage access.",
+            10000,
+          );
+        });
+      }
       if (Platform.isMobileApp && this.settings.debugLogging) {
         const ready = status.kind === "unlocked";
         new Notice(
@@ -1471,20 +1862,75 @@ export class AtRestAdapterRuntime {
     return found.length > 0;
   }
 
-  private async findAtRestCiphertextFiles(options: { limit?: number } = {}): Promise<string[]> {
+  /**
+   * One-time/ongoing migration for vaults encrypted before the durable
+   * protected-path index existed. Intact VG1 paths are hashed and persisted in
+   * one write. Unreadable files do not block cipher use, but the failure is
+   * surfaced because those paths cannot yet gain the corruption guard.
+   */
+  private async seedAtRestProtectionState(): Promise<void> {
+    const state = this.atRestProtectionState;
+    if (!state) return;
+    if (await state.isMigrationComplete()) return;
+    const managedFiles = this.app.vault
+      .getFiles()
+      .filter((file) => !this.isAtRestExcluded(file.path));
+    if (managedFiles.length === 0) return;
     const readBin = this.originalAdapterMethods.readBinary;
-    if (!readBin) return [];
+    if (!readBin) {
+      throw new Error("the vault adapter has no binary reader");
+    }
+
+    const protectedPaths: string[] = [];
+    let failed = 0;
+    for (const file of managedFiles) {
+      try {
+        const classification = classifyAtRestPayload(await readBin(file.path), false);
+        if (classification.kind === "encrypted") protectedPaths.push(file.path);
+      } catch {
+        failed += 1;
+      }
+    }
+    if (failed > 0) {
+      await state.markProtectedMany(protectedPaths);
+      throw new Error(`${failed} managed file(s) could not be inspected`);
+    }
+    await state.completeMigration(protectedPaths);
+  }
+
+  private async findAtRestCiphertextFiles(
+    options: { limit?: number; failClosed?: boolean } = {},
+  ): Promise<string[]> {
+    const readBin = this.originalAdapterMethods.readBinary;
+    const failClosed = options.failClosed !== false;
+    if (!readBin) {
+      if (failClosed) {
+        throw new Error(
+          "VaultGuard Sync: cannot inspect protected local files because the vault adapter has no binary reader.",
+        );
+      }
+      return [];
+    }
     const limit = options.limit ?? Number.POSITIVE_INFINITY;
     const paths: string[] = [];
     for (const file of this.app.vault.getFiles()) {
       try {
         const bytes = await readBin(file.path);
-        if (this.hasVg1MagicBytes(bytes)) {
+        const classification = await this.classifyAtRestBytes(file.path, bytes);
+        if (classification.kind === "encrypted") {
+          await this.rememberAtRestProtected(file.path);
+          paths.push(file.path);
+          if (paths.length >= limit) break;
+        } else if (classification.kind === "corrupt-protected") {
           paths.push(file.path);
           if (paths.length >= limit) break;
         }
-      } catch {
-        // Warning scans should never block plugin startup.
+      } catch (error) {
+        if (failClosed) {
+          throw new Error(
+            `VaultGuard Sync: protected-file inspection failed for "${file.path}": ${boundedErrorMessage(error)}`,
+          );
+        }
       }
     }
     return paths;
@@ -1492,7 +1938,7 @@ export class AtRestAdapterRuntime {
 
   async warnIfLocalProjectMemoryCiphertextPresent(): Promise<void> {
     if (!this.isLocalProjectMemoryModeEnabled()) return;
-    const paths = await this.findAtRestCiphertextFiles({ limit: 20 });
+    const paths = await this.findAtRestCiphertextFiles({ limit: 20, failClosed: false });
     if (paths.length === 0) return;
     const doc = getActiveObsidianDocument();
     if (!doc) {
@@ -1693,7 +2139,12 @@ export class AtRestAdapterRuntime {
 
           try {
             const bytes = await readBin(file.path);
-            if (cipher.isEncrypted(bytes)) {
+            const classification = await this.classifyAtRestBytes(file.path, bytes);
+            if (classification.kind === "corrupt-protected") {
+              throw this.corruptProtectedReadError(file.path, classification.reason);
+            }
+            if (classification.kind === "encrypted") {
+              await this.rememberAtRestProtected(file.path);
               skipped += 1;
               processed += 1;
               processedBytes += file.stat?.size ?? bytes.byteLength;
@@ -1707,6 +2158,7 @@ export class AtRestAdapterRuntime {
             }
             const ct = await cipher.encryptBinary(bytes);
             await writeBin(file.path, ct);
+            await this.rememberAtRestProtected(file.path);
             encrypted += 1;
             processed += 1;
             processedBytes += file.stat?.size ?? bytes.byteLength;
@@ -1846,6 +2298,7 @@ export class AtRestAdapterRuntime {
             // ONLY the local disk file. The plugin's resettingLocalCache flag +
             // paused sync loop suppress the vault.on('delete') propagation path.
             await remove(path);
+            await this.forgetAtRestProtected(path);
             wipedPaths.push(path);
             // SD-07-F4: register in the CROSS-INSTANCE suppression registry the
             // instant the file is gone. The post-wipe bulk registration in the
@@ -1973,18 +2426,17 @@ export class AtRestAdapterRuntime {
       throw new Error(guard.error ?? "VaultGuard workload guard blocked decryption.");
     }
 
-    this.settings.localProjectMemoryMode = true;
-    this.settings.localProjectMemoryModeAutoEnableSuppressed = false;
-    this.settings.atRestFirstRunDismissed = true;
-    await this.saveSettings();
-
     try {
       await processInBatches(
         files,
         async (file) => {
           try {
             const bytes = await readBin(file.path);
-            if (!cipher.isEncrypted(bytes)) {
+            const classification = await this.classifyAtRestBytes(file.path, bytes);
+            if (classification.kind === "corrupt-protected") {
+              throw this.corruptProtectedReadError(file.path, classification.reason);
+            }
+            if (classification.kind !== "encrypted") {
               skipped += 1;
               processed += 1;
               processedBytes += file.stat?.size ?? bytes.byteLength;
@@ -1998,6 +2450,7 @@ export class AtRestAdapterRuntime {
             }
             const plain = await cipher.decryptBinary(bytes);
             await writeBin(file.path, plain);
+            await this.forgetAtRestProtected(file.path);
             decrypted += 1;
             processed += 1;
             processedBytes += file.stat?.size ?? bytes.byteLength;
@@ -2031,6 +2484,13 @@ export class AtRestAdapterRuntime {
     const remainingCiphertextPaths = await this.findAtRestCiphertextFiles();
     const verified = remainingCiphertextPaths.length === 0;
     if (verified && failed === 0) {
+      // Publish plaintext/LPM mode only after the complete pass and fail-closed
+      // final scan prove that no valid or damaged protected payload remains.
+      // Until then normal adapter writes continue to use encryption.
+      this.settings.localProjectMemoryMode = true;
+      this.settings.localProjectMemoryModeAutoEnableSuppressed = false;
+      this.settings.atRestFirstRunDismissed = true;
+      await this.saveSettings();
       await cipher.reset();
       this.atRestCipher = null;
       this.cipherInitPromise = null;
@@ -2050,8 +2510,8 @@ export class AtRestAdapterRuntime {
           : "";
     new Notice(
       verified
-        ? `VaultGuard Sync: at-rest decryption complete. ${decrypted} decrypted, ${skipped} already plaintext, ${failed} failed. Encryption remains disabled.`
-        : `VaultGuard Sync: decryption finished, but ${remainingCiphertextPaths.length} VG1 file(s) remain${remainingSuffix}. Encryption remains disabled.`,
+        ? `VaultGuard Sync: at-rest decryption complete. ${decrypted} decrypted, ${skipped} already plaintext, ${failed} failed. Encryption is now disabled.`
+        : `VaultGuard Sync: decryption did not complete; ${remainingCiphertextPaths.length} protected or damaged file(s) remain${remainingSuffix}. Encryption remains enabled so those files cannot be overwritten as plaintext.`,
       verified ? 8000 : 12000,
     );
     return {
@@ -2318,7 +2778,12 @@ export class AtRestAdapterRuntime {
   private async readLocalProjectMemoryText(path: string): Promise<string> {
     if (this.originalAdapterMethods.readBinary) {
       const bytes = await this.originalAdapterMethods.readBinary(path);
-      if (this.hasVg1MagicBytes(bytes)) {
+      const classification = await this.classifyAtRestBytes(path, bytes);
+      if (classification.kind === "corrupt-protected") {
+        throw this.corruptProtectedReadError(path, classification.reason);
+      }
+      if (classification.kind === "encrypted") {
+        await this.rememberAtRestProtected(path);
         if (this.atRestCipher?.isReady()) {
           return this.atRestCipher.decryptString(bytes);
         }
@@ -2339,7 +2804,12 @@ export class AtRestAdapterRuntime {
       throw new Error("VaultGuard Sync: vault adapter readBinary unavailable.");
     }
     const bytes = await this.originalAdapterMethods.readBinary(path);
-    if (this.hasVg1MagicBytes(bytes)) {
+    const classification = await this.classifyAtRestBytes(path, bytes);
+    if (classification.kind === "corrupt-protected") {
+      throw this.corruptProtectedReadError(path, classification.reason);
+    }
+    if (classification.kind === "encrypted") {
+      await this.rememberAtRestProtected(path);
       if (this.atRestCipher?.isReady()) {
         return this.atRestCipher.decryptBinary(bytes);
       }
@@ -2377,6 +2847,9 @@ export class AtRestAdapterRuntime {
       return this.readLocalProjectMemoryText(path);
     }
     if (this.isPathExcluded(path)) {
+      if (this.isDetectedGitRepositoryPath(path)) {
+        return this.readPlainFromDisk(path);
+      }
       if (!this.originalAdapterMethods.read) {
         throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
       }
@@ -2901,12 +3374,34 @@ export class AtRestAdapterRuntime {
   // Local at-rest read/write helpers
   // ─────────────────────────────────────────────────────────────────────────
 
+  private async classifyAtRestBytes(
+    path: string,
+    bytes: ArrayBuffer | Uint8Array,
+  ): Promise<AtRestPayloadClassification> {
+    const durablyProtected = (await this.atRestProtectionState?.isProtected(path)) ?? false;
+    return classifyAtRestPayload(bytes, durablyProtected);
+  }
+
+  private async rememberAtRestProtected(path: string): Promise<void> {
+    await this.atRestProtectionState?.markProtected(path);
+  }
+
+  private async forgetAtRestProtected(path: string): Promise<void> {
+    await this.atRestProtectionState?.clear(path);
+  }
+
+  private corruptProtectedReadError(path: string, reason: string): Error {
+    return new Error(
+      `VaultGuard Sync: refusing to read "${path}" because durable at-rest state says it is protected but its VG1 envelope is damaged (${reason}). Restore a known-good version or use the recovery workflow; the bytes were preserved.`,
+    );
+  }
+
   /**
    * Read a vault-relative file from local disk and return its plaintext.
    *
    * If the bytes on disk start with the at-rest magic header, decrypt with
-   * the LAK. Otherwise, treat the bytes as legacy plaintext (UTF-8) and
-   * return as-is — this is what makes lazy migration safe. Excluded paths
+   * the LAK. Otherwise, treat bytes as legacy plaintext only when durable
+   * protection state does not say the path was VG1-protected. Excluded paths
    * (plugin self, Obsidian internals) are passed through unchanged because
    * they were never encrypted.
    *
@@ -2924,6 +3419,7 @@ export class AtRestAdapterRuntime {
    */
   isAtRestExcluded(path: string): boolean {
     if (this.isLocalProjectMemoryModeEnabled()) return true;
+    if (this.isDetectedGitRepositoryPath(path)) return true;
     const normalized = path.replace(/^\/+/, "");
     if (!normalized) return false;
     const configDir = this.normalizeVaultPath(this.app.vault.configDir);
@@ -2936,7 +3432,8 @@ export class AtRestAdapterRuntime {
     if (this.isLocalProjectMemoryModeEnabled()) {
       return this.readLocalProjectMemoryText(path);
     }
-    if (this.isAtRestExcluded(path)) {
+    const detectedGitRepositoryPath = this.isDetectedGitRepositoryPath(path);
+    if (this.isAtRestExcluded(path) && !detectedGitRepositoryPath) {
       if (!this.originalAdapterMethods.read) {
         throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
       }
@@ -2946,7 +3443,12 @@ export class AtRestAdapterRuntime {
     // Prefer readBinary so we can detect the magic header bytes precisely.
     if (this.originalAdapterMethods.readBinary) {
       const bytes = await this.originalAdapterMethods.readBinary(path);
-      if (this.atRestCipher?.isEncrypted(bytes)) {
+      const classification = await this.classifyAtRestBytes(path, bytes);
+      if (classification.kind === "corrupt-protected") {
+        throw this.corruptProtectedReadError(path, classification.reason);
+      }
+      if (classification.kind === "encrypted") {
+        await this.rememberAtRestProtected(path);
         // Phase 12 fail-CLOSED (Pitfall 4): a locked vault rejects a managed VG1
         // read IMMEDIATELY — no 10s waitForCipherInit hang, no plaintext
         // fallback. This is intentional fail-CLOSED, distinct from the
@@ -2955,10 +3457,10 @@ export class AtRestAdapterRuntime {
         if (this.locked) {
           throw new Error("VaultGuard: vault is locked");
         }
-        if (!this.atRestCipher.isReady()) {
+        if (!this.atRestCipher?.isReady()) {
           await this.waitForCipherInit(10_000);
         }
-        if (!this.atRestCipher.isReady()) {
+        if (!this.atRestCipher?.isReady()) {
           throw new Error(
             `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
           );
@@ -2976,6 +3478,9 @@ export class AtRestAdapterRuntime {
       throw new Error("VaultGuard Sync: vault adapter read method unavailable.");
     }
     const text = await this.originalAdapterMethods.read(path);
+    if (await this.atRestProtectionState?.isProtected(path)) {
+      throw this.corruptProtectedReadError(path, "binary inspection unavailable");
+    }
     if (text.length >= 4) {
       const head = new TextEncoder().encode(text.slice(0, 4));
       if (
@@ -3030,6 +3535,7 @@ export class AtRestAdapterRuntime {
     }
     if (this.isLocalProjectMemoryModeEnabled()) {
       await this.writeLocalProjectMemoryText(path, data);
+      await this.forgetAtRestProtected(path);
       return;
     }
     if (this.isAtRestExcluded(path)) {
@@ -3038,6 +3544,7 @@ export class AtRestAdapterRuntime {
         return; // legacy adapter without this method: unchanged silent return
       }
       await this.originalAdapterMethods.write(path, data);
+      await this.forgetAtRestProtected(path);
       return;
     }
     if (!this.atRestCipher?.isReady()) {
@@ -3048,6 +3555,7 @@ export class AtRestAdapterRuntime {
     const ciphertext = await this.atRestCipher.encryptString(data);
     if (this.originalAdapterMethods.writeBinary) {
       await this.originalAdapterMethods.writeBinary(path, ciphertext);
+      await this.rememberAtRestProtected(path);
       return;
     }
     // AR2: no writeBinary means the ciphertext cannot reach disk intact —
@@ -3072,20 +3580,26 @@ export class AtRestAdapterRuntime {
     if (this.isLocalProjectMemoryModeEnabled()) {
       return this.readLocalProjectMemoryBinary(path);
     }
-    if (this.isAtRestExcluded(path)) {
+    const detectedGitRepositoryPath = this.isDetectedGitRepositoryPath(path);
+    if (this.isAtRestExcluded(path) && !detectedGitRepositoryPath) {
       return this.originalAdapterMethods.readBinary(path);
     }
     const bytes = await this.originalAdapterMethods.readBinary(path);
-    if (this.atRestCipher?.isEncrypted(bytes)) {
+    const classification = await this.classifyAtRestBytes(path, bytes);
+    if (classification.kind === "corrupt-protected") {
+      throw this.corruptProtectedReadError(path, classification.reason);
+    }
+    if (classification.kind === "encrypted") {
+      await this.rememberAtRestProtected(path);
       // Phase 12 fail-CLOSED (Pitfall 4): a locked vault rejects a managed VG1
       // binary read immediately — no 10s wait, no plaintext fallback.
       if (this.locked) {
         throw new Error("VaultGuard: vault is locked");
       }
-      if (!this.atRestCipher.isReady()) {
+      if (!this.atRestCipher?.isReady()) {
         await this.waitForCipherInit(10_000);
       }
-      if (!this.atRestCipher.isReady()) {
+      if (!this.atRestCipher?.isReady()) {
         throw new Error(
           `VaultGuard Sync: cannot read "${path}" — local at-rest encryption is not ready. Try again in a moment.`
         );
@@ -3121,7 +3635,7 @@ export class AtRestAdapterRuntime {
     if (
       !this.session ||
       !this.atRestCipher?.isReady() ||
-      this.isAtRestExcluded(path) ||
+      (this.isAtRestExcluded(path) && !this.isDetectedGitRepositoryPath(path)) ||
       !isKnownBinaryExtensionPath(path)
     ) {
       return originalUrl;
@@ -3146,7 +3660,7 @@ export class AtRestAdapterRuntime {
       !original ||
       !this.session ||
       !this.atRestCipher?.isReady() ||
-      this.isAtRestExcluded(path) ||
+      (this.isAtRestExcluded(path) && !this.isDetectedGitRepositoryPath(path)) ||
       !isKnownBinaryExtensionPath(path)
     ) {
       return;
@@ -3309,7 +3823,14 @@ export class AtRestAdapterRuntime {
     try {
       const bytes = await readBin(path);
       // isEncrypted FIRST (research §5): an already-VG1 file is a no-op.
-      if (this.atRestCipher.isEncrypted(bytes)) return false;
+      const classification = await this.classifyAtRestBytes(path, bytes);
+      if (classification.kind === "corrupt-protected") {
+        throw this.corruptProtectedReadError(path, classification.reason);
+      }
+      if (classification.kind === "encrypted") {
+        await this.rememberAtRestProtected(path);
+        return false;
+      }
       // Direct-transfer / CR-1: do not LAK-encrypt a large external file until
       // its direct transfer has been finalized. The sync caller passes
       // remoteDurable=true only after successful promotion.
@@ -3368,6 +3889,7 @@ export class AtRestAdapterRuntime {
     }
     if (this.isLocalProjectMemoryModeEnabled()) {
       await this.writeLocalProjectMemoryBinary(path, data);
+      await this.forgetAtRestProtected(path);
       return;
     }
     if (this.isAtRestExcluded(path)) {
@@ -3376,6 +3898,7 @@ export class AtRestAdapterRuntime {
         return; // legacy adapter without this method: unchanged silent return
       }
       await this.originalAdapterMethods.writeBinary(path, data);
+      await this.forgetAtRestProtected(path);
       return;
     }
     if (!this.atRestCipher?.isReady()) {
@@ -3386,6 +3909,7 @@ export class AtRestAdapterRuntime {
     const ciphertext = await this.atRestCipher.encryptBinary(data);
     if (this.originalAdapterMethods.writeBinary) {
       await this.originalAdapterMethods.writeBinary(path, ciphertext);
+      await this.rememberAtRestProtected(path);
       return;
     }
     this.failIfAdapterDetached("writeBinary", path);
@@ -3428,6 +3952,9 @@ export class AtRestAdapterRuntime {
       return this.readLocalProjectMemoryBinary(path);
     }
     if (this.isPathExcluded(path)) {
+      if (this.isDetectedGitRepositoryPath(path)) {
+        return this.readPlainBinaryFromDisk(path);
+      }
       return this.originalAdapterMethods.readBinary(path);
     }
     if (!this.session) {
@@ -3715,12 +4242,10 @@ export class AtRestAdapterRuntime {
     }
 
     if (this.isOnline()) {
-      const roles = this.session.roles?.length ? this.session.roles : [this.session.role];
       let response: ApiResponse<{ allowed: boolean }>;
       try {
         response = await this.apiRequest<{ allowed: boolean }>("POST", this.vaultPath('/permissions/check'), {
           userId: this.session.userId,
-          roles,
           action: "delete",
           path: this.toPermissionPath(path),
         });
@@ -3790,11 +4315,13 @@ export class AtRestAdapterRuntime {
       if (this.originalAdapterMethods.remove) {
         await this.originalAdapterMethods.remove(path);
       }
+      await this.forgetAtRestProtected(path);
       return;
     }
     if (this.isPathExcluded(path)) {
       if (this.originalAdapterMethods.remove) {
         await this.originalAdapterMethods.remove(path);
+        await this.forgetAtRestProtected(path);
       }
       return;
     }
@@ -3852,6 +4379,7 @@ export class AtRestAdapterRuntime {
       // Delete locally only after authorization and, when online, remote success.
       if (this.originalAdapterMethods.remove) {
         await this.originalAdapterMethods.remove(path);
+        await this.forgetAtRestProtected(path);
       }
 
       await this.emitAuditEvent("file.delete", path);
@@ -3887,6 +4415,7 @@ export class AtRestAdapterRuntime {
     // best-effort on top.
     if (this.originalAdapterMethods.rename) {
       await this.originalAdapterMethods.rename(oldPath, newPath);
+      await this.atRestProtectionState?.move(oldPath, newPath);
     } else {
       this.failIfAdapterDetached("rename", oldPath);
     }
@@ -4042,7 +4571,9 @@ export class AtRestAdapterRuntime {
     }
 
     if (!this.shouldUploadChangesImmediately() || !this.isOnline() || !this.keyLease) {
-      this.queueOfflineOperation("write", newNormalized, content);
+      this.queueOfflineOperation("write", newNormalized, content, {
+        intent: { kind: "must-be-absent" },
+      });
       this.queueOfflineOperation("delete", oldNormalized);
       // Pitfall 5: rename emits OLD path.
       this.permissionStore.emit("changed", { path: oldNormalized });
@@ -4104,7 +4635,9 @@ export class AtRestAdapterRuntime {
     } catch (error) {
       if (this.isNetworkError(error)) {
         this.setConnectionStatus("offline");
-        this.queueOfflineOperation("write", newNormalized, content);
+        this.queueOfflineOperation("write", newNormalized, content, {
+          intent: { kind: "must-be-absent" },
+        });
         this.queueOfflineOperation("delete", oldNormalized);
         // Pitfall 5: rename emits OLD path.
         this.permissionStore.emit("changed", { path: oldNormalized });
@@ -4232,6 +4765,7 @@ export class AtRestAdapterRuntime {
         contentType,
         baseVersionId,
         baseHash: hash,
+        intent: { kind: "must-be-absent" },
       });
       this.queueOfflineOperation("delete", oldNormalized);
       // Pitfall 5: rename emits OLD path.
@@ -4303,6 +4837,7 @@ export class AtRestAdapterRuntime {
           contentType,
           baseVersionId,
           baseHash: hash,
+          intent: { kind: "must-be-absent" },
         });
         this.queueOfflineOperation("delete", oldNormalized);
         // Pitfall 5: rename emits OLD path.

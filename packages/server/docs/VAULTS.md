@@ -156,9 +156,11 @@ DELETE /vaults/{vaultId}/members/{userId}      → remove member (vault-admin, c
 ```
 GET    /vaults/{vaultId}/files                 → list files (filtered by permissions)
 GET    /vaults/{vaultId}/files/{path+}         → read content
+GET    /vaults/{vaultId}/files-decrypted/{path+}?versionId=... → authenticated exact-version plaintext read
 PUT    /vaults/{vaultId}/files/{path+}         → write content
 DELETE /vaults/{vaultId}/files/{path+}         → soft-delete (S3 delete marker)
 GET    /vaults/{vaultId}/files/{path+}/history → version history
+POST   /vaults/{vaultId}/files/{path+}/restore → restore exact version with expectedCurrentVersionId
 POST   /vaults/{vaultId}/files/sync            → delta sync (server returns changed files)
 GET    /vaults/{vaultId}/files/deleted         → list soft-deleted files
 ```
@@ -175,6 +177,26 @@ It is restricted to vault admins/org admins and returns only metadata needed for
 inventory comparison: paths, inferred folders, sizes, timestamps, aggregate counts,
 file-type counts, and largest-file summaries. It must not return file bodies,
 wrapped keys, checksums, ETags, version IDs, or any decrypted content.
+
+### Exact-version agent history boundary
+
+The AC-06 history/read/diff/restore capability is `Implemented` in
+`src/plugin/agent-bridge.ts`, `src/api/client.ts`, and
+`infrastructure/lambda/files/handler.ts`. It is exposed through the
+in-app-only `vaultguard_files` surface, never the default external bridge or
+remote ChatGPT connector. History and exact-version reads still require the
+signed-in caller's backend READ authority. Restore requires the current
+optimistic version, administrative/write authority, an always-on interactive
+confirmation, a backend conditional race check, and an audit record.
+
+Historical content is fetched through the vault-scoped authenticated
+`files-decrypted` route. When a historical object uses another cloud DEK, the
+restore handler decrypts it with its recorded key and re-encrypts it under the
+current key; it does not copy old ciphertext. These are cloud-key operations,
+not Local At-rest Key operations. Representative source tests exist, but this
+documentation pass did not exercise an authenticated live provider. See
+[Agent Command Expansion](AGENT-COMMAND-EXPANSION.md) and
+[At-Rest Encryption](AT-REST-ENCRYPTION.md).
 
 ### Permissions (vault-scoped)
 

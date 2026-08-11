@@ -10,7 +10,21 @@
 //  - `@`-mention note picker (candidates supplied by the view; metadata only)
 //  - optional image attachments (button + paste), desktop/API-key only
 
-import { Notice, setIcon } from "obsidian";
+import { Menu, Notice, setIcon } from "obsidian";
+
+import {
+  AttachmentValidationError,
+  MAX_IMAGE_BYTES,
+  MAX_PENDING_IMAGES,
+  MAX_TURN_ATTACHMENT_PAYLOAD_BYTES,
+  attachmentPayloadBytes,
+  sanitizeAttachmentName,
+  validateImageAttachment,
+  type AttachmentCapabilities,
+  type DocumentPin,
+  type ImageAttachment,
+} from "./attachment-model";
+export type { ImageAttachment } from "./attachment-model";
 
 const BAR_CLS = "vaultguard-chat-input-bar";
 const TEXTAREA_CLS = "vaultguard-chat-input";
@@ -18,10 +32,6 @@ const SEND_BTN_CLS = "vaultguard-chat-send-btn";
 const MAX_ROWS = 6;
 const LINE_HEIGHT_PX = 22;
 
-// Anthropic vision accepts only these media types; anything else 400s, so we
-// reject unsupported images at attach time with a clear notice rather than
-// failing the whole turn later.
-const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
 export type SlashCommand =
   | { kind: "clear" }
@@ -120,17 +130,10 @@ export interface MentionCandidate {
   name: string;
 }
 
-export interface ImageAttachment {
-  /** MIME type, e.g. "image/png". */
-  mediaType: string;
-  /** Base64 image bytes (no data: prefix). */
-  data: string;
-  /** Original filename for the thumbnail label / alt text. */
-  name: string;
-}
-
 export interface InputControllerOptions {
-  /** Show the image-attach affordance + accept pasted/dropped images. */
+  /** Show the desktop attachment menu and accept pasted images. */
+  enableAttachments?: boolean;
+  /** Backward-compatible alias used by older callers/tests. */
   enableImages?: boolean;
 }
 
@@ -143,6 +146,12 @@ export interface InputControllerCallbacks {
    * in subscription mode). Return false to keep the input as-is.
    */
   canSubmit?(text: string, images?: ImageAttachment[]): boolean;
+  /** Current provider/platform attachment capability, evaluated when the menu opens. */
+  getAttachmentCapabilities?(): AttachmentCapabilities;
+  /** Ask the view to select and pin one or more original documents. */
+  onPinDocuments?(): void | Promise<void>;
+  /** Remove a conversation-scoped document pin by opaque id. */
+  onRemoveDocumentPin?(id: string): void | Promise<void>;
   /** Esc / Stop while a turn is running. */
   onCancel(): void;
   /** A recognized slash command. */
@@ -296,17 +305,23 @@ export class InputController {
    */
   private mentionQuerySeq = 0;
 
-  // Image attachment state (desktop, API-key mode).
-  private readonly enableImages: boolean;
+  // Attachment state. Images are transient drafts; document pins are supplied
+  // by the view from the active encrypted conversation.
+  private readonly enableAttachments: boolean;
   private readonly attachmentsEl: HTMLElement | null = null;
+  private attachmentBtn: HTMLButtonElement | null = null;
+  private imageInput: HTMLInputElement | null = null;
   private pendingImages: ImageAttachment[] = [];
+  private documentPins: DocumentPin[] = [];
+  private attachmentGeneration = 0;
+  private disposed = false;
 
   constructor(
     parent: HTMLElement,
     private readonly callbacks: InputControllerCallbacks,
     options: InputControllerOptions = {},
   ) {
-    this.enableImages = options.enableImages === true;
+    this.enableAttachments = options.enableAttachments === true || options.enableImages === true;
     const bar = parent.createDiv({ cls: BAR_CLS });
 
     this.slashPopup = bar.createDiv({ cls: "vaultguard-chat-slash-popup" });
@@ -315,7 +330,7 @@ export class InputController {
     this.mentionPopup = bar.createDiv({ cls: "vaultguard-chat-mention-popup" });
     this.mentionPopup.hide();
 
-    if (this.enableImages) {
+    if (this.enableAttachments) {
       this.attachmentsEl = bar.createDiv({ cls: "vaultguard-chat-attachments" });
       this.attachmentsEl.hide();
     }
@@ -329,7 +344,7 @@ export class InputController {
       },
     });
 
-    if (this.enableImages) this.buildAttachButton(bar);
+    if (this.enableAttachments) this.buildAttachmentButton(bar);
 
     this.sendBtn = bar.createEl("button", {
       cls: SEND_BTN_CLS,
@@ -350,7 +365,7 @@ export class InputController {
         this.hideSlashCommands();
       }, 120),
     );
-    if (this.enableImages) {
+    if (this.enableAttachments) {
       this.textarea.addEventListener("paste", (evt) => this.onPaste(evt));
     }
     this.sendBtn.addEventListener("click", () => {
@@ -367,6 +382,7 @@ export class InputController {
   setBusy(busy: boolean): void {
     this.busy = busy;
     this.textarea.disabled = busy;
+    if (this.attachmentBtn) this.attachmentBtn.disabled = busy;
     this.sendBtn.setText(busy ? "Stop" : "Send");
     this.sendBtn.toggleClass("is-busy", busy);
     this.sendBtn.setAttribute("aria-label", busy ? "Stop" : "Send");
@@ -389,6 +405,39 @@ export class InputController {
     this.autoGrow();
     const end = this.textarea.value.length;
     this.textarea.setSelectionRange(end, end);
+  }
+
+  /** Restore a complete unsent/user-edited draft, including image blocks. */
+  setDraft(text: string, images: ImageAttachment[] = []): void {
+    this.setText(text);
+    this.attachmentGeneration += 1;
+    this.pendingImages = images.map((image) => ({ ...image }));
+    this.renderAttachments();
+  }
+
+  /** Render only the active conversation's reference pins. */
+  setDocumentPins(pins: ReadonlyArray<DocumentPin>): void {
+    this.documentPins = pins.map((pin) => ({ ...pin }));
+    this.renderAttachments();
+  }
+
+  getPendingImages(): ImageAttachment[] {
+    return this.pendingImages.map((image) => ({ ...image }));
+  }
+
+  getDraft(): { text: string; images: ImageAttachment[] } {
+    return {
+      text: this.textarea.value,
+      images: this.getPendingImages(),
+    };
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.attachmentGeneration += 1;
+    this.pendingImages = [];
+    this.documentPins = [];
+    this.renderAttachments();
   }
 
   private onKeyDown(evt: KeyboardEvent): void {
@@ -666,91 +715,202 @@ export class InputController {
 
   // ─── Image attachments ──────────────────────────────────────────────────────
 
-  private buildAttachButton(bar: HTMLElement): void {
-    const fileInput = bar.createEl("input", {
-      attr: { type: "file", accept: "image/*", multiple: "true" },
+  private buildAttachmentButton(bar: HTMLElement): void {
+    this.imageInput = bar.createEl("input", {
+      attr: {
+        type: "file",
+        accept: "image/png,image/jpeg,image/gif,image/webp",
+        multiple: "true",
+      },
     });
-    fileInput.hide();
-    fileInput.addEventListener("change", () => {
-      const files = fileInput.files;
-      if (files) Array.from(files).forEach((f) => void this.addImageFile(f));
-      fileInput.value = "";
+    this.imageInput.hide();
+    this.imageInput.addEventListener("change", () => {
+      const files = this.imageInput?.files;
+      if (files) Array.from(files).forEach((file) => void this.addImageFile(file));
+      if (this.imageInput) this.imageInput.value = "";
     });
 
-    const btn = bar.createEl("button", {
+    this.attachmentBtn = bar.createEl("button", {
       cls: "vaultguard-chat-attach-btn clickable-icon",
-      attr: { type: "button", "aria-label": "Attach image", title: "Attach image" },
+      attr: { type: "button", "aria-label": "Add attachment", title: "Add attachment" },
     });
-    setIcon(btn, "paperclip");
-    btn.addEventListener("click", () => fileInput.click());
+    setIcon(this.attachmentBtn, "paperclip");
+    this.attachmentBtn.addEventListener("click", (event) => this.openAttachmentMenu(event));
   }
 
-  private onPaste(evt: ClipboardEvent): void {
-    const items = evt.clipboardData?.items;
+  private openAttachmentMenu(event: MouseEvent): void {
+    const capabilities = this.callbacks.getAttachmentCapabilities?.();
+    const menu = new Menu();
+    menu.addItem((item) =>
+      item
+        .setTitle("Add photos")
+        .setIcon("image")
+        .setDisabled(capabilities?.imageInput === false)
+        .onClick(() => this.imageInput?.click()),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Pin document")
+        .setIcon("file-text")
+        .setDisabled(
+          capabilities !== undefined &&
+            !capabilities.textDocumentInput &&
+            !capabilities.pdfDocumentInput,
+        )
+        .onClick(() => {
+          const result = this.callbacks.onPinDocuments?.();
+          if (result instanceof Promise) void result.catch(() => undefined);
+        }),
+    );
+    menu.showAtMouseEvent(event);
+  }
+
+  private onPaste(event: ClipboardEvent): void {
+    const clipboard = event.clipboardData;
+    const items = clipboard?.items;
     if (!items) return;
-    let handled = false;
+    let handledImage = false;
     for (const item of Array.from(items)) {
-      if (item.kind === "file" && item.type.startsWith("image/")) {
-        const file = item.getAsFile();
-        if (file) {
-          void this.addImageFile(file);
-          handled = true;
-        }
-      }
+      if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+      const file = item.getAsFile();
+      if (!file) continue;
+      void this.addImageFile(file);
+      handledImage = true;
     }
-    if (handled) evt.preventDefault();
+    const hasPlainText =
+      Array.from(clipboard.types ?? []).includes("text/plain") &&
+      clipboard.getData("text/plain").length > 0;
+    if (handledImage && !hasPlainText) event.preventDefault();
   }
 
   private async addImageFile(file: File): Promise<void> {
-    const dataUrl = await readAsDataUrl(file);
-    const match = /^data:([^;]+);base64,(.*)$/.exec(dataUrl);
-    if (!match) return;
-    const mediaType = match[1].toLowerCase();
-    if (!SUPPORTED_IMAGE_TYPES.has(mediaType)) {
-      new Notice(
-        `VaultGuard Chat: ${mediaType || "that file"} isn't a supported image ` +
-          "(use PNG, JPEG, GIF, or WebP).",
-      );
+    if (this.pendingImages.length >= MAX_PENDING_IMAGES) {
+      new Notice(`VaultGuard Chat: add at most ${MAX_PENDING_IMAGES} photos per message.`);
       return;
     }
-    this.pendingImages.push({ mediaType, data: match[2], name: file.name || "image" });
-    this.renderAttachments();
+    const generation = this.attachmentGeneration;
+    try {
+      if (file.size > MAX_IMAGE_BYTES) {
+        throw new AttachmentValidationError(
+          "file-too-large",
+          "Images must be 10 MB or smaller.",
+        );
+      }
+      const bytes = await readFileBytes(file);
+      if (this.disposed || generation !== this.attachmentGeneration) return;
+      const mediaType = validateImageAttachment(bytes, file.type || undefined);
+      if (this.pendingImages.length >= MAX_PENDING_IMAGES) {
+        throw new AttachmentValidationError(
+          "too-many-files",
+          `Add at most ${MAX_PENDING_IMAGES} photos per message.`,
+        );
+      }
+      const candidate: ImageAttachment = {
+        mediaType,
+        data: bytesToBase64(bytes),
+        name: sanitizeAttachmentName(file.name || "image", "image"),
+        byteLength: bytes.byteLength,
+      };
+      if (
+        attachmentPayloadBytes([...this.pendingImages, candidate], []) >
+        MAX_TURN_ATTACHMENT_PAYLOAD_BYTES
+      ) {
+        throw new AttachmentValidationError(
+          "payload-too-large",
+          "The combined attachment payload must be 32 MB or smaller.",
+        );
+      }
+      this.pendingImages.push(candidate);
+      this.renderAttachments();
+    } catch (error) {
+      const message =
+        error instanceof AttachmentValidationError
+          ? error.message
+          : "That photo could not be read.";
+      new Notice(`VaultGuard Chat: ${message}`);
+    }
   }
 
   private renderAttachments(): void {
     if (!this.attachmentsEl) return;
     this.attachmentsEl.empty();
-    if (this.pendingImages.length === 0) {
+    if (this.pendingImages.length === 0 && this.documentPins.length === 0) {
       this.attachmentsEl.hide();
       return;
     }
-    this.pendingImages.forEach((img, i) => {
+    this.pendingImages.forEach((image, index) => {
       const chip = this.attachmentsEl!.createDiv({ cls: "vaultguard-chat-attachment" });
       chip.createEl("img", {
         cls: "vaultguard-chat-attachment-thumb",
-        attr: { src: `data:${img.mediaType};base64,${img.data}`, alt: img.name },
+        attr: {
+          src: `data:${image.mediaType};base64,${image.data}`,
+          alt: `Photo ${image.name}`,
+        },
       });
-      const remove = chip.createSpan({
+      const details = chip.createDiv({ cls: "vaultguard-chat-attachment-details" });
+      details.createSpan({ cls: "vaultguard-chat-attachment-name", text: image.name });
+      details.createSpan({
+        cls: "vaultguard-chat-attachment-meta",
+        text: formatAttachmentBytes(image.byteLength),
+      });
+      const remove = chip.createEl("button", {
         cls: "vaultguard-chat-attachment-remove clickable-icon",
-        attr: { "aria-label": "Remove image", title: "Remove image" },
+        attr: {
+          type: "button",
+          "aria-label": `Remove photo ${image.name}`,
+          title: `Remove photo ${image.name}`,
+        },
       });
       setIcon(remove, "x");
       remove.addEventListener("click", () => {
-        this.pendingImages.splice(i, 1);
+        this.pendingImages.splice(index, 1);
         this.renderAttachments();
+        this.textarea.focus();
+      });
+    });
+
+    this.documentPins.forEach((pin) => {
+      const chip = this.attachmentsEl!.createDiv({
+        cls: `vaultguard-chat-document-pin${pin.state === "unavailable" ? " is-unavailable" : ""}`,
+      });
+      const icon = chip.createSpan({ cls: "vaultguard-chat-document-pin-icon" });
+      setIcon(icon, pin.state === "unavailable" ? "file-warning" : "file-text");
+      const details = chip.createDiv({ cls: "vaultguard-chat-attachment-details" });
+      details.createSpan({ cls: "vaultguard-chat-attachment-name", text: pin.displayName });
+      details.createSpan({
+        cls: "vaultguard-chat-attachment-meta",
+        text:
+          pin.state === "unavailable"
+            ? "Unavailable - fix the original or unpin"
+            : `${pin.format.toUpperCase()} - ${formatAttachmentBytes(pin.byteLength)}`,
+      });
+      const remove = chip.createEl("button", {
+        cls: "vaultguard-chat-attachment-remove clickable-icon",
+        attr: {
+          type: "button",
+          "aria-label": `Unpin document ${pin.displayName}`,
+          title: `Unpin document ${pin.displayName}`,
+        },
+      });
+      setIcon(remove, "x");
+      remove.addEventListener("click", () => {
+        const result = this.callbacks.onRemoveDocumentPin?.(pin.id);
+        if (result instanceof Promise) void result.catch(() => undefined);
+        this.textarea.focus();
       });
     });
     this.attachmentsEl.show();
   }
 
   private clearAttachments(): void {
+    this.attachmentGeneration += 1;
     this.pendingImages = [];
     this.renderAttachments();
   }
 
   private submit(): void {
     const text = this.textarea.value.trim();
-    const images = this.enableImages ? this.pendingImages : [];
+    const images = this.enableAttachments ? this.pendingImages : [];
     if (!text && images.length === 0) return;
 
     // Slash commands are text-only; skip parsing when images are attached.
@@ -810,15 +970,30 @@ export class InputController {
   }
 }
 
-// Read a File as a base64 data URL. FileReader is a local browser API (no
-// network), so it honors the Networking Rule.
-function readAsDataUrl(file: File): Promise<string> {
+// FileReader/arrayBuffer are local browser APIs (no network).
+async function readFileBytes(file: File): Promise<Uint8Array> {
+  if (typeof file.arrayBuffer === "function") {
+    return new Uint8Array(await file.arrayBuffer());
+  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+    reader.onload = () =>
+      resolve(reader.result instanceof ArrayBuffer ? new Uint8Array(reader.result) : new Uint8Array());
     reader.onerror = () => reject(reader.error ?? new Error("Could not read the image file."));
-    reader.readAsDataURL(file);
+    reader.readAsArrayBuffer(file);
   });
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function formatAttachmentBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 export { BAR_CLS as INPUT_BAR_CLS };

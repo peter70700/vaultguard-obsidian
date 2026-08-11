@@ -15,6 +15,7 @@ import type { SemanticRuntimeStatus } from "../../plugin/discovery/semantic-sear
 export interface SecureSearchViewContext {
   isEnabled(): boolean;
   isReady(): boolean;
+  getDefaultResultLimit(): number;
   search(request: SecureSearchRequest): Promise<SecureSearchResponse>;
   cancel(): void;
   openLocalPath(path: string): Promise<void>;
@@ -351,6 +352,7 @@ export class SecureSearchView extends ItemView {
         scope: this.scopeEl.value as SecureSearchScope,
         includeContent: this.contentToggleEl.checked,
         semantic: this.semanticQueryToggleEl?.checked === true,
+        limit: this.context.getDefaultResultLimit(),
       });
     } catch {
       this.setStatus(this.i18n.t("discovery.search.invalidQuery"), "alert");

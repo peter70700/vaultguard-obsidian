@@ -27,9 +27,31 @@ export interface OpenAiFunctionTool {
   parameters: Record<string, unknown>;
 }
 
+export interface OpenAiInputTextContent {
+  type: "input_text";
+  text: string;
+}
+
+export interface OpenAiInputImageContent {
+  type: "input_image";
+  image_url: string;
+  detail: "auto" | "low" | "high";
+}
+
+export interface OpenAiInputFileContent {
+  type: "input_file";
+  filename: string;
+  file_data: string;
+}
+
+export type OpenAiMessageInputContent =
+  | OpenAiInputTextContent
+  | OpenAiInputImageContent
+  | OpenAiInputFileContent;
+
 export interface OpenAiMessageInputItem {
   role: "user" | "assistant";
-  content: string;
+  content: string | OpenAiMessageInputContent[];
 }
 
 export interface OpenAiFunctionCallOutputItem {

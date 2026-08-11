@@ -8,10 +8,11 @@ VaultGuard Sync is the Obsidian plugin for permission-aware encrypted sync, part
 of the VaultGuard product family. This public plugin repository contains only
 the Obsidian client.
 
-Fresh installs start with one shield and the protection/sync core. AI Chat,
-Permissions Graph, and external Agent Access are optional modules that remain
-off until enabled in settings; established installs preserve their previous
-availability during migration.
+Fresh installs start with one shield and the protection/sync core. AI Chat and
+Permissions Graph are enabled by default, while external Agent Access and Secure
+Discovery start off. Each module remains independently configurable, and
+recognized legacy installs preserve their previous P1 availability during
+migration; Secure Discovery never migrates on.
 
 - **Try Pro free for 14 days (payment method required):** https://admin.vaultguard.cloud/#/signup
 - **Learn more / managed hosting:** https://vaultguard.cloud
@@ -93,8 +94,8 @@ the operational layer most teams want once they scale past a few users,
 | **Price** | Free, self-hosted | €12 / user / month | Custom |
 | **Edition (code)** | `community` | `pro` | `pro` |
 | **License** | Sustainable Use License | Cloud ToS | Commercial contract |
-| **User cap** | Your deployment limit | Up to 100 | By agreement |
-| **Storage** | Your AWS configuration | 100 GB included | By agreement |
+| **User cap** | Up to 100 | Up to 100 | By agreement |
+| **Storage** | Your AWS configuration | 100 GB included | 1 TB |
 | **Trial** | Clone + deploy | 14 days; payment method required | Sales call |
 
 ### Security plane
@@ -139,7 +140,6 @@ Where Pro starts to earn its keep.
 | Capability | CE | Pro | Enterprise |
 | --- | :---: | :---: | :---: |
 | SAML / OIDC SSO integration | ✗ | ✗ | ✓ |
-| SOC 2 / HIPAA evidence packages | ✗ | ✗ | Available by agreement |
 | Dedicated infrastructure | ✗ | ✗ | ✓ |
 | Custom data residency | ✗ | ✗ | ✓ |
 | Custom key rotation & retention policies | ✗ | ✗ | ✓ |
@@ -156,7 +156,6 @@ What you do vs. what we do.
 | Run backups | You | Us | Us |
 | Monitor uptime / page on-call | You | Us | Us |
 | Pay AWS bill | You | — | Custom |
-| Compliance evidence | You | — | Us |
 
 ### What CE actually delivers
 
@@ -172,18 +171,18 @@ What you do vs. what we do.
 - No share links — every external collaboration needs the recipient to be a full vault member
 - No audit dashboards, alerts, or CSV exports for compliance teams
 - No managed uptime commitment, backup operations, or patch pipeline — AWS deprecations are your responsibility
-- No SSO, no compliance attestations — Enterprise is the only path for regulated environments
+- No SSO — Enterprise is the path for managed identity integration
 
 ### The one-sentence pitch
 
 Community Edition is the trust signal and the escape hatch. Pro is what you pay
 for once the team grows past two non-technical admins, needs to share with
 outsiders, or has a compliance team asking for audit evidence. Enterprise adds
-SSO, dedicated infra, and compliance attestations on top of Pro.
+SSO, dedicated infrastructure, and custom data residency on top of Pro.
 
 > **Want managed hosting?** [Start a 14-day Pro trial](https://admin.vaultguard.cloud/#/signup)
 > — a payment method is required at trial start. Or [contact Enterprise sales](mailto:support@vaultguard.cloud?subject=VaultGuard%20Enterprise%20Inquiry)
-> for SSO and compliance.
+> for SSO and dedicated infrastructure.
 
 ## Self-Hosting (Community Edition)
 

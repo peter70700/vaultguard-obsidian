@@ -20,6 +20,7 @@ import {
   UpdateCommand,
   ScanCommand,
   BatchWriteCommand,
+  TransactWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
 import type { QueryCommandInput } from '@aws-sdk/lib-dynamodb';
 import { AdminGetUserCommand, CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
@@ -420,7 +421,7 @@ export async function verifyToken(event: APIGatewayProxyEvent): Promise<UserCont
  */
 export async function verifyActiveUser(
   event: APIGatewayProxyEvent,
-  options: { allowPendingCheckout?: boolean } = {}
+  options: { allowPendingCheckout?: boolean; allowSessionless?: boolean } = {}
 ): Promise<UserContext> {
   const user = await verifyToken(event);
   requireOrgId(user);
@@ -435,7 +436,9 @@ export async function verifyActiveUser(
   // INCLUDING callers the later MFA or subscription gates go on to reject — a
   // slight over-count, which is acceptable for adoption telemetry (it never
   // under-reports the population that would need a header before enforcing).
-  await applySessionHeaderPolicy(event, user);
+  await applySessionHeaderPolicy(event, user, {
+    allowSessionless: options.allowSessionless,
+  });
   await assertOrgMfaSatisfied(user);
   if (!options.allowPendingCheckout) {
     await assertSubscriptionAllowsAccess(user);
@@ -806,9 +809,8 @@ export function assertSessionAgePolicy(user: UserContext, settings: OrgSettings)
  * `X-VaultGuard-Session-Id`.
  *
  * - `off` — no telemetry, no enforcement.
- * - `observe` — **the default.** Emits one `[SESSION_TELEMETRY]` line per
- *   headerless authenticated call and changes nothing else: not the status, not
- *   the body, not a header.
+ * - `observe` — **the default.** Emits at most one privacy-minimal
+ *   `[SESSION_TELEMETRY]` route sample per minute and changes nothing else.
  * - `enforce` — rejects headerless authenticated calls with 401 and, for
  *   ordinary (non-super-admin) callers, additionally applies the org
  *   session-age policy to header-bearing calls.
@@ -821,18 +823,17 @@ export type SessionEnforcementMode = 'off' | 'observe' | 'enforce';
  * **Scope ceiling — binding.** The default is `observe`, and observe never
  * rejects, so with no configuration change every authenticated response stays
  * byte-identical to today's. `enforce` is fully built and fully tested but
- * DORMANT: **no Terraform in this phase sets this variable.** Flipping it is an
- * operator decision made against real adoption telemetry — the admin panel
- * sends no session header today, so a premature flip would brick every deployed
- * panel until an Amplify deploy caught up (the 2026-07-11 production-incident
- * class: an audit finding's wrong premise, applied confidently).
+ * Terraform exposes this as an explicit validated operator control. The safe
+ * default remains observe; a live flip still requires deployment authorization
+ * and migration evidence.
  *
  * **The env var is read live on every call — deliberately NOT captured in a
  * module-level const** like this file's other env constants, for two reasons:
  *   1. module-level constants resolve at Lambda cold start, which would make
  *      the mode untestable without module resets; and
- *   2. it would make the operator's flip take effect only after a cold start
- *      rather than on the next invocation.
+ *   2. tests can change it without resetting the module.
+ * AWS Lambda configuration updates replace execution environments; this live
+ * read does not imply that an already-running environment is mutated in place.
  * The cost is one `process.env` read per authenticated request — free next to
  * the DynamoDB round trips already on that path.
  */
@@ -842,6 +843,38 @@ export function getSessionEnforcementMode(): SessionEnforcementMode {
     return raw;
   }
   return 'observe';
+}
+
+const SESSION_TELEMETRY_WINDOW_MS = 60_000;
+const sessionTelemetryWindows = new Map<string, number>();
+
+/** Test isolation for the warm-container route-window limiter. */
+export function resetSessionTelemetryForTests(): void {
+  sessionTelemetryWindows.clear();
+}
+
+function recordHeaderlessSessionTelemetry(event: APIGatewayProxyEvent): void {
+  // `resource` is API Gateway's route template; never fall back to `path`,
+  // which may contain vault/user identifiers.
+  const resource = event.resource || '<unmapped>';
+  const method = (event.httpMethod || 'UNKNOWN').toUpperCase();
+  const key = `${method}\u0000${resource}`;
+  const now = Date.now();
+  const windowStartedAt = sessionTelemetryWindows.get(key);
+  if (
+    windowStartedAt !== undefined &&
+    now - windowStartedAt < SESSION_TELEMETRY_WINDOW_MS
+  ) {
+    return;
+  }
+
+  sessionTelemetryWindows.set(key, now);
+  console.warn('[SESSION_TELEMETRY]', {
+    resource,
+    method,
+    hasHeader: false,
+    windowSeconds: SESSION_TELEMETRY_WINDOW_MS / 1000,
+  });
 }
 
 /**
@@ -854,36 +887,32 @@ export function getSessionEnforcementMode(): SessionEnforcementMode {
  * | header  | off   | observe (default)  | enforce                            |
  * |---------|-------|--------------------|------------------------------------|
  * | present | no-op | no-op              | org age policy (ordinary callers)  |
- * | absent  | no-op | ONE telemetry line | 401                                |
+ * | absent  | no-op | bounded route sample | 401                              |
  *
  * Header-present is a no-op below `enforce` because `assertSessionActiveIfPresent`
  * has already validated the session row upstream in BOTH callers — this helper
  * never re-reads it and never emits telemetry for it.
  *
- * The telemetry payload is fixed at five non-secret fields. It must **never**
- * carry the token, any header value, the email or the org id: CloudWatch
- * retention turns a convenience field into an information-disclosure surface.
+ * Telemetry is route-window bounded and contains no user, organization, email,
+ * IP, session, token, or user-agent identifier.
  *
  * @param options.skipAgePolicy - set by `requireSuperAdmin`; super-admins
  *   operate cross-org and have no single org's settings to apply.
+ * @param options.allowSessionless - route-specific authenticated bootstrap
+ *   exception. The caller still passed token/revocation/cutoff checks.
  */
 export async function applySessionHeaderPolicy(
   event: APIGatewayProxyEvent,
   user: UserContext,
-  options: { skipAgePolicy?: boolean } = {}
+  options: { skipAgePolicy?: boolean; allowSessionless?: boolean } = {}
 ): Promise<void> {
   const mode = getSessionEnforcementMode();
   const hasHeader = getSessionIdFromRequest(event) !== '';
 
   if (!hasHeader) {
+    if (options.allowSessionless) return;
     if (mode === 'observe') {
-      console.warn('[SESSION_TELEMETRY]', {
-        resource: event.resource || event.path || '',
-        method: event.httpMethod,
-        userId: user.userId,
-        hasHeader: false,
-        userAgent: getUserAgent(event),
-      });
+      recordHeaderlessSessionTelemetry(event);
       return;
     }
     if (mode === 'enforce') {
@@ -2088,7 +2117,7 @@ export interface PlanLimits {
 
 export const PLAN_LIMITS: Record<PlanTier, PlanLimits> = {
   pro:        { maxUsers: 100,    maxStorageBytes: 100 * 1024 * 1024 * 1024 },        // 100 GB
-  enterprise: { maxUsers: -1,     maxStorageBytes: -1 },                               // unlimited
+  enterprise: { maxUsers: -1,     maxStorageBytes: 1024 * 1024 * 1024 * 1024 },       // 1 TB
 };
 
 export interface OrgSettings {
@@ -2493,8 +2522,8 @@ export function checkUserLimit(org: OrgRecord): OrgEnforcementResult {
  * Checks if uploading a file of the given size would exceed storage quota.
  */
 export function checkStorageLimit(org: OrgRecord, additionalBytes: number): OrgEnforcementResult {
-  // LA4: -1 is the enterprise "unlimited" sentinel — skip the quota check so
-  // uploads aren't blocked with "Storage limit reached" on unlimited plans.
+  // LA4: Retain support for explicitly configured unlimited storage. Current
+  // Enterprise organizations use the finite 1 TB limit in PLAN_LIMITS.
   if (org.maxStorageBytes < 0) return { allowed: true, org };
   if (org.currentStorageBytes + additionalBytes > org.maxStorageBytes) {
     const usedMB = Math.round(org.currentStorageBytes / 1024 / 1024);
@@ -2817,6 +2846,24 @@ export interface VaultCursor {
   lastChangedAt: string;
 }
 
+export interface VaultMutationIntent {
+  vaultId: string;
+  sk: string;
+  intentId: string;
+  orgId: string;
+  action: VaultActivityAction;
+  path: string;
+  actorUserId: string;
+  status: 'pending';
+  createdAt: string;
+  createdAtMs: number;
+  verification?:
+    | { kind: 'object-metadata' }
+    | { kind: 'delete-head' }
+    | { kind: 'restored-version'; versionId: string }
+    | { kind: 'permission-state' };
+}
+
 /**
  * Pads an epoch-ms number to 15 digits so string-compared sort keys order
  * the same way as numeric comparison. Year 33658 fits in 15 digits.
@@ -2825,29 +2872,170 @@ function padEpochMs(ms: number): string {
   return ms.toString().padStart(15, '0');
 }
 
-/** Builds a sort key that is unique per event and orders by time. */
-function buildActivitySortKey(epochMs: number): string {
-  return `${padEpochMs(epochMs)}#${generateId().slice(0, 8)}`;
+function activityRecordFor(
+  params: Pick<VaultMutationIntent, 'vaultId' | 'action' | 'path' | 'actorUserId'>,
+  activityId: string,
+  now: Date,
+): VaultActivityRecord & { activityId: string } {
+  const epochMs = now.getTime();
+  const changedAt = now.toISOString();
+  const ttl = Math.floor(epochMs / 1000) + VAULT_ACTIVITY_TTL_DAYS * 24 * 60 * 60;
+  return {
+    vaultId: params.vaultId,
+    sk: `${padEpochMs(epochMs)}#${activityId.replace(/[^A-Za-z0-9]/g, '').slice(0, 8).padEnd(8, '0')}`,
+    activityId,
+    changedAt,
+    changedAtMs: epochMs,
+    action: params.action,
+    path: params.path,
+    actorUserId: params.actorUserId,
+    ttl,
+  };
+}
+
+/** Persist an outbox row before the mutation it describes. `!` keeps intent
+ * sort keys below timestamp activity keys, so delta queries never deserialize
+ * an intent as an activity record. Pending intents intentionally have no TTL. */
+export async function beginVaultMutationIntent(params: {
+  orgId: string;
+  vaultId: string;
+  action: VaultActivityAction;
+  path: string;
+  actorUserId: string;
+  verification?: VaultMutationIntent['verification'];
+}): Promise<VaultMutationIntent> {
+  const intentId = generateId();
+  const now = new Date();
+  // Permission mutations now create their durable outbox row before changing
+  // the permission table. Preserve the existing off-hours detection at this
+  // pre-mutation chokepoint so a publication failure cannot suppress the
+  // security signal. Fire-and-forget: telemetry must never decide whether the
+  // intent itself is persisted.
+  if (params.action === 'permission_changed' && isOffHours(now.toISOString())) {
+    void emitSecurityMetric('OffHoursPermissionChange');
+  }
+  const intent: VaultMutationIntent = {
+    vaultId: params.vaultId,
+    sk: `!INTENT#${intentId}`,
+    intentId,
+    orgId: params.orgId,
+    action: params.action,
+    path: params.path,
+    actorUserId: params.actorUserId,
+    status: 'pending',
+    createdAt: now.toISOString(),
+    createdAtMs: now.getTime(),
+    ...(params.verification ? { verification: params.verification } : {}),
+  };
+  await docClient.send(
+    new PutCommand({
+      TableName: VAULT_ACTIVITY_TABLE,
+      Item: intent,
+      ConditionExpression: 'attribute_not_exists(vaultId) AND attribute_not_exists(sk)',
+    }),
+  );
+  return intent;
 }
 
 /**
- * Appends an activity-log row and bumps the vault's revision counter +
- * lastChangedAt timestamp. Writes are NOT transactional, so the order
- * matters for crash safety:
+ * Atomically consume a pending intent, append its activity row, and advance the
+ * vault revision. If this throws, the intent remains pending and cursor clients
+ * are forced onto reconciliation instead of trusting an unchanged revision.
+ */
+export async function commitVaultMutationIntent(intent: VaultMutationIntent): Promise<void> {
+  const activityId = intent.intentId;
+  // Derive the transaction payload from the persisted intent so retries with
+  // the same ClientRequestToken remain byte-identical after an ambiguous SDK
+  // response.
+  const activity = activityRecordFor(intent, activityId, new Date(intent.createdAtMs));
+  await docClient.send(
+    new TransactWriteCommand({
+      ClientRequestToken: activityId.replace(/[^A-Za-z0-9-]/g, '').slice(0, 36),
+      TransactItems: [
+        {
+          Put: {
+            TableName: VAULT_ACTIVITY_TABLE,
+            Item: activity,
+            ConditionExpression: 'attribute_not_exists(vaultId) AND attribute_not_exists(sk)',
+          },
+        },
+        {
+          Update: {
+            TableName: VAULTS_TABLE,
+            Key: { orgId: intent.orgId, vaultId: intent.vaultId },
+            UpdateExpression: 'ADD #rev :one SET lastChangedAt = :ts',
+            ConditionExpression: 'attribute_exists(orgId) AND attribute_exists(vaultId)',
+            ExpressionAttributeNames: { '#rev': 'revision' },
+            ExpressionAttributeValues: { ':one': 1, ':ts': activity.changedAt },
+          },
+        },
+        {
+          Delete: {
+            TableName: VAULT_ACTIVITY_TABLE,
+            Key: { vaultId: intent.vaultId, sk: intent.sk },
+            ConditionExpression: '#status = :pending AND intentId = :intentId',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':pending': 'pending', ':intentId': intent.intentId },
+          },
+        },
+      ],
+    }),
+  );
+}
+
+/** Delete an intent only when the associated mutation definitely did not run. */
+export async function abortVaultMutationIntent(intent: VaultMutationIntent): Promise<void> {
+  await docClient.send(
+    new TransactWriteCommand({
+      ClientRequestToken: generateId().replace(/[^A-Za-z0-9-]/g, '').slice(0, 36),
+      TransactItems: [
+        {
+          Delete: {
+            TableName: VAULT_ACTIVITY_TABLE,
+            Key: { vaultId: intent.vaultId, sk: intent.sk },
+            ConditionExpression: '#status = :pending AND intentId = :intentId',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':pending': 'pending', ':intentId': intent.intentId },
+          },
+        },
+      ],
+    }),
+  );
+}
+
+export async function listPendingVaultMutationIntents(
+  vaultId: string,
+  limit = 100,
+): Promise<VaultMutationIntent[]> {
+  const result = await docClient.send(
+    new QueryCommand({
+      TableName: VAULT_ACTIVITY_TABLE,
+      KeyConditionExpression: 'vaultId = :vaultId AND begins_with(sk, :prefix)',
+      FilterExpression: '#status = :pending',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: {
+        ':vaultId': vaultId,
+        ':prefix': '!INTENT#',
+        ':pending': 'pending',
+      },
+      ConsistentRead: true,
+      Limit: Math.max(1, Math.min(limit, 100)),
+    }),
+  );
+  return (result.Items ?? []) as VaultMutationIntent[];
+}
+
+/**
+ * Atomically appends an activity row and bumps the vault revision/high-water
+ * timestamp. Keeping both mutations in one DynamoDB transaction removes the
+ * old log-written/revision-failed split-brain state, which could strand a
+ * delta behind a cursor that never advanced (and later let a timestamp-based
+ * warm sync skip it). The SDK retries a transaction with the same client
+ * request token, so an ambiguous network response cannot duplicate the bump.
  *
- *   1. Append log row first.
- *   2. Then bump revision (the public "something changed" signal).
- *
- * Why this order: if the log write fails, no revision bump happens, and
- * clients don't see a phantom revision they can't reconcile. If the log
- * write succeeds but the revision bump fails, the log row is harmless —
- * clients just won't see it via the warm path until the cold-path full
- * scan reaches it. The reverse order (bump-first) would let clients
- * silently mark themselves up-to-date after a missing-log query and
- * permanently lose the delta.
- *
- * Both writes are best-effort: failures log but never throw, because the
- * user's actual file mutation must not be blocked by sync bookkeeping.
+ * Bookkeeping remains best-effort with respect to the user's already-durable
+ * file mutation: a failed transaction returns null and the next sync uses the
+ * cold S3 path. It never publishes a cursor without its matching log row.
  *
  * Returns the new revision number on full success, otherwise null.
  */
@@ -2862,6 +3050,8 @@ export async function recordVaultActivity(params: {
   const epochMs = now.getTime();
   const changedAt = now.toISOString();
   const ttl = Math.floor(epochMs / 1000) + VAULT_ACTIVITY_TTL_DAYS * 24 * 60 * 60;
+  const activityId = generateId();
+  const activitySortKey = `${padEpochMs(epochMs)}#${activityId.replace(/[^A-Za-z0-9]/g, '').slice(0, 8).padEnd(8, '0')}`;
 
   // SD-09-F1: a permission change outside business hours feeds the
   // OffHoursPermissionChange alarm. recordVaultActivity is the single chokepoint
@@ -2873,52 +3063,67 @@ export async function recordVaultActivity(params: {
     void emitSecurityMetric('OffHoursPermissionChange');
   }
 
-  let logWritten = false;
   try {
     await docClient.send(
-      new PutCommand({
-        TableName: VAULT_ACTIVITY_TABLE,
-        Item: {
-          vaultId: params.vaultId,
-          sk: buildActivitySortKey(epochMs),
-          changedAt,
-          changedAtMs: epochMs,
-          action: params.action,
-          path: params.path,
-          actorUserId: params.actorUserId,
-          ttl,
-        },
+      new TransactWriteCommand({
+        ClientRequestToken: activityId.slice(0, 36),
+        TransactItems: [
+          {
+            Put: {
+              TableName: VAULT_ACTIVITY_TABLE,
+              Item: {
+                vaultId: params.vaultId,
+                sk: activitySortKey,
+                activityId,
+                changedAt,
+                changedAtMs: epochMs,
+                action: params.action,
+                path: params.path,
+                actorUserId: params.actorUserId,
+                ttl,
+              },
+              ConditionExpression: 'attribute_not_exists(vaultId) AND attribute_not_exists(sk)',
+            },
+          },
+          {
+            Update: {
+              TableName: VAULTS_TABLE,
+              Key: { orgId: params.orgId, vaultId: params.vaultId },
+              UpdateExpression: 'ADD #rev :one SET lastChangedAt = :ts',
+              ConditionExpression: 'attribute_exists(orgId) AND attribute_exists(vaultId)',
+              ExpressionAttributeNames: { '#rev': 'revision' },
+              ExpressionAttributeValues: { ':one': 1, ':ts': changedAt },
+            },
+          },
+        ],
       })
     );
-    logWritten = true;
   } catch (err) {
-    console.error('[VAULT_ACTIVITY_LOG_FAILURE]', err, {
+    console.error('[VAULT_ACTIVITY_TRANSACTION_FAILURE]', err, {
       vaultId: params.vaultId,
       action: params.action,
       path: params.path,
     });
+    return null;
   }
 
-  // If the log write failed, skip the revision bump — we don't want to
-  // signal "something changed" to clients without a queryable record of
-  // what changed. They'll pick the file up via the cold-path full scan.
-  if (!logWritten) return null;
-
+  // The transaction is already durable. This strongly consistent projection
+  // is only to preserve the historical numeric return contract; a read failure
+  // cannot undo or split the atomic bookkeeping mutation.
   try {
     const result = await docClient.send(
-      new UpdateCommand({
+      new GetCommand({
         TableName: VAULTS_TABLE,
         Key: { orgId: params.orgId, vaultId: params.vaultId },
-        UpdateExpression: 'ADD #rev :one SET lastChangedAt = :ts',
+        ProjectionExpression: '#rev',
         ExpressionAttributeNames: { '#rev': 'revision' },
-        ExpressionAttributeValues: { ':one': 1, ':ts': changedAt },
-        ReturnValues: 'UPDATED_NEW',
+        ConsistentRead: true,
       })
     );
-    const updatedRevision = (result.Attributes as { revision?: number } | undefined)?.revision;
+    const updatedRevision = (result.Item as { revision?: number } | undefined)?.revision;
     return typeof updatedRevision === 'number' ? updatedRevision : null;
   } catch (err) {
-    console.error('[VAULT_ACTIVITY_BUMP_FAILURE]', err, {
+    console.error('[VAULT_ACTIVITY_REVISION_READ_FAILURE]', err, {
       vaultId: params.vaultId,
       action: params.action,
       path: params.path,

@@ -51,14 +51,34 @@ export function userPromptImages(m: AnthropicConversationMessage): AnthropicImag
 export function sliceBeforeUserTurn(
   messages: AnthropicConversationMessage[],
   n: number,
-): { kept: AnthropicConversationMessage[]; removedText: string } | null {
+): {
+  kept: AnthropicConversationMessage[];
+  removedText: string;
+  removedImages?: AnthropicImageBlock[];
+} | null {
   const indices: number[] = [];
   messages.forEach((m, i) => {
     if (isUserPrompt(m)) indices.push(i);
   });
   if (n < 0 || n >= indices.length) return null;
   const at = indices[n];
-  return { kept: messages.slice(0, at), removedText: userPromptText(messages[at]) };
+  const removedImages = userPromptImages(messages[at]);
+  return {
+    kept: messages.slice(0, at),
+    removedText: userPromptText(messages[at]),
+    ...(removedImages.length > 0 ? { removedImages } : {}),
+  };
+}
+
+export function shouldRebaseSubscriptionSession(
+  activeDocumentCount: number,
+  hasClient: boolean,
+  currentTransport: "claude" | "codex" | null,
+  targetTransport: "claude" | "codex",
+): boolean {
+  return (
+    activeDocumentCount > 0 || !hasClient || currentTransport !== targetTransport
+  );
 }
 
 export const SUBSCRIPTION_RETAINED_CONTEXT_MAX_CHARS = 24_000;

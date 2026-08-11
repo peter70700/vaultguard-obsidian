@@ -19,6 +19,53 @@ import type {
   VaultOrientationSnapshot,
 } from "./vault-orientation";
 import { settleCleanupTasks } from "./lifecycle-cleanup";
+import {
+  AGENT_COMMAND_SCHEMAS,
+  isAgentCommandToolName,
+  validateAgentCommandInput,
+} from "./agent-command-schemas";
+import {
+  createMarkdownTask,
+  insertNoteText,
+  listMarkdownTasks,
+  mutateMarkdownTask,
+  readNoteProperty,
+  removeNoteProperty,
+  setNoteProperty,
+  sha256Text,
+  type AgentFrontmatterCodec,
+  type AgentPropertyValue,
+  type AgentPropertyValueType,
+} from "./agent-note-operations";
+import {
+  AgentSemanticMutationCoordinator,
+  hashSemanticRequest,
+  type MutationReceipt,
+  type SemanticMutationTransform,
+} from "./agent-semantic-mutation";
+import {
+  AgentInspectionService,
+  type AgentInspectionFileFact,
+  type AgentInspectionQuery,
+} from "./agent-inspection-service";
+import {
+  AgentTemplateService,
+  type AgentTemplateProvider,
+} from "./agent-template-service";
+import type { AgentSyncStatus } from "./agent-sync-status";
+import type {
+  AgentAutomationRegistry,
+  AutomationExecutionPlan,
+  AutomationRunInput,
+} from "./agent-automation-registry";
+import {
+  classifyAgentReadPath,
+  createAgentReadWindow,
+  findSafePathSuggestions,
+  preflightAgentRead,
+  type AgentReadClassification,
+  type AgentReadFileInfo,
+} from "./agent-read-window";
 
 // Cherry-picked from AuditAction so the bridge only emits its own events
 // and gets a compile error if those names drift.
@@ -34,6 +81,13 @@ export type AgentBridgeToolName =
   | "vaultguard_get_vault_orientation"
   | "vaultguard_delete"
   | "vaultguard_rename"
+  | "vaultguard_note"
+  | "vaultguard_property"
+  | "vaultguard_task"
+  | "vaultguard_inspect"
+  | "vaultguard_template"
+  | "vaultguard_sync_status"
+  | "vaultguard_automation"
   // In-process chat ONLY. Deliberately absent from the TOOLS array and the
   // MCP_TOOLS map, so the RPC (`TOOLS.includes`) and MCP (`MCP_TOOLS[name]`)
   // dispatch gates structurally reject it for external agents. Reachable
@@ -133,6 +187,9 @@ export interface AgentBridgeLeaseInput {
   // false (fail closed). Only the in-app AI chat lease sets it true; the backend
   // re-authorizes every op (vault-admin) and every op is user-confirmed.
   allowMembershipWrites?: boolean;
+  // Governed automation is an in-app desktop capability only. This flag
+  // defaults false and never widens public, persistent, or connector leases.
+  allowAutomation?: boolean;
   maxReadBytes?: number;
   maxSearchResults?: number;
   // In-memory lease with no wall-clock expiry. Used by the official in-app chat
@@ -173,6 +230,8 @@ export interface AgentBridgeLeaseSummary {
   allowShareManagement: boolean;
   // True only on the in-app chat lease — gates the `vaultguard_membership` tool.
   allowMembershipWrites: boolean;
+  // True only on the trusted in-app desktop lease — gates governed aliases.
+  allowAutomation: boolean;
   createdAt: string;
   // ISO timestamp for wall-clock leases. For session-bound / persistent leases
   // this is the string "session".
@@ -283,7 +342,20 @@ export interface AgentBridgeReadResult {
   path: string;
   content: string;
   truncated: boolean;
+  /** Legacy total-byte field retained for existing callers. */
   bytes: number;
+  offsetBytes: number;
+  returnedBytes: number;
+  nextOffsetBytes: number | null;
+  totalBytes: number;
+  complete: boolean;
+  classification: Extract<AgentReadClassification, "text" | "supported_source">;
+}
+
+export interface AgentBridgeReadArgs {
+  path: string;
+  offsetBytes?: number;
+  maxBytes?: number;
 }
 
 export interface AgentBridgeWriteResult {
@@ -299,6 +371,64 @@ export interface AgentBridgeDeleteResult {
 export interface AgentBridgeRenameResult {
   from: string;
   to: string;
+}
+
+export interface AgentBridgeNoteArgs {
+  op: string;
+  path?: string;
+  daily?: boolean;
+  content?: string;
+  section?: string;
+  expectedContentHash?: string;
+  idempotencyKey?: string;
+}
+
+export interface AgentBridgePropertyArgs {
+  op: string;
+  path: string;
+  key: string;
+  value?: AgentPropertyValue;
+  valueType?: AgentPropertyValueType;
+  expectedContentHash?: string;
+  idempotencyKey?: string;
+}
+
+export interface AgentBridgeTaskArgs {
+  op: string;
+  path?: string;
+  scope?: string;
+  line?: number;
+  originalTextHash?: string;
+  expectedContentHash?: string;
+  text?: string;
+  status?: string;
+  section?: string;
+  limit?: number;
+  idempotencyKey?: string;
+}
+
+export interface AgentBridgeTemplateArgs {
+  op: string;
+  templatePath?: string;
+  path?: string;
+  uniqueName?: string;
+  position?: "append" | "prepend";
+  section?: string;
+  variables?: Readonly<Record<string, string>>;
+  maxBytes?: number;
+  limit?: number;
+  expectedContentHash?: string;
+  idempotencyKey?: string;
+}
+
+export interface AgentBridgeAutomationArgs {
+  op: string;
+  alias?: string;
+  revision?: string;
+  path?: string;
+  arguments?: ReadonlyArray<{ name: string; value: unknown }> | Record<string, unknown>;
+  idempotencyKey?: string;
+  limit?: number;
 }
 
 // Args for the in-process `vaultguard_access` permission-query tool. The
@@ -338,6 +468,10 @@ export interface AgentBridgeFilesArgs {
   op: string;
   path?: string;
   limit?: number;
+  versionId?: string;
+  compareVersionId?: string;
+  expectedCurrentVersionId?: string;
+  maxBytes?: number;
 }
 
 // Args for the in-process `vaultguard_share` tool. `op` selects the action;
@@ -453,7 +587,13 @@ export type AgentBridgeConfirmOperation =
   | "member_add"
   | "member_remove"
   | "member_set_role"
-  | "restore";
+  | "restore"
+  | "version_restore"
+  | "note_mutation"
+  | "property_mutation"
+  | "task_mutation"
+  | "template_mutation"
+  | "automation_run";
 
 // Resolved payload for a set_permission confirmation (principal already resolved
 // to a userId/role + a normalized path/level), so the apply step never re-resolves.
@@ -482,7 +622,17 @@ export interface AgentBridgeConfirmAction {
     role?: string;
     label: string;
   };
-  restore?: { path: string };
+  restore?: {
+    path: string;
+    versionId?: string;
+    expectedCurrentVersionId?: string;
+  };
+  semantic?:
+    | { tool: "vaultguard_note"; args: AgentBridgeNoteArgs }
+    | { tool: "vaultguard_property"; args: AgentBridgePropertyArgs }
+    | { tool: "vaultguard_task"; args: AgentBridgeTaskArgs }
+    | { tool: "vaultguard_template"; args: AgentBridgeTemplateArgs };
+  automation?: AutomationRunInput;
 }
 
 // Non-blocking confirmation handler. Shows an Approve/Deny card carrying `action`
@@ -505,6 +655,12 @@ const CONFIRM_OP_TOOL: Record<AgentBridgeConfirmOperation, string> = {
   member_remove: "vaultguard_membership",
   member_set_role: "vaultguard_membership",
   restore: "vaultguard_files",
+  version_restore: "vaultguard_files",
+  note_mutation: "vaultguard_note",
+  property_mutation: "vaultguard_property",
+  task_mutation: "vaultguard_task",
+  template_mutation: "vaultguard_template",
+  automation_run: "vaultguard_automation",
 };
 
 // Read-only filesystem surface for the gated import tools. main.ts wires this
@@ -543,7 +699,7 @@ export interface AgentBridgeToolSurface {
   };
   list(leaseId: string, args?: { scope?: string; limit?: number }): Promise<AgentBridgeListResult>;
   search(leaseId: string, args: { query: string; scope?: string; limit?: number }): Promise<AgentBridgeSearchResult>;
-  read(leaseId: string, args: { path: string; maxBytes?: number }): Promise<AgentBridgeReadResult>;
+  read(leaseId: string, args: AgentBridgeReadArgs): Promise<AgentBridgeReadResult>;
   getVaultOrientation(
     leaseId: string,
     args?: VaultOrientationOptions,
@@ -552,6 +708,13 @@ export interface AgentBridgeToolSurface {
   create(leaseId: string, args: { path: string; content: string }): Promise<AgentBridgeWriteResult>;
   delete(leaseId: string, args: { path: string }): Promise<AgentBridgeDeleteResult>;
   rename(leaseId: string, args: { path: string; newPath: string }): Promise<AgentBridgeRenameResult>;
+  note(leaseId: string, args: AgentBridgeNoteArgs): Promise<unknown>;
+  property(leaseId: string, args: AgentBridgePropertyArgs): Promise<unknown>;
+  task(leaseId: string, args: AgentBridgeTaskArgs): Promise<unknown>;
+  inspect(leaseId: string, args: AgentInspectionQuery): Promise<unknown>;
+  template(leaseId: string, args: AgentBridgeTemplateArgs): Promise<unknown>;
+  syncStatus(leaseId: string, args: Record<string, never>): Promise<unknown>;
+  automation(leaseId: string, args: AgentBridgeAutomationArgs): Promise<unknown>;
   graph(leaseId: string, args: GraphArgs): Promise<GraphResult>;
   // Permission/membership queries. In-app chat only; gated by the lease's
   // allowAccessQueries flag. Result shape depends on args.op.
@@ -684,6 +847,22 @@ export interface AccessQueryProvider {
   // path; deleted/overview/restore are admin). Optional/null when no server
   // connection is available (the tool fails closed with a clear error).
   getFileHistory?(path: string): Promise<FileVersionRecord[]>;
+  readHistoricalFile?(path: string, versionId: string): Promise<{
+    path: string;
+    content: ArrayBuffer;
+    size: number;
+    versionId?: string;
+    contentType?: string;
+  }>;
+  restoreFileVersion?(
+    path: string,
+    versionId: string,
+    expectedCurrentVersionId: string,
+  ): Promise<{
+    versionId: string;
+    restoredFrom: { versionId: string; keyId: string };
+    targetKeyId: string;
+  }>;
   getDeletedFiles?(): Promise<{ path: string; deleteMarkerVersionId: string; deletedAt: string }[]>;
   restoreDeletedFile?(path: string): Promise<{ path: string; versionId: string; restoredFrom: string }>;
   getVaultOverview?(): Promise<VaultOverviewResponse>;
@@ -725,6 +904,8 @@ interface AgentBridgeDeps {
   getVaultConfigDir?: () => string;
   getAllFilePaths(): string[];
   fileExists(path: string): Promise<boolean>;
+  /** Metadata-only preflight. Production wiring uses TFile.stat and never raw adapter reads. */
+  getReadFileInfo?: (path: string) => AgentReadFileInfo | null | Promise<AgentReadFileInfo | null>;
   ensureParentFolders(path: string): Promise<void>;
   isPathExcluded(path: string): boolean;
   getPermission(path: string): Promise<PermissionLevel>;
@@ -735,6 +916,19 @@ interface AgentBridgeDeps {
   // headless tests that don't need it) this may be absent and graph() fails
   // closed with a clear error.
   makeVaultGraph?: (deps: GraphPermissionDeps) => VaultGraph;
+  // Optional, feature-detected Obsidian providers. Each is deliberately narrow;
+  // the bridge remains the owner of lease, scope, exclusion, permission,
+  // confirmation, attribution, and audit policy.
+  resolveDailyNotePath?: () => string | null | Promise<string | null>;
+  frontmatterCodec?: AgentFrontmatterCodec | null;
+  getInspectionFileFact?: (
+    path: string,
+  ) => AgentInspectionFileFact | null | Promise<AgentInspectionFileFact | null>;
+  getCoreTemplateFolder?: () => string | null | Promise<string | null>;
+  listCoreTemplatePaths?: () => readonly string[] | Promise<readonly string[]>;
+  listAllowlistedTemplatePaths?: () => readonly string[] | Promise<readonly string[]>;
+  getSyncStatus?: () => AgentSyncStatus | Promise<AgentSyncStatus>;
+  automation?: AgentAutomationRegistry | null;
   readText(path: string): Promise<string>;
   getVaultOrientation?(
     context: AgentConnectorContext,
@@ -759,6 +953,12 @@ interface AgentBridgeDeps {
       | "rename"
       | "set_permission"
       | "restore"
+      | "version_restore"
+      | "note_mutation"
+      | "property_mutation"
+      | "task_mutation"
+      | "template_mutation"
+      | "automation_run"
       | "share_create"
       | "share_revoke"
       | "member_add"
@@ -855,6 +1055,12 @@ const TOOLS: AgentBridgeToolName[] = [
   "vaultguard_list",
   "vaultguard_search",
   "vaultguard_read",
+  "vaultguard_note",
+  "vaultguard_property",
+  "vaultguard_task",
+  "vaultguard_inspect",
+  "vaultguard_template",
+  "vaultguard_sync_status",
   "vaultguard_get_vault_orientation",
   "vaultguard_apply_patch",
   "vaultguard_create",
@@ -871,6 +1077,9 @@ const TOOLS: AgentBridgeToolName[] = [
   // are in-process chat only, and are gated by allowImportRead + an active
   // import session. Adding either here would expose external-disk reads to RPC/
   // MCP agents — exactly the breach the chat-only design prevents.
+  //
+  // NOTE: "vaultguard_automation" is also absent. Only the trusted in-app
+  // desktop lease can receive its independent allowAutomation capability.
 ];
 
 // vaultguard_import_* bounds. The list walk is breadth-capped and the per-file
@@ -956,10 +1165,45 @@ const MCP_TOOLS: Record<string, McpToolDefinition> = {
       required: ["path"],
       properties: {
         path: { type: "string", description: "Vault-relative path (e.g. project-x/Plan.md)." },
+        offsetBytes: {
+          type: "integer",
+          minimum: 0,
+          description: "UTF-8 byte offset returned by the previous window's nextOffsetBytes.",
+        },
         maxBytes: { type: "integer", minimum: 1, description: "Truncate the response to at most this many UTF-8 bytes." },
       },
       additionalProperties: false,
     },
+  },
+  note: {
+    internal: "vaultguard_note",
+    description: AGENT_COMMAND_SCHEMAS.vaultguard_note.description,
+    inputSchema: AGENT_COMMAND_SCHEMAS.vaultguard_note.inputSchema,
+  },
+  property: {
+    internal: "vaultguard_property",
+    description: AGENT_COMMAND_SCHEMAS.vaultguard_property.description,
+    inputSchema: AGENT_COMMAND_SCHEMAS.vaultguard_property.inputSchema,
+  },
+  task: {
+    internal: "vaultguard_task",
+    description: AGENT_COMMAND_SCHEMAS.vaultguard_task.description,
+    inputSchema: AGENT_COMMAND_SCHEMAS.vaultguard_task.inputSchema,
+  },
+  inspect: {
+    internal: "vaultguard_inspect",
+    description: AGENT_COMMAND_SCHEMAS.vaultguard_inspect.description,
+    inputSchema: AGENT_COMMAND_SCHEMAS.vaultguard_inspect.inputSchema,
+  },
+  template: {
+    internal: "vaultguard_template",
+    description: AGENT_COMMAND_SCHEMAS.vaultguard_template.description,
+    inputSchema: AGENT_COMMAND_SCHEMAS.vaultguard_template.inputSchema,
+  },
+  sync_status: {
+    internal: "vaultguard_sync_status",
+    description: AGENT_COMMAND_SCHEMAS.vaultguard_sync_status.description,
+    inputSchema: AGENT_COMMAND_SCHEMAS.vaultguard_sync_status.inputSchema,
   },
   get_vault_orientation: {
     internal: "vaultguard_get_vault_orientation",
@@ -1296,18 +1540,37 @@ const FILES_MCP_TOOLS: Record<string, McpToolDefinition> = {
       "files, extension breakdown — admin-only), 'deleted' (list soft-deleted " +
       "files that can be restored — admin-only), 'restore' (UNDELETE a soft-" +
       "deleted file — needs `path`, admin-only; pops a user confirmation and the " +
-      "file re-appears locally on the next sync). The backend authorizes every " +
+      "file re-appears locally on the next sync), 'version_read' (read exactly one " +
+      "historical plaintext version), 'version_diff' (bounded deterministic diff " +
+      "against the current head or another exact version), and 'version_restore' " +
+      "(restore one exact version only if the caller's expected current head still " +
+      "matches; always confirmed). The backend authorizes every " +
       "op, so a non-admin caller gets an authorization error rather than data.",
     inputSchema: {
       type: "object",
       required: ["op"],
       properties: {
-        op: { type: "string", enum: ["history", "overview", "deleted", "restore"] },
+        op: {
+          type: "string",
+          enum: [
+            "history",
+            "overview",
+            "deleted",
+            "restore",
+            "version_read",
+            "version_diff",
+            "version_restore",
+          ],
+        },
         path: {
           type: "string",
           description: "Vault-relative file path (required for op=history and op=restore).",
         },
         limit: { type: "integer", minimum: 1, description: "Max entries for op=deleted." },
+        versionId: { type: "string", minLength: 1, maxLength: 1024 },
+        compareVersionId: { type: "string", minLength: 1, maxLength: 1024 },
+        expectedCurrentVersionId: { type: "string", minLength: 1, maxLength: 1024 },
+        maxBytes: { type: "integer", minimum: 1, maximum: 262144 },
       },
       additionalProperties: false,
     },
@@ -1383,6 +1646,17 @@ const MEMBERSHIP_MCP_TOOLS: Record<string, McpToolDefinition> = {
   },
 };
 
+// Governed automation is intentionally absent from the default MCP/HTTP tool
+// set. It is advertised only to a trusted in-app lease that explicitly carries
+// allowAutomation; the registry independently defaults to disabled and empty.
+const AUTOMATION_MCP_TOOLS: Record<string, McpToolDefinition> = {
+  automation: {
+    internal: "vaultguard_automation",
+    description: AGENT_COMMAND_SCHEMAS.vaultguard_automation.description,
+    inputSchema: AGENT_COMMAND_SCHEMAS.vaultguard_automation.inputSchema,
+  },
+};
+
 interface JsonRpcRequest {
   jsonrpc?: string;
   id?: string | number | null;
@@ -1397,6 +1671,8 @@ const DEFAULT_MAX_READ_BYTES = 256 * 1024;
 const MAX_READ_BYTES = 1024 * 1024;
 const DEFAULT_MAX_SEARCH_RESULTS = 50;
 const MAX_SEARCH_RESULTS = 200;
+const MAX_SEMANTIC_NOTE_BYTES = 2 * 1024 * 1024;
+const MAX_TEMPLATE_CREATE_IDEMPOTENCY = 256;
 const DEFAULT_LIST_LIMIT = 1000;
 const MAX_LIST_LIMIT = 5000;
 const CHATGPT_CONNECTOR_DEFAULT_TTL_MINUTES = 30;
@@ -1522,6 +1798,11 @@ const CHATGPT_CONNECTOR_MCP_TOOLS: Record<ChatGptConnectorToolName, McpToolDefin
       required: ["path"],
       properties: {
         path: { type: "string", description: "Vault-relative text note path." },
+        offsetBytes: {
+          type: "integer",
+          minimum: 0,
+          description: "Byte continuation offset from the previous response.",
+        },
         maxBytes: {
           type: "integer",
           minimum: 1,
@@ -1580,19 +1861,13 @@ interface PersistedLeaseEnvelope {
   leases: PersistedLeaseRecord[];
 }
 
-const TEXT_EXTENSIONS = new Set([
-  ".md",
-  ".txt",
-  ".canvas",
-  ".csv",
-  ".tsv",
-  ".json",
-  ".yaml",
-  ".yml",
-]);
-
 export class VaultGuardAgentBridge {
   private deps: AgentBridgeDeps;
+  private semanticMutations: AgentSemanticMutationCoordinator;
+  private templateCreateIdempotency = new Map<
+    string,
+    { fingerprint: string; receipt: Readonly<Record<string, unknown>> }
+  >();
   private leases: Map<string, AgentBridgeLease> = new Map();
   // Reverse index of token → leaseId for O(1) bearer matching on every
   // request. Kept in lockstep with `leases` by every code path that
@@ -1611,6 +1886,11 @@ export class VaultGuardAgentBridge {
 
   constructor(deps: AgentBridgeDeps) {
     this.deps = deps;
+    this.semanticMutations = new AgentSemanticMutationCoordinator({
+      readText: (path) => this.deps.readText(path),
+      writeText: (path, content) => this.deps.writeText(path, content),
+      hashText: sha256Text,
+    });
   }
 
   /**
@@ -1693,6 +1973,7 @@ export class VaultGuardAgentBridge {
         // Persistent/external leases never manage shares or membership.
         allowShareManagement: false,
         allowMembershipWrites: false,
+        allowAutomation: false,
         createdAt: record.createdAt,
         expiresAt: SESSION_EXPIRY_SENTINEL,
         expiresAtMs: Number.POSITIVE_INFINITY,
@@ -1748,6 +2029,7 @@ export class VaultGuardAgentBridge {
     this.tokenIndex.clear();
     this.chatGptConnectorSessions.clear();
     this.chatGptConnectorTokenIndex.clear();
+    this.clearProcessMutationState();
     this.persistedLoaded = false;
     if (this.deps.persistence) {
       await this.deps.persistence.deleteEnvelope().catch((err) =>
@@ -1800,7 +2082,7 @@ export class VaultGuardAgentBridge {
         this.invokeInProcess(
           "vaultguard_read",
           leaseId,
-          args as Record<string, unknown>,
+          args as unknown as Record<string, unknown>,
         ) as Promise<AgentBridgeReadResult>,
       getVaultOrientation: (leaseId, args) =>
         this.invokeInProcess(
@@ -1832,6 +2114,20 @@ export class VaultGuardAgentBridge {
           leaseId,
           args as Record<string, unknown>,
         ) as Promise<AgentBridgeRenameResult>,
+      note: (leaseId, args) =>
+        this.invokeInProcess("vaultguard_note", leaseId, args as unknown as Record<string, unknown>),
+      property: (leaseId, args) =>
+        this.invokeInProcess("vaultguard_property", leaseId, args as unknown as Record<string, unknown>),
+      task: (leaseId, args) =>
+        this.invokeInProcess("vaultguard_task", leaseId, args as unknown as Record<string, unknown>),
+      inspect: (leaseId, args) =>
+        this.invokeInProcess("vaultguard_inspect", leaseId, args as unknown as Record<string, unknown>),
+      template: (leaseId, args) =>
+        this.invokeInProcess("vaultguard_template", leaseId, args as unknown as Record<string, unknown>),
+      syncStatus: (leaseId, args) =>
+        this.invokeInProcess("vaultguard_sync_status", leaseId, args),
+      automation: (leaseId, args) =>
+        this.invokeInProcess("vaultguard_automation", leaseId, args as unknown as Record<string, unknown>),
       graph: (leaseId, args) =>
         this.invokeInProcess(
           "vaultguard_graph",
@@ -2105,6 +2401,15 @@ export class VaultGuardAgentBridge {
       // Default false (fail closed). Only the in-app chat lease passes true; the
       // backend re-authorizes every op (vault-admin) and every op is confirmed.
       allowMembershipWrites: input.allowMembershipWrites === true,
+      // Independent chat-only capability; never implied by writeMode. Enforce
+      // the trusted lease shape here as well as in main.ts so callers that can
+      // reach the bridge object directly cannot widen a public, wall-clock, or
+      // persistent lease into private Obsidian command authority.
+      allowAutomation:
+        input.allowAutomation === true &&
+        input.allowUserInteraction === true &&
+        expiresWithSession &&
+        !persistent,
       createdAt: new Date(now).toISOString(),
       expiresAt:
         ttlMinutes === null
@@ -2153,6 +2458,7 @@ export class VaultGuardAgentBridge {
       allowFileHistory: lease.allowFileHistory,
       allowShareManagement: lease.allowShareManagement,
       allowMembershipWrites: lease.allowMembershipWrites,
+      allowAutomation: lease.allowAutomation,
       persistent,
       ttlMinutes,
       sessionUserId: lease.sessionUserId,
@@ -2267,6 +2573,7 @@ export class VaultGuardAgentBridge {
     if (!lease) return false;
     this.leases.delete(leaseId);
     this.tokenIndex.delete(lease.token);
+    this.clearProcessMutationState();
     if (lease.persistent) {
       void this.persistLeases().catch((err) =>
         this.deps.log(
@@ -2289,6 +2596,7 @@ export class VaultGuardAgentBridge {
     }
     this.leases.clear();
     this.tokenIndex.clear();
+    this.clearProcessMutationState();
     if (persistentLeaseIds.length > 0) {
       void this.persistLeases().catch((err) =>
         this.deps.log(
@@ -2465,6 +2773,12 @@ export class VaultGuardAgentBridge {
     }
   }
 
+  private clearProcessMutationState(): void {
+    this.semanticMutations.clearIdempotency();
+    this.templateCreateIdempotency.clear();
+    this.deps.automation?.clearProcessState();
+  }
+
   getServerInfo(): AgentBridgeServerInfo {
     if (!this.serverEndpoint || !this.serverMcpEndpoint) {
       throw new Error("VaultGuard agent bridge server is not running.");
@@ -2580,7 +2894,7 @@ export class VaultGuardAgentBridge {
 
   async read(
     leaseId: string,
-    args: { path: string; maxBytes?: number }
+    args: AgentBridgeReadArgs,
   ): Promise<AgentBridgeReadResult> {
     const lease = this.requireLease(leaseId);
     return this.readForLease(lease, args);
@@ -2588,30 +2902,74 @@ export class VaultGuardAgentBridge {
 
   private async readForLease(
     lease: AgentBridgeLease,
-    args: { path: string; maxBytes?: number }
+    args: AgentBridgeReadArgs,
+    transformContent: (content: string) => string = (content) => content,
   ): Promise<AgentBridgeReadResult> {
     if (!lease.allowRead) {
       throw new Error("VaultGuard agent lease does not allow reads.");
     }
 
-    const path = await this.requireReadablePath(args.path, lease);
-    if (!this.isTextPath(path)) {
-      throw new Error(`VaultGuard agent bridge refuses to read non-text file "${path}".`);
+    const candidatePath = this.requirePathInLease(args.path, lease);
+    if (!(await this.deps.fileExists(candidatePath))) {
+      const suggestions = await this.findReadablePathSuggestions(candidatePath, lease);
+      const suffix = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}?` : "";
+      throw new Error(`VaultGuard agent read target was not found.${suffix}`);
     }
 
-    const content = await this.deps.readText(path);
-    const bytes = this.utf8Bytes(content);
+    const path = await this.requireReadablePath(candidatePath, lease);
+    const fileInfo = await this.deps.getReadFileInfo?.(path);
+    const preflight = preflightAgentRead({
+      path,
+      ...(fileInfo ? { sizeBytes: fileInfo.sizeBytes, storage: fileInfo.storage } : {}),
+    });
+    if (!preflight.readable) {
+      if (preflight.reasonCode === "use_attachment_workflow") {
+        throw new Error(
+          "VaultGuard agent bridge refuses to read non-text file content; use the in-app attachment workflow.",
+        );
+      }
+      if (preflight.reasonCode === "use_import_workflow") {
+        throw new Error(
+          "VaultGuard agent bridge refuses to read binary content; use the gated import workflow.",
+        );
+      }
+      if (
+        preflight.reasonCode === "file_too_large" ||
+        preflight.reasonCode === "oversized_encrypted"
+      ) {
+        throw new Error(
+          "VaultGuard agent bridge refuses to read this file because it is too large for the bounded at-rest-safe read path.",
+        );
+      }
+      throw new Error("VaultGuard agent bridge refuses to read this unsupported file type.");
+    }
+
+    // The injected provider remains the sole plaintext/decrypt owner. For the
+    // current monolithic AES-GCM envelope this may still authenticate/decrypt
+    // the complete bounded file; the metadata preflight above prevents an
+    // unbounded read without introducing raw adapter access.
+    const content = transformContent(await this.deps.readText(path));
     const maxBytes = this.clampNumber(args.maxBytes ?? lease.maxReadBytes, 1, lease.maxReadBytes);
-
-    if (bytes <= maxBytes) {
-      return { path, content, bytes, truncated: false };
-    }
-
+    const window = createAgentReadWindow(content, {
+      offsetBytes: args.offsetBytes ?? 0,
+      maxBytes,
+      maxAllowedBytes: lease.maxReadBytes,
+      classification: preflight.classification as Extract<
+        AgentReadClassification,
+        "text" | "supported_source"
+      >,
+    });
     return {
       path,
-      content: this.truncateUtf8(content, maxBytes),
-      bytes,
-      truncated: true,
+      content: window.content,
+      bytes: window.totalBytes,
+      truncated: !window.complete,
+      offsetBytes: window.offsetBytes,
+      returnedBytes: window.returnedBytes,
+      nextOffsetBytes: window.nextOffsetBytes,
+      totalBytes: window.totalBytes,
+      complete: window.complete,
+      classification: window.classification,
     };
   }
 
@@ -2731,6 +3089,686 @@ export class VaultGuardAgentBridge {
     await this.deps.ensureParentFolders(to);
     await this.deps.renameFile(from, to);
     return { from, to };
+  }
+
+  // ─── Spec 019 semantic note / property / task tools ───────────────────────
+
+  async note(
+    leaseId: string,
+    args: AgentBridgeNoteArgs,
+    transport: AgentBridgeTransport = "inproc",
+    confirmationApproved = false,
+  ): Promise<unknown> {
+    const lease = this.requireLease(leaseId);
+    const path = await this.resolveAgentNotePath(lease, args.path, args.daily === true);
+    const op = String(args.op ?? "").trim();
+    if (op === "state") {
+      if (!lease.allowRead) throw new Error("VaultGuard agent lease does not allow reads.");
+      await this.requireReadablePath(path, lease);
+      if (!(await this.deps.fileExists(path))) return { path, exists: false };
+      const content = await this.readSemanticNote(path);
+      return {
+        path,
+        exists: true,
+        contentHash: await sha256Text(content),
+        bytes: this.utf8Bytes(content),
+      };
+    }
+    if (op !== "append" && op !== "prepend") {
+      throw new Error("vaultguard_note op must be state, append, or prepend.");
+    }
+    this.requireExpectedContentHash(args.expectedContentHash, "vaultguard_note");
+    await this.requireSemanticWritablePath(path, lease);
+    if (!(await this.deps.fileExists(path))) {
+      throw new Error(`VaultGuard note mutation target "${path}" does not exist.`);
+    }
+    if (!confirmationApproved) {
+      const confirmation = await this.confirmSemanticMutation(
+        lease,
+        {
+          operation: "note_mutation",
+          leaseId,
+          preview: this.makeWritePreview(args.content ?? ""),
+          semantic: { tool: "vaultguard_note", args: { ...args, path, daily: false } },
+        },
+        path,
+        transport,
+      );
+      if (confirmation) return confirmation;
+    }
+    return this.executeSemanticMutation(
+      lease,
+      `note.${op}`,
+      path,
+      args.expectedContentHash,
+      args.idempotencyKey,
+      { ...args, path, daily: false },
+      async (current) => {
+        const result = insertNoteText(current, {
+          position: op,
+          content: args.content ?? "",
+          ...(args.section === undefined ? {} : { section: args.section }),
+        });
+        return {
+          content: result.content,
+          receipt: args.section === undefined ? undefined : { section: args.section },
+        };
+      },
+    );
+  }
+
+  async property(
+    leaseId: string,
+    args: AgentBridgePropertyArgs,
+    transport: AgentBridgeTransport = "inproc",
+    confirmationApproved = false,
+  ): Promise<unknown> {
+    const lease = this.requireLease(leaseId);
+    const path = this.requirePathInLease(args.path, lease);
+    const codec = this.requireFrontmatterCodec();
+    const op = String(args.op ?? "").trim();
+    if (op === "get") {
+      if (!lease.allowRead) throw new Error("VaultGuard agent lease does not allow reads.");
+      await this.requireReadablePath(path, lease);
+      const content = await this.readSemanticNote(path);
+      return {
+        path,
+        key: args.key,
+        ...readNoteProperty(content, args.key, codec),
+        contentHash: await sha256Text(content),
+      };
+    }
+    if (op !== "set" && op !== "remove") {
+      throw new Error("vaultguard_property op must be get, set, or remove.");
+    }
+    this.requireExpectedContentHash(args.expectedContentHash, "vaultguard_property");
+    await this.requireSemanticWritablePath(path, lease);
+    if (!(await this.deps.fileExists(path))) {
+      throw new Error(`VaultGuard property target "${path}" does not exist.`);
+    }
+    if (!confirmationApproved) {
+      const confirmation = await this.confirmSemanticMutation(
+        lease,
+        {
+          operation: "property_mutation",
+          leaseId,
+          preview: `${op === "set" ? "Set" : "Remove"} frontmatter property: ${args.key}`,
+          semantic: { tool: "vaultguard_property", args: { ...args, path } },
+        },
+        path,
+        transport,
+      );
+      if (confirmation) return confirmation;
+    }
+    return this.executeSemanticMutation(
+      lease,
+      `property.${op}`,
+      path,
+      args.expectedContentHash,
+      args.idempotencyKey,
+      { ...args, path },
+      (current) => {
+        const result = op === "set"
+          ? setNoteProperty(
+              current,
+              {
+                key: args.key,
+                value: args.value as AgentPropertyValue,
+                ...(args.valueType === undefined ? {} : { valueType: args.valueType }),
+              },
+              codec,
+            )
+          : removeNoteProperty(current, args.key, codec);
+        return { content: result.content };
+      },
+      async (readback) => {
+        const property = readNoteProperty(readback, args.key, codec);
+        return op === "remove"
+          ? !property.exists
+          : property.exists && JSON.stringify(property.value) === JSON.stringify(args.value);
+      },
+    );
+  }
+
+  async task(
+    leaseId: string,
+    args: AgentBridgeTaskArgs,
+    transport: AgentBridgeTransport = "inproc",
+    confirmationApproved = false,
+  ): Promise<unknown> {
+    const lease = this.requireLease(leaseId);
+    const op = String(args.op ?? "").trim();
+    if (op === "list") return this.listAgentTasks(lease, args);
+    if (!(op === "create" || op === "update" || op === "toggle" || op === "set_status")) {
+      throw new Error("vaultguard_task op must be list, create, update, toggle, or set_status.");
+    }
+    const path = this.requirePathInLease(args.path ?? "", lease);
+    this.requireExpectedContentHash(args.expectedContentHash, "vaultguard_task");
+    await this.requireSemanticWritablePath(path, lease);
+    if (!(await this.deps.fileExists(path))) {
+      throw new Error(`VaultGuard task target "${path}" does not exist.`);
+    }
+    if (!confirmationApproved) {
+      const confirmation = await this.confirmSemanticMutation(
+        lease,
+        {
+          operation: "task_mutation",
+          leaseId,
+          preview: op === "create" ? "Create one Markdown task." : `Update task at line ${args.line ?? 0}.`,
+          semantic: { tool: "vaultguard_task", args: { ...args, path } },
+        },
+        path,
+        transport,
+      );
+      if (confirmation) return confirmation;
+    }
+    let updatedTask: Awaited<ReturnType<typeof listMarkdownTasks>>["tasks"][number] | undefined;
+    const receipt = await this.executeSemanticMutation(
+      lease,
+      `task.${op}`,
+      path,
+      args.expectedContentHash,
+      args.idempotencyKey,
+      { ...args, path },
+      async (current) => {
+        const result = op === "create"
+          ? await createMarkdownTask(current, {
+              text: args.text ?? "",
+              ...(args.status === undefined ? {} : { status: args.status }),
+              ...(args.section === undefined ? {} : { section: args.section }),
+            })
+          : await mutateMarkdownTask(current, {
+              operation: op,
+              line: args.line ?? 0,
+              originalTextHash: args.originalTextHash ?? "",
+              ...(args.text === undefined ? {} : { text: args.text }),
+              ...(args.status === undefined ? {} : { status: args.status }),
+            });
+        updatedTask = result.task;
+        return { content: result.content, receipt: { line: result.task.line } };
+      },
+      async (readback) => {
+        if (!updatedTask) return false;
+        const listed = await listMarkdownTasks(readback, { limit: 200 });
+        return listed.tasks.some(
+          (candidate) =>
+            candidate.line === updatedTask?.line &&
+            candidate.originalTextHash === updatedTask.originalTextHash,
+        );
+      },
+    );
+    return { ...receipt, ...(updatedTask ? { task: updatedTask } : {}) };
+  }
+
+  async inspect(leaseId: string, args: AgentInspectionQuery): Promise<unknown> {
+    const lease = this.requireLease(leaseId);
+    if (!lease.allowRead) throw new Error("VaultGuard agent lease does not allow reads.");
+    if (!this.deps.getInspectionFileFact) {
+      throw new Error("VaultGuard inspection metadata is unavailable in this runtime.");
+    }
+    const service = new AgentInspectionService({
+      listPaths: () => this.deps.getAllFilePaths(),
+      isInScope: (path) => this.matchesAnyScope(this.normalizePath(path), lease.scopes),
+      isExcluded: (path) => this.isBlockedPath(path),
+      isMetadataSuppressed: (path) => this.deps.isMetadataSuppressed?.(path) === true,
+      canRead: async (path) => (await this.deps.getPermission(path)) >= PermissionLevel.READ,
+      getFileFact: (path) => this.deps.getInspectionFileFact!(path),
+      readText: async (path, maxBytes) => {
+        const content = await this.deps.readText(path);
+        const bytes = this.utf8Bytes(content);
+        return {
+          content: bytes <= maxBytes ? content : this.truncateUtf8(content, maxBytes),
+          truncated: bytes > maxBytes,
+        };
+      },
+    });
+    return service.inspect(args);
+  }
+
+  async template(
+    leaseId: string,
+    args: AgentBridgeTemplateArgs,
+    transport: AgentBridgeTransport = "inproc",
+    confirmationApproved = false,
+  ): Promise<unknown> {
+    const lease = this.requireLease(leaseId);
+    const service = this.createAgentTemplateService(lease);
+    const op = String(args.op ?? "").trim();
+    if (op === "list") return service.list(args.limit);
+    if (op === "read") return service.read(args.templatePath ?? "", args.maxBytes);
+    if (op === "preview") {
+      return service.preview({
+        templatePath: args.templatePath ?? "",
+        ...(args.path === undefined ? {} : { destination: args.path }),
+        ...(args.variables === undefined ? {} : { variables: args.variables }),
+        ...(args.maxBytes === undefined ? {} : { maxBytes: args.maxBytes }),
+      });
+    }
+    if (op === "insert") {
+      this.requireExpectedContentHash(args.expectedContentHash, "vaultguard_template insert");
+      const prepared = await service.prepareInsert({
+        templatePath: args.templatePath ?? "",
+        path: args.path ?? "",
+        ...(args.position === undefined ? {} : { position: args.position }),
+        ...(args.section === undefined ? {} : { section: args.section }),
+        ...(args.variables === undefined ? {} : { variables: args.variables }),
+        expectedContentHash: args.expectedContentHash!,
+      });
+      const path = await this.requireSemanticWritablePath(prepared.path, lease);
+      if (!(await this.deps.fileExists(path))) {
+        throw new Error(`VaultGuard template insertion target "${path}" does not exist.`);
+      }
+      if (!confirmationApproved) {
+        const confirmation = await this.confirmSemanticMutation(
+          lease,
+          {
+            operation: "template_mutation",
+            leaseId,
+            preview: this.makeWritePreview(prepared.content),
+            semantic: { tool: "vaultguard_template", args: { ...args, path } },
+          },
+          path,
+          transport,
+        );
+        if (confirmation) return confirmation;
+      }
+      return this.executeSemanticMutation(
+        lease,
+        "template.insert",
+        path,
+        prepared.expectedContentHash,
+        args.idempotencyKey,
+        { ...args, path },
+        (current) => {
+          const result = insertNoteText(current, {
+            position: prepared.position,
+            content: prepared.content,
+            ...(prepared.section === undefined ? {} : { section: prepared.section }),
+          });
+          return {
+            content: result.content,
+            receipt: prepared.section === undefined ? undefined : { section: prepared.section },
+          };
+        },
+      );
+    }
+    if (op === "create") {
+      const prepared = await service.prepareCreate({
+        templatePath: args.templatePath ?? "",
+        ...(args.path === undefined ? {} : { path: args.path }),
+        ...(args.uniqueName === undefined ? {} : { uniqueName: args.uniqueName }),
+        ...(args.variables === undefined ? {} : { variables: args.variables }),
+      });
+      const path = await this.requireSemanticWritablePath(prepared.path, lease);
+      if (!confirmationApproved) {
+        const confirmation = await this.confirmSemanticMutation(
+          lease,
+          {
+            operation: "template_mutation",
+            leaseId,
+            preview: this.makeWritePreview(prepared.content),
+            semantic: { tool: "vaultguard_template", args: { ...args, path } },
+          },
+          path,
+          transport,
+        );
+        if (confirmation) return confirmation;
+      }
+      return this.createFromAgentTemplate(lease, path, prepared.content, args);
+    }
+    throw new Error("vaultguard_template op must be list, read, preview, insert, or create.");
+  }
+
+  async syncStatus(
+    leaseId: string,
+    _args: Record<string, never> = {},
+  ): Promise<AgentSyncStatus> {
+    const lease = this.requireLease(leaseId);
+    if (!lease.allowRead) throw new Error("VaultGuard agent lease does not allow reads.");
+    if (!this.deps.getSyncStatus) {
+      throw new Error("VaultGuard sync status is unavailable in this runtime.");
+    }
+    return this.deps.getSyncStatus();
+  }
+
+  async automation(
+    leaseId: string,
+    args: AgentBridgeAutomationArgs,
+    transport: AgentBridgeTransport = "inproc",
+    confirmationApproved = false,
+  ): Promise<unknown> {
+    const lease = this.requireLease(leaseId);
+    if (!lease.allowAutomation) {
+      throw new Error("VaultGuard agent lease does not allow governed automation.");
+    }
+    const registry = this.deps.automation;
+    if (!registry) throw new Error("VaultGuard governed automation is unavailable.");
+    const op = String(args.op ?? "").trim();
+    if (op === "list") return registry.listApprovedAliases(args.limit);
+    if (op !== "run") throw new Error("vaultguard_automation op must be list or run.");
+    const input: AutomationRunInput = {
+      alias: args.alias ?? "",
+      ...(args.revision === undefined ? {} : { revision: args.revision }),
+      ...(args.path === undefined ? {} : { path: args.path }),
+      ...(args.idempotencyKey === undefined ? {} : { idempotencyKey: args.idempotencyKey }),
+      arguments: this.normalizeAutomationArguments(args.arguments),
+    };
+    let plan = registry.planRun(input);
+    await this.authorizeAutomationPlan(lease, plan);
+    if (plan.requiresConfirmation && !confirmationApproved) {
+      const confirmedInput: AutomationRunInput = { ...input, revision: plan.revision };
+      const path = plan.targetPaths[0] ?? "governed-automation";
+      const confirmation = await this.confirmMutation(
+        lease,
+        {
+          operation: "automation_run",
+          leaseId,
+          preview: `Run governed automation alias "${plan.alias}" (${plan.risk}).`,
+          automation: confirmedInput,
+        },
+        path,
+        transport,
+      );
+      if (confirmation.paused) return this.pausedConfirmResult(`Run ${plan.alias}.`, "automation");
+    }
+    // Policy, runtime descriptor, context, scope, and permission can all drift
+    // while the user is deciding. Re-plan/revalidate and authorize immediately
+    // before the single invocation.
+    plan = registry.revalidatePlan(plan);
+    await this.authorizeAutomationPlan(lease, plan);
+    return registry.executePlan(plan);
+  }
+
+  private async resolveAgentNotePath(
+    lease: AgentBridgeLease,
+    rawPath: string | undefined,
+    daily: boolean,
+  ): Promise<string> {
+    if (daily && typeof rawPath === "string" && rawPath.trim()) {
+      throw new Error("vaultguard_note accepts either path or daily=true, not both.");
+    }
+    let candidate = rawPath ?? "";
+    if (daily) {
+      if (!this.deps.resolveDailyNotePath) {
+        throw new Error("VaultGuard Daily Notes provider is unavailable.");
+      }
+      candidate = (await this.deps.resolveDailyNotePath()) ?? "";
+      if (!candidate) {
+        throw new Error("VaultGuard could not resolve the configured Daily Note safely.");
+      }
+    }
+    const path = this.requirePathInLease(candidate, lease);
+    if (!path.toLowerCase().endsWith(".md")) {
+      throw new Error("VaultGuard semantic note operations require a Markdown file.");
+    }
+    return path;
+  }
+
+  private async readSemanticNote(path: string): Promise<string> {
+    const content = await this.deps.readText(path);
+    if (this.utf8Bytes(content) > MAX_SEMANTIC_NOTE_BYTES) {
+      throw new Error("VaultGuard semantic note operation exceeds the safe file-size bound.");
+    }
+    return content;
+  }
+
+  private requireFrontmatterCodec(): AgentFrontmatterCodec {
+    if (!this.deps.frontmatterCodec) {
+      throw new Error("VaultGuard frontmatter support is unavailable in this runtime.");
+    }
+    return this.deps.frontmatterCodec;
+  }
+
+  private requireExpectedContentHash(value: string | undefined, tool: string): void {
+    if (!value || !/^[a-fA-F0-9]{64}$/u.test(value)) {
+      throw new Error(`${tool} requires the current expectedContentHash.`);
+    }
+  }
+
+  private async requireSemanticWritablePath(
+    rawPath: string,
+    lease: AgentBridgeLease,
+  ): Promise<string> {
+    const path = this.requirePathInLease(rawPath, lease);
+    if (!this.isTextPath(path)) {
+      throw new Error(`VaultGuard agent bridge refuses to write non-text file "${path}".`);
+    }
+    if (lease.writeMode === "deny") throw new Error("VaultGuard agent lease is read-only.");
+    if ((await this.deps.getPermission(path)) < PermissionLevel.WRITE) {
+      throw new Error(`VaultGuard agent bridge: no WRITE permission for "${path}".`);
+    }
+    return path;
+  }
+
+  private async confirmSemanticMutation(
+    lease: AgentBridgeLease,
+    action: AgentBridgeConfirmAction,
+    path: string,
+    transport: AgentBridgeTransport,
+  ): Promise<Record<string, unknown> | null> {
+    if (lease.writeMode !== "confirm") return null;
+    const confirmation = await this.confirmMutation(lease, action, path, transport);
+    return confirmation.paused
+      ? this.pausedConfirmResult(action.preview, "semantic change")
+      : null;
+  }
+
+  private async executeSemanticMutation(
+    lease: AgentBridgeLease,
+    operation: string,
+    path: string,
+    expectedContentHash: string | undefined,
+    idempotencyKey: string | undefined,
+    requestShape: unknown,
+    transform: (currentContent: string) => SemanticMutationTransform | Promise<SemanticMutationTransform>,
+    verify?: (readbackContent: string) => boolean | Promise<boolean>,
+  ): Promise<MutationReceipt> {
+    const requestFingerprint = await hashSemanticRequest({ operation, path, requestShape });
+    return this.semanticMutations.execute({
+      operation,
+      path,
+      ...(expectedContentHash === undefined ? {} : { expectedContentHash }),
+      ...(idempotencyKey === undefined
+        ? {}
+        : { idempotencyKey, requestFingerprint, idempotencyScope: lease.leaseId }),
+      transform: async (currentContent) => {
+        if (this.utf8Bytes(currentContent) > MAX_SEMANTIC_NOTE_BYTES) {
+          throw new Error("VaultGuard semantic note operation exceeds the safe file-size bound.");
+        }
+        const result = await transform(currentContent);
+        if (this.utf8Bytes(result.content) > MAX_SEMANTIC_NOTE_BYTES) {
+          throw new Error("VaultGuard semantic note result exceeds the safe file-size bound.");
+        }
+        return result;
+      },
+      ...(verify ? { verify } : {}),
+    });
+  }
+
+  private async listAgentTasks(
+    lease: AgentBridgeLease,
+    args: AgentBridgeTaskArgs,
+  ): Promise<Record<string, unknown>> {
+    if (!lease.allowRead) throw new Error("VaultGuard agent lease does not allow reads.");
+    const limit = this.clampNumber(args.limit ?? 50, 1, 200);
+    const paths = args.path
+      ? [await this.requireReadablePath(args.path, lease)]
+      : this.deps.getAllFilePaths()
+          .map((path) => this.normalizePath(path))
+          .filter((path) => this.isPathAgentReadable(path, lease, args.scope ?? null))
+          .sort((left, right) => left.localeCompare(right));
+    const tasks: Array<Record<string, unknown>> = [];
+    let truncated = false;
+    for (const path of paths) {
+      if (!path.toLowerCase().endsWith(".md")) continue;
+      if ((await this.deps.getPermission(path)) < PermissionLevel.READ) continue;
+      const content = await this.deps.readText(path);
+      if (this.utf8Bytes(content) > MAX_SEMANTIC_NOTE_BYTES) {
+        truncated = true;
+        continue;
+      }
+      const remaining = Math.max(1, limit - tasks.length);
+      const listed = await listMarkdownTasks(content, {
+        ...(args.status === undefined ? {} : { status: args.status }),
+        limit: remaining,
+      });
+      for (const task of listed.tasks) tasks.push({ path, ...task });
+      truncated ||= listed.truncated;
+      if (tasks.length >= limit) {
+        truncated ||= paths.indexOf(path) < paths.length - 1;
+        break;
+      }
+    }
+    return { tasks, truncated };
+  }
+
+  private createAgentTemplateService(lease: AgentBridgeLease): AgentTemplateService {
+    const visiblePaths = async (source: readonly string[]): Promise<string[]> => {
+      const paths: string[] = [];
+      for (const raw of source) {
+        try {
+          const path = this.requirePathInLease(raw, lease);
+          if (!path.toLowerCase().endsWith(".md")) continue;
+          if ((await this.deps.getPermission(path)) < PermissionLevel.READ) continue;
+          paths.push(path);
+        } catch {
+          // A trusted-source path outside this lease remains completely hidden.
+        }
+      }
+      return paths;
+    };
+    const provider: AgentTemplateProvider = {
+      getCoreTemplateFolder: () => this.deps.getCoreTemplateFolder?.() ?? null,
+      listCoreTemplatePaths: async () => visiblePaths(
+        (await this.deps.listCoreTemplatePaths?.()) ?? [],
+      ),
+      listAllowlistedTemplatePaths: async () => visiblePaths(
+        (await this.deps.listAllowlistedTemplatePaths?.()) ?? [],
+      ),
+      pathExists: (path) => this.deps.fileExists(path),
+      readText: async (rawPath, maxBytes) => {
+        if (!lease.allowRead) throw new Error("VaultGuard agent lease does not allow reads.");
+        const path = await this.requireReadablePath(rawPath, lease);
+        if (!path.toLowerCase().endsWith(".md")) {
+          throw new Error("VaultGuard templates must be Markdown files.");
+        }
+        const content = await this.deps.readText(path);
+        const bytes = this.utf8Bytes(content);
+        return {
+          content: bytes <= maxBytes ? content : this.truncateUtf8(content, maxBytes),
+          truncated: bytes > maxBytes,
+        };
+      },
+    };
+    return new AgentTemplateService(provider);
+  }
+
+  private async createFromAgentTemplate(
+    lease: AgentBridgeLease,
+    path: string,
+    content: string,
+    args: AgentBridgeTemplateArgs,
+  ): Promise<Record<string, unknown>> {
+    return this.semanticMutations.runExclusive(path, () =>
+      this.createFromAgentTemplateQueued(lease, path, content, args),
+    );
+  }
+
+  private async createFromAgentTemplateQueued(
+    lease: AgentBridgeLease,
+    path: string,
+    content: string,
+    args: AgentBridgeTemplateArgs,
+  ): Promise<Record<string, unknown>> {
+    const fingerprint = await hashSemanticRequest({
+      tool: "vaultguard_template",
+      op: "create",
+      path,
+      ...(args.templatePath === undefined ? {} : { templatePath: args.templatePath }),
+      ...(args.uniqueName === undefined ? {} : { uniqueName: args.uniqueName }),
+      ...(args.variables === undefined ? {} : { variables: args.variables }),
+      contentHash: await sha256Text(content),
+    });
+    const cacheKey = args.idempotencyKey
+      ? await sha256Text(`${lease.leaseId}\0${args.idempotencyKey}`)
+      : null;
+    if (cacheKey) {
+      const cached = this.templateCreateIdempotency.get(cacheKey);
+      if (cached) {
+        if (cached.fingerprint !== fingerprint) {
+          throw new Error("The idempotency key was already used with different arguments.");
+        }
+        return { ...cached.receipt, idempotentReplay: true };
+      }
+    }
+    if (await this.deps.fileExists(path)) {
+      throw new Error(`VaultGuard template creation refuses to overwrite "${path}".`);
+    }
+    await this.deps.ensureParentFolders(path);
+    // Close the confirmation/create race immediately before the write.
+    if (await this.deps.fileExists(path)) {
+      throw new Error(`VaultGuard template creation became stale for "${path}".`);
+    }
+    await this.deps.writeText(path, content);
+    const readback = await this.deps.readText(path);
+    if (readback !== content) {
+      throw new Error("VaultGuard template creation could not be verified.");
+    }
+    const receipt: Record<string, unknown> = {
+      operation: "template.create",
+      path,
+      changed: true,
+      verified: true,
+      idempotentReplay: false,
+      beforeHash: await sha256Text(""),
+      afterHash: await sha256Text(content),
+      beforeBytes: 0,
+      afterBytes: this.utf8Bytes(content),
+      destination: path,
+    };
+    if (cacheKey) {
+      while (this.templateCreateIdempotency.size >= MAX_TEMPLATE_CREATE_IDEMPOTENCY) {
+        const oldest = this.templateCreateIdempotency.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.templateCreateIdempotency.delete(oldest);
+      }
+      this.templateCreateIdempotency.set(cacheKey, {
+        fingerprint,
+        receipt: Object.freeze({ ...receipt }),
+      });
+    }
+    return receipt;
+  }
+
+  private normalizeAutomationArguments(
+    value: AgentBridgeAutomationArgs["arguments"],
+  ): Record<string, unknown> {
+    if (!value) return {};
+    if (!Array.isArray(value)) return { ...value };
+    const result: Record<string, unknown> = {};
+    for (const entry of value) {
+      if (!entry || typeof entry.name !== "string" || !entry.name || entry.name in result) {
+        throw new Error("VaultGuard automation arguments are invalid or duplicated.");
+      }
+      result[entry.name] = entry.value;
+    }
+    return result;
+  }
+
+  private async authorizeAutomationPlan(
+    lease: AgentBridgeLease,
+    plan: AutomationExecutionPlan,
+  ): Promise<void> {
+    if (!lease.allowAutomation) {
+      throw new Error("VaultGuard agent lease does not allow governed automation.");
+    }
+    if (plan.risk !== "read" && lease.writeMode === "deny") {
+      throw new Error("VaultGuard agent lease is read-only.");
+    }
+    for (const path of plan.targetPaths) {
+      if (plan.risk === "read") await this.requireReadablePath(path, lease);
+      else await this.requireSemanticWritablePath(path, lease);
+    }
   }
 
   // Read-only structural navigation over Obsidian's metadataCache. Resolves
@@ -2984,7 +4022,10 @@ export class VaultGuardAgentBridge {
         if (typeof provider.getFileHistory !== "function") {
           throw new Error("VaultGuard file history is unavailable — update the plugin/server.");
         }
-        const path = this.requireFilesPath(args.path, "history");
+        const path = await this.requireReadablePath(
+          this.requireFilesPath(args.path, "history"),
+          lease,
+        );
         const versions = await provider.getFileHistory(path);
         return { path, versionCount: versions.length, versions };
       }
@@ -3034,9 +4075,105 @@ export class VaultGuardAgentBridge {
         return provider.restoreDeletedFile(path);
       }
 
+      case "version_read": {
+        if (typeof provider.readHistoricalFile !== "function") {
+          throw new Error("VaultGuard exact-version reads are unavailable — update the plugin/server.");
+        }
+        const path = await this.requireReadablePath(
+          this.requireFilesPath(args.path, "version_read"),
+          lease,
+        );
+        const versionId = this.requireOpaqueVersionId(args.versionId, "version_read", "versionId");
+        const maxBytes = this.clampNumber(
+          args.maxBytes ?? Math.min(64 * 1024, lease.maxReadBytes),
+          1,
+          Math.min(256 * 1024, lease.maxReadBytes),
+        );
+        const read = await this.readExactVersionText(provider, path, versionId, maxBytes);
+        return { path, versionId, ...read };
+      }
+
+      case "version_diff": {
+        if (typeof provider.readHistoricalFile !== "function") {
+          throw new Error("VaultGuard exact-version diffs are unavailable — update the plugin/server.");
+        }
+        const path = await this.requireReadablePath(
+          this.requireFilesPath(args.path, "version_diff"),
+          lease,
+        );
+        const versionId = this.requireOpaqueVersionId(args.versionId, "version_diff", "versionId");
+        const compareVersionId = args.compareVersionId
+          ? this.requireOpaqueVersionId(args.compareVersionId, "version_diff", "compareVersionId")
+          : undefined;
+        const maxBytes = this.clampNumber(
+          args.maxBytes ?? Math.min(64 * 1024, lease.maxReadBytes),
+          1,
+          Math.min(256 * 1024, lease.maxReadBytes),
+        );
+        const before = await this.readExactVersionText(provider, path, versionId, maxBytes);
+        const after = compareVersionId
+          ? await this.readExactVersionText(provider, path, compareVersionId, maxBytes)
+          : this.boundText(await this.deps.readText(path), maxBytes);
+        const diff = this.fullFileUnifiedDiff(
+          path,
+          versionId,
+          compareVersionId ?? "current",
+          before.content,
+          after.content,
+        );
+        const boundedDiff = this.boundText(diff, maxBytes);
+        return {
+          path,
+          versionId,
+          compareVersionId: compareVersionId ?? null,
+          diff: boundedDiff.content,
+          bytes: boundedDiff.bytes,
+          truncated: before.truncated || after.truncated || boundedDiff.truncated,
+        };
+      }
+
+      case "version_restore": {
+        if (
+          typeof provider.restoreFileVersion !== "function" ||
+          typeof provider.getFileHistory !== "function" ||
+          typeof provider.readHistoricalFile !== "function"
+        ) {
+          throw new Error("VaultGuard exact-version restore is unavailable — update the plugin/server.");
+        }
+        const path = await this.requireReadablePath(
+          this.requireFilesPath(args.path, "version_restore"),
+          lease,
+        );
+        await this.requireHistoryMutationAuthority(path, lease);
+        const versionId = this.requireOpaqueVersionId(args.versionId, "version_restore", "versionId");
+        const expectedCurrentVersionId = this.requireOpaqueVersionId(
+          args.expectedCurrentVersionId,
+          "version_restore",
+          "expectedCurrentVersionId",
+        );
+        await this.assertRestorableVersionHead(
+          provider,
+          path,
+          versionId,
+          expectedCurrentVersionId,
+        );
+        const preview =
+          `Restore the exact historical version ${versionId} of "${path}" only if ` +
+          `the current server head is still ${expectedCurrentVersionId}.`;
+        const action: AgentBridgeConfirmAction = {
+          operation: "version_restore",
+          leaseId,
+          preview,
+          restore: { path, versionId, expectedCurrentVersionId },
+        };
+        const { paused } = await this.confirmMutation(lease, action, path, transport);
+        if (paused) return this.pausedConfirmResult(preview, "exact-version restore");
+        return this.restoreExactVersion(provider, path, versionId, expectedCurrentVersionId);
+      }
+
       default:
         throw new Error(
-          `Unknown files op "${op}". Use one of: history, overview, deleted, restore.`,
+          `Unknown files op "${op}". Use one of: history, overview, deleted, restore, version_read, version_diff, version_restore.`,
         );
     }
   }
@@ -3047,6 +4184,147 @@ export class VaultGuardAgentBridge {
       throw new Error(`vaultguard_files op=${op} requires a "path".`);
     }
     return path;
+  }
+
+  private requireOpaqueVersionId(
+    raw: string | undefined,
+    op: string,
+    field: string,
+  ): string {
+    if (!raw || raw.trim().length === 0 || raw.length > 1024 || /[\r\n]/.test(raw)) {
+      throw new Error(`vaultguard_files op=${op} requires a valid "${field}".`);
+    }
+    return raw;
+  }
+
+  private boundText(content: string, maxBytes: number): {
+    content: string;
+    bytes: number;
+    truncated: boolean;
+  } {
+    const bytes = this.utf8Bytes(content);
+    return bytes <= maxBytes
+      ? { content, bytes, truncated: false }
+      : { content: this.truncateUtf8(content, maxBytes), bytes, truncated: true };
+  }
+
+  private async readExactVersionText(
+    provider: AccessQueryProvider,
+    path: string,
+    versionId: string,
+    maxBytes: number,
+  ): Promise<{ content: string; bytes: number; truncated: boolean }> {
+    if (!this.isTextPath(path)) {
+      throw new Error(`VaultGuard exact-version reads refuse non-text file "${path}".`);
+    }
+    const response = await provider.readHistoricalFile!(path, versionId);
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(response.content);
+    } catch {
+      throw new Error("VaultGuard historical version is not valid UTF-8 text.");
+    }
+    return this.boundText(text, maxBytes);
+  }
+
+  private fullFileUnifiedDiff(
+    path: string,
+    fromVersion: string,
+    toVersion: string,
+    before: string,
+    after: string,
+  ): string {
+    if (before === after) return "";
+    const oldLines = before.replace(/\r\n/g, "\n").split("\n");
+    const newLines = after.replace(/\r\n/g, "\n").split("\n");
+    return [
+      `--- ${path}@${fromVersion}`,
+      `+++ ${path}@${toVersion}`,
+      `@@ -1,${oldLines.length} +1,${newLines.length} @@`,
+      ...oldLines.map((line) => `-${line}`),
+      ...newLines.map((line) => `+${line}`),
+    ].join("\n");
+  }
+
+  private async assertRestorableVersionHead(
+    provider: AccessQueryProvider,
+    path: string,
+    sourceVersionId: string,
+    expectedCurrentVersionId: string,
+  ): Promise<void> {
+    const versions = await provider.getFileHistory!(path);
+    const source = versions.find((version) => version.versionId === sourceVersionId);
+    if (!source || source.isDeleteMarker) {
+      throw new Error("VaultGuard source version is unavailable or is a delete marker.");
+    }
+    const current = versions.find((version) => version.isLatest);
+    if (!current || current.versionId !== expectedCurrentVersionId) {
+      throw new Error("VaultGuard restore is stale: the current file version changed.");
+    }
+  }
+
+  private async requireHistoryMutationAuthority(
+    rawPath: string,
+    lease: AgentBridgeLease,
+  ): Promise<string> {
+    const path = this.requirePathInLease(rawPath, lease);
+    if (lease.writeMode === "deny") {
+      throw new Error("VaultGuard agent lease is read-only.");
+    }
+    if ((await this.deps.getPermission(path)) < PermissionLevel.WRITE) {
+      throw new Error(`VaultGuard agent bridge: no WRITE permission for "${path}".`);
+    }
+    return path;
+  }
+
+  private async restoreExactVersion(
+    provider: AccessQueryProvider,
+    path: string,
+    sourceVersionId: string,
+    expectedCurrentVersionId: string,
+  ): Promise<Record<string, unknown>> {
+    if (typeof provider.readHistoricalFile !== "function") {
+      throw new Error("VaultGuard exact-version verification is unavailable — update the plugin/server.");
+    }
+    // Confirmation may have been open for minutes. Re-read history immediately
+    // before the API call; the server then closes the remaining race with ETag.
+    await this.assertRestorableVersionHead(
+      provider,
+      path,
+      sourceVersionId,
+      expectedCurrentVersionId,
+    );
+    const source = await provider.readHistoricalFile(path, sourceVersionId);
+    const restored = await provider.restoreFileVersion!(
+      path,
+      sourceVersionId,
+      expectedCurrentVersionId,
+    );
+    const after = await provider.getFileHistory!(path);
+    const verified = after.some(
+      (version) => version.isLatest && version.versionId === restored.versionId,
+    );
+    if (!verified) {
+      throw new Error("VaultGuard restore completed but post-restore verification failed.");
+    }
+    const readback = await provider.readHistoricalFile(path, restored.versionId);
+    const expectedBytes = new Uint8Array(source.content);
+    const actualBytes = new Uint8Array(readback.content);
+    const contentVerified =
+      expectedBytes.byteLength === actualBytes.byteLength &&
+      expectedBytes.every((value, index) => value === actualBytes[index]);
+    if (!contentVerified) {
+      throw new Error("VaultGuard restore completed but restored content did not match the source version.");
+    }
+    return {
+      path,
+      sourceVersionId,
+      expectedCurrentVersionId,
+      targetVersionId: restored.versionId,
+      restored: true,
+      verified: true,
+      contentVerified: true,
+    };
   }
 
   // Shared ALWAYS-on confirmation for the administrative mutations exposed by
@@ -3480,21 +4758,54 @@ export class VaultGuardAgentBridge {
     }
 
     const lease = this.requireLease(leaseId);
-    const provider = this.deps.queryAccess;
-    if (!provider) {
-      throw new Error("VaultGuard action is unavailable — no server connection.");
-    }
     const auditPath = this.confirmActionPath(action);
     const auditMeta: Record<string, unknown> = {
       leaseId: lease.leaseId,
       agentName: lease.agentName,
       transport: "confirm",
       tool: CONFIRM_OP_TOOL[action.operation],
-      preview: action.preview,
+      operation: action.operation,
     };
+    if (!action.semantic && !action.automation) auditMeta.preview = action.preview;
     try {
-      const summary = await this.deps.withAgentContext(lease.agentName, lease.leaseId, () =>
-        this.runConfirmedMutation(lease, provider, action),
+      const summary = await this.deps.withAgentContext(
+        lease.agentName,
+        lease.leaseId,
+        async () => {
+          if (action.semantic) {
+            const expectedOperation: Record<
+              NonNullable<AgentBridgeConfirmAction["semantic"]>["tool"],
+              AgentBridgeConfirmOperation
+            > = {
+              vaultguard_note: "note_mutation",
+              vaultguard_property: "property_mutation",
+              vaultguard_task: "task_mutation",
+              vaultguard_template: "template_mutation",
+            };
+            if (action.operation !== expectedOperation[action.semantic.tool]) {
+              throw new Error("Malformed semantic confirmation payload.");
+            }
+            const result = await this.applyConfirmedSemanticAction(leaseId, action.semantic);
+            return JSON.stringify(result);
+          }
+          if (action.automation) {
+            if (action.operation !== "automation_run") {
+              throw new Error("Malformed automation confirmation payload.");
+            }
+            const result = await this.automation(
+              leaseId,
+              { op: "run", ...action.automation },
+              "inproc",
+              true,
+            );
+            return JSON.stringify(result);
+          }
+          const provider = this.deps.queryAccess;
+          if (!provider) {
+            throw new Error("VaultGuard action is unavailable — no server connection.");
+          }
+          return this.runConfirmedMutation(lease, provider, action);
+        },
       );
       void this.deps.emitAudit("bridge.tool_invoked", auditPath, { ...auditMeta, outcome: "success" });
       return summary;
@@ -3505,6 +4816,22 @@ export class VaultGuardAgentBridge {
         error: err instanceof Error ? err.message : String(err),
       });
       throw err;
+    }
+  }
+
+  private applyConfirmedSemanticAction(
+    leaseId: string,
+    payload: NonNullable<AgentBridgeConfirmAction["semantic"]>,
+  ): Promise<unknown> {
+    switch (payload.tool) {
+      case "vaultguard_note":
+        return this.note(leaseId, payload.args, "inproc", true);
+      case "vaultguard_property":
+        return this.property(leaseId, payload.args, "inproc", true);
+      case "vaultguard_task":
+        return this.task(leaseId, payload.args, "inproc", true);
+      case "vaultguard_template":
+        return this.template(leaseId, payload.args, "inproc", true);
     }
   }
 
@@ -3575,6 +4902,33 @@ export class VaultGuardAgentBridge {
         await provider.restoreDeletedFile(path);
         return `Restored the deleted file "${path}". It will re-appear locally on the next sync.`;
       }
+      case "version_restore": {
+        if (!lease.allowFileHistory) {
+          throw new Error("VaultGuard agent lease does not allow file history queries.");
+        }
+        if (
+          typeof provider.restoreFileVersion !== "function" ||
+          typeof provider.getFileHistory !== "function" ||
+          typeof provider.readHistoricalFile !== "function"
+        ) {
+          throw new Error("VaultGuard exact-version restore is unavailable — update the plugin/server.");
+        }
+        const path = action.restore?.path;
+        const versionId = action.restore?.versionId;
+        const expectedCurrentVersionId = action.restore?.expectedCurrentVersionId;
+        if (!path || !versionId || !expectedCurrentVersionId) {
+          throw new Error("Malformed exact-version restore confirmation.");
+        }
+        await this.requireReadablePath(path, lease);
+        await this.requireHistoryMutationAuthority(path, lease);
+        const receipt = await this.restoreExactVersion(
+          provider,
+          path,
+          versionId,
+          expectedCurrentVersionId,
+        );
+        return `Restored historical version ${versionId} of "${path}" as ${String(receipt.targetVersionId)} and verified the new head.`;
+      }
       default:
         throw new Error(`Unsupported confirmed mutation "${action.operation}".`);
     }
@@ -3612,7 +4966,15 @@ export class VaultGuardAgentBridge {
       case "share_revoke":
         return action.share?.shareId ?? null;
       case "restore":
+      case "version_restore":
         return action.restore?.path ?? null;
+      case "note_mutation":
+      case "property_mutation":
+      case "task_mutation":
+      case "template_mutation":
+        return action.semantic?.args.path ?? null;
+      case "automation_run":
+        return action.automation?.path ?? null;
       case "member_add":
       case "member_remove":
       case "member_set_role":
@@ -4198,6 +5560,28 @@ export class VaultGuardAgentBridge {
     return path;
   }
 
+  private async findReadablePathSuggestions(
+    requestedPath: string,
+    lease: AgentBridgeLease,
+  ): Promise<string[]> {
+    const allowedPaths: string[] = [];
+    for (const rawPath of this.deps.getAllFilePaths().slice(0, 5_000)) {
+      const path = this.normalizePath(rawPath);
+      if (!path || !this.isPathAgentReadable(path, lease, null)) continue;
+      const permission = await this.deps.getPermission(path);
+      if (permission >= PermissionLevel.READ) allowedPaths.push(path);
+    }
+    return findSafePathSuggestions({
+      requestedPath,
+      candidatePaths: allowedPaths,
+      // Denied paths have already been removed before the similarity helper
+      // sees the candidate set; retain an explicit predicate for fail-closed
+      // behavior if this call site is refactored later.
+      isAllowed: (path) => allowedPaths.includes(path),
+      maxSuggestions: 3,
+    });
+  }
+
   private requirePathInLease(rawPath: string, lease: AgentBridgeLease): string {
     const path = this.normalizePath(rawPath);
     if (!path) {
@@ -4351,6 +5735,7 @@ export class VaultGuardAgentBridge {
       allowFileHistory: false,
       allowShareManagement: false,
       allowMembershipWrites: false,
+      allowAutomation: false,
       createdAt: session.createdAt,
       expiresAt: session.expiresAt,
       expiresAtMs: session.expiresAtMs,
@@ -4523,6 +5908,7 @@ export class VaultGuardAgentBridge {
     if (typeof args.depth === "number") shape.depth = args.depth;
     if (typeof args.limit === "number") shape.limit = args.limit;
     if (typeof args.maxBytes === "number") shape.maxBytes = args.maxBytes;
+    if (typeof args.offsetBytes === "number") shape.offsetBytes = args.offsetBytes;
     if (typeof args.query === "string") shape.queryLength = args.query.length;
     return shape;
   }
@@ -4542,6 +5928,7 @@ export class VaultGuardAgentBridge {
       allowFileHistory: lease.allowFileHistory,
       allowShareManagement: lease.allowShareManagement,
       allowMembershipWrites: lease.allowMembershipWrites,
+      allowAutomation: lease.allowAutomation,
       createdAt: lease.createdAt,
       expiresAt: lease.expiresAt,
       persistent: lease.persistent,
@@ -4624,12 +6011,8 @@ export class VaultGuardAgentBridge {
   }
 
   private isTextPath(path: string): boolean {
-    const normalized = this.normalizePath(path).toLocaleLowerCase();
-    const slash = normalized.lastIndexOf("/");
-    const basename = slash === -1 ? normalized : normalized.slice(slash + 1);
-    const dot = basename.lastIndexOf(".");
-    if (dot === -1) return true;
-    return TEXT_EXTENSIONS.has(basename.slice(dot));
+    const classification = classifyAgentReadPath(path);
+    return classification === "text" || classification === "supported_source";
   }
 
   private cleanAgentName(agentName: string | undefined): string {
@@ -4659,9 +6042,10 @@ export class VaultGuardAgentBridge {
   }
 
   private makeWritePreview(value: string): string {
-    const normalized = value.replace(/\r\n/g, "\n");
-    if (normalized.length <= 2000) return normalized;
-    return `${normalized.slice(0, 2000)}\n...`;
+    // SD-13-F6: approval must cover the exact proposed payload. The modal is a
+    // bounded, scrollable viewport, so normalize line endings but never hide a
+    // security-relevant tail that will still be applied after confirmation.
+    return value.replace(/\r\n/g, "\n");
   }
 
   private truncateText(value: string, maxChars: number): string {
@@ -5132,6 +6516,7 @@ export class VaultGuardAgentBridge {
       case "read":
         return this.chatGptConnectorRead(lease, session, {
           path: typeof args.path === "string" ? args.path : "",
+          offsetBytes: typeof args.offsetBytes === "number" ? args.offsetBytes : undefined,
           maxBytes: typeof args.maxBytes === "number" ? args.maxBytes : undefined,
         });
       case "graph":
@@ -5217,7 +6602,7 @@ export class VaultGuardAgentBridge {
   private async chatGptConnectorRead(
     lease: AgentBridgeLease,
     session: ChatGptConnectorSession,
-    args: { path: string; maxBytes?: number },
+    args: AgentBridgeReadArgs,
   ): Promise<AgentBridgeReadResult> {
     const path = this.normalizePath(args.path);
     if (this.isChatGptConnectorBlockedPath(path)) {
@@ -5228,11 +6613,13 @@ export class VaultGuardAgentBridge {
       1,
       session.limits.maxReadBytes,
     );
-    const result = await this.readForLease(lease, { path, maxBytes });
-    return {
-      ...result,
-      content: this.redactConnectorText(result.content),
-    };
+    // Redact the complete bounded plaintext before windowing so a secret-like
+    // token split across two windows cannot evade the connector redactor.
+    return this.readForLease(
+      lease,
+      { path, offsetBytes: args.offsetBytes, maxBytes },
+      (content) => this.redactConnectorText(content),
+    );
   }
 
   private async chatGptConnectorGraph(
@@ -5291,6 +6678,7 @@ export class VaultGuardAgentBridge {
       ...(lease.allowFileHistory ? FILES_MCP_TOOLS : {}),
       ...(lease.allowShareManagement ? SHARE_MCP_TOOLS : {}),
       ...(lease.allowMembershipWrites ? MEMBERSHIP_MCP_TOOLS : {}),
+      ...(lease.allowAutomation ? AUTOMATION_MCP_TOOLS : {}),
     };
     return {
       tools: Object.entries(tools).map(([name, def]) => ({
@@ -5319,7 +6707,8 @@ export class VaultGuardAgentBridge {
       (lease.allowAuditQueries ? AUDIT_MCP_TOOLS[name] : undefined) ??
       (lease.allowFileHistory ? FILES_MCP_TOOLS[name] : undefined) ??
       (lease.allowShareManagement ? SHARE_MCP_TOOLS[name] : undefined) ??
-      (lease.allowMembershipWrites ? MEMBERSHIP_MCP_TOOLS[name] : undefined);
+      (lease.allowMembershipWrites ? MEMBERSHIP_MCP_TOOLS[name] : undefined) ??
+      (lease.allowAutomation ? AUTOMATION_MCP_TOOLS[name] : undefined);
     if (!def) {
       return this.makeMcpToolError(`Unknown tool "${name}".`);
     }
@@ -5506,6 +6895,9 @@ export class VaultGuardAgentBridge {
     args: Record<string, unknown>,
     transport: AgentBridgeTransport
   ): Promise<unknown> {
+    if (isAgentCommandToolName(tool)) {
+      validateAgentCommandInput(tool, args);
+    }
     switch (tool) {
       case "vaultguard_list":
         return this.list(leaseId, {
@@ -5521,6 +6913,7 @@ export class VaultGuardAgentBridge {
       case "vaultguard_read":
         return this.read(leaseId, {
           path: typeof args.path === "string" ? args.path : "",
+          offsetBytes: typeof args.offsetBytes === "number" ? args.offsetBytes : undefined,
           maxBytes: typeof args.maxBytes === "number" ? args.maxBytes : undefined,
         });
       case "vaultguard_get_vault_orientation":
@@ -5556,6 +6949,20 @@ export class VaultGuardAgentBridge {
           path: typeof args.path === "string" ? args.path : "",
           newPath: typeof args.newPath === "string" ? args.newPath : "",
         });
+      case "vaultguard_note":
+        return this.note(leaseId, args as unknown as AgentBridgeNoteArgs, transport);
+      case "vaultguard_property":
+        return this.property(leaseId, args as unknown as AgentBridgePropertyArgs, transport);
+      case "vaultguard_task":
+        return this.task(leaseId, args as unknown as AgentBridgeTaskArgs, transport);
+      case "vaultguard_inspect":
+        return this.inspect(leaseId, args as unknown as AgentInspectionQuery);
+      case "vaultguard_template":
+        return this.template(leaseId, args as unknown as AgentBridgeTemplateArgs, transport);
+      case "vaultguard_sync_status":
+        return this.syncStatus(leaseId, {});
+      case "vaultguard_automation":
+        return this.automation(leaseId, args as unknown as AgentBridgeAutomationArgs, transport);
       case "vaultguard_graph":
         return this.graph(leaseId, {
           op: (typeof args.op === "string" ? args.op : "") as GraphArgs["op"],
@@ -5593,6 +7000,14 @@ export class VaultGuardAgentBridge {
             op: typeof args.op === "string" ? args.op : "",
             path: typeof args.path === "string" ? args.path : undefined,
             limit: typeof args.limit === "number" ? args.limit : undefined,
+            versionId: typeof args.versionId === "string" ? args.versionId : undefined,
+            compareVersionId:
+              typeof args.compareVersionId === "string" ? args.compareVersionId : undefined,
+            expectedCurrentVersionId:
+              typeof args.expectedCurrentVersionId === "string"
+                ? args.expectedCurrentVersionId
+                : undefined,
+            maxBytes: typeof args.maxBytes === "number" ? args.maxBytes : undefined,
           },
           transport,
         );

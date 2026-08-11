@@ -29,16 +29,35 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
-      - name: Verify tag matches manifest version
+      - name: Verify tag and plugin metadata agree
         if: github.event_name == 'push'
         run: |
           node - <<'NODE'
+          const fs = require("node:fs");
           const manifest = require("./packages/plugin/manifest.json");
+          const rootManifest = require("./manifest.json");
+          const packageJson = require("./packages/plugin/package.json");
+          const versions = require("./packages/plugin/versions.json");
           const tag = process.env.GITHUB_REF_NAME;
-          if (tag !== manifest.version) {
-            throw new Error(`Release tag ${tag} must match manifest.json version ${manifest.version}`);
+          const versionsSeen = new Set([tag, manifest.version, rootManifest.version, packageJson.version]);
+          if (versionsSeen.size !== 1 || !/^\d+\.\d+\.\d+$/.test(tag)) {
+            throw new Error(`Release versions disagree: ${[...versionsSeen].join(", ")}`);
+          }
+          if (packageJson.name !== manifest.id || !/^[a-z0-9][a-z0-9_-]*$/.test(manifest.id)) {
+            throw new Error(`Plugin identity mismatch: package=${packageJson.name}, manifest=${manifest.id}`);
+          }
+          if (versions[tag] !== manifest.minAppVersion) {
+            throw new Error(`versions.json[${tag}] must equal minAppVersion ${manifest.minAppVersion}`);
+          }
+          if (JSON.stringify(rootManifest) !== JSON.stringify(manifest)) {
+            throw new Error("Root manifest.json must match packages/plugin/manifest.json");
+          }
+          for (const name of ["manifest.json", "styles.css"]) {
+            if (fs.statSync(`packages/plugin/${name}`).size <= 0) {
+              throw new Error(`Required release input is empty: ${name}`);
+            }
           }
           NODE
 
@@ -51,15 +70,151 @@ jobs:
       - name: Build plugin
         run: npm run -w vaultguard-sync build
 
+      - name: Generate CycloneDX SBOM, provenance, and SHA-256 manifest
+        run: |
+          set -euo pipefail
+          mkdir -p release-evidence
+          npm sbom --workspace vaultguard-sync --package-lock-only --sbom-format=cyclonedx --json > release-evidence/vaultguard-plugin-sbom.cdx.json
+          export PUBLIC_COMMIT_SHA="$(git rev-parse HEAD)"
+          export TAG_TARGET_SHA="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          test "$TAG_TARGET_SHA" = "$PUBLIC_COMMIT_SHA"
+          export PUBLIC_COMMIT_TIME="$(git show -s --format=%cI "$PUBLIC_COMMIT_SHA")"
+          export PRIVATE_SOURCE_SHA="$(git log -1 --format='%(trailers:key=VaultGuard-Private-Source,valueonly)' | tr -d '[:space:]')"
+          export EXPORT_TREE_SHA256="$(git log -1 --format='%(trailers:key=VaultGuard-Export-Tree-SHA256,valueonly)' | tr -d '[:space:]')"
+          node - <<'NODE'
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const manifest = require("./packages/plugin/manifest.json");
+          const sha256 = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          const source = process.env.PRIVATE_SOURCE_SHA;
+          const tree = process.env.EXPORT_TREE_SHA256;
+          const commit = process.env.PUBLIC_COMMIT_SHA;
+          const generatedAt = process.env.PUBLIC_COMMIT_TIME;
+          if (!/^[a-f0-9]{40}$/.test(source ?? "")) throw new Error("Missing full VaultGuard-Private-Source commit trailer");
+          if (!/^[a-f0-9]{64}$/.test(tree ?? "")) throw new Error("Missing VaultGuard-Export-Tree-SHA256 commit trailer");
+          if (!/^[a-f0-9]{40}$/.test(commit ?? "")) throw new Error("Invalid public commit SHA");
+          if (Number.isNaN(Date.parse(generatedAt ?? ""))) throw new Error("Invalid public commit time");
+          const canonicalize = (value) => {
+            if (Array.isArray(value)) {
+              return value.map(canonicalize)
+                .sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0);
+            }
+            if (value && typeof value === "object") {
+              return Object.fromEntries(Object.keys(value).sort()
+                .map((key) => [key, canonicalize(value[key])]));
+            }
+            return value;
+          };
+          const sbomPath = "release-evidence/vaultguard-plugin-sbom.cdx.json";
+          const sbom = JSON.parse(fs.readFileSync(sbomPath, "utf8"));
+          if (sbom.bomFormat !== "CycloneDX" || !Array.isArray(sbom.components)) {
+            throw new Error("npm sbom did not return a CycloneDX document with components");
+          }
+          delete sbom.serialNumber;
+          if (sbom.metadata && typeof sbom.metadata === "object") {
+            delete sbom.metadata.timestamp;
+            delete sbom.metadata.tools;
+          }
+          fs.writeFileSync(sbomPath, `${JSON.stringify(canonicalize(sbom), null, 2)}\n`);
+          const paths = [
+            "packages/plugin/main.js",
+            "packages/plugin/manifest.json",
+            "packages/plugin/styles.css",
+            sbomPath,
+          ];
+          const records = paths.map((file) => ({
+            name: path.basename(file),
+            size: fs.statSync(file).size,
+            sha256: sha256(file),
+          })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+          if (records.some((record) => record.size <= 0)) throw new Error("Release evidence includes an empty asset");
+          const provenance = {
+            schemaVersion: 1,
+            evidenceState: "packaged",
+            generatedAt,
+            privateSourceSha: source,
+            exportTreeSha256: tree,
+            publicCommitSha: commit,
+            tagTargetSha: commit,
+            plugin: { id: manifest.id, version: manifest.version, minAppVersion: manifest.minAppVersion },
+            assets: records.filter((record) => ["main.js", "manifest.json", "styles.css"].includes(record.name)),
+            sbom: records.find((record) => record.name.endsWith("sbom.cdx.json")),
+            attestation: {
+              workflow: ".github/workflows/plugin-release.yml",
+              subjectNames: [
+                "main.js",
+                "manifest.json",
+                "styles.css",
+                "vaultguard-plugin-sbom.cdx.json",
+                "vaultguard-release-provenance.json",
+                "SHA256SUMS",
+              ],
+              state: "workflow-issued",
+            },
+            releaseState: "unverified",
+            deploymentState: "unverified",
+            liveVerificationState: "unverified",
+          };
+          const provenancePath = "release-evidence/vaultguard-release-provenance.json";
+          fs.writeFileSync(provenancePath, `${JSON.stringify(provenance, null, 2)}\n`);
+          records.push({
+            name: path.basename(provenancePath),
+            size: fs.statSync(provenancePath).size,
+            sha256: sha256(provenancePath),
+          });
+          fs.writeFileSync(
+            "release-evidence/SHA256SUMS",
+            records.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+              .map((record) => `${record.sha256}  ${record.name}`).join("\n") + "\n",
+          );
+          NODE
+
+      - name: Inspect existing immutable release
+        id: existing_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          view_error="$RUNNER_TEMP/vg-release-view-error.txt"
+          if gh release view "$GITHUB_REF_NAME" --json tagName > /dev/null 2> "$view_error"; then
+            release_dir="$RUNNER_TEMP/vg-existing-release"
+            expected_sums="$RUNNER_TEMP/vg-expected-SHA256SUMS"
+            rm -rf "$release_dir"
+            mkdir -p "$release_dir"
+            cp release-evidence/SHA256SUMS "$expected_sums"
+            gh release download "$GITHUB_REF_NAME" --dir "$release_dir" --clobber
+            cmp "$expected_sums" "$release_dir/SHA256SUMS"
+            (
+              cd "$release_dir"
+              sha256sum --check "$expected_sums"
+            )
+            expected='SHA256SUMS main.js manifest.json styles.css vaultguard-plugin-sbom.cdx.json vaultguard-release-provenance.json'
+            actual="$(find "$release_dir" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ' | sed 's/ $//')"
+            expected_sorted="$(printf '%s\n' $expected | sort | tr '\n' ' ' | sed 's/ $//')"
+            test "$actual" = "$expected_sorted"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -Eqi 'release not found|HTTP 404|Not Found' "$view_error"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$view_error" >&2
+            exit 1
+          fi
+
       - name: Attest build provenance
+        if: steps.existing_release.outputs.exists != 'true'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             packages/plugin/main.js
             packages/plugin/manifest.json
             packages/plugin/styles.css
+            release-evidence/vaultguard-plugin-sbom.cdx.json
+            release-evidence/vaultguard-release-provenance.json
+            release-evidence/SHA256SUMS
 
       - name: Publish GitHub release
+        if: steps.existing_release.outputs.exists != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
@@ -67,3 +222,23 @@ jobs:
             packages/plugin/main.js
             packages/plugin/manifest.json
             packages/plugin/styles.css
+            release-evidence/vaultguard-plugin-sbom.cdx.json
+            release-evidence/vaultguard-release-provenance.json
+            release-evidence/SHA256SUMS
+
+      - name: Re-download and verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf release-download
+          mkdir -p release-download
+          cp release-evidence/SHA256SUMS "$RUNNER_TEMP/vg-final-expected-SHA256SUMS"
+          gh release download "$GITHUB_REF_NAME" --dir release-download --clobber
+          cmp "$RUNNER_TEMP/vg-final-expected-SHA256SUMS" release-download/SHA256SUMS
+          cd release-download
+          sha256sum --check "$RUNNER_TEMP/vg-final-expected-SHA256SUMS"
+          expected='SHA256SUMS main.js manifest.json styles.css vaultguard-plugin-sbom.cdx.json vaultguard-release-provenance.json'
+          actual="$(find . -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ' | sed 's/ $//')"
+          expected_sorted="$(printf '%s\n' $expected | sort | tr '\n' ' ' | sed 's/ $//')"
+          test "$actual" = "$expected_sorted"

@@ -1,4 +1,14 @@
-import { Notice } from "obsidian";
+import {
+  Notice,
+  Platform,
+  TFile,
+  apiVersion,
+  getAllTags,
+  moment,
+  normalizePath,
+  parseYaml,
+  stringifyYaml,
+} from "obsidian";
 import { classifyExtension, dispatchConvert } from "../ui/import/converters/dispatch";
 import { makeImportSourceFs } from "../ui/import/local-file-importer";
 import { VaultGuardChatView, VAULTGUARD_CHAT_VIEW_TYPE } from "../ui/chat/chat-view";
@@ -41,13 +51,19 @@ import {
 import { VaultGraph } from "./graph/vault-graph";
 import type { AgentBridgeRuntimeContext } from "./plugin-runtime-types";
 import { resolveAgentPermission } from "./agent-permission";
+import { AgentAutomationRegistry } from "./agent-automation-registry";
+import { ObsidianAutomationRuntime } from "./obsidian-automation-runtime";
+import { projectAgentSyncStatus } from "./agent-sync-status";
+import { sha256Text } from "./agent-note-operations";
 
 export class AgentBridgeRuntime {
   private bridge: VaultGuardAgentBridge | null = null;
+  private automationRegistry: AgentAutomationRegistry | null = null;
 
   constructor(private readonly ctx: AgentBridgeRuntimeContext) {}
 
   init(): void {
+    this.automationRegistry = this.createAutomationRegistry();
     this.bridge = new VaultGuardAgentBridge({
       getSession: () => this.ctx.getSession(),
       getServerVaultId: () => this.ctx.getServerVaultId(),
@@ -56,11 +72,32 @@ export class AgentBridgeRuntime {
         this.ctx.app.vault
           .getFiles()
           .map((file) => this.ctx.normalizeVaultPath(file.path)),
-      fileExists: async (path) => this.ctx.app.vault.adapter.exists(path),
+      fileExists: async (path) => this.ctx.app.vault.getAbstractFileByPath(path) !== null,
+      getReadFileInfo: (path) => {
+        const file = this.ctx.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile)) return null;
+        return {
+          sizeBytes: Math.max(0, file.stat.size),
+          storage: "unknown" as const,
+        };
+      },
       ensureParentFolders: (path) => this.ctx.ensureParentFoldersForPath(path),
       isPathExcluded: (path) => this.ctx.isPathExcluded(path),
       getPermission: (path) => resolveAgentPermission(this.ctx, path),
       makeVaultGraph: (graphDeps) => new VaultGraph(this.ctx.app, graphDeps),
+      resolveDailyNotePath: () => this.resolveConfiguredDailyNotePath(),
+      frontmatterCodec: {
+        parse: (source) => parseYaml(source),
+        stringify: (value) => stringifyYaml(value),
+      },
+      getInspectionFileFact: (path) => this.getInspectionFileFact(path),
+      getCoreTemplateFolder: () => this.getCoreTemplateFolder(),
+      listCoreTemplatePaths: () => this.listCoreTemplatePaths(),
+      listAllowlistedTemplatePaths: () => [
+        ...this.ctx.getSettings().agentTemplateAllowlist,
+      ],
+      getSyncStatus: () => this.getAgentSyncStatus(),
+      automation: this.automationRegistry,
       isMetadataSuppressed: (path) => this.ctx.isMetadataSuppressed(path),
       readText: (path) => this.ctx.readText(path),
       getVaultOrientation: (context, options) => {
@@ -97,6 +134,8 @@ export class AgentBridgeRuntime {
     // Remove live authority before asynchronous server drain. Late callers on
     // the old runtime cannot reuse leases while Obsidian replaces the plugin.
     this.bridge = null;
+    this.automationRegistry?.clearProcessState();
+    this.automationRegistry = null;
     bridge.revokeAllLeases();
     await bridge.stopHttpServer().catch((err) =>
       this.ctx.logError("Stopping agent bridge server failed", err),
@@ -334,6 +373,144 @@ export class AgentBridgeRuntime {
     return this.bridge!;
   }
 
+  /**
+   * Narrow, feature-detected read of one enabled Obsidian core plugin's options.
+   * `internalPlugins` is private API, so absence or shape drift fails closed and
+   * is isolated here instead of spreading casts through Agent Bridge.
+   */
+  private getEnabledCorePluginOptions(pluginId: "daily-notes" | "templates"):
+    | Record<string, unknown>
+    | null {
+    const app = this.ctx.app as unknown as {
+      internalPlugins?: {
+        getPluginById?: (id: string) => {
+          enabled?: unknown;
+          instance?: { options?: unknown };
+        } | null;
+      };
+    };
+    const plugin = app.internalPlugins?.getPluginById?.(pluginId);
+    if (!plugin || plugin.enabled !== true) return null;
+    const options = plugin.instance?.options;
+    return options && typeof options === "object" && !Array.isArray(options)
+      ? options as Record<string, unknown>
+      : null;
+  }
+
+  private resolveConfiguredDailyNotePath(): string | null {
+    const options = this.getEnabledCorePluginOptions("daily-notes");
+    if (!options) return null;
+    const folder = typeof options.folder === "string" ? options.folder.trim() : "";
+    const format = typeof options.format === "string" && options.format.trim()
+      ? options.format.trim()
+      : "YYYY-MM-DD";
+    if (folder.length > 512 || format.length > 200 || /[\0\r\n]/u.test(`${folder}${format}`)) {
+      return null;
+    }
+    const momentFactory = moment as unknown as () => { format(value: string): string };
+    const rendered = momentFactory().format(format);
+    if (!rendered || rendered.length > 512 || /[\0]/u.test(rendered)) return null;
+    const fileName = rendered.toLowerCase().endsWith(".md") ? rendered : `${rendered}.md`;
+    try {
+      return normalizePath(folder ? `${folder}/${fileName}` : fileName);
+    } catch {
+      return null;
+    }
+  }
+
+  private getCoreTemplateFolder(): string | null {
+    const options = this.getEnabledCorePluginOptions("templates");
+    if (!options || typeof options.folder !== "string") return null;
+    const folder = options.folder.trim();
+    if (!folder || folder.length > 512 || /[\0\r\n]/u.test(folder)) return null;
+    try {
+      return normalizePath(folder).replace(/\/+$/u, "");
+    } catch {
+      return null;
+    }
+  }
+
+  private listCoreTemplatePaths(): string[] {
+    const folder = this.getCoreTemplateFolder();
+    if (!folder) return [];
+    const prefix = `${folder}/`;
+    return this.ctx.app.vault
+      .getMarkdownFiles()
+      .map((file) => normalizePath(file.path))
+      .filter((path) => path.startsWith(prefix))
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  private getInspectionFileFact(path: string) {
+    const file = this.ctx.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return null;
+    const cache = this.ctx.app.metadataCache.getFileCache(file);
+    const frontmatter: Record<string, unknown> = {};
+    if (cache?.frontmatter) {
+      for (const [key, value] of Object.entries(cache.frontmatter)) {
+        if (key !== "position") frontmatter[key] = value;
+      }
+    }
+    const unresolvedLinks = Object.entries(
+      this.ctx.app.metadataCache.unresolvedLinks[path] ?? {},
+    ).map(([link, count]) => ({ link, count }));
+    return {
+      path: normalizePath(file.path),
+      name: file.basename,
+      extension: file.extension,
+      ctime: file.stat.ctime,
+      mtime: file.stat.mtime,
+      sizeBytes: file.stat.size,
+      headings: cache?.headings?.map((heading) => ({
+        heading: heading.heading,
+        level: heading.level,
+        line: heading.position.start.line + 1,
+      })) ?? [],
+      tags: cache ? getAllTags(cache) ?? [] : [],
+      unresolvedLinks,
+      resolvedLinks: Object.keys(this.ctx.app.metadataCache.resolvedLinks[path] ?? {}),
+      frontmatter,
+    };
+  }
+
+  private getAgentSyncStatus() {
+    const observedAt = new Date().toISOString();
+    if (this.ctx.isLocalProjectMemoryModeEnabled()) {
+      return projectAgentSyncStatus({ kind: "local-project-memory", observedAt });
+    }
+    return projectAgentSyncStatus({
+      kind: "vaultguard",
+      observedAt,
+      vaultId: this.ctx.getServerVaultId() || null,
+      syncState: this.ctx.getSyncState(),
+      connectionState: this.ctx.getConnectionState(),
+      offlineQueueLength: this.ctx.getOfflineQueueLength(),
+    });
+  }
+
+  private createAutomationRegistry(): AgentAutomationRegistry {
+    const runtime = new ObsidianAutomationRuntime(this.ctx.app, {
+      isDesktop: Platform.isDesktopApp === true,
+      obsidianVersion: apiVersion,
+      getActiveFilePath: () => this.ctx.app.workspace.getActiveFile()?.path ?? null,
+    });
+    return new AgentAutomationRegistry({
+      getSettings: () => this.ctx.getSettings().automationRegistry,
+      runtime,
+      observeFile: async (path) => {
+        const exists = this.ctx.app.vault.getAbstractFileByPath(path) !== null;
+        if (!exists) return { exists: false };
+        try {
+          return { exists: true, fingerprint: await sha256Text(await this.ctx.readText(path)) };
+        } catch {
+          // A postcondition that requires a fingerprint will fail closed. An
+          // existence-only postcondition can still be evaluated safely.
+          return { exists: true };
+        }
+      },
+    });
+  }
+
   private createAccessProvider(): AccessQueryProvider {
     const requireClient = () => {
       const client = this.ctx.getApiClient();
@@ -352,6 +529,13 @@ export class AgentBridgeRuntime {
         return { entries: page.entries, count: page.count, nextCursor: page.nextCursor };
       },
       getFileHistory: (path) => requireClient().getFileHistory(path),
+      readHistoricalFile: (path, versionId) => {
+        const vaultId = this.ctx.getServerVaultId();
+        if (!vaultId) throw new Error("VaultGuard exact-version reads require a connected vault.");
+        return requireClient().readVaultFileDecrypted(vaultId, path, versionId);
+      },
+      restoreFileVersion: (path, versionId, expectedCurrentVersionId) =>
+        requireClient().restoreFileVersion(path, versionId, expectedCurrentVersionId),
       getDeletedFiles: () => requireClient().getDeletedFiles(),
       restoreDeletedFile: (path) => requireClient().restoreDeletedFile(path),
       getVaultOverview: () => requireClient().getVaultOverview(),
@@ -476,6 +660,12 @@ export class AgentBridgeRuntime {
       | "rename"
       | "set_permission"
       | "restore"
+      | "version_restore"
+      | "note_mutation"
+      | "property_mutation"
+      | "task_mutation"
+      | "template_mutation"
+      | "automation_run"
       | "share_create"
       | "share_revoke"
       | "member_add"

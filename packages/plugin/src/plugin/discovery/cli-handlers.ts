@@ -14,6 +14,7 @@ export interface DiscoveryCliContext {
   getSession(): { userId: string } | null;
   getConnectionStatus(): string;
   getBoundVault(): { id: string; name: string } | null;
+  getDefaultResultLimit(): number;
   getSemanticStatus(): {
     enabled: boolean;
     indexState: string;
@@ -172,7 +173,7 @@ export function createDiscoveryCliHandlers(ctx: DiscoveryCliContext): DiscoveryC
       if (params.semantic !== undefined && params.semantic !== "true") {
         return invalidArguments("Semantic is a boolean flag.");
       }
-      let limit: number | undefined;
+      let limit = ctx.getDefaultResultLimit();
       if (params.limit !== undefined) {
         if (typeof params.limit !== "string" || !/^\d+$/u.test(params.limit)) {
           return invalidArguments("Limit must be a positive integer.");

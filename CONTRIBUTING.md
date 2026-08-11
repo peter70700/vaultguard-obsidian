@@ -57,6 +57,23 @@ change affects vault scoping, file APIs, permissions, auth, security posture,
 operations, testing, or release behavior, update the relevant docs in the same
 PR and prefer repository-backed statements over roadmap language.
 
+Read [VaultGuard Product Design
+Principles](docs/PRODUCT-DESIGN-PRINCIPLES.md) before changing user-facing copy,
+onboarding, settings, commands, AI-agent interaction, permissions,
+synchronization, vault orientation, or documentation navigation. Begin with the
+user's intended outcome, but retain precise consent, risk, and implementation
+language wherever the consequence depends on it.
+
+Every new user-facing feature or experience proposal must document:
+
+- the intended outcome;
+- the safe default, or why no default is safe;
+- the consent required before data, access, cost, or local state changes;
+- which actions are reversible and how, including any irreversible remainder;
+- the advanced controls available; and
+- current implementation evidence labeled `Implemented`, `Partial`, `Planned`,
+  `Stale`, or `Unknown`.
+
 Follow [docs/DOCUMENTATION-SYSTEM.md](docs/DOCUMENTATION-SYSTEM.md) for
 document lifecycle, formatting, traceability, and index obligations. Use the
 [Graph Atlas](docs/GRAPH-ATLAS.md) to find the smallest relevant source, test,

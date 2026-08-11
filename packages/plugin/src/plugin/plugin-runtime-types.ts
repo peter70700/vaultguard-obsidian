@@ -598,6 +598,7 @@ export interface AtRestAdapterRuntimeContext {
       contentType?: string;
       baseVersionId?: string;
       baseHash?: string;
+      intent?: MutationIntent;
     },
   ): void;
   getRemoteFileState(path: string): RemoteFileStateEntry | null;
@@ -944,6 +945,10 @@ export interface AgentBridgeRuntimeContext {
   getServerVaultId(): string;
   isLocalProjectMemoryModeEnabled(): boolean;
   getApiClient(): VaultGuardApiClient | null;
+  getSettings(): VaultGuardSettings;
+  getSyncState(): SyncState;
+  getConnectionState(): ConnectionState;
+  getOfflineQueueLength(): number;
   getAtRestCipher(): AtRestCipher | null;
   getVaultOrientationService(): VaultOrientationService | null;
   getAdapterReadBinary(): ((normalizedPath: string) => Promise<ArrayBuffer>) | null;

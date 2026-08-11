@@ -4,6 +4,59 @@ variable "production_hardening" { type = bool }
 variable "callback_urls" { type = list(string) }
 variable "logout_urls" { type = list(string) }
 variable "ses_sender_email" { type = string }
+variable "sessions_table_name" { type = string }
+variable "sessions_table_arn" { type = string }
+variable "kms_key_arn" { type = string }
+variable "turnstile_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Secrets Manager ARN containing the Turnstile secret used for account binding."
+}
+variable "login_verification_mode" {
+  type        = string
+  default     = "disabled"
+  description = "Dedicated Pre Authentication permit posture."
+
+  validation {
+    condition     = contains(["disabled", "observe", "enforce"], var.login_verification_mode)
+    error_message = "login_verification_mode must be disabled, observe, or enforce."
+  }
+}
+variable "login_verification_client_ids" {
+  type        = list(string)
+  default     = []
+  description = "Explicit managed app-client allowlist for login-permit enforcement."
+
+  validation {
+    condition = alltrue([
+      for client_id in var.login_verification_client_ids :
+      can(regex("^[a-z0-9]{20,128}$", client_id))
+    ])
+    error_message = "Every login verification client ID must be a Cognito app-client identifier."
+  }
+}
+variable "mfa_configuration" {
+  type        = string
+  default     = "OPTIONAL"
+  description = "Explicit user-pool MFA posture; independent of the deployment stage name."
+
+  validation {
+    condition     = contains(["OFF", "OPTIONAL", "ON"], var.mfa_configuration)
+    error_message = "mfa_configuration must be OFF, OPTIONAL, or ON."
+  }
+}
+
+variable "advanced_security_mode" {
+  type        = string
+  default     = "OFF"
+  description = "Explicit Cognito advanced-security posture; AUDIT/ENFORCED may incur cost."
+
+  validation {
+    condition     = contains(["OFF", "AUDIT", "ENFORCED"], var.advanced_security_mode)
+    error_message = "advanced_security_mode must be OFF, AUDIT, or ENFORCED."
+  }
+}
+
 variable "ses_sender_arn" {
   type    = string
   default = ""
@@ -11,9 +64,9 @@ variable "ses_sender_arn" {
 
 resource "aws_cognito_user_pool" "main" {
   name = "obsidian-vaultguard-${var.stage}"
-  # Deletion protection is a pure durability guard (no auth impact) → hardening
-  # flag. MFA/advanced-security below stay on is_prod so enabling hardening
-  # never forces MFA enrollment on existing users.
+  # Deletion protection is a pure durability guard (no auth impact). MFA and
+  # advanced security have separate explicit inputs so stage naming cannot
+  # silently select the live authentication posture.
   deletion_protection      = var.production_hardening ? "ACTIVE" : "INACTIVE"
   auto_verified_attributes = ["email"]
 
@@ -102,17 +155,113 @@ resource "aws_cognito_user_pool" "main" {
     }
   }
 
-  mfa_configuration = var.is_prod ? "ON" : "OPTIONAL"
+  mfa_configuration = var.mfa_configuration
 
   software_token_mfa_configuration {
     enabled = true
   }
 
   user_pool_add_ons {
-    advanced_security_mode = var.is_prod ? "ENFORCED" : "OFF"
+    advanced_security_mode = var.advanced_security_mode
+  }
+
+  lambda_config {
+    pre_authentication = aws_lambda_function.pre_authentication.arn
   }
 
   tags = { Name = "obsidian-vaultguard-${var.stage}" }
+}
+
+# Dedicated trigger role and artifact. It can consume one permit row and read
+# one provider secret; it has no Cognito admin or tenant-data permissions.
+data "archive_file" "pre_authentication" {
+  type        = "zip"
+  source_dir  = "${path.module}/../../../infrastructure/dist/auth"
+  output_path = "${path.module}/.build/pre-authentication.zip"
+}
+
+data "aws_iam_policy_document" "pre_authentication_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "pre_authentication" {
+  name               = "vaultguard-${var.stage}-cognito-pre-authentication"
+  assume_role_policy = data.aws_iam_policy_document.pre_authentication_assume.json
+}
+
+data "aws_iam_policy_document" "pre_authentication" {
+  statement {
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:*:*:*"]
+  }
+  statement {
+    actions   = ["dynamodb:UpdateItem"]
+    resources = [var.sessions_table_arn]
+  }
+  dynamic "statement" {
+    for_each = var.turnstile_secret_arn != "" ? [1] : []
+    content {
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.turnstile_secret_arn]
+    }
+  }
+  statement {
+    actions   = ["kms:Decrypt"]
+    resources = [var.kms_key_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "pre_authentication" {
+  name   = "cognito-pre-authentication"
+  role   = aws_iam_role.pre_authentication.id
+  policy = data.aws_iam_policy_document.pre_authentication.json
+}
+
+resource "aws_lambda_function" "pre_authentication" {
+  function_name = "vaultguard-cognito-pre-authentication-${var.stage}"
+  role          = aws_iam_role.pre_authentication.arn
+  handler       = "handler.cognitoPreAuthenticationHandler"
+  runtime       = "nodejs22.x"
+  architectures = ["arm64"]
+  timeout       = 10
+  memory_size   = 128
+
+  filename         = data.archive_file.pre_authentication.output_path
+  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/auth/handler.js")
+
+  environment {
+    variables = {
+      SESSIONS_TABLE                = var.sessions_table_name
+      TURNSTILE_SECRET_ARN          = var.turnstile_secret_arn
+      LOGIN_VERIFICATION_MODE       = var.login_verification_mode
+      LOGIN_VERIFICATION_CLIENT_IDS = join(",", var.login_verification_client_ids)
+      NODE_OPTIONS                  = "--enable-source-maps"
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition = (
+        var.login_verification_mode == "disabled" ||
+        length(var.login_verification_client_ids) > 0
+      )
+      error_message = "observe/enforce login verification requires a non-empty managed app-client allowlist."
+    }
+  }
+}
+
+resource "aws_lambda_permission" "allow_cognito_pre_authentication" {
+  statement_id  = "AllowCognitoPreAuthentication"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.pre_authentication.function_name
+  principal     = "cognito-idp.amazonaws.com"
+  source_arn    = aws_cognito_user_pool.main.arn
 }
 
 resource "aws_cognito_user_pool_client" "plugin" {

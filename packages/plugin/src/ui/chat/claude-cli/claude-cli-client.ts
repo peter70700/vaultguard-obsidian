@@ -37,6 +37,7 @@ import {
   serializeMcpConfig,
 } from "./mcp-config";
 import type { AiChatPermissionMode } from "../../../types";
+import type { AnthropicImageBlock } from "../anthropic-client";
 
 const LOG_PREFIX = "[VaultGuard Chat]";
 
@@ -361,7 +362,18 @@ export class ClaudeCliClient {
    * parses stream-json, and fires `handlers`. Aborting the signal kills the
    * child. Resolves when the process closes.
    */
-  async runTurn(text: string, handlers: ClaudeCliHandlers, signal?: AbortSignal): Promise<void> {
+  async runTurn(
+    text: string,
+    handlers: ClaudeCliHandlers,
+    signal?: AbortSignal,
+    images?: ReadonlyArray<AnthropicImageBlock>,
+  ): Promise<void> {
+    if (images?.length) {
+      handlers.onError?.(
+        "Claude Code subscription chat does not have a verified native image-input contract.",
+      );
+      return;
+    }
     if (!this.deps) {
       handlers.onError?.("Claude Code subscription mode needs desktop Obsidian.");
       return;

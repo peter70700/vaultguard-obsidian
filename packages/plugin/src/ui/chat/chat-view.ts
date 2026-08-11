@@ -38,6 +38,17 @@ import {
   type AnthropicToolResultBlock,
 } from "./anthropic-client";
 import { AnthropicKeyStore, OpenAiKeyStore } from "./api-key-store";
+import {
+  AttachmentValidationError,
+  attachmentPayloadBytes,
+  base64DecodedByteLength,
+  buildPinnedDocumentPrompt,
+  resolveAttachmentCapabilities,
+  type AttachmentCapabilities,
+  type DocumentPin,
+  type PreparedDocument,
+} from "./attachment-model";
+import { DocumentReferenceService } from "./document-reference-service";
 import { ChatRuntime } from "./chat-runtime";
 import { ClaudeCliClient } from "./claude-cli/claude-cli-client";
 import {
@@ -74,6 +85,7 @@ import {
   promptTemplatePrefix,
   sameCommandName,
 } from "./prompt-commands";
+import { WELCOME_PROMPT_CHIPS } from "./welcome-prompts";
 import { StatusPanel } from "./status-panel";
 import {
   renderAssistantMessage,
@@ -106,6 +118,7 @@ import {
   buildSubscriptionRebasePrompt,
   isUserPrompt,
   sliceBeforeUserTurn,
+  shouldRebaseSubscriptionSession,
   userPromptImages,
   userPromptText,
 } from "./message-utils";
@@ -158,6 +171,8 @@ interface ChatConversationTab {
   key: string;
   conversationId: string | null;
   title: string;
+  draftText?: string;
+  draftImages?: ImageAttachment[];
 }
 
 export class VaultGuardChatView extends ItemView {
@@ -186,6 +201,8 @@ export class VaultGuardChatView extends ItemView {
   private importSessionActive = false;
   private model: string;
   private abortController: AbortController | null = null;
+  private attachmentAbortController: AbortController | null = null;
+  private readonly documentReferenceService = new DocumentReferenceService();
   private modelDiscoveryAbort: AbortController | null = null;
 
   // Official CLI subscription transport (Claude Code or Codex). Lazily built
@@ -375,6 +392,9 @@ export class VaultGuardChatView extends ItemView {
         {
           onSubmit: (text, images) => void this.handleSubmit(text, images),
           canSubmit: (text, images) => this.canSubmit(text, images),
+          getAttachmentCapabilities: () => this.attachmentCapabilities(),
+          onPinDocuments: () => this.handlePinDocuments(),
+          onRemoveDocumentPin: (id) => this.removeDocumentPin(id),
           onCancel: () => this.handleCancel(),
           onSlash: (cmd) => this.handleSlash(cmd),
           onUnknownSlash: (raw) => new Notice(`VaultGuard Chat: unknown command "${raw}".`),
@@ -383,10 +403,7 @@ export class VaultGuardChatView extends ItemView {
           resolveTemplate: (name, arg, prefix) => this.resolveTemplate(name, arg, prefix),
         },
         {
-          // Vision input is API-key + desktop only (subscription CLI turns keep
-          // no replayable image array; mobile uses the non-streaming path).
-          enableImages:
-            !Platform.isMobileApp && this.plugin.settings.aiChatProvider === "apiKey",
+          enableAttachments: !Platform.isMobileApp,
         },
       );
 
@@ -456,6 +473,8 @@ export class VaultGuardChatView extends ItemView {
   async onClose(): Promise<void> {
     this.cancelModelDiscovery();
     this.handleCancel();
+    this.attachmentAbortController?.abort();
+    this.attachmentAbortController = null;
     this.endImportSessionIfActive();
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
@@ -473,6 +492,7 @@ export class VaultGuardChatView extends ItemView {
     this.activeAssistantBubble = null;
     this.pendingIndicator = null;
     this.streamController = null;
+    this.inputController?.dispose();
     this.inputController = null;
     this.statusPanel = null;
     this.inputNavRowEl = null;
@@ -545,16 +565,8 @@ export class VaultGuardChatView extends ItemView {
         "I work over your vault with your permissions.",
     });
 
-    const chips: { label: string; value: string }[] = [
-      { label: "Summarize my recent notes", value: "Summarize my recent notes" },
-      { label: "Find notes about…", value: "Find notes about " },
-      { label: "What links to this note?", value: "What links to this note?" },
-      { label: "/organize-knowledge-base", value: "/organize-knowledge-base" },
-      { label: "$format-note", value: "$format-note " },
-    ];
-
     const chipRow = welcome.createDiv({ cls: "vaultguard-chat-welcome-chips" });
-    for (const chip of chips) {
+    for (const chip of WELCOME_PROMPT_CHIPS) {
       const button = chipRow.createEl("button", {
         cls: "vaultguard-chat-welcome-chip",
         text: chip.label,
@@ -678,33 +690,46 @@ export class VaultGuardChatView extends ItemView {
 
   // ─── Turn handling ─────────────────────────────────────────────────────────
 
-  private canSubmit(text: string, images?: ImageAttachment[]): boolean {
+  private attachmentCapabilities(): AttachmentCapabilities {
+    const capabilities = resolveAttachmentCapabilities(
+      this.currentProvider(),
+      Platform.isMobileApp,
+    );
+    if (capabilities.platform === "desktop" && !this.documentReferenceService.isAvailable()) {
+      return {
+        ...capabilities,
+        textDocumentInput: false,
+        pdfDocumentInput: false,
+        reason: "Document pins are unavailable in this Obsidian desktop environment.",
+      };
+    }
+    return capabilities;
+  }
+
+  private canSubmit(_text: string, images?: ImageAttachment[]): boolean {
     if (this.inputController?.isBusy()) return false;
+
+    const capabilities = this.attachmentCapabilities();
+    if (images?.length && !capabilities.imageInput) {
+      new Notice(
+        `VaultGuard Chat: ${capabilities.reason ?? "Photos are unavailable for this provider."}`,
+      );
+      return false;
+    }
 
     if (
       this.plugin.settings.aiChatProvider === "subscription" ||
       this.plugin.settings.aiChatProvider === "codex"
     ) {
-      if (images && images.length) {
-        new Notice("VaultGuard Chat: image attachments need the API-key provider.");
-        // A stale image-only submit after switching providers should not spawn
-        // Claude Code with an empty prompt.
-        if (!text.trim()) return false;
-      }
       return true;
-    }
-
-    if (this.plugin.settings.aiChatProvider === "openai" && images && images.length) {
-      new Notice("VaultGuard Chat: image attachments are not supported by the OpenAI provider yet.");
-      if (!text.trim()) return false;
     }
 
     if (!this.hasCurrentProviderKey()) {
       this.renderConnectState();
       new Notice(
         this.currentApiKeyProvider() === "openai"
-          ? "VaultGuard Chat: add your OpenAI API key in settings → AI Chat."
-          : "VaultGuard Chat: add your Anthropic API key in settings → AI Chat.",
+          ? "VaultGuard Chat: add your OpenAI API key in settings -> AI Chat."
+          : "VaultGuard Chat: add your Anthropic API key in settings -> AI Chat.",
       );
       return false;
     }
@@ -712,12 +737,138 @@ export class VaultGuardChatView extends ItemView {
     return true;
   }
 
+  private async handlePinDocuments(): Promise<void> {
+    if (this.inputController?.isBusy()) return;
+    const capabilities = this.attachmentCapabilities();
+    if (!capabilities.textDocumentInput && !capabilities.pdfDocumentInput) {
+      new Notice(`VaultGuard Chat: ${capabilities.reason ?? "Document pins are unavailable."}`);
+      return;
+    }
+
+    try {
+      const existing = this.convo?.documentPins ?? [];
+      const pins = await this.documentReferenceService.pickDocumentPins(existing.length);
+      if (pins.length === 0) return;
+      if (!this.convo) this.startConversation("");
+      if (!this.convo) return;
+      this.convo.documentPins = [...(this.convo.documentPins ?? []), ...pins];
+      this.convo.updatedAt = Date.now();
+      this.inputController?.setDocumentPins(this.convo.documentPins);
+      this.queueMutationSave(
+        "VaultGuard Chat: the pin is active for this session, but its encrypted reference could not be saved.",
+      );
+      const providerLabel =
+        this.currentProvider() === "subscription"
+          ? "Claude"
+          : this.currentProvider() === "codex"
+            ? "GPT through ChatGPT"
+            : this.currentProvider() === "openai"
+              ? "OpenAI"
+              : "Anthropic";
+      new Notice(
+        `VaultGuard Chat: pinned ${pins.length} original document${pins.length === 1 ? "" : "s"} by reference. When you send, current contents are re-read and sent to ${providerLabel}; no vault copy is created.`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof AttachmentValidationError
+          ? error.message
+          : "The selected document could not be pinned.";
+      new Notice(`VaultGuard Chat: ${message}`);
+    }
+  }
+
+  private removeDocumentPin(id: string): void {
+    if (!this.convo) return;
+    const pins = (this.convo.documentPins ?? []).filter((pin) => pin.id !== id);
+    if (pins.length === (this.convo.documentPins ?? []).length) return;
+    this.convo.documentPins = pins.length > 0 ? pins : undefined;
+    this.convo.updatedAt = Date.now();
+    this.inputController?.setDocumentPins(pins);
+    this.disposeProviderSession();
+    this.scheduleSave();
+  }
+
+  private async preparePinnedDocuments(
+    text: string,
+    images: ImageAttachment[] | undefined,
+  ): Promise<PreparedDocument[] | null> {
+    const pins = this.convo?.documentPins ?? [];
+    if (pins.length === 0) return [];
+
+    const capabilities = this.attachmentCapabilities();
+    const controller = new AbortController();
+    this.attachmentAbortController?.abort();
+    this.attachmentAbortController = controller;
+    this.inputController?.setBusy(true);
+    try {
+      const documents = await this.documentReferenceService.preparePins(
+        pins,
+        capabilities,
+        controller.signal,
+      );
+      if (attachmentPayloadBytes(images ?? [], documents) > capabilities.maxPayloadBytes) {
+        throw new AttachmentValidationError(
+          "payload-too-large",
+          "The combined attachment payload must be 32 MB or smaller.",
+        );
+      }
+      if (this.convo) {
+        this.convo.documentPins = pins.map((pin) => ({
+          ...pin,
+          state: "ready" as const,
+          errorCode: undefined,
+        }));
+        this.convo.updatedAt = Date.now();
+        this.inputController?.setDocumentPins(this.convo.documentPins);
+        this.scheduleSave();
+      }
+      return documents;
+    } catch (error) {
+      if (controller.signal.aborted) return null;
+      const code =
+        error instanceof AttachmentValidationError ? error.code : "file-unavailable";
+      if (this.convo) {
+        this.convo.documentPins = pins.map((pin) => ({
+          ...pin,
+          state: "unavailable" as const,
+          errorCode: code,
+        }));
+        this.convo.updatedAt = Date.now();
+        this.inputController?.setDocumentPins(this.convo.documentPins);
+        this.scheduleSave();
+      }
+      this.inputController?.setDraft(text, images ?? []);
+      const message =
+        error instanceof AttachmentValidationError
+          ? error.message
+          : "A pinned document is unavailable or unreadable.";
+      new Notice(`VaultGuard Chat: ${message} Nothing was sent.`);
+      return null;
+    } finally {
+      if (this.attachmentAbortController === controller) {
+        this.attachmentAbortController = null;
+      }
+      this.inputController?.setBusy(false);
+    }
+  }
+
   private async handleSubmit(text: string, images?: ImageAttachment[]): Promise<void> {
     if (!this.listEl || !this.inputController || !this.statusPanel) return;
     if (this.inputController.isBusy()) return;
+    const capabilities = this.attachmentCapabilities();
+    if (images?.length && !capabilities.imageInput) {
+      this.inputController.setDraft(text, images);
+      new Notice(
+        `VaultGuard Chat: ${capabilities.reason ?? "Photos are unavailable for this provider."} Nothing was sent.`,
+      );
+      return;
+    }
     if (this.convo?.pendingUserQuestion) {
       this.clearPendingUserQuestion();
     }
+
+    const documents = await this.preparePinnedDocuments(text, images);
+    if (documents === null) return;
 
     // Re-arm the import session from the conversation's remembered source root
     // before every turn. The bridge session is in-memory; without this it would
@@ -730,26 +881,17 @@ export class VaultGuardChatView extends ItemView {
     this.syncModelFromSettings();
 
     if (this.plugin.settings.aiChatProvider === "subscription") {
-      // Subscription (CLI) turns don't carry image blocks; drop with a hint.
-      if (images && images.length) {
-        if (!text.trim()) return;
-      }
-      await this.handleSubmitSubscription(text, "claude");
+      await this.handleSubmitSubscription(text, "claude", images, documents);
       return;
     }
 
     if (this.plugin.settings.aiChatProvider === "codex") {
-      if (images && images.length && !text.trim()) return;
-      await this.handleSubmitSubscription(text, "codex");
+      await this.handleSubmitSubscription(text, "codex", images, documents);
       return;
     }
 
     if (this.plugin.settings.aiChatProvider === "openai") {
-      if (images && images.length) {
-        new Notice("VaultGuard Chat: image attachments are not supported by the OpenAI provider yet.");
-        if (!text.trim()) return;
-      }
-      await this.handleSubmitOpenAi(text);
+      await this.handleSubmitOpenAi(text, images, documents);
       return;
     }
 
@@ -801,13 +943,29 @@ export class VaultGuardChatView extends ItemView {
 
     const runtime = this.runtime;
     await this.executeTurn(apiKey, streaming, (signal) =>
-      runtime.runTurn(text, signal, imageBlocks.length ? imageBlocks : undefined),
+      runtime.runTurn(
+        text,
+        signal,
+        imageBlocks.length ? imageBlocks : undefined,
+        documents.length ? documents : undefined,
+      ),
       "anthropic",
     );
   }
 
-  private async handleSubmitOpenAi(text: string): Promise<void> {
+  private async handleSubmitOpenAi(
+    text: string,
+    images: ImageAttachment[] | undefined,
+    documents: PreparedDocument[],
+  ): Promise<void> {
     if (!this.listEl) return;
+
+    const imageBlocks = (images ?? []).map(
+      (image): AnthropicImageBlock => ({
+        type: "image",
+        source: { type: "base64", media_type: image.mediaType, data: image.data },
+      }),
+    );
 
     const apiKey = await this.ensureOpenAiApiKey();
     if (!apiKey) {
@@ -820,7 +978,12 @@ export class VaultGuardChatView extends ItemView {
     if (!this.convo) this.startConversation(text);
 
     const turnIndex = this.userTurnCount();
-    renderUserMessage(this.listEl, text, this.userMessageActions(turnIndex));
+    renderUserMessage(
+      this.listEl,
+      text,
+      this.userMessageActions(turnIndex),
+      imageBlocks,
+    );
     this.scrollToBottom();
 
     try {
@@ -832,7 +995,18 @@ export class VaultGuardChatView extends ItemView {
     if (!this.runtime) return;
 
     const runtime = this.runtime;
-    await this.executeTurn(apiKey, false, (signal) => runtime.runTurn(text, signal), "openai");
+    await this.executeTurn(
+      apiKey,
+      false,
+      (signal) =>
+        runtime.runTurn(
+          text,
+          signal,
+          imageBlocks.length ? imageBlocks : undefined,
+          documents.length ? documents : undefined,
+        ),
+      "openai",
+    );
   }
 
   // Shared busy/pending/streaming/finalize scaffolding for an API-key turn.
@@ -949,6 +1123,8 @@ export class VaultGuardChatView extends ItemView {
   private async handleSubmitSubscription(
     text: string,
     transport: "claude" | "codex",
+    images: ImageAttachment[] | undefined,
+    documents: PreparedDocument[],
   ): Promise<void> {
     if (!this.listEl || !this.inputController || !this.statusPanel) return;
 
@@ -991,10 +1167,11 @@ export class VaultGuardChatView extends ItemView {
           apiKey: null,
           codexBinaryPath: binaryPath,
           selectedModel: this.model,
+          preferNewest: this.plugin.settings.codexAutoSelectLatest !== false,
           signal: catalogController.signal,
         });
         if (catalogController.signal.aborted || this.currentProvider() !== "codex") return;
-        if (catalog.selectedModel !== this.model) this.setModel(catalog.selectedModel);
+        if (catalog.selectedModel !== this.model) this.setModel(catalog.selectedModel, true);
       } finally {
         if (this.modelDiscoveryAbort === catalogController) this.modelDiscoveryAbort = null;
       }
@@ -1017,18 +1194,45 @@ export class VaultGuardChatView extends ItemView {
     if (!this.convo) this.startConversation(text);
 
     const turnIndex = this.userTurnCount();
-    const needsContextRebase = !this.cliClient || this.cliTransport !== transport;
+    const imageBlocks = (images ?? []).map(
+      (image): AnthropicImageBlock => ({
+        type: "image",
+        source: { type: "base64", media_type: image.mediaType, data: image.data },
+      }),
+    );
+
+    // A pin-bearing subscription turn starts a fresh opaque provider session.
+    // The current file contents are injected once and never retained in local
+    // conversation history; the visible transcript is safely rebased.
+    if (documents.length > 0) this.disposeProviderSession();
+    const needsContextRebase = shouldRebaseSubscriptionSession(
+      documents.length,
+      this.cliClient !== null,
+      this.cliTransport,
+      transport,
+    );
     const retainedMessages = needsContextRebase ? [...(this.convo?.messages ?? [])] : [];
 
-    renderUserMessage(this.listEl, text, this.userMessageActions(turnIndex));
+    renderUserMessage(
+      this.listEl,
+      text,
+      this.userMessageActions(turnIndex),
+      imageBlocks,
+    );
     this.scrollToBottom();
 
-    // Subscription turns keep no Anthropic message array (the CLI owns its own
-    // context), so we build a SYNTHETIC transcript here — otherwise the saved
-    // conversation has empty messages and history reopens blank. Record the
-    // user prompt now; the assistant reply is assembled from the stream below
-    // and folded in (with tool results) in the finally block.
-    this.convo?.messages.push({ role: "user", content: text });
+    // Keep only the user's visible prompt and optional images in encrypted chat
+    // history. Pinned document content remains transient provider input.
+    const persistedContent =
+      imageBlocks.length > 0
+        ? [
+            ...imageBlocks,
+            ...(text.length > 0
+              ? [{ type: "text", text } as AnthropicContentBlock]
+              : []),
+          ]
+        : text;
+    this.convo?.messages.push({ role: "user", content: persistedContent });
     const assistantBlocks: AnthropicContentBlock[] = [];
     const toolResultBlocks: AnthropicToolResultBlock[] = [];
     const pendingToolUseIds: string[] = [];
@@ -1066,12 +1270,14 @@ export class VaultGuardChatView extends ItemView {
     // delta and re-renders markdown once on finalize (mirrors the API-key
     // streaming path). Subscription mode is desktop-only, so streaming is safe.
     this.streamController = this.makeStreamController();
+    const currentPrompt =
+      documents.length > 0 ? buildPinnedDocumentPrompt(text, documents) : text;
     const providerText = needsContextRebase
-      ? buildSubscriptionRebasePrompt(retainedMessages, text)
-      : text;
+      ? buildSubscriptionRebasePrompt(retainedMessages, currentPrompt)
+      : currentPrompt;
 
     try {
-      await client.runTurn(
+      await (client as CodexAppServerClient).runTurn(
         providerText,
         {
           onTextDelta: (t) => {
@@ -1122,6 +1328,7 @@ export class VaultGuardChatView extends ItemView {
           onError: (message) => this.renderError(message),
         },
         controller.signal,
+        transport === "codex" && imageBlocks.length > 0 ? imageBlocks : undefined,
       );
     } catch (e) {
       // A user-initiated Stop aborts the CLI turn — not an error to surface.
@@ -1259,6 +1466,10 @@ export class VaultGuardChatView extends ItemView {
       this.abortController.abort();
       this.abortController = null;
     }
+    if (this.attachmentAbortController) {
+      this.attachmentAbortController.abort();
+      this.attachmentAbortController = null;
+    }
     if (hadCliSession) this.disposeProviderSession();
   }
 
@@ -1266,6 +1477,8 @@ export class VaultGuardChatView extends ItemView {
   handleProviderConfigurationChanged(): void {
     this.cancelModelDiscovery();
     this.handleCancel();
+    this.attachmentAbortController?.abort();
+    this.attachmentAbortController = null;
     this.disposeProviderSession();
     this.syncModelFromSettings();
   }
@@ -1507,6 +1720,7 @@ export class VaultGuardChatView extends ItemView {
       this.inputController?.focus();
       return;
     }
+    this.captureActiveTabDraft();
     this.showFreshConversation({ createTab: true });
   }
 
@@ -1526,6 +1740,8 @@ export class VaultGuardChatView extends ItemView {
     this.cancelActiveUserQuestion("Question cancelled.");
     this.pendingRestoreMessages = null;
     this.statusPanel?.resetSession();
+    this.inputController?.setDraft("", []);
+    this.inputController?.setDocumentPins([]);
     // Drop the current conversation; the next turn mints a fresh id in the
     // active in-panel tab.
     this.convo = null;
@@ -1566,6 +1782,19 @@ export class VaultGuardChatView extends ItemView {
   private activeTab(): ChatConversationTab | null {
     if (!this.activeTabKey) return null;
     return this.openTabs.find((tab) => tab.key === this.activeTabKey) ?? null;
+  }
+
+  private captureActiveTabDraft(): void {
+    const tab = this.activeTab();
+    const draft = this.inputController?.getDraft();
+    if (!tab || !draft) return;
+    tab.draftText = draft.text;
+    tab.draftImages = draft.images;
+  }
+
+  private restoreActiveTabDraft(): void {
+    const tab = this.activeTab();
+    this.inputController?.setDraft(tab?.draftText ?? "", tab?.draftImages ?? []);
   }
 
   private ensureActiveTab(): ChatConversationTab {
@@ -1727,12 +1956,14 @@ export class VaultGuardChatView extends ItemView {
     }
     const tab = this.openTabs.find((candidate) => candidate.key === key);
     if (!tab) return;
+    this.captureActiveTabDraft();
     this.activeTabKey = key;
     if (tab.conversationId) {
       await this.loadConversation(tab.conversationId);
     } else {
       this.showFreshConversation({ createTab: false });
     }
+    this.restoreActiveTabDraft();
   }
 
   private async closeChatTab(key: string): Promise<void> {
@@ -1761,6 +1992,7 @@ export class VaultGuardChatView extends ItemView {
     } else {
       this.showFreshConversation({ createTab: false });
     }
+    this.restoreActiveTabDraft();
   }
 
   // ─── Persistence (§10) ─────────────────────────────────────────────────────
@@ -1775,6 +2007,7 @@ export class VaultGuardChatView extends ItemView {
       createdAt: now,
       updatedAt: now,
       messages: [],
+      documentPins: [],
     };
     this.titleGenerated = false;
     this.updateActiveTab(this.convo.id, this.convo.title);
@@ -1897,6 +2130,7 @@ export class VaultGuardChatView extends ItemView {
 
   // Render a persisted conversation read-only into the list.
   private renderConversation(convo: Conversation): void {
+    this.inputController?.setDocumentPins(convo.documentPins ?? []);
     this.renderMessages(convo.messages);
     this.renderPersistedPendingQuestion(convo.pendingUserQuestion ?? null);
     // Re-show any pending Approve/Deny confirmations so an approval that was
@@ -2107,7 +2341,9 @@ export class VaultGuardChatView extends ItemView {
   // History-picker entry: open the chosen conversation as an in-panel tab
   // instead of creating/focusing a separate standalone Obsidian chat leaf.
   private async openConversationFromHistory(id: string): Promise<void> {
+    this.captureActiveTabDraft();
     await this.loadConversation(id);
+    this.restoreActiveTabDraft();
   }
 
   private async loadConversation(id: string): Promise<void> {
@@ -2125,6 +2361,7 @@ export class VaultGuardChatView extends ItemView {
     this.activeAssistantBubble = null;
     this.cancelActiveUserQuestion("Question cancelled.");
     this.statusPanel?.resetSession();
+    this.inputController?.setDraft("", []);
     this.convo = convo;
     this.titleGenerated = true; // restored conversations already have a title
     this.setHeaderTitle(convo.title);
@@ -2149,6 +2386,7 @@ export class VaultGuardChatView extends ItemView {
       allowFileHistory: true,
       allowShareManagement: true,
       allowMembershipWrites: true,
+      allowAutomation: Platform.isDesktopApp === true,
     });
   }
 
@@ -2158,7 +2396,9 @@ export class VaultGuardChatView extends ItemView {
     this.saveTimer = null;
   }
 
-  private queueMutationSave(): void {
+  private queueMutationSave(
+    failureMessage = "VaultGuard Chat: the message changed in this session but could not be saved.",
+  ): void {
     if (!this.store || !this.convo) return;
     this.cancelScheduledSave();
     const store = this.store;
@@ -2167,9 +2407,7 @@ export class VaultGuardChatView extends ItemView {
       .catch(() => undefined)
       .then(async () => {
         if (!(await store.save(snapshot))) {
-          new Notice(
-            "VaultGuard Chat: the message changed in this session but could not be saved.",
-          );
+          new Notice(failureMessage);
         }
       });
   }
@@ -2707,6 +2945,7 @@ export class VaultGuardChatView extends ItemView {
         apiKey,
         codexBinaryPath,
         selectedModel: this.model,
+        preferNewest: provider === "codex" && this.plugin.settings.codexAutoSelectLatest !== false,
         signal: controller.signal,
       });
       if (
@@ -2715,7 +2954,7 @@ export class VaultGuardChatView extends ItemView {
         this.currentCatalogProvider() === "codex" &&
         catalog.selectedModel !== this.model
       ) {
-        this.setModel(catalog.selectedModel);
+        this.setModel(catalog.selectedModel, true);
       }
       return catalog;
     } finally {
@@ -2788,13 +3027,16 @@ export class VaultGuardChatView extends ItemView {
     new Notice(`VaultGuard Chat: permissions → ${permissionModeLabel(mode)}`);
   }
 
-  private setModel(model: string): void {
+  private setModel(model: string, automatic = false): void {
     this.model = model;
     this.statusPanel?.setModel(model);
     // Persist so the choice survives a panel reopen / new chat (mirrors
     // setEffort) and stays in sync with the settings dropdown.
     if (this.currentProvider() === "codex") {
       this.plugin.settings.codexModel = model;
+      if (!automatic) {
+        this.plugin.settings.codexAutoSelectLatest = false;
+      }
     } else if (this.currentProvider() === "openai") {
       this.plugin.settings.openAiModel = model;
     } else {
@@ -3098,7 +3340,11 @@ export class VaultGuardChatView extends ItemView {
   // callers decide (edit re-seeds + saves; delete may reset an emptied chat).
   private truncateFromUserTurn(
     n: number,
-  ): { kept: Conversation["messages"]; removedText: string } | null {
+  ): {
+    kept: Conversation["messages"];
+    removedText: string;
+    removedImages?: AnthropicImageBlock[];
+  } | null {
     // Delegate to the runtime when it's built (it owns the live message array);
     // otherwise slice the persisted/restored array directly. Both index user
     // prompts via isUserPrompt, so image-bearing turns truncate correctly.
@@ -3135,8 +3381,25 @@ export class VaultGuardChatView extends ItemView {
     if (!res) return;
     this.listEl.empty();
     this.renderMessages(res.kept);
-    // Seed the input with the original prompt so the user can revise + resend.
-    this.inputController.setText(res.removedText);
+    // Seed the input with the complete original prompt so the user can revise
+    // both its text and image attachments before resending.
+    const restoredImages = (res.removedImages ?? []).flatMap((image, index) => {
+      try {
+        const mediaType = image.source.media_type;
+        if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mediaType)) {
+          return [];
+        }
+        return [{
+          mediaType: mediaType as ImageAttachment["mediaType"],
+          data: image.source.data,
+          name: `image-${index + 1}`,
+          byteLength: base64DecodedByteLength(image.source.data),
+        }];
+      } catch {
+        return [];
+      }
+    });
+    this.inputController.setDraft(res.removedText, restoredImages);
     this.inputController.focus();
     if (this.convo) {
       this.queueMutationSave();

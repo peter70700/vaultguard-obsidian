@@ -4,8 +4,8 @@
 // the new file content.
 //
 // Presentation only — it preserves the approve/reject `Promise<boolean>`
-// contract of `confirmAgentBridgeWrite`. The preview string is already capped
-// upstream; this modal does not re-truncate.
+// contract of `confirmAgentBridgeWrite`. The preview is the complete proposed
+// payload and remains reviewable inside the scrollable diff viewport.
 
 import { App, Modal, Setting } from "obsidian";
 
@@ -18,6 +18,12 @@ export type WriteConfirmOperation =
   | "rename"
   | "set_permission"
   | "restore"
+  | "version_restore"
+  | "note_mutation"
+  | "property_mutation"
+  | "task_mutation"
+  | "template_mutation"
+  | "automation_run"
   | "share_create"
   | "share_revoke"
   | "member_add"
@@ -33,6 +39,12 @@ export const AGENT_BRIDGE_CONFIRM_LABELS: Record<WriteConfirmOperation, string> 
   rename: "move",
   set_permission: "change permissions on",
   restore: "restore",
+  version_restore: "restore an exact version of",
+  note_mutation: "change note text in",
+  property_mutation: "change a property in",
+  task_mutation: "change a task in",
+  template_mutation: "apply a trusted template to",
+  automation_run: "run a governed automation for",
   share_create: "create a share link for",
   share_revoke: "revoke a share link for",
   member_add: "add a member to",

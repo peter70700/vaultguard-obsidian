@@ -69,6 +69,12 @@ import {
 } from '../shared/utils';
 import { clampLeaseExpiration } from '../shared/guest-access';
 import { sendEmail } from '../email/handler';
+import { handleHumanVerificationRequest } from './human-verification';
+
+// The auth bundle is also the Cognito Pre Authentication artifact. Keeping the
+// trigger export in this entrypoint lets Cognito invoke `handler.cognitoPreAuthenticationHandler`
+// without creating a second package that could drift from the API-side store.
+export { cognitoPreAuthenticationHandler } from './cognito-pre-authentication';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -263,6 +269,13 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       case method === 'POST' && path === '/auth/recovery-codes/verify':
         return await handleVerifyRecoveryCode(event, requestId);
 
+      case method === 'POST' && (
+        path === '/auth/human-verification/attempts' ||
+        path === '/auth/human-verification/complete' ||
+        path === '/auth/human-verification/poll'
+      ):
+        return await handleHumanVerificationRequest(event, requestId);
+
       // AI-chat API key cross-device sync (opaque, client-encrypted blob).
       case method === 'GET' && path === '/auth/ai-key':
         return await handleAiKeyGet(event, requestId);
@@ -339,7 +352,7 @@ async function handleLogin(
   requestId: string
 ): Promise<APIGatewayProxyResult> {
   // Step 1: Verify the Cognito token
-  const user = await verifyActiveUser(event);
+  const user = await verifyActiveUser(event, { allowPendingCheckout: true, allowSessionless: true });
   const orgId = requireOrgId(user);
   const orgSettings = await getRequiredOrgSettings(user);
   assertMfaPolicy(user, orgSettings);
@@ -603,7 +616,7 @@ async function handleLogout(
   event: APIGatewayProxyEvent,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  const user = await verifyActiveUser(event);
+  const user = await verifyActiveUser(event, { allowPendingCheckout: true });
   requireOrgId(user);
   const body = parseBody(event);
   validateRequiredFields(body, ['sessionId']);
@@ -2833,19 +2846,83 @@ async function handleConfirmReset(
     : Boolean(legacyPlaintext) && legacyPlaintext === code;
 
   if (!codeMatches) {
-    await docClient.send(new UpdateCommand({
-      TableName: SESSIONS_TABLE,
-      Key: resetKey,
-      UpdateExpression: 'SET attempts = attempts + :one',
-      ExpressionAttributeValues: { ':one': 1 },
-    }));
+    // Atomically consume a guess against the exact reset row we just read.
+    // The former read-then-unconditional-update let concurrent requests all
+    // observe attempts=4 and continue beyond the cap. The row fingerprint also
+    // prevents an old request from consuming a newly-issued replacement code.
+    const fingerprintCondition = storedHash
+      ? 'resetCodeHash = :expectedCodeHash'
+      : legacyPlaintext
+        ? 'resetCode = :expectedCode'
+        : 'attribute_not_exists(resetCodeHash) AND attribute_not_exists(resetCode)';
+    const fingerprintValues = storedHash
+      ? { ':expectedCodeHash': storedHash }
+      : legacyPlaintext
+        ? { ':expectedCode': legacyPlaintext }
+        : {};
+    const expectedExpiresAt = result.Item.expiresAt;
+    let updatedAttempts: number;
+    try {
+      const updateResult = await docClient.send(new UpdateCommand({
+        TableName: SESSIONS_TABLE,
+        Key: resetKey,
+        UpdateExpression: 'SET attempts = if_not_exists(attempts, :zero) + :one',
+        ConditionExpression:
+          `attribute_exists(sessionId) AND ` +
+          `(attribute_not_exists(attempts) OR attempts < :max) AND ` +
+          `expiresAt = :expectedExpiresAt AND (${fingerprintCondition})`,
+        ExpressionAttributeValues: {
+          ':zero': 0,
+          ':one': 1,
+          ':max': MAX_RESET_ATTEMPTS,
+          ':expectedExpiresAt': expectedExpiresAt,
+          ...fingerprintValues,
+        },
+        ReturnValues: 'UPDATED_NEW',
+      }));
+      const returnedAttempts = updateResult.Attributes?.attempts;
+      updatedAttempts = typeof returnedAttempts === 'number'
+        ? returnedAttempts
+        : attempts + 1;
+    } catch (error) {
+      const errorName = error && typeof error === 'object' && 'name' in error
+        ? (error as { name?: string }).name
+        : '';
+      if (errorName === 'ConditionalCheckFailedException') {
+        // Another request hit the cap, consumed/replaced the row, or issued a
+        // newer code. In every case this stale guess gains no additional try.
+        return formatError(400, 'Invalid or expired reset code. Please request a new one.', requestId);
+      }
+      throw error;
+    }
+
+    if (updatedAttempts >= MAX_RESET_ATTEMPTS) {
+      try {
+        await docClient.send(new DeleteCommand({
+          TableName: SESSIONS_TABLE,
+          Key: resetKey,
+          ConditionExpression: `expiresAt = :expectedExpiresAt AND (${fingerprintCondition})`,
+          ExpressionAttributeValues: {
+            ':expectedExpiresAt': expectedExpiresAt,
+            ...fingerprintValues,
+          },
+        }));
+      } catch (error) {
+        const errorName = error && typeof error === 'object' && 'name' in error
+          ? (error as { name?: string }).name
+          : '';
+        if (errorName !== 'ConditionalCheckFailedException') throw error;
+        // A newer reset replaced this row between increment and deletion.
+      }
+      return formatError(429, 'Too many attempts. Please request a new reset code.', requestId);
+    }
     return formatError(400, 'Invalid or expired reset code. Please request a new one.', requestId);
   }
 
   // SD-02-F2: resolve the identity BEFORE the password is set, so an
   // operational Cognito failure aborts while this request is still a no-op.
-  // The sweep below is keyed by the Cognito `sub` and gated on `custom:org`;
-  // neither is derivable from the reset row.
+  // The sweep below is keyed by the Cognito `sub`; neither it nor the optional
+  // organization metadata is derivable from the reset row.
   let resolvedIdentity: { userId: string; orgId: string | null } | null;
   try {
     resolvedIdentity = await resolveResetIdentity(email);
@@ -2940,19 +3017,17 @@ async function handleConfirmReset(
       },
     }));
 
-    // Layers 3 and 4 are org-gated: session and lease creation both run
-    // through requireOrgId, so an org-less user cannot hold either and running
-    // the queries would be dead work.
-    if (identity.orgId) {
-      sweepStep = 'invalidate_sessions';
-      invalidatedSessions = await invalidateAllUserSessions(identity.userId);
+    // UserId is the sweep authority. Do not gate cleanup on optional org
+    // metadata: legacy/corrupt identities may still have sessions or leases
+    // created before today's requireOrgId boundary.
+    sweepStep = 'invalidate_sessions';
+    invalidatedSessions = await invalidateAllUserSessions(identity.userId);
 
-      // Two arguments on purpose — the lease sweep is userId-only. The query
-      // is already keyed by the victim's own userId, so omitting the org
-      // filter is strictly more complete and opens no cross-tenant surface.
-      sweepStep = 'revoke_leases';
-      revokedLeases = await revokeAllUserLeases(identity.userId, 'password-reset');
-    }
+    // Two arguments on purpose — the lease sweep is userId-only. The query is
+    // already keyed by the victim's own userId, so omitting the org filter is
+    // strictly more complete and opens no cross-tenant surface.
+    sweepStep = 'revoke_leases';
+    revokedLeases = await revokeAllUserLeases(identity.userId, 'password-reset');
 
     // Recovery is invisible in the audit trail today. An empty orgId is safe:
     // logAudit guards its settings lookup with `if (entry.orgId)` and

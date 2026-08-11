@@ -103,6 +103,7 @@ interface VaultFileDecryptedWireResponse {
 
 export interface PutFileOptions {
   expectedVersionId?: string;
+  mustBeAbsent?: boolean;
 }
 
 export interface DeleteFileOptions {
@@ -929,12 +930,23 @@ export class VaultGuardApiClient {
   async readVaultFileDecrypted(
     vaultId: string,
     path: string,
+    versionId?: string,
   ): Promise<VaultFileDecryptedResponse> {
     const base = explicitVaultBase(vaultId);
     const normalizedPath = normalizeExplicitVaultPath(path, "path", false);
+    if (
+      versionId !== undefined &&
+      (typeof versionId !== "string" ||
+        versionId.trim().length === 0 ||
+        versionId.length > 1024 ||
+        /[\r\n]/.test(versionId))
+    ) {
+      throw new Error("versionId must be a non-empty, bounded opaque identifier.");
+    }
+    const versionQuery = versionId ? `?versionId=${encodeURIComponent(versionId)}` : "";
     const response = await this.request<VaultFileDecryptedWireResponse>(
       "GET",
-      `${base}/files-decrypted/${encodeURIComponent(normalizedPath)}`,
+      `${base}/files-decrypted/${encodeURIComponent(normalizedPath)}${versionQuery}`,
     );
     if (
       !response ||
@@ -982,12 +994,17 @@ export class VaultGuardApiClient {
     metadata: Partial<FileMetadata>,
     options: PutFileOptions = {}
   ): Promise<FileMetadata> {
-    const body: Record<string, string> = {
+    if (options.expectedVersionId && options.mustBeAbsent === true) {
+      throw new Error("expectedVersionId and mustBeAbsent are mutually exclusive");
+    }
+    const body: Record<string, string | boolean> = {
       content: uint8ToBase64(new Uint8Array(content)),
       contentType: metadata.encryptedKey ? "application/octet-stream" : "text/markdown",
     };
     if (options.expectedVersionId) {
       body.expectedVersionId = options.expectedVersionId;
+    } else if (options.mustBeAbsent === true) {
+      body.mustBeAbsent = true;
     }
     const response = await this.request<FileMetadata>("PUT", `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}`, body);
     return response;
@@ -1172,7 +1189,8 @@ export class VaultGuardApiClient {
 
   async restoreFileVersion(
     path: string,
-    versionId: string
+    versionId: string,
+    expectedCurrentVersionId: string
   ): Promise<{
     versionId: string;
     restoredFrom: { versionId: string; keyId: string };
@@ -1181,7 +1199,7 @@ export class VaultGuardApiClient {
     return this.request(
       "POST",
       `${this.vaultBase()}/files/${encodeFilePathForRoute(path)}/restore`,
-      { versionId }
+      { versionId, expectedCurrentVersionId }
     );
   }
 

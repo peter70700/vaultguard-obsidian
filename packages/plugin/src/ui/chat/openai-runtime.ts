@@ -4,21 +4,29 @@
 import type {
   AnthropicContentBlock,
   AnthropicConversationMessage,
+  AnthropicImageBlock,
   AnthropicMessage,
   AnthropicToolResultBlock,
   AnthropicToolUseBlock,
   AnthropicUsage,
 } from "./anthropic-client";
-import { MAX_STEPS, type ChatProgress, type ChatRuntimeToolRuntime } from "./chat-runtime";
+import {
+  MAX_STEPS,
+  buildAnthropicTurnContent,
+  type ChatProgress,
+  type ChatRuntimeToolRuntime,
+} from "./chat-runtime";
 import {
   type OpenAiFunctionCallItem,
   type OpenAiInputItem,
+  type OpenAiMessageInputContent,
   type OpenAiOutputItem,
   type OpenAiResponse,
   type OpenAiResponsesRequest,
 } from "./openai-client";
 import { toOpenAiFunctionTools } from "./openai-tools";
-import { isUserPrompt, sliceBeforeUserTurn, userPromptText } from "./message-utils";
+import type { PreparedDocument } from "./attachment-model";
+import { isUserPrompt, sliceBeforeUserTurn } from "./message-utils";
 
 export const OPENAI_TOOL_OUTPUT_MAX_CHARS = 120_000;
 
@@ -35,6 +43,11 @@ export interface OpenAiChatRuntimeDeps {
   toolRuntime: ChatRuntimeToolRuntime;
   config: OpenAiChatRuntimeConfig;
   progress?: ChatProgress;
+}
+
+interface TransientOpenAiUserTurn {
+  index: number;
+  content: AnthropicContentBlock[];
 }
 
 export class OpenAiChatRuntime {
@@ -63,9 +76,31 @@ export class OpenAiChatRuntime {
     this.messages = [];
   }
 
-  async runTurn(userText: string, signal?: AbortSignal): Promise<void> {
-    this.messages.push({ role: "user", content: userText });
-    await this.runLoop(signal);
+  async runTurn(
+    userText: string,
+    signal?: AbortSignal,
+    images?: AnthropicImageBlock[],
+    documents?: PreparedDocument[],
+  ): Promise<void> {
+    const persistedContent =
+      images && images.length > 0
+        ? [
+            ...images,
+            ...(userText.length > 0
+              ? [{ type: "text", text: userText } as AnthropicContentBlock]
+              : []),
+          ]
+        : userText;
+    const promptIndex = this.messages.length;
+    this.messages.push({ role: "user", content: persistedContent });
+    const transient =
+      documents && documents.length > 0
+        ? {
+            index: promptIndex,
+            content: buildAnthropicTurnContent(userText, images ?? [], documents),
+          }
+        : undefined;
+    await this.runLoop(signal, transient);
   }
 
   async regenerateLast(signal?: AbortSignal): Promise<void> {
@@ -82,7 +117,11 @@ export class OpenAiChatRuntime {
     return this.messages;
   }
 
-  removeFromUserTurn(n: number): { kept: AnthropicConversationMessage[]; removedText: string } | null {
+  removeFromUserTurn(n: number): {
+    kept: AnthropicConversationMessage[];
+    removedText: string;
+    removedImages?: AnthropicImageBlock[];
+  } | null {
     const sliced = sliceBeforeUserTurn(this.messages, n);
     if (!sliced) return null;
     this.messages = sliced.kept;
@@ -96,9 +135,12 @@ export class OpenAiChatRuntime {
     return -1;
   }
 
-  private async runLoop(signal?: AbortSignal): Promise<void> {
+  private async runLoop(
+    signal?: AbortSignal,
+    transient?: TransientOpenAiUserTurn,
+  ): Promise<void> {
     let guard = 0;
-    let input = displayMessagesToOpenAiInput(this.messages);
+    let input = displayMessagesToOpenAiInput(this.messages, transient);
 
     while (guard++ < MAX_STEPS) {
       if (signal?.aborted) return;
@@ -185,19 +227,55 @@ export class OpenAiChatRuntime {
   }
 }
 
-function displayMessagesToOpenAiInput(messages: AnthropicConversationMessage[]): OpenAiInputItem[] {
+export function displayMessagesToOpenAiInput(
+  messages: AnthropicConversationMessage[],
+  transient?: TransientOpenAiUserTurn,
+): OpenAiInputItem[] {
   const input: OpenAiInputItem[] = [];
-  for (const message of messages) {
+  const effectiveMessages = transient
+    ? messages.map((message, index) =>
+        index === transient.index ? { role: "user" as const, content: transient.content } : message,
+      )
+    : messages;
+  for (const message of effectiveMessages) {
     if (message.role === "user") {
       if (typeof message.content === "string") {
         input.push({ role: "user", content: message.content });
         continue;
       }
       if (Array.isArray(message.content)) {
-        const promptText = isUserPrompt(message)
-          ? userPromptText(message)
-          : summarizeToolResults(message.content as AnthropicToolResultBlock[]);
-        if (promptText) input.push({ role: "user", content: promptText });
+        if (isUserPrompt(message)) {
+          const content: OpenAiMessageInputContent[] = [];
+          const blocks = message.content as AnthropicContentBlock[];
+          const textBlocks = blocks.filter(
+            (block): block is { type: "text"; text: string } =>
+              block.type === "text" && Boolean(block.text),
+          );
+          const userText = textBlocks.at(-1);
+          if (userText) content.push({ type: "input_text", text: userText.text });
+          for (const block of textBlocks.slice(0, -1)) {
+            content.push({ type: "input_text", text: block.text });
+          }
+          for (const block of blocks) {
+            if (block.type === "image") {
+              content.push({
+                type: "input_image",
+                image_url: `data:${block.source.media_type};base64,${block.source.data}`,
+                detail: "auto",
+              });
+            } else if (block.type === "document") {
+              content.push({
+                type: "input_file",
+                filename: block.title || "document.pdf",
+                file_data: `data:application/pdf;base64,${block.source.data}`,
+              });
+            }
+          }
+          if (content.length > 0) input.push({ role: "user", content });
+        } else {
+          const toolText = summarizeToolResults(message.content as AnthropicToolResultBlock[]);
+          if (toolText) input.push({ role: "user", content: toolText });
+        }
       }
       continue;
     }

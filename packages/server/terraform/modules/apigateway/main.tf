@@ -1523,6 +1523,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.auth_ai_key_get,
     aws_api_gateway_integration.auth_ai_key_put,
     aws_api_gateway_integration.auth_ai_key_delete,
+    aws_api_gateway_integration.auth_human_verification_post,
     # Users
     aws_api_gateway_integration.users_get,
     aws_api_gateway_integration.users_roles_get,
@@ -1636,6 +1637,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.auth_ai_key_get.id,
       aws_api_gateway_integration.auth_ai_key_put.id,
       aws_api_gateway_integration.auth_ai_key_delete.id,
+      aws_api_gateway_integration.auth_human_verification_post.id,
       aws_api_gateway_integration.users_get.id,
       aws_api_gateway_integration.users_roles_get.id,
       aws_api_gateway_integration.users_invite_post.id,

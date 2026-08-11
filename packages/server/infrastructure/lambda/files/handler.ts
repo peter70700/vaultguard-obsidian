@@ -34,6 +34,10 @@ import { createHash } from 'node:crypto';
 import { KMSClient, DecryptCommand } from '@aws-sdk/client-kms';
 import { emitSecurityMetric } from '../shared/metrics';
 import {
+  acquireVaultMutationPermit,
+  releaseVaultMutationPermit,
+} from '../shared/rotation-fence';
+import {
   aesDecrypt,
   aesEncrypt,
   getActiveScopeDataKey,
@@ -62,12 +66,16 @@ import {
   isAdmin,
   vaultRoleMeetsRequirement,
   sanitizeFilePath,
-  recordVaultActivity,
+  beginVaultMutationIntent,
+  commitVaultMutationIntent,
+  abortVaultMutationIntent,
+  listPendingVaultMutationIntents,
   getVaultCursor,
   queryVaultActivity,
   UserContext,
   VaultRecord,
   VaultActivityRecord,
+  VaultMutationIntent,
   AuthError,
   GetCommand,
   QueryCommand,
@@ -86,10 +94,10 @@ const DIRECT_TRANSFER_MAX_ENCRYPTED_SIZE = MAX_FILE_SIZE + AES_GCM_ENVELOPE_OVER
 const DEFAULT_OVERVIEW_LIMIT = 5000;
 const MAX_OVERVIEW_LIMIT = 10000;
 
-// Phase 6 (Plan 06-02): the `user_keys` table holds per-`(orgId, scope, vaultId)`
-// DEK metadata. This handler does NOT decrypt DEKs (that's the reencryption Lambda's
-// job) — it only reads the `keyId` attribute to annotate S3 objects + audit rows so
-// Phase 7's cross-DEK restore endpoint can match noncurrent versions to their DEKs.
+// Phase 6/7: the `user_keys` table holds per-`(orgId, scope, vaultId)`
+// DEK metadata. Normal writes read only `keyId`; exact historical reads/restores
+// resolve the matching wrapped DEK and unwrap it through the vault-bound KMS
+// encryption context.
 const USER_KEYS_TABLE = process.env.USER_KEYS_TABLE || 'UserKeysTable';
 
 // ─── Active DEK keyId lookup (Plan 06-02) ────────────────────────────────────
@@ -122,10 +130,9 @@ function scopeKeyPk(orgId: string, scope: string, vaultId?: string): string {
  * exists yet (pre-backfill / first-ever write).
  *
  * Pre-backfill rows that exist but lack the `keyId` attribute return the
- * `'legacy'` sentinel — matching the same fallback semantics used by
- * `getActiveScopeDataKey` in the reencryption handler. Phase 7's restore
- * endpoint treats `'legacy'` as a "fall back to current-ACTIVE DEK + emit
- * warning audit" signal.
+ * `'legacy'` sentinel — matching `getActiveScopeDataKey` in the reencryption
+ * handler. Exact historical reads/restores treat that sentinel as unavailable
+ * because the object cannot be bound to a specific historical envelope.
  *
  * Implementation note: this is a single DDB Get on `user_keys` with NO KMS
  * Decrypt call — we only need the metadata id here, not the plaintext key
@@ -288,6 +295,176 @@ async function decryptCurrentVaultBlobForRead(
   }
 }
 
+type HistoricalDekItem = {
+  keyId: string;
+  orgId: string;
+  vaultId: string;
+  scope: string;
+  encryptedDataKey: string;
+};
+
+function vaultBoundHistoricalDekItem(
+  item: unknown,
+  sourceKeyId: string,
+  user: UserContext,
+  vault: VaultRecord
+): HistoricalDekItem | null {
+  if (!item || typeof item !== 'object') return null;
+  const candidate = item as Partial<HistoricalDekItem>;
+  if (
+    candidate.keyId !== sourceKeyId ||
+    candidate.orgId !== user.orgId ||
+    candidate.vaultId !== vault.vaultId ||
+    typeof candidate.scope !== 'string' ||
+    candidate.scope.length === 0 ||
+    typeof candidate.encryptedDataKey !== 'string' ||
+    candidate.encryptedDataKey.length === 0
+  ) {
+    return null;
+  }
+  return candidate as HistoricalDekItem;
+}
+
+/**
+ * Resolves a historical envelope only inside the authenticated org + vault.
+ * `keyId-index` is global, so the hash-key predicate alone is not a tenant
+ * boundary. The server-side filter limits normal results and the application
+ * check remains authoritative before any row can influence a KMS context.
+ */
+async function lookupHistoricalDekForVault(
+  sourceKeyId: string,
+  user: UserContext,
+  vault: VaultRecord
+): Promise<HistoricalDekItem | null> {
+  const attempts = 3;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const result = await docClient.send(
+      new QueryCommand({
+        TableName: USER_KEYS_TABLE,
+        IndexName: 'keyId-index',
+        KeyConditionExpression: 'keyId = :kid',
+        FilterExpression: '#orgId = :orgId AND #vaultId = :vaultId',
+        ExpressionAttributeNames: {
+          '#orgId': 'orgId',
+          '#vaultId': 'vaultId',
+        },
+        ExpressionAttributeValues: {
+          ':kid': sourceKeyId,
+          ':orgId': user.orgId,
+          ':vaultId': vault.vaultId,
+        },
+        Limit: 25,
+      })
+    );
+    for (const item of result.Items ?? []) {
+      const match = vaultBoundHistoricalDekItem(item, sourceKeyId, user, vault);
+      if (match) return match;
+    }
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+  return null;
+}
+
+async function encryptHistoricalPlaintextForRestore(
+  plaintext: Buffer,
+  user: UserContext,
+  vault: VaultRecord
+): Promise<{
+  newCiphertext: Buffer;
+  plaintextSize: number;
+  plaintextSha256: string;
+  encryptedSha256: string;
+  currentKeyId: string;
+}> {
+  try {
+    const plaintextSize = plaintext.byteLength;
+    const plaintextSha256 = sha256Hex(plaintext);
+    const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
+    if (!active) {
+      throw new Error('No active DEK for vault — cannot complete restore');
+    }
+
+    try {
+      const newCiphertext = aesEncrypt(plaintext, active.key);
+      return {
+        newCiphertext,
+        plaintextSize,
+        plaintextSha256,
+        encryptedSha256: sha256Hex(newCiphertext),
+        currentKeyId: active.keyId,
+      };
+    } finally {
+      active.key.fill(0);
+    }
+  } finally {
+    plaintext.fill(0);
+  }
+}
+
+/**
+ * Decrypts an explicitly selected S3 version with the DEK recorded on that
+ * version. Historical objects can pre-date one or more vault-key rotations,
+ * so using the current lease key here would either fail or, worse, make the
+ * endpoint's behaviour depend on rotation timing. The key-id lookup is scoped
+ * back through the KMS encryption context before any plaintext is returned.
+ */
+async function decryptHistoricalVaultBlobForRead(
+  ciphertext: Buffer,
+  metadata: Record<string, string> | undefined,
+  user: UserContext,
+  vault: VaultRecord
+): Promise<{ plaintext: Buffer; keyId: string }> {
+  const sourceKeyId = metadata?.['vaultguard-key-id'];
+  if (!sourceKeyId || sourceKeyId === 'legacy') {
+    throw new AuthError('Historical key material is no longer available', 410);
+  }
+
+  // Most version reads are still on the active DEK. Avoid the eventually
+  // consistent GSI lookup in that common case, while preserving exact key-id
+  // matching and best-effort key zeroing.
+  const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
+  if (active) {
+    try {
+      if (active.keyId === sourceKeyId) {
+        return { plaintext: aesDecrypt(ciphertext, active.key), keyId: sourceKeyId };
+      }
+    } finally {
+      active.key.fill(0);
+    }
+  }
+
+  const dekItem = await lookupHistoricalDekForVault(sourceKeyId, user, vault);
+  if (!dekItem) {
+    throw new AuthError('Historical key material is no longer available', 410);
+  }
+
+  let decryptResponse;
+  try {
+    decryptResponse = await kmsClient.send(
+      new DecryptCommand({
+        CiphertextBlob: Buffer.from(dekItem.encryptedDataKey, 'base64'),
+        EncryptionContext: scopeKmsContext(user.orgId, dekItem.scope, vault.vaultId),
+      })
+    );
+  } catch (error) {
+    await emitSecurityMetric('KMSDecryptFailure');
+    throw error;
+  }
+  if (!decryptResponse.Plaintext) {
+    await emitSecurityMetric('KMSDecryptFailure');
+    throw new Error('KMS Decrypt returned no plaintext for historical DEK');
+  }
+  const historicalDek = Buffer.from(decryptResponse.Plaintext);
+  decryptResponse.Plaintext.fill(0);
+  try {
+    return { plaintext: aesDecrypt(ciphertext, historicalDek), keyId: sourceKeyId };
+  } finally {
+    historicalDek.fill(0);
+  }
+}
+
 /**
  * Returns the vault-scoped S3 prefix: `vault/{orgId}/{vaultId}/`.
  *
@@ -334,6 +511,91 @@ function sha256Hex(value: string | Buffer | Uint8Array): string {
 
 function checksumBase64FromHex(value: string): string {
   return Buffer.from(value, 'hex').toString('base64');
+}
+
+async function abortMutationIntentAfterDefiniteFailure(intent: VaultMutationIntent): Promise<void> {
+  try {
+    await abortVaultMutationIntent(intent);
+  } catch (error) {
+    // Leaving the intent pending is the fail-safe outcome: cursor clients will
+    // reconcile instead of trusting an unchanged revision.
+    console.error('[VAULT_MUTATION_INTENT_ABORT_FAILURE]', error, {
+      vaultId: intent.vaultId,
+      intentId: intent.intentId,
+    });
+  }
+}
+
+async function publishMutationIntentOrThrow(intent: VaultMutationIntent): Promise<void> {
+  try {
+    await commitVaultMutationIntent(intent);
+  } catch (error) {
+    await emitSecurityMetric('VaultMutationReconciliationRequired');
+    console.error('[VAULT_MUTATION_INTENT_COMMIT_FAILURE]', error, {
+      vaultId: intent.vaultId,
+      intentId: intent.intentId,
+      action: intent.action,
+      path: intent.path,
+    });
+    throw new AuthError(
+      'The file mutation is durable but sync publication requires reconciliation; retry sync before editing again.',
+      503,
+      'ACTIVITY_RECONCILIATION_REQUIRED',
+    );
+  }
+}
+
+const MUTATION_RECONCILIATION_GRACE_MS = 2 * 60 * 1000;
+
+async function reconcilePendingMutationIntents(
+  user: UserContext,
+  vault: VaultRecord,
+): Promise<VaultMutationIntent[]> {
+  const pending = await listPendingVaultMutationIntents(vault.vaultId, 100);
+  const now = Date.now();
+  for (const intent of pending) {
+    if (intent.orgId !== user.orgId || intent.vaultId !== vault.vaultId) {
+      console.error('[VAULT_MUTATION_INTENT_SCOPE_MISMATCH]', {
+        vaultId: vault.vaultId,
+        intentId: intent.intentId,
+      });
+      continue;
+    }
+    if (now - intent.createdAtMs < MUTATION_RECONCILIATION_GRACE_MS) continue;
+
+    try {
+      let observed = intent.verification?.kind === 'permission-state';
+      if (!observed) {
+        const filePath = sanitizeFilePath(intent.path.replace(/^\/+/, ''));
+        const key = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+        const head = await headObjectOrNull({ Key: key });
+        switch (intent.verification?.kind) {
+          case 'object-metadata':
+            observed = head?.Metadata?.['vaultguard-mutation-id'] === intent.intentId;
+            break;
+          case 'delete-head':
+            observed = head === null;
+            break;
+          case 'restored-version':
+            observed = head?.VersionId === intent.verification.versionId;
+            break;
+          default:
+            observed = false;
+        }
+      }
+      if (observed) {
+        await commitVaultMutationIntent(intent);
+      } else {
+        await abortVaultMutationIntent(intent);
+      }
+    } catch (error) {
+      console.error('[VAULT_MUTATION_INTENT_RECONCILE_FAILURE]', error, {
+        vaultId: vault.vaultId,
+        intentId: intent.intentId,
+      });
+    }
+  }
+  return listPendingVaultMutationIntents(vault.vaultId, 100);
 }
 
 function isSha256Hex(value: unknown): value is string {
@@ -1225,6 +1487,17 @@ async function handleReadDecrypted(
     return formatError(404, 'File not found', requestId);
   }
 
+  const requestedVersionId = event.queryStringParameters?.versionId;
+  if (
+    requestedVersionId !== undefined &&
+    (typeof requestedVersionId !== 'string' ||
+      requestedVersionId.trim().length === 0 ||
+      requestedVersionId.length > 1024 ||
+      /[\r\n]/.test(requestedVersionId))
+  ) {
+    return formatError(400, 'versionId is invalid', requestId);
+  }
+
   // Per-file permission gate — 404 on deny (D-02). Audit BEFORE returning per T-08-05.
   // LF1: evaluate with the vault-membership role (resolveFileOpRoles), NOT
   // user.roles — this decrypt endpoint returns plaintext, so a role-scoped
@@ -1263,10 +1536,24 @@ async function handleReadDecrypted(
       new GetObjectCommand({
         Bucket: S3_BUCKET,
         Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+        ...(requestedVersionId ? { VersionId: requestedVersionId } : {}),
       })
     );
   } catch (err: unknown) {
-    if (err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'NoSuchKey') {
+    const errorName = err && typeof err === 'object' && 'name' in err
+      ? String((err as { name: unknown }).name)
+      : '';
+    const statusCode = err && typeof err === 'object' && '$metadata' in err
+      ? (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode
+      : undefined;
+    if (
+      errorName === 'NoSuchKey' ||
+      errorName === 'NoSuchVersion' ||
+      errorName === 'NotFound' ||
+      errorName === 'MethodNotAllowed' ||
+      statusCode === 404 ||
+      statusCode === 405
+    ) {
       // Indistinguishable from permission deny per D-02.
       return formatError(404, 'File not found', requestId);
     }
@@ -1279,7 +1566,9 @@ async function handleReadDecrypted(
   // Reuse the existing scope-DEK unwrap helper (Phase 6/7 plumbing) — KMS Decrypt
   // with EncryptionContext is the tampering defense (T-08-03). Helper zeros the
   // DEK in its own finally; we zero the plaintext buffer below (T-08-06).
-  const { plaintext, keyId } = await decryptCurrentVaultBlobForRead(ciphertext, user, vault);
+  const { plaintext, keyId } = requestedVersionId
+    ? await decryptHistoricalVaultBlobForRead(ciphertext, s3Response.Metadata, user, vault)
+    : await decryptCurrentVaultBlobForRead(ciphertext, user, vault);
 
   let content: string;
   try {
@@ -1302,6 +1591,7 @@ async function handleReadDecrypted(
       size: s3Response.ContentLength,
       versionId: s3Response.VersionId,
       keyId,
+      historical: Boolean(requestedVersionId),
     },
   });
   // SD-09-F1: FileAccessCount (server-side decrypt read path). Fire-and-forget
@@ -1320,6 +1610,7 @@ async function handleReadDecrypted(
       size: s3Response.ContentLength,
       lastModified: s3Response.LastModified?.toISOString(),
       versionId: s3Response.VersionId,
+      historical: Boolean(requestedVersionId),
     },
     requestId
   );
@@ -1645,6 +1936,11 @@ async function handleFinalizeDirectUpload(
   if (expectedVersionId && expectedVersionId !== transfer.issuedVersionId) {
     return formatError(409, 'Direct upload expected-version binding changed', requestId);
   }
+  const mutationPermit = await acquireVaultMutationPermit({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+  });
+  try {
   const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
   if (!activeKeyId || activeKeyId !== transfer.activeKeyId) {
     return formatError(409, 'The active encryption key changed before finalization', requestId);
@@ -1683,6 +1979,14 @@ async function handleFinalizeDirectUpload(
     if (!quota.allowed) return formatError(402, quota.reason || 'Storage limit exceeded', requestId);
   }
 
+  const mutationIntent = await beginVaultMutationIntent({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: current ? 'modified' : 'created',
+    path: '/' + filePath,
+    actorUserId: user.userId,
+    verification: { kind: 'object-metadata' },
+  });
   let copied;
   try {
     copied = await s3Client.send(new CopyObjectCommand({
@@ -1700,10 +2004,12 @@ async function handleFinalizeDirectUpload(
         'vaultguard-plaintext-sha256': transfer.plaintextSha256,
         'vaultguard-plaintext-size': String(transfer.plaintextSize),
         'vaultguard-encrypted-sha256': transfer.encryptedSha256,
+        'vaultguard-mutation-id': mutationIntent.intentId,
       },
       ...(current?.ETag ? { IfMatch: current.ETag } : { IfNoneMatch: '*' }),
     }));
   } catch (error: unknown) {
+    await abortMutationIntentAfterDefiniteFailure(mutationIntent);
     const name = error && typeof error === 'object' && 'name' in error
       ? String((error as { name: unknown }).name)
       : '';
@@ -1717,16 +2023,11 @@ async function handleFinalizeDirectUpload(
     throw error;
   }
 
+  await publishMutationIntentOrThrow(mutationIntent);
+
   if (orgResult.org && storageDelta !== 0) {
     await updateOrgStorageUsage(orgResult.org.slug, storageDelta);
   }
-  await recordVaultActivity({
-    orgId: user.orgId,
-    vaultId: vault.vaultId,
-    action: current ? 'modified' : 'created',
-    path: '/' + filePath,
-    actorUserId: user.userId,
-  });
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
@@ -1764,6 +2065,9 @@ async function handleFinalizeDirectUpload(
     transfer.contentType,
     copied.CopyObjectResult?.LastModified?.toISOString()
   ), requestId);
+  } finally {
+    await releaseVaultMutationPermit(mutationPermit);
+  }
 }
 
 /** Issues a short-lived GET capability after current read authorization. */
@@ -2187,6 +2491,11 @@ async function handleWriteFile(
 
   // Phase 6 (Plan 06-02): annotate the object with the DEK keyId so Phase 7's
   // cross-DEK restore endpoint can match noncurrent versions back to their DEK.
+  const mutationPermit = await acquireVaultMutationPermit({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+  });
+  try {
   const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
 
   // SD-06-F1 (DECISION 5) — the S3 precondition, resolved per lane:
@@ -2208,6 +2517,21 @@ async function handleWriteFile(
         ? { IfNoneMatch: '*' }
         : {};
 
+  const activityAction =
+    writeIntent === 'must-be-absent'
+      ? 'created'
+      : writeIntent === 'expect-version' || writeIntent === 'force'
+        ? 'modified'
+        : expectedVersionId ? 'modified' : 'created';
+  const mutationIntent = await beginVaultMutationIntent({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: activityAction,
+    path: '/' + filePath,
+    actorUserId: user.userId,
+    verification: { kind: 'object-metadata' },
+  });
+
   // Write to S3
   let putResponse;
   try {
@@ -2220,14 +2544,21 @@ async function handleWriteFile(
         Metadata: {
           'modified-by': user.userId,
           'modified-at': new Date().toISOString(),
+          'vaultguard-mutation-id': mutationIntent.intentId,
           ...(activeKeyId ? { 'vaultguard-key-id': activeKeyId } : {}),
         },
         ...writeCondition,
       })
     );
   } catch (err: unknown) {
+    await abortMutationIntentAfterDefiniteFailure(mutationIntent);
     const name = err && typeof err === 'object' && 'name' in err ? (err as { name: string }).name : '';
-    if (expectedVersionId && (name === 'PreconditionFailed' || name === 'NotFound')) {
+    if (
+      writeIntent === 'expect-version' &&
+      (name === 'PreconditionFailed' ||
+        name === 'ConditionalRequestConflict' ||
+        name === 'NotFound')
+    ) {
       return formatError(
         409,
         'Conflict: file has been modified or deleted since your write began',
@@ -2254,6 +2585,8 @@ async function handleWriteFile(
     throw err;
   }
 
+  await publishMutationIntentOrThrow(mutationIntent);
+
   // Track storage usage (best-effort, non-blocking)
   const orgResult = await getActiveOrg(user.orgId);
   if (orgResult.org) {
@@ -2271,21 +2604,6 @@ async function handleWriteFile(
   // (`IfNoneMatch: '*'` succeeded, so nothing was there); `expect-version` and
   // `force` provably replaced one. Only the intent-less legacy lane keeps the
   // old heuristic, unchanged.
-  const activityAction =
-    writeIntent === 'must-be-absent'
-      ? 'created'
-      : writeIntent === 'expect-version' || writeIntent === 'force'
-        ? 'modified'
-        : expectedVersionId ? 'modified' : 'created';
-
-  await recordVaultActivity({
-    orgId: user.orgId,
-    vaultId: vault.vaultId,
-    action: activityAction,
-    path: '/' + filePath,
-    actorUserId: user.userId,
-  });
-
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
@@ -2315,6 +2633,9 @@ async function handleWriteFile(
     },
     requestId
   );
+  } finally {
+    await releaseVaultMutationPermit(mutationPermit);
+  }
 }
 
 // ─── DELETE /vaults/{vaultId}/files/{path} ──────────────────────────────────
@@ -2421,7 +2742,20 @@ async function handleDeleteFile(
 
   // Phase 6 (Plan 06-02): record the keyId active at delete time so the audit
   // log has chain-of-custody for which DEK protected the now-hidden version.
+  const mutationPermit = await acquireVaultMutationPermit({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+  });
+  try {
   const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
+  const mutationIntent = await beginVaultMutationIntent({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'deleted',
+    path: '/' + filePath,
+    actorUserId: user.userId,
+    verification: { kind: 'delete-head' },
+  });
 
   // Soft delete (S3 versioning creates a delete marker). For guarded deletes,
   // IfMatch closes the HEAD→DELETE race: if a newer write lands after the HEAD,
@@ -2436,6 +2770,7 @@ async function handleDeleteFile(
       })
     );
   } catch (err: unknown) {
+    await abortMutationIntentAfterDefiniteFailure(mutationIntent);
     const name = err && typeof err === 'object' && 'name' in err ? (err as { name: string }).name : '';
     if (expectedVersionId && (name === 'PreconditionFailed' || name === 'NotFound')) {
       return formatError(
@@ -2447,6 +2782,8 @@ async function handleDeleteFile(
     throw err;
   }
 
+  await publishMutationIntentOrThrow(mutationIntent);
+
   // Decrement storage usage
   if (fileSize > 0) {
     const orgResult = await getActiveOrg(user.orgId);
@@ -2454,16 +2791,6 @@ async function handleDeleteFile(
       await updateOrgStorageUsage(orgResult.org.slug, -fileSize);
     }
   }
-
-  // Record on the activity log so peers learn about the deletion without
-  // having to diff their full manifest against an S3 listing.
-  await recordVaultActivity({
-    orgId: user.orgId,
-    vaultId: vault.vaultId,
-    action: 'deleted',
-    path: '/' + filePath,
-    actorUserId: user.userId,
-  });
 
   await logAudit({
     userId: user.userId,
@@ -2494,6 +2821,9 @@ async function handleDeleteFile(
     },
     requestId
   );
+  } finally {
+    await releaseVaultMutationPermit(mutationPermit);
+  }
 }
 
 // ─── GET /vaults/{vaultId}/files/{path}/history ─────────────────────────────
@@ -2735,6 +3065,11 @@ async function handleRestoreDelete(
   // Find the current delete marker via ListObjectVersionsCommand. The Prefix
   // returns anything starting with `key`, so we filter to exact-key matches
   // (e.g. a sibling file whose key starts with the same characters).
+  const mutationPermit = await acquireVaultMutationPermit({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+  });
+  try {
   const listRes = await s3Client.send(
     new ListObjectVersionsCommand({
       Bucket: S3_BUCKET,
@@ -2767,15 +3102,31 @@ async function handleRestoreDelete(
     return formatError(409, 'No recoverable prior version', requestId);
   }
 
+  const mutationIntent = await beginVaultMutationIntent({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    action: 'created',
+    path: '/' + filePath,
+    actorUserId: user.userId,
+    verification: { kind: 'restored-version', versionId: priorNonMarker.VersionId },
+  });
+
   // Remove the delete marker. S3 automatically promotes the most-recent
   // non-marker version as the new head.
-  await s3Client.send(
-    new DeleteObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: key,
-      VersionId: currentMarker.VersionId,
-    })
-  );
+  try {
+    await s3Client.send(
+      new DeleteObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+        VersionId: currentMarker.VersionId,
+      })
+    );
+  } catch (error) {
+    await abortMutationIntentAfterDefiniteFailure(mutationIntent);
+    throw error;
+  }
+
+  await publishMutationIntentOrThrow(mutationIntent);
 
   // Removing the delete marker makes the prior object active again. Mirror the
   // normal write path so active-storage accounting and warm sync cursors notice
@@ -2787,14 +3138,6 @@ async function handleRestoreDelete(
       await updateOrgStorageUsage(orgResult.org.slug, restoredSizeBytes);
     }
   }
-
-  await recordVaultActivity({
-    orgId: user.orgId,
-    vaultId: vault.vaultId,
-    action: 'created',
-    path: '/' + filePath,
-    actorUserId: user.userId,
-  });
 
   // Phase 6 (Plan 06-02): chain-of-custody record of which DEK is active when
   // the file is re-promoted. Future Phase 7 cross-DEK restore reads this to
@@ -2828,6 +3171,9 @@ async function handleRestoreDelete(
     },
     requestId
   );
+  } finally {
+    await releaseVaultMutationPermit(mutationPermit);
+  }
 }
 
 // ─── POST /vaults/{vaultId}/files/{path+}/restore ───────────────────────────
@@ -2922,8 +3268,22 @@ async function handleRestoreVersion(
   // a malformed body before the role check matches the rest of this handler).
   const body = parseBody(event);
   const sourceVersionId = body?.versionId;
-  if (!sourceVersionId || typeof sourceVersionId !== 'string') {
+  if (
+    !sourceVersionId ||
+    typeof sourceVersionId !== 'string' ||
+    sourceVersionId.length > 1024 ||
+    /[\r\n]/.test(sourceVersionId)
+  ) {
     return formatError(400, 'Missing or invalid body field: versionId', requestId);
+  }
+  const expectedCurrentVersionId = body?.expectedCurrentVersionId;
+  if (
+    !expectedCurrentVersionId ||
+    typeof expectedCurrentVersionId !== 'string' ||
+    expectedCurrentVersionId.length > 1024 ||
+    /[\r\n]/.test(expectedCurrentVersionId)
+  ) {
+    return formatError(400, 'Missing or invalid body field: expectedCurrentVersionId', requestId);
   }
 
   // Upgrade the dispatcher's viewer-level membership to 'admin' for this
@@ -2986,6 +3346,33 @@ async function handleRestoreVersion(
   const bucket = S3_BUCKET;
   const key = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
 
+  // Bind the restore to the exact head the caller inspected. The ETag is then
+  // carried into the conditional PUT below, closing the HEAD -> PUT race.
+  const currentHead = await headObjectOrNull({ Key: key });
+  if (!currentHead?.VersionId || currentHead.VersionId !== expectedCurrentVersionId || !currentHead.ETag) {
+    await logAudit(
+      {
+        userId: user.userId,
+        userEmail: user.email,
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        action: 'files.restore.version.conflict',
+        resourcePath: '/' + filePath,
+        outcome: 'denied',
+        ipAddress: getClientIp(event),
+        userAgent: getUserAgent(event),
+        metadata: {
+          sourceVersionId,
+          expectedCurrentVersionId,
+          observedCurrentVersionId: currentHead?.VersionId ?? null,
+          reason: currentHead?.ETag ? 'version_mismatch' : 'current_head_unavailable',
+        },
+      },
+      event
+    );
+    return formatError(409, 'Conflict: the current file version changed before restore', requestId);
+  }
+
   // STEP 1 — GET the historical ciphertext by VersionId.
   type S3GetResp = {
     Metadata?: Record<string, string>;
@@ -3031,40 +3418,19 @@ async function handleRestoreVersion(
     return formatError(410, 'Historical key material is no longer available', requestId);
   }
 
-  // STEP 4 — Query `keyId-index` GSI with retry/backoff for DDB GSI eventual
-  // consistency (T-07-04 mitigation). 3 total attempts × 200ms backoff bounds
-  // worst-case latency at ~600ms added.
-  type DekItem = {
-    orgId?: string;
-    vaultId?: string;
-    scope?: string;
-    encryptedDataKey?: string;
-  };
-  let dekItem: DekItem | null = null;
-  const ATTEMPTS = 3;
-  const BACKOFF_MS = 200;
-  for (let i = 0; i < ATTEMPTS; i++) {
-    const q = await docClient.send(
-      new QueryCommand({
-        TableName: USER_KEYS_TABLE,
-        IndexName: 'keyId-index',
-        KeyConditionExpression: 'keyId = :kid',
-        ExpressionAttributeValues: { ':kid': sourceKeyId },
-        Limit: 1,
-      })
-    );
-    if (q.Items && q.Items.length > 0) {
-      dekItem = q.Items[0] as DekItem;
-      break;
-    }
-    if (i < ATTEMPTS - 1) {
-      await new Promise((r) => setTimeout(r, BACKOFF_MS));
-    }
-  }
+  const mutationPermit = await acquireVaultMutationPermit({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+  });
+  try {
+  // STEP 4 — Query the eventually-consistent `keyId-index` through the shared
+  // org/vault-bound resolver. A global key-id match is never sufficient by
+  // itself to select key material or construct the KMS EncryptionContext.
+  const dekItem = await lookupHistoricalDekForVault(sourceKeyId, user, vault);
 
   // STEP 5 — still empty after retries → 410. Same generic message as the
   // missing-metadata and 'legacy' branches above (T-07-03 mitigation).
-  if (!dekItem || !dekItem.encryptedDataKey) {
+  if (!dekItem) {
     return formatError(410, 'Historical key material is no longer available', requestId);
   }
 
@@ -3077,11 +3443,7 @@ async function handleRestoreVersion(
     decryptResp = await kmsClient.send(
       new DecryptCommand({
         CiphertextBlob: Buffer.from(dekItem.encryptedDataKey, 'base64'),
-        EncryptionContext: scopeKmsContext(
-          dekItem.orgId || user.orgId,
-          dekItem.scope || '/**',
-          dekItem.vaultId || vault.vaultId
-        ),
+        EncryptionContext: scopeKmsContext(user.orgId, dekItem.scope, vault.vaultId),
       })
     );
   } catch (err) {
@@ -3095,46 +3457,113 @@ async function handleRestoreVersion(
     throw new Error('KMS Decrypt returned no plaintext for historical DEK');
   }
   const oldDek = Buffer.from(decryptResp.Plaintext);
+  decryptResp.Plaintext.fill(0);
 
   // STEP 7 — AES-decrypt the historical ciphertext.
-  const ciphertextBody = await getResp.Body!.transformToByteArray();
-  const plaintext = aesDecrypt(Buffer.from(ciphertextBody), oldDek);
-  const plaintextSize = plaintext.byteLength;
-  const plaintextSha256 = sha256Hex(plaintext);
-
-  // STEP 8 — fetch the current ACTIVE DEK for the vault.
-  const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
-  if (!active) {
-    throw new Error('No active DEK for vault — cannot complete restore');
+  let plaintext: Buffer;
+  try {
+    const ciphertextBody = await getResp.Body!.transformToByteArray();
+    plaintext = aesDecrypt(Buffer.from(ciphertextBody), oldDek);
+  } finally {
+    oldDek.fill(0);
   }
-  const { key: currentDek, keyId: currentKeyId } = active;
 
-  // STEP 9 — AES-encrypt with the current DEK.
-  const newCiphertext = aesEncrypt(plaintext, currentDek);
-  const encryptedSha256 = sha256Hex(newCiphertext);
+  // STEPS 8–10 — re-encrypt under the current vault DEK, then zero both the
+  // active key and plaintext on every success/error path.
+  const {
+    newCiphertext,
+    plaintextSize,
+    plaintextSha256,
+    encryptedSha256,
+    currentKeyId,
+  } = await encryptHistoricalPlaintextForRestore(plaintext, user, vault);
 
-  // STEP 10 — best-effort plaintext wipe. Matches `reEncryptFile`'s pattern.
-  plaintext.fill(0);
+  let mutationIntent: VaultMutationIntent;
+  try {
+    mutationIntent = await beginVaultMutationIntent({
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      action: 'modified',
+      path: '/' + filePath,
+      actorUserId: user.userId,
+      verification: { kind: 'object-metadata' },
+    });
+  } catch (error) {
+    newCiphertext.fill(0);
+    throw error;
+  }
 
   // STEP 11 — PUT as the new head with audit-tagged Metadata.
-  const putResp = await s3Client.send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Body: newCiphertext,
-      ChecksumSHA256: checksumBase64FromHex(encryptedSha256),
-      ContentType: getResp.ContentType || 'application/octet-stream',
-      Metadata: {
-        'modified-by': user.userId,
-        'modified-at': new Date().toISOString(),
-        'vaultguard-key-id': currentKeyId,
-        'vaultguard-plaintext-sha256': plaintextSha256,
-        'vaultguard-plaintext-size': String(plaintextSize),
-        'vaultguard-encrypted-sha256': encryptedSha256,
-        'restored-from-version': sourceVersionId,
-      },
-    })
-  );
+  let putResp;
+  try {
+    putResp = await s3Client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: newCiphertext,
+        ChecksumSHA256: checksumBase64FromHex(encryptedSha256),
+        ContentType: getResp.ContentType || 'application/octet-stream',
+        IfMatch: currentHead.ETag,
+        Metadata: {
+          'modified-by': user.userId,
+          'modified-at': new Date().toISOString(),
+          'vaultguard-key-id': currentKeyId,
+          'vaultguard-plaintext-sha256': plaintextSha256,
+          'vaultguard-plaintext-size': String(plaintextSize),
+          'vaultguard-encrypted-sha256': encryptedSha256,
+          'vaultguard-mutation-id': mutationIntent.intentId,
+          'restored-from-version': sourceVersionId,
+          'restore-expected-version': expectedCurrentVersionId,
+        },
+      })
+    );
+  } catch (error: unknown) {
+    newCiphertext.fill(0);
+    await abortMutationIntentAfterDefiniteFailure(mutationIntent);
+    const name = error && typeof error === 'object' && 'name' in error
+      ? String((error as { name: unknown }).name)
+      : '';
+    const status = error && typeof error === 'object' && '$metadata' in error
+      ? (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode
+      : undefined;
+    if (
+      name === 'PreconditionFailed' ||
+      name === 'ConditionalRequestConflict' ||
+      name === 'NotFound' ||
+      name === 'NoSuchKey' ||
+      status === 404 ||
+      status === 409 ||
+      status === 412
+    ) {
+      await logAudit(
+        {
+          userId: user.userId,
+          userEmail: user.email,
+          orgId: user.orgId,
+          vaultId: vault.vaultId,
+          action: 'files.restore.version.conflict',
+          resourcePath: '/' + filePath,
+          outcome: 'denied',
+          ipAddress: getClientIp(event),
+          userAgent: getUserAgent(event),
+          metadata: {
+            sourceVersionId,
+            expectedCurrentVersionId,
+            observedCurrentVersionId: currentHead.VersionId,
+            reason: 'conditional_write_failed',
+            errorName: name || null,
+            httpStatusCode: status ?? null,
+          },
+        },
+        event
+      );
+      return formatError(409, 'Conflict: the current file version changed during restore', requestId);
+    }
+    throw error;
+  }
+  newCiphertext.fill(0);
+
+  await publishMutationIntentOrThrow(mutationIntent);
 
   // STEP 12 — capture the new head versionId.
   const targetVersionId = (putResp as { VersionId?: string }).VersionId || '';
@@ -3153,6 +3582,7 @@ async function handleRestoreVersion(
       userAgent: getUserAgent(event),
       metadata: {
         sourceVersionId,
+        expectedCurrentVersionId,
         sourceKeyId,
         targetVersionId,
         targetKeyId: currentKeyId,
@@ -3171,6 +3601,9 @@ async function handleRestoreVersion(
     },
     requestId
   );
+  } finally {
+    await releaseVaultMutationPermit(mutationPermit);
+  }
 }
 
 // ─── GET /vaults/{vaultId}/files/deleted ────────────────────────────────────
@@ -3457,6 +3890,9 @@ async function handleSync(
     return formatError(400, 'Invalid lastSyncTimestamp format', requestId);
   }
 
+  const pendingMutationIntents = await reconcilePendingMutationIntents(user, vault);
+  const reconciliationRequired = pendingMutationIntents.length > 0;
+
   // LF5: snapshot the high-water mark (timestamp + revision) BEFORE reading any
   // deltas. Returning a cursor captured at handler END would permanently skip a
   // write that lands mid-handler (after the activity/S3 read but before the
@@ -3474,7 +3910,7 @@ async function handleSync(
   // the cold-path response so the client can invalidate its local
   // permission cache.
   let permissionsChanged = false;
-  if (!prefix) {
+  if (!prefix && !reconciliationRequired) {
     const warm = await buildSyncDeltasFromActivityLog(user, vault, lastSyncDate.getTime());
     if (warm.kind === 'warm') {
       const cursor = cursorSnapshot;
@@ -3504,6 +3940,7 @@ async function handleSync(
           revision: cursor.revision,
           mode: 'activity-log',
           permissionsChanged: false,
+          reconciliationRequired: false,
           isTruncated: false,
         },
         requestId
@@ -3675,6 +4112,7 @@ async function handleSync(
       revision: cursor.revision,
       mode: 'full-scan',
       permissionsChanged,
+      reconciliationRequired,
       isTruncated: false,
     },
     requestId
@@ -3698,12 +4136,14 @@ async function handleSyncCursorGet(
   vault: VaultRecord,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
+  const pendingMutationIntents = await reconcilePendingMutationIntents(user, vault);
   const cursor = await getVaultCursor(user.orgId, vault.vaultId);
   return formatSuccess(
     200,
     {
       revision: cursor.revision,
       lastChangedAt: cursor.lastChangedAt,
+      reconciliationRequired: pendingMutationIntents.length > 0,
       serverTime: new Date().toISOString(),
     },
     requestId

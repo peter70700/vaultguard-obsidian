@@ -26,7 +26,8 @@ import {
   GenerateDataKeyCommand,
   DecryptCommand,
 } from '@aws-sdk/client-kms';
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'crypto';
+import { TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import {
   docClient,
   verifyActiveUser,
@@ -45,11 +46,16 @@ import {
   PutCommand,
   QueryCommand,
   UpdateCommand,
-  DeleteCommand,
   PERMISSIONS_TABLE,
   LEASES_TABLE,
   USER_KEYS_TABLE,
 } from '../shared/utils';
+import {
+  acquireRotationLease,
+  releaseRotationLease,
+  ROTATION_CONTROL_SK,
+  type RotationLease,
+} from '../shared/rotation-fence';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -66,6 +72,8 @@ const kmsClient = new KMSClient({ region: REGION });
 const IV_LENGTH = 12;
 const AUTH_TAG_LENGTH = 16;
 const AES_ALGORITHM = 'aes-256-gcm';
+const QUERY_MAX_PAGES = 100;
+const QUERY_MAX_ITEMS = 10_000;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -79,6 +87,7 @@ interface ReEncryptionJob {
   processedFiles: number;
   failedFiles: number;
   errors: string[];
+  scopeResults?: ReEncryptionScopeResult[];
   startedAt: string;
   completedAt?: string;
   /** TTL: auto-delete 90 days after completion */
@@ -107,6 +116,66 @@ interface PreparedScopeKey {
    * via the `keyId-index` GSI on `user_keys` using this id.
    */
   newKeyId: string;
+}
+
+interface ReEncryptionScopeResult extends AffectedVaultScope {
+  status: 'committed' | 'rolled_back' | 'recovery_required';
+  totalFiles: number;
+  processedFiles: number;
+  failedFiles: number;
+  reason?: string;
+}
+
+interface ReEncryptionPlan extends AffectedVaultScope {
+  oldKey: { key: Buffer; keyId: string };
+  newKey: PreparedScopeKey;
+  s3Keys: string[];
+}
+
+/**
+ * Copy KMS plaintext into the caller-owned buffer and immediately wipe the SDK
+ * response view. The returned buffer must itself be wiped by its owner in a
+ * `finally` block.
+ */
+export function takeAndWipeKmsPlaintext(plaintext: Uint8Array): Buffer {
+  const owned = Buffer.from(plaintext);
+  plaintext.fill(0);
+  return owned;
+}
+
+function wipeBuffers(buffers: Iterable<Buffer | null | undefined>): void {
+  for (const buffer of buffers) buffer?.fill(0);
+}
+
+function boundedJobError(message: string): string {
+  return message.replace(/[\r\n\t]+/g, ' ').slice(0, 500);
+}
+
+async function queryAllPages(
+  input: Record<string, unknown> & { TableName: string },
+  label: string,
+): Promise<Record<string, unknown>[]> {
+  const items: Record<string, unknown>[] = [];
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  for (let page = 1; page <= QUERY_MAX_PAGES; page++) {
+    const result = await docClient.send(
+      new QueryCommand({
+        ...input,
+        ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+      } as never),
+    );
+    for (const item of result.Items ?? []) {
+      items.push(item as Record<string, unknown>);
+      if (items.length > QUERY_MAX_ITEMS) {
+        throw new Error(
+          `${label} exceeded the fail-closed ${QUERY_MAX_ITEMS}-row discovery ceiling`,
+        );
+      }
+    }
+    exclusiveStartKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+    if (!exclusiveStartKey) return items;
+  }
+  throw new Error(`${label} exceeded the fail-closed ${QUERY_MAX_PAGES}-page discovery ceiling`);
 }
 
 // ─── Main Handler ────────────────────────────────────────────────────────────
@@ -276,11 +345,16 @@ async function executeReEncryptionJob(
     new PutCommand({ TableName: REENCRYPTION_JOBS_TABLE, Item: job })
   );
 
+  let oldDeks: RecoveredDek[] = [];
+  let plans: ReEncryptionPlan[] = [];
+  const acquiredLeases: RotationLease[] = [];
+  const scopeResults: ReEncryptionScopeResult[] = [];
+  const errors: string[] = [];
   try {
     // Step 1: Recover old DEKs from the user's lease records. These cover
     // legacy deployments and tell us which vaults the revoked user actually
     // held usable keys for.
-    const oldDeks = await recoverOldDeks(targetUserId, orgId);
+    oldDeks = await recoverOldDeks(targetUserId, orgId);
 
     // Step 2: Find affected vaults. The current plugin uses one active key
     // per bound vault, so any revoked access inside a vault rotates that
@@ -293,14 +367,36 @@ async function executeReEncryptionJob(
     }
 
     // Step 3: Rotate each affected vault/scope key and list matching objects.
-    const plans = await Promise.all(
-      affectedScopes.map(async (affected) => {
-        const oldKey = await resolveOldScopeKey(orgId, affected.vaultId, affected.scope, oldDeks);
-        const newKey = await prepareRotatedScopeDataKey(orgId, affected.vaultId, affected.scope);
-        const s3Keys = await listAffectedS3Objects(orgId, affected.vaultId, [affected.scope]);
-        return { ...affected, oldKey, newKey, s3Keys };
-      })
+    // Plan sequentially so every acquired plaintext key is either attached to
+    // `plans` (and wiped by the outer finally) or wiped by the local catch.
+    // Promise.all made already-resolved sibling plans unreachable when any
+    // other scope rejected, leaving their DEKs live in a warm Lambda process.
+    const orderedScopes = [...affectedScopes].sort((a, b) =>
+      `${a.vaultId}\u0000${a.scope}`.localeCompare(`${b.vaultId}\u0000${b.scope}`)
     );
+    for (const affected of orderedScopes) {
+      let oldKey: { key: Buffer; keyId: string } | null = null;
+      let newKey: PreparedScopeKey | null = null;
+      try {
+        const lease = await acquireRotationLease({
+          orgId,
+          vaultId: affected.vaultId,
+          scope: affected.scope,
+          jobId,
+        });
+        acquiredLeases.push(lease);
+        oldKey = await resolveOldScopeKey(orgId, affected.vaultId, affected.scope, oldDeks);
+        newKey = await prepareRotatedScopeDataKey(orgId, affected.vaultId, affected.scope, jobId);
+        const s3Keys = await listAffectedS3Objects(orgId, affected.vaultId, [affected.scope]);
+        plans.push({ ...affected, oldKey, newKey, s3Keys });
+        oldKey = null;
+        newKey = null;
+      } catch (error) {
+        oldKey?.key.fill(0);
+        newKey?.plaintextKey.fill(0);
+        throw error;
+      }
+    }
 
     const totalFiles = plans.reduce((sum, plan) => sum + plan.s3Keys.length, 0);
 
@@ -309,12 +405,13 @@ async function executeReEncryptionJob(
     // Step 4: Re-encrypt each file
     let processedFiles = 0;
     let failedFiles = 0;
-    const errors: string[] = [];
+    let jobFailed = false;
 
     for (const plan of plans) {
       const prefix = vaultS3Prefix(orgId, plan.vaultId);
       const processedPlanKeys: string[] = [];
       let planFailed = false;
+      let planFailedFiles = 0;
 
       for (const s3Key of plan.s3Keys) {
         try {
@@ -332,9 +429,11 @@ async function executeReEncryptionJob(
           processedFiles++;
         } catch (err) {
           planFailed = true;
+          jobFailed = true;
+          planFailedFiles++;
           failedFiles++;
-          const errMsg = `${s3Key}: ${err instanceof Error ? err.message : String(err)}`;
-          errors.push(errMsg);
+          const errMsg = boundedJobError(`${s3Key}: ${err instanceof Error ? err.message : String(err)}`);
+          if (errors.length < 100) errors.push(errMsg);
           console.error(`[REENCRYPTION] Failed: ${errMsg}`);
         }
 
@@ -344,6 +443,7 @@ async function executeReEncryptionJob(
       }
 
       if (planFailed) {
+        let rollbackFailed = false;
         for (const s3Key of processedPlanKeys) {
           try {
             const vaultPath = '/' + s3Key.replace(prefix, '');
@@ -361,27 +461,93 @@ async function executeReEncryptionJob(
             );
             processedFiles--;
           } catch (rollbackErr) {
-            const errMsg = `${s3Key}: rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`;
-            errors.push(errMsg);
+            rollbackFailed = true;
+            const errMsg = boundedJobError(`${s3Key}: rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`);
+            if (errors.length < 100) errors.push(errMsg);
             console.error(`[REENCRYPTION] ${errMsg}`);
           }
         }
+        scopeResults.push({
+          vaultId: plan.vaultId,
+          scope: plan.scope,
+          status: rollbackFailed ? 'recovery_required' : 'rolled_back',
+          totalFiles: plan.s3Keys.length,
+          processedFiles: rollbackFailed ? processedPlanKeys.length : 0,
+          failedFiles: planFailedFiles,
+          reason: rollbackFailed
+            ? 'One or more conditional rollbacks failed; the prepared key record was retained for recovery.'
+            : 'At least one forward re-encryption failed; successful rewrites were rolled back.',
+        });
       } else {
-        await commitRotatedScopeDataKey(orgId, plan.vaultId, plan.scope, triggeredBy, plan.newKey);
+        try {
+          await commitRotatedScopeDataKey(
+            orgId,
+            plan.vaultId,
+            plan.scope,
+            triggeredBy,
+            jobId,
+            plan.newKey,
+          );
+          scopeResults.push({
+            vaultId: plan.vaultId,
+            scope: plan.scope,
+            status: 'committed',
+            totalFiles: plan.s3Keys.length,
+            processedFiles: plan.s3Keys.length,
+            failedFiles: 0,
+          });
+        } catch (commitError) {
+          jobFailed = true;
+          const commitMessage = boundedJobError(
+            `Vault ${plan.vaultId} scope ${plan.scope}: key commit failed: ${
+              commitError instanceof Error ? commitError.message : String(commitError)
+            }`,
+          );
+          if (errors.length < 100) errors.push(commitMessage);
+          console.error(`[REENCRYPTION] ${commitMessage}`);
+
+          let rollbackFailed = false;
+          for (const s3Key of processedPlanKeys) {
+            try {
+              const vaultPath = '/' + s3Key.replace(prefix, '');
+              await reEncryptFile(
+                s3Key,
+                vaultPath,
+                orgId,
+                plan.vaultId,
+                plan.newKey.plaintextKey,
+                plan.oldKey.key,
+                plan.oldKey.keyId,
+              );
+              processedFiles--;
+            } catch (rollbackError) {
+              rollbackFailed = true;
+              const rollbackMessage = boundedJobError(
+                `${s3Key}: rollback after commit failure failed: ${
+                  rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+                }`,
+              );
+              if (errors.length < 100) errors.push(rollbackMessage);
+              console.error(`[REENCRYPTION] ${rollbackMessage}`);
+            }
+          }
+          scopeResults.push({
+            vaultId: plan.vaultId,
+            scope: plan.scope,
+            status: rollbackFailed ? 'recovery_required' : 'rolled_back',
+            totalFiles: plan.s3Keys.length,
+            processedFiles: rollbackFailed ? processedPlanKeys.length : 0,
+            failedFiles: 0,
+            reason: rollbackFailed
+              ? 'The conditional key commit and one or more rollbacks failed; the prepared key record was retained.'
+              : 'The conditional key commit failed; rewritten objects were rolled back.',
+          });
+        }
       }
     }
 
-    // Step 5: Wipe recovered and rotated DEKs from memory
-    for (const dek of oldDeks) {
-      dek.plaintextKey.fill(0);
-    }
-    for (const plan of plans) {
-      plan.oldKey.key.fill(0);
-      plan.newKey.plaintextKey.fill(0);
-    }
-
     // Finalize
-    const finalStatus = failedFiles === 0 ? 'completed' : (failedFiles === totalFiles ? 'failed' : 'completed');
+    const finalStatus: ReEncryptionJob['status'] = jobFailed ? 'failed' : 'completed';
     const completedAt = new Date().toISOString();
     const ttl = Math.floor(new Date(completedAt).getTime() / 1000) + 90 * 24 * 60 * 60;
 
@@ -389,6 +555,7 @@ async function executeReEncryptionJob(
       processedFiles,
       failedFiles,
       errors,
+      scopeResults,
       completedAt,
       expiresAtTtl: ttl,
     });
@@ -398,18 +565,36 @@ async function executeReEncryptionJob(
       orgId,
       action: 'reencryption.completed',
       resourcePath: `/re-encryption/${jobId}`,
-      outcome: failedFiles === 0 ? 'success' : 'error',
-      metadata: { jobId, targetUserId, totalFiles, processedFiles, failedFiles },
+      outcome: finalStatus === 'completed' ? 'success' : 'error',
+      metadata: { jobId, targetUserId, totalFiles, processedFiles, failedFiles, scopeResults },
     });
 
     console.info(`[REENCRYPTION] Job ${jobId}: ${processedFiles} re-encrypted, ${failedFiles} failed`);
     return jobId;
   } catch (err) {
     await updateJobStatus(jobId, 'failed', {
-      errors: [err instanceof Error ? err.message : String(err)],
+      errors: [boundedJobError(err instanceof Error ? err.message : String(err)), ...errors].slice(0, 100),
+      scopeResults,
       completedAt: new Date().toISOString(),
     });
     throw err;
+  } finally {
+    // Recovered and freshly generated DEKs are process-memory secrets. Wipe
+    // them on every exit, including discovery, S3, rollback, job-status, and
+    // commit failures. The previous success-only cleanup leaked them in warm
+    // Lambda containers whenever an exception escaped before finalization.
+    wipeBuffers(oldDeks.map((dek) => dek.plaintextKey));
+    wipeBuffers(plans.flatMap((plan) => [plan.oldKey.key, plan.newKey.plaintextKey]));
+    for (const lease of acquiredLeases.reverse()) {
+      try {
+        await releaseRotationLease(lease);
+      } catch (releaseError) {
+        console.warn(
+          `[REENCRYPTION] Rotation lease release failed for vault ${lease.vaultId} scope ${lease.scope}; it will expire automatically:`,
+          releaseError,
+        );
+      }
+    }
   }
 }
 
@@ -421,17 +606,16 @@ async function executeReEncryptionJob(
  * with the original encryption context to recover the plaintext DEK.
  */
 async function recoverOldDeks(userId: string, orgId: string): Promise<RecoveredDek[]> {
-  const result = await docClient.send(
-    new QueryCommand({
+  const leases = await queryAllPages(
+    {
       TableName: LEASES_TABLE,
       IndexName: 'userId-index',
       KeyConditionExpression: 'userId = :uid',
       FilterExpression: 'orgId = :orgId',
       ExpressionAttributeValues: { ':uid': userId, ':orgId': orgId },
-    })
+    },
+    'revoked-user lease discovery',
   );
-
-  const leases = result.Items || [];
   const recovered: RecoveredDek[] = [];
   const seenScopes = new Set<string>();
 
@@ -470,7 +654,7 @@ async function recoverOldDeks(userId: string, orgId: string): Promise<RecoveredD
         recovered.push({
           ...(vaultId ? { vaultId } : {}),
           scope,
-          plaintextKey: Buffer.from(decryptResponse.Plaintext),
+          plaintextKey: takeAndWipeKmsPlaintext(decryptResponse.Plaintext),
         });
       }
     } catch {
@@ -491,7 +675,7 @@ async function recoverOldDeks(userId: string, orgId: string): Promise<RecoveredD
           recovered.push({
             ...(vaultId ? { vaultId } : {}),
             scope,
-            plaintextKey: Buffer.from(decryptResponse.Plaintext),
+            plaintextKey: takeAndWipeKmsPlaintext(decryptResponse.Plaintext),
           });
         }
       } catch {
@@ -513,7 +697,7 @@ async function recoverOldDeks(userId: string, orgId: string): Promise<RecoveredD
             recovered.push({
               ...(vaultId ? { vaultId } : {}),
               scope,
-              plaintextKey: Buffer.from(decryptResponse.Plaintext),
+              plaintextKey: takeAndWipeKmsPlaintext(decryptResponse.Plaintext),
             });
           }
         } catch {
@@ -545,8 +729,21 @@ export function aesDecrypt(payload: Buffer, key: Buffer): Buffer {
   const decipher = createDecipheriv(AES_ALGORITHM, key, iv);
   decipher.setAuthTag(authTag);
 
-  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  return decrypted;
+  const updated = decipher.update(ciphertext);
+  let finalized: Buffer | null = null;
+  try {
+    finalized = decipher.final();
+    const decrypted = Buffer.alloc(updated.length + finalized.length);
+    updated.copy(decrypted, 0);
+    finalized.copy(decrypted, updated.length);
+    return decrypted;
+  } finally {
+    // `decipher.update()` can yield unauthenticated plaintext before final()
+    // verifies the GCM tag. Keep explicit ownership so both success and tag
+    // failure wipe every transient plaintext buffer.
+    updated.fill(0);
+    finalized?.fill(0);
+  }
 }
 
 /**
@@ -557,16 +754,27 @@ export function aesEncrypt(plaintext: Buffer, key: Buffer): Buffer {
   const iv = randomBytes(IV_LENGTH);
   const cipher = createCipheriv(AES_ALGORITHM, key, iv);
 
-  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const authTag = cipher.getAuthTag();
+  const updated = cipher.update(plaintext);
+  let finalized: Buffer | null = null;
+  let authTag: Buffer | null = null;
+  try {
+    finalized = cipher.final();
+    authTag = cipher.getAuthTag();
 
-  // Pack exactly like the plugin Web Crypto path: [IV][ciphertext || tag].
-  const result = Buffer.alloc(IV_LENGTH + AUTH_TAG_LENGTH + encrypted.length);
-  iv.copy(result, 0);
-  encrypted.copy(result, IV_LENGTH);
-  authTag.copy(result, IV_LENGTH + encrypted.length);
-
-  return result;
+    // Pack exactly like the plugin Web Crypto path: [IV][ciphertext || tag].
+    const encryptedLength = updated.length + finalized.length;
+    const result = Buffer.alloc(IV_LENGTH + AUTH_TAG_LENGTH + encryptedLength);
+    iv.copy(result, 0);
+    updated.copy(result, IV_LENGTH);
+    finalized.copy(result, IV_LENGTH + updated.length);
+    authTag.copy(result, IV_LENGTH + encryptedLength);
+    return result;
+  } finally {
+    iv.fill(0);
+    updated.fill(0);
+    finalized?.fill(0);
+    authTag?.fill(0);
+  }
 }
 
 // ─── File Re-encryption ────────────────────────────────────────────────────
@@ -598,31 +806,30 @@ async function reEncryptFile(
   if (!body || body.length === 0) {
     throw new Error('Empty file body');
   }
-
-  const encryptedPayload = Buffer.from(body);
-
-  // Decrypt with old DEK
-  let plaintext: Buffer;
-  try {
-    plaintext = aesDecrypt(encryptedPayload, oldKey);
-  } catch (err) {
-    throw new Error(`AES decryption failed for ${vaultPath}: ${err instanceof Error ? err.message : String(err)}`);
+  if (!getResponse.ETag) {
+    throw new Error(`S3 did not return an ETag for ${vaultPath}; refusing an unfenced overwrite`);
   }
 
-  // Re-encrypt with new DEK
-  const reEncrypted = aesEncrypt(plaintext, newKey);
+  const encryptedPayload = Buffer.from(body);
+  let plaintext: Buffer | null = null;
+  let reEncrypted: Buffer | null = null;
+  try {
+    try {
+      plaintext = aesDecrypt(encryptedPayload, oldKey);
+    } catch (err) {
+      throw new Error(`AES decryption failed for ${vaultPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
-  // Zero out sensitive material
-  plaintext.fill(0);
+    reEncrypted = aesEncrypt(plaintext, newKey);
 
-  // Upload re-encrypted content
-  await s3Client.send(
-    new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: s3Key,
-      Body: reEncrypted,
-      ContentType: getResponse.ContentType || 'application/octet-stream',
-      Metadata: {
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: s3Key,
+        IfMatch: getResponse.ETag,
+        Body: reEncrypted,
+        ContentType: getResponse.ContentType || 'application/octet-stream',
+        Metadata: {
         // SPREAD FIRST: inherit any unrelated S3 metadata from the pre-rotation
         // GET (e.g. `modified-by`, `modified-at`) so the re-encrypted object
         // retains its provenance.
@@ -638,9 +845,14 @@ async function reEncryptFile(
         // explicit assignment AFTER the spread guarantees override semantics.
         // See: 06-02-PLAN.md "spread-then-override invariant", T-06-02-02.
         'vaultguard-key-id': newKeyId,
-      },
-    })
-  );
+        },
+      })
+    );
+  } finally {
+    plaintext?.fill(0);
+    reEncrypted?.fill(0);
+    encryptedPayload.fill(0);
+  }
 }
 
 // ─── Vault/Key Discovery ─────────────────────────────────────────────────────
@@ -702,39 +914,37 @@ async function getAffectedVaultScopes(
     add(dek.vaultId, dek.scope);
   }
 
-  const userResult = await docClient.send(
-    new QueryCommand({
+  const userItems = await queryAllPages(
+    {
       TableName: PERMISSIONS_TABLE,
       IndexName: 'userId-index',
       KeyConditionExpression: 'userId = :uid',
       FilterExpression: 'orgId = :orgId',
       ExpressionAttributeValues: { ':uid': userId, ':orgId': orgId },
-    })
+    },
+    'user permission discovery',
   );
 
-  if (userResult.Items) {
-    for (const item of userResult.Items) {
-      if (item.pathPattern && item.effect === 'allow') {
-        add(item.vaultId, item.pathPattern);
-      }
+  for (const item of userItems) {
+    if (item.pathPattern && item.effect === 'allow') {
+      add(item.vaultId, item.pathPattern);
     }
   }
 
-  const wildcardResult = await docClient.send(
-    new QueryCommand({
+  const wildcardItems = await queryAllPages(
+    {
       TableName: PERMISSIONS_TABLE,
       IndexName: 'userId-index',
       KeyConditionExpression: 'userId = :uid',
       FilterExpression: 'orgId = :orgId',
       ExpressionAttributeValues: { ':uid': '*', ':orgId': orgId },
-    })
+    },
+    'wildcard permission discovery',
   );
 
-  if (wildcardResult.Items) {
-    for (const item of wildcardResult.Items) {
-      if (item.pathPattern && item.effect === 'allow') {
-        add(item.vaultId, item.pathPattern);
-      }
+  for (const item of wildcardItems) {
+    if (item.pathPattern && item.effect === 'allow') {
+      add(item.vaultId, item.pathPattern);
     }
   }
 
@@ -752,6 +962,7 @@ export async function getActiveScopeDataKey(
     new GetCommand({
       TableName: USER_KEYS_TABLE,
       Key: { pk: scopeKeyPk(orgId, scope, vaultId), sk: 'ACTIVE' },
+      ConsistentRead: true,
     })
   );
 
@@ -779,7 +990,7 @@ export async function getActiveScopeDataKey(
   // audit when the keyId on an S3 object is `'legacy'` or absent.
   const keyId = typeof item.keyId === 'string' && item.keyId.length > 0 ? item.keyId : 'legacy';
 
-  return { key: Buffer.from(decryptResponse.Plaintext), keyId };
+  return { key: takeAndWipeKmsPlaintext(decryptResponse.Plaintext), keyId };
 }
 
 async function resolveOldScopeKey(
@@ -809,13 +1020,15 @@ async function resolveOldScopeKey(
 async function prepareRotatedScopeDataKey(
   orgId: string,
   vaultId: string,
-  scope: string
+  scope: string,
+  jobId: string,
 ): Promise<PreparedScopeKey> {
   const pk = scopeKeyPk(orgId, scope, vaultId);
   const currentResult = await docClient.send(
     new GetCommand({
       TableName: USER_KEYS_TABLE,
       Key: { pk, sk: 'ACTIVE' },
+      ConsistentRead: true,
     })
   );
 
@@ -828,49 +1041,61 @@ async function prepareRotatedScopeDataKey(
   );
 
   if (!dataKeyResponse.Plaintext || !dataKeyResponse.CiphertextBlob) {
+    dataKeyResponse.Plaintext?.fill(0);
     throw new Error('KMS GenerateDataKey did not return usable key material');
   }
 
-  // Fresh UUID v4 per rotation. Stays with this DEK for life — through ACTIVE
-  // state and into ROTATED# state. Phase 7 looks this up via the keyId-index GSI.
-  const newKeyId = randomUUID();
+  // Take ownership immediately. No DynamoDB call may retain plaintext only in
+  // an SDK response object whose lifetime escapes on an exception.
+  const plaintextKey = takeAndWipeKmsPlaintext(dataKeyResponse.Plaintext);
 
-  const encryptedDataKey = Buffer.from(dataKeyResponse.CiphertextBlob).toString('base64');
+  try {
+    // Fresh UUID v4 per rotation. Stays with this DEK for life — through ACTIVE
+    // state and into ROTATED# state. Phase 7 looks this up via the keyId-index GSI.
+    const newKeyId = randomUUID();
 
-  // RE1: persist the wrapped DEK durably BEFORE any file is re-wrapped under
-  // it. commitRotatedScopeDataKey only runs after the whole re-encrypt loop,
-  // so a mid-loop crash (15-minute Lambda timeout on a large vault) used to
-  // strand every already-re-encrypted head under a keyId with NO stored key
-  // material — unreadable except by S3 noncurrent-version rollback. The
-  // PENDING row carries keyId + encryptedDataKey + the KMS EncryptionContext
-  // fields (orgId/scope/vaultId) and is discoverable through the keyId-index
-  // GSI, so the Phase-7 restore endpoint can re-wrap stranded heads back to
-  // the ACTIVE DEK. Abandoned PENDING rows (crashed or rolled-back rotations)
-  // are intentionally kept: they are tiny and remain load-bearing for any
-  // head still stamped with that keyId.
-  await docClient.send(
-    new PutCommand({
-      TableName: USER_KEYS_TABLE,
-      Item: {
-        pk,
-        sk: `PENDING#${newKeyId}`,
-        orgId,
-        vaultId,
-        scope,
-        encryptedDataKey,
-        keyId: newKeyId,
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-      },
-    })
-  );
+    const encryptedDataKey = Buffer.from(dataKeyResponse.CiphertextBlob).toString('base64');
 
-  return {
-    plaintextKey: Buffer.from(dataKeyResponse.Plaintext),
-    encryptedDataKey,
-    previousItem: currentResult.Item as Record<string, unknown> | undefined,
-    newKeyId,
-  };
+    // RE1: persist the wrapped DEK durably BEFORE any file is re-wrapped under
+    // it. commitRotatedScopeDataKey only runs after the whole re-encrypt loop,
+    // so a mid-loop crash (15-minute Lambda timeout on a large vault) used to
+    // strand every already-re-encrypted head under a keyId with NO stored key
+    // material — unreadable except by S3 noncurrent-version rollback. The
+    // The immutable KEY# row carries keyId + encryptedDataKey + the KMS EncryptionContext
+    // fields (orgId/scope/vaultId) and is discoverable through the keyId-index
+    // GSI, so the Phase-7 restore endpoint can re-wrap stranded heads back to
+    // the ACTIVE DEK. Prepared rows are never deleted: a crashed or rolled-back
+    // rotation can leave an S3 version stamped with the new keyId, making this
+    // wrapped key material permanently load-bearing.
+    await docClient.send(
+      new PutCommand({
+        TableName: USER_KEYS_TABLE,
+        Item: {
+          pk,
+          sk: `KEY#${newKeyId}`,
+          orgId,
+          vaultId,
+          scope,
+          encryptedDataKey,
+          keyId: newKeyId,
+          status: 'prepared',
+          rotationJobId: jobId,
+          createdAt: new Date().toISOString(),
+        },
+        ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+      })
+    );
+
+    return {
+      plaintextKey,
+      encryptedDataKey,
+      previousItem: currentResult.Item as Record<string, unknown> | undefined,
+      newKeyId,
+    };
+  } catch (error) {
+    plaintextKey.fill(0);
+    throw error;
+  }
 }
 
 async function commitRotatedScopeDataKey(
@@ -878,74 +1103,127 @@ async function commitRotatedScopeDataKey(
   vaultId: string,
   scope: string,
   rotatedBy: string,
+  jobId: string,
   prepared: PreparedScopeKey
 ): Promise<void> {
   const pk = scopeKeyPk(orgId, scope, vaultId);
   const now = new Date().toISOString();
 
-  if (prepared.previousItem) {
-    try {
-      await docClient.send(
-        new PutCommand({
-          TableName: USER_KEYS_TABLE,
-          Item: {
-            // Spread preserves the prior entry's `keyId` (post-backfill) for free —
-            // ROTATED# rows carry the OLD keyId; only the new ACTIVE row gets newKeyId.
-            ...prepared.previousItem,
-            sk: `ROTATED#${now}`,
-            status: 'rotated',
-            rotatedAt: now,
-            rotatedBy,
-          },
-        })
-      );
-    } catch (err) {
-      // INVARIANT (T-06-01-01): if the prior DEK cannot be preserved as ROTATED#,
-      // ABORT the rotation. The new ACTIVE write does NOT run; the existing
-      // ACTIVE row remains valid and decryptable. Without this guard, a
-      // ROTATED# write failure followed by a successful ACTIVE write would
-      // leave noncurrent S3 versions un-decryptable forever.
-      throw new Error(
-        `Failed to preserve prior DEK as ROTATED#${now}: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
+  const previous = prepared.previousItem;
+  const previousKeyId = typeof previous?.keyId === 'string' && previous.keyId
+    ? previous.keyId
+    : 'legacy';
+  const previousEncryptedDataKey = typeof previous?.encryptedDataKey === 'string'
+    ? previous.encryptedDataKey
+    : null;
+  const oldKeyRecordSk = previousKeyId === 'legacy'
+    ? `KEY#legacy#${Date.now()}`
+    : `KEY#${previousKeyId}`;
+
+  const activeCondition = previous
+    ? {
+        ConditionExpression:
+          previousKeyId === 'legacy'
+            ? '#status = :active AND encryptedDataKey = :previousEncryptedDataKey AND attribute_not_exists(#keyId)'
+            : '#status = :active AND encryptedDataKey = :previousEncryptedDataKey AND #keyId = :previousKeyId',
+        ExpressionAttributeNames: { '#status': 'status', '#keyId': 'keyId' },
+        ExpressionAttributeValues: {
+          ':active': 'active',
+          ':previousEncryptedDataKey': previousEncryptedDataKey,
+          ...(previousKeyId === 'legacy' ? {} : { ':previousKeyId': previousKeyId }),
+        },
+      }
+    : {
+        ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+      };
+
+  const transactions: NonNullable<ConstructorParameters<typeof TransactWriteCommand>[0]['TransactItems']> = [
+    {
+      ConditionCheck: {
+        TableName: USER_KEYS_TABLE,
+        Key: { pk, sk: ROTATION_CONTROL_SK },
+        ConditionExpression: '#rotationOwner = :jobId AND #rotationExpiresAt >= :nowEpoch',
+        ExpressionAttributeNames: {
+          '#rotationOwner': 'rotationOwner',
+          '#rotationExpiresAt': 'rotationExpiresAt',
+        },
+        ExpressionAttributeValues: { ':jobId': jobId, ':nowEpoch': Date.now() },
+      },
+    },
+  ];
+
+  if (previous) {
+    transactions.push({
+      Put: {
+        TableName: USER_KEYS_TABLE,
+        Item: {
+          ...previous,
+          sk: oldKeyRecordSk,
+          status: 'rotated',
+          rotatedAt: now,
+          rotatedBy,
+        },
+      },
+    });
   }
 
-  await docClient.send(
-    new PutCommand({
-      TableName: USER_KEYS_TABLE,
-      Item: {
-        pk,
-        sk: 'ACTIVE',
-        orgId,
-        vaultId,
-        scope,
-        encryptedDataKey: prepared.encryptedDataKey,
-        keyId: prepared.newKeyId,
-        status: 'active',
-        createdAt: now,
-        lastUsedAt: now,
-        rotatedBy,
+  transactions.push(
+    {
+      Put: {
+        TableName: USER_KEYS_TABLE,
+        Item: {
+          pk,
+          sk: 'ACTIVE',
+          orgId,
+          vaultId,
+          scope,
+          encryptedDataKey: prepared.encryptedDataKey,
+          keyId: prepared.newKeyId,
+          status: 'active',
+          createdAt: now,
+          lastUsedAt: now,
+          rotatedBy,
+          rotationJobId: jobId,
+        },
+        ...activeCondition,
       },
-    })
+    },
+    {
+      Put: {
+        TableName: USER_KEYS_TABLE,
+        Item: {
+          pk,
+          sk: `KEY#${prepared.newKeyId}`,
+          orgId,
+          vaultId,
+          scope,
+          encryptedDataKey: prepared.encryptedDataKey,
+          keyId: prepared.newKeyId,
+          status: 'active-key-record',
+          createdAt: now,
+          activatedAt: now,
+          rotatedBy,
+          rotationJobId: jobId,
+        },
+        ConditionExpression: '#keyId = :newKeyId AND encryptedDataKey = :newEncryptedDataKey',
+        ExpressionAttributeNames: { '#keyId': 'keyId' },
+        ExpressionAttributeValues: {
+          ':newKeyId': prepared.newKeyId,
+          ':newEncryptedDataKey': prepared.encryptedDataKey,
+        },
+      },
+    },
   );
 
-  // RE1: the ACTIVE row now carries this keyId — retire the PENDING
-  // placeholder. Best-effort: a leftover PENDING row is harmless (it holds
-  // the SAME encryptedDataKey, so keyId-index resolvers work with either).
-  try {
-    await docClient.send(
-      new DeleteCommand({
-        TableName: USER_KEYS_TABLE,
-        Key: { pk, sk: `PENDING#${prepared.newKeyId}` },
-      })
-    );
-  } catch (err) {
-    console.warn(
-      `[REENCRYPTION] Could not delete PENDING row for keyId ${prepared.newKeyId}:`,
-      err
-    );
-  }
+  await docClient.send(
+    new TransactWriteCommand({
+      ClientRequestToken: createHash('sha256')
+        .update(`${jobId}\u0000${vaultId}\u0000${scope}`)
+        .digest('hex')
+        .slice(0, 36),
+      TransactItems: transactions,
+    }),
+  );
 }
 
 async function listAffectedS3Objects(

@@ -19,6 +19,36 @@ variable "cognito_user_pool_id" { type = string }
 variable "cognito_client_id" { type = string }
 variable "key_lease_duration_seconds" { type = number }
 variable "session_duration_seconds" { type = number }
+variable "session_enforcement_mode" {
+  type        = string
+  default     = "observe"
+  description = "Shared authenticated-request server-session policy."
+
+  validation {
+    condition     = contains(["observe", "enforce"], var.session_enforcement_mode)
+    error_message = "session_enforcement_mode must be either observe or enforce."
+  }
+}
+variable "login_verification_mode" {
+  type        = string
+  default     = "disabled"
+  description = "One-time login-permit posture. Disabled is the migration-safe default."
+
+  validation {
+    condition     = contains(["disabled", "observe", "enforce"], var.login_verification_mode)
+    error_message = "login_verification_mode must be disabled, observe, or enforce."
+  }
+}
+variable "login_verification_browser_url" {
+  type        = string
+  default     = "https://auth.example.com/complete"
+  description = "Browser completion URL returned to an initiating login client."
+}
+variable "turnstile_expected_hostnames" {
+  type        = string
+  default     = "admin.example.com,auth.example.com"
+  description = "Comma-separated exact hostnames accepted from Turnstile Siteverify."
+}
 variable "max_file_size_bytes" { type = number }
 variable "organizations_table_name" { type = string }
 variable "organizations_table_arn" { type = string }
@@ -138,34 +168,35 @@ data "aws_caller_identity" "current" {}
 
 locals {
   common_env = {
-    STAGE                   = var.stage
-    VAULT_BUCKET            = var.vault_bucket_name
-    PERMISSIONS_TABLE       = var.permissions_table_name
-    AUDIT_TABLE             = var.audit_table_name
-    ALERTS_TABLE            = var.alerts_table_name
-    SESSIONS_TABLE          = var.sessions_table_name
-    USER_KEYS_TABLE         = var.user_keys_table_name
-    REVOKED_KEYS_TABLE      = var.revoked_keys_table_name
-    RECOVERY_CODES_TABLE    = var.recovery_codes_table_name
-    RECOVERY_ATTEMPTS_TABLE = var.recovery_attempts_table_name
-    ORGANIZATIONS_TABLE     = var.organizations_table_name
-    LEASES_TABLE            = var.leases_table_name
-    VAULTS_TABLE            = var.vaults_table_name
-    VAULT_MEMBERS_TABLE     = var.vault_members_table_name
-    VAULT_ACTIVITY_TABLE    = var.vault_activity_table_name
-    SHARES_TABLE            = var.shares_table_name
+    STAGE                    = var.stage
+    VAULT_BUCKET             = var.vault_bucket_name
+    PERMISSIONS_TABLE        = var.permissions_table_name
+    AUDIT_TABLE              = var.audit_table_name
+    ALERTS_TABLE             = var.alerts_table_name
+    SESSIONS_TABLE           = var.sessions_table_name
+    SESSION_ENFORCEMENT_MODE = var.session_enforcement_mode
+    USER_KEYS_TABLE          = var.user_keys_table_name
+    REVOKED_KEYS_TABLE       = var.revoked_keys_table_name
+    RECOVERY_CODES_TABLE     = var.recovery_codes_table_name
+    RECOVERY_ATTEMPTS_TABLE  = var.recovery_attempts_table_name
+    ORGANIZATIONS_TABLE      = var.organizations_table_name
+    LEASES_TABLE             = var.leases_table_name
+    VAULTS_TABLE             = var.vaults_table_name
+    VAULT_MEMBERS_TABLE      = var.vault_members_table_name
+    VAULT_ACTIVITY_TABLE     = var.vault_activity_table_name
+    SHARES_TABLE             = var.shares_table_name
     # Every authenticated Lambda reads this in `assertSubscriptionAllowsAccess`
     # (the SaaS subscription gate). Signup also writes a `pending_checkout`
     # row here. Promoted to common_env so a new handler can't forget it.
-    SUBSCRIPTIONS_TABLE  = var.subscriptions_table_name
-    KMS_KEY_ID           = var.kms_key_id
-    COGNITO_USER_POOL_ID = var.cognito_user_pool_id
-    COGNITO_CLIENT_ID    = var.cognito_client_id
-    VAULTGUARD_EDITION   = var.vaultguard_edition
-    SENDER_EMAIL         = var.sender_email
-    ALLOWED_CORS_ORIGIN  = var.domain_name != "" ? "https://admin.${var.domain_name}" : "http://localhost:5173"
-    SHARE_BASE_URL       = var.domain_name != "" ? "https://share.${var.domain_name}" : "http://localhost:5176"
-    NODE_OPTIONS         = "--enable-source-maps"
+    SUBSCRIPTIONS_TABLE      = var.subscriptions_table_name
+    KMS_KEY_ID               = var.kms_key_id
+    COGNITO_USER_POOL_ID     = var.cognito_user_pool_id
+    COGNITO_CLIENT_ID        = var.cognito_client_id
+    VAULTGUARD_EDITION       = var.vaultguard_edition
+    SENDER_EMAIL             = var.sender_email
+    ALLOWED_CORS_ORIGIN      = var.domain_name != "" ? "https://admin.${var.domain_name}" : "http://localhost:5173"
+    SHARE_BASE_URL           = var.domain_name != "" ? "https://share.${var.domain_name}" : "http://localhost:5176"
+    NODE_OPTIONS             = "--enable-source-maps"
   }
   log_retention = var.is_prod ? 365 : 7
 }
@@ -334,16 +365,25 @@ data "aws_iam_policy_document" "auth_lambda" {
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:PutItem"]
     resources = [var.recovery_attempts_table_arn]
   }
+  # File writes take a conditional per-vault mutation permit in the user-keys
+  # control row so a re-encryption ACTIVE-key swap cannot race an object write.
   statement {
-    actions = ["dynamodb:GetItem", "dynamodb:Query"]
+    actions = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
     resources = [
       var.vaults_table_arn, "${var.vaults_table_arn}/index/*",
       var.vault_members_table_arn, "${var.vault_members_table_arn}/index/*",
     ]
   }
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:TransactWriteItems"]
     resources = [var.sessions_table_arn, "${var.sessions_table_arn}/index/*"]
+  }
+  dynamic "statement" {
+    for_each = var.turnstile_secret_arn != "" ? [1] : []
+    content {
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [var.turnstile_secret_arn]
+    }
   }
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
@@ -429,6 +469,11 @@ resource "aws_lambda_function" "auth" {
       SESSION_DURATION_SECONDS   = tostring(var.session_duration_seconds)
       USER_POOL_ID               = var.cognito_user_pool_id
       CLIENT_ID                  = var.cognito_client_id
+      LOGIN_VERIFICATION_MODE        = var.login_verification_mode
+      LOGIN_VERIFICATION_BROWSER_URL = var.login_verification_browser_url
+      LOGIN_VERIFICATION_ALLOWED_ORIGINS = join(",", [for hostname in split(",", var.turnstile_expected_hostnames) : "https://${trimspace(hostname)}"])
+      TURNSTILE_EXPECTED_HOSTNAMES    = var.turnstile_expected_hostnames
+      TURNSTILE_SECRET_ARN            = var.turnstile_secret_arn
     })
   }
 
@@ -486,6 +531,12 @@ data "aws_iam_policy_document" "files_lambda" {
   statement {
     actions   = ["dynamodb:PutItem", "dynamodb:Query"]
     resources = [var.vault_activity_table_arn]
+  }
+  # recordVaultActivity writes its activity row and vault revision in one
+  # transaction. DynamoDB authorizes TransactWriteItems against both tables.
+  statement {
+    actions   = ["dynamodb:TransactWriteItems"]
+    resources = [var.vault_activity_table_arn, var.vaults_table_arn]
   }
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:Query"]
@@ -606,6 +657,10 @@ data "aws_iam_policy_document" "permissions_lambda" {
   statement {
     actions   = ["dynamodb:PutItem"]
     resources = [var.vault_activity_table_arn]
+  }
+  statement {
+    actions   = ["dynamodb:TransactWriteItems"]
+    resources = [var.vault_activity_table_arn, var.vaults_table_arn]
   }
   statement {
     actions   = ["dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:Scan"]
@@ -1013,9 +1068,11 @@ resource "aws_lambda_function" "signup" {
     variables = merge(local.common_env, {
       USER_POOL_ID                   = var.cognito_user_pool_id
       CLIENT_ID                      = var.cognito_client_id
+      LOGIN_VERIFICATION_MODE        = var.login_verification_mode
       VAULTGUARD_ALLOW_PUBLIC_SIGNUP = tostring(var.allow_public_signup)
       BILLING_EXEMPT_DOMAINS         = var.billing_exempt_domains
       TURNSTILE_SECRET_ARN           = var.turnstile_secret_arn
+      TURNSTILE_EXPECTED_HOSTNAMES   = var.turnstile_expected_hostnames
       # Meta Conversions API — CompleteRegistration. Both empty by default,
       # which makes every Meta call a no-op. BASE_URL is the fallback
       # event_source_url when the browser did not supply one.
@@ -1218,11 +1275,16 @@ data "aws_iam_policy_document" "reencryption_lambda" {
     actions   = ["dynamodb:Query"]
     resources = [var.leases_table_arn, "${var.leases_table_arn}/index/*"]
   }
-  # DynamoDB — user keys (Get current scope DEK, archive previous as ROTATED#,
-  # insert new ACTIVE). Without this, every re-encryption job 500s during
-  # the key-rotation step.
+  # DynamoDB — user keys and the per-vault rotation control row. Re-encryption
+  # conditionally acquires/releases its lease and atomically swaps the exact
+  # prior ACTIVE record while retaining immutable key history.
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:TransactWriteItems",
+    ]
     resources = [var.user_keys_table_arn]
   }
   # DynamoDB — audit logging
@@ -1564,6 +1626,10 @@ data "aws_iam_policy_document" "vaults_lambda" {
   statement {
     actions   = ["dynamodb:PutItem"]
     resources = [var.vault_activity_table_arn]
+  }
+  statement {
+    actions   = ["dynamodb:TransactWriteItems"]
+    resources = [var.vault_activity_table_arn, var.vaults_table_arn]
   }
   # Audit logging
   statement {

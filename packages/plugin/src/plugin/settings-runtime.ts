@@ -10,7 +10,9 @@ import {
   ConflictResolutionStrategy,
   type ServerEdition,
   type ServerFeatures,
+  type LoginVerificationMode,
   type OptionalModulePreferences,
+  type StatusBarMode,
   type UserSession,
   type VaultGuardSettings,
 } from "../types";
@@ -18,7 +20,9 @@ import {
   DEFAULT_EXCLUDED_PATHS,
   DEFAULT_SETTINGS,
   SAAS_DEFAULTS,
+  normalizeAgentTemplateAllowlist,
 } from "./settings";
+import { normalizeAutomationRegistry } from "./agent-automation-registry";
 import { deriveConnectionConfigFromTokenPayload } from "./session-config";
 import type { PluginSettingsRuntimeContext } from "./plugin-runtime-types";
 
@@ -36,6 +40,21 @@ export function normalizeCodexModelPreference(
   return priorSharedModel || DEFAULT_SETTINGS.codexModel;
 }
 
+export function normalizeCodexAutoSelectLatest(
+  rawData: { codexAutoSelectLatest?: unknown },
+): boolean {
+  return typeof rawData.codexAutoSelectLatest === "boolean"
+    ? rawData.codexAutoSelectLatest
+    : true;
+}
+
+/** Fail closed to the migration-safe server default for untrusted/stale data. */
+export function normalizeLoginVerificationMode(value: unknown): LoginVerificationMode {
+  return value === "observe" || value === "enforce" || value === "disabled"
+    ? value
+    : "disabled";
+}
+
 export type SettingsLoadMode = "startup" | "external";
 
 const RECOGNIZED_LEGACY_SETTINGS_KEYS = new Set<keyof VaultGuardSettings>([
@@ -45,6 +64,7 @@ const RECOGNIZED_LEGACY_SETTINGS_KEYS = new Set<keyof VaultGuardSettings>([
   "organizationId",
   "cognitoUserPoolId",
   "cognitoClientId",
+  "loginVerificationMode",
   "syncInterval",
   "cacheEncryptionStrength",
   "localProjectMemoryMode",
@@ -64,6 +84,52 @@ const RECOGNIZED_LEGACY_SETTINGS_KEYS = new Set<keyof VaultGuardSettings>([
 
 function isBoolean(value: unknown): value is boolean {
   return typeof value === "boolean";
+}
+
+export interface InterfacePreferences {
+  statusBarMode: StatusBarMode;
+  showStatusBar: boolean;
+  showRibbonIcons: boolean;
+  showAiChatRibbonIcon: boolean;
+  showPermissionsGraphRibbonIcon: boolean;
+}
+
+function isStatusBarMode(value: unknown): value is StatusBarMode {
+  return value === "full" || value === "compact" || value === "hidden";
+}
+
+/**
+ * Normalize interface preferences while preserving the meaning of data written
+ * before status-bar modes and granular ribbon controls existed. Canonical keys
+ * win when present; legacy booleans are only migration fallbacks.
+ */
+export function normalizeInterfacePreferences(
+  rawData: Record<string, unknown>,
+): InterfacePreferences {
+  const statusBarMode = isStatusBarMode(rawData.statusBarMode)
+    ? rawData.statusBarMode
+    : rawData.showStatusBar === false
+      ? "hidden"
+      : "full";
+  const legacyRibbonVisibility = isBoolean(rawData.showRibbonIcons)
+    ? rawData.showRibbonIcons
+    : true;
+  const showAiChatRibbonIcon = isBoolean(rawData.showAiChatRibbonIcon)
+    ? rawData.showAiChatRibbonIcon
+    : legacyRibbonVisibility;
+  const showPermissionsGraphRibbonIcon = isBoolean(rawData.showPermissionsGraphRibbonIcon)
+    ? rawData.showPermissionsGraphRibbonIcon
+    : legacyRibbonVisibility;
+
+  return {
+    statusBarMode,
+    // Keep the legacy field as a synchronized compatibility mirror. This also
+    // gives older plugin builds the closest representation after data sync.
+    showStatusBar: statusBarMode !== "hidden",
+    showRibbonIcons: showAiChatRibbonIcon && showPermissionsGraphRibbonIcon,
+    showAiChatRibbonIcon,
+    showPermissionsGraphRibbonIcon,
+  };
 }
 
 /**
@@ -229,7 +295,18 @@ export class PluginSettingsRuntime {
     delete data.storedSessions;
     this.ctx.setSettings(Object.assign({}, DEFAULT_SETTINGS, data));
     this.settings.codexModel = normalizeCodexModelPreference(data);
+    this.settings.codexAutoSelectLatest = normalizeCodexAutoSelectLatest(
+      data as Record<string, unknown>,
+    );
     this.settings.optionalModules = normalizeOptionalModules(data as Record<string, unknown>);
+    this.settings.automationRegistry = normalizeAutomationRegistry(data.automationRegistry);
+    this.settings.agentTemplateAllowlist = normalizeAgentTemplateAllowlist(
+      data.agentTemplateAllowlist,
+    );
+    Object.assign(
+      this.settings,
+      normalizeInterfacePreferences(data as Record<string, unknown>),
+    );
     Object.assign(
       this.settings,
       normalizeDiscoveryPreferences(data as Record<string, unknown>),
@@ -256,6 +333,9 @@ export class PluginSettingsRuntime {
     this.settings.defaultConflictResolution = this.normalizeConflictStrategy(
       this.settings.defaultConflictResolution,
     );
+    this.settings.loginVerificationMode = normalizeLoginVerificationMode(
+      data.loginVerificationMode,
+    );
     this.settings.excludedPaths = this.withRequiredExcludedPaths(this.settings.excludedPaths);
     this.settings.apiEndpoint = normalizeVaultGuardApiBaseUrl(this.settings.apiEndpoint);
     this.ctx.setConfiguredApiEndpoint(this.settings.apiEndpoint);
@@ -275,6 +355,19 @@ export class PluginSettingsRuntime {
     const normalizedApiEndpoint = normalizeVaultGuardApiBaseUrl(this.settings.apiEndpoint);
     const apiEndpointChanged = normalizedApiEndpoint !== this.ctx.configuredApiEndpoint;
     this.settings.apiEndpoint = normalizedApiEndpoint;
+    Object.assign(
+      this.settings,
+      normalizeInterfacePreferences(this.settings as unknown as Record<string, unknown>),
+    );
+    this.settings.automationRegistry = normalizeAutomationRegistry(
+      this.settings.automationRegistry,
+    );
+    this.settings.loginVerificationMode = normalizeLoginVerificationMode(
+      this.settings.loginVerificationMode,
+    );
+    this.settings.agentTemplateAllowlist = normalizeAgentTemplateAllowlist(
+      this.settings.agentTemplateAllowlist,
+    );
     await this.ctx.savePluginData();
 
     if (apiEndpointChanged) {
@@ -382,6 +475,7 @@ export class PluginSettingsRuntime {
     cognitoUserPoolId: string;
     cognitoClientId: string;
     organizationId: string;
+    loginVerificationMode: LoginVerificationMode;
   } {
     if (this.settings.manualConfig) {
       return {
@@ -389,6 +483,7 @@ export class PluginSettingsRuntime {
         cognitoUserPoolId: this.settings.cognitoUserPoolId,
         cognitoClientId: this.settings.cognitoClientId,
         organizationId: this.settings.organizationId,
+        loginVerificationMode: this.settings.loginVerificationMode,
       };
     }
     return {
@@ -396,6 +491,7 @@ export class PluginSettingsRuntime {
       cognitoUserPoolId: this.settings.cognitoUserPoolId || SAAS_DEFAULTS.cognitoUserPoolId,
       cognitoClientId: this.settings.cognitoClientId || SAAS_DEFAULTS.cognitoClientId,
       organizationId: this.settings.organizationId,
+      loginVerificationMode: this.settings.loginVerificationMode,
     };
   }
 
@@ -1086,6 +1182,9 @@ export class PluginSettingsRuntime {
     this.settings.organizationId = organizationId;
     this.settings.cognitoUserPoolId = cognitoUserPoolId;
     this.settings.cognitoClientId = cognitoClientId;
+    this.settings.loginVerificationMode = normalizeLoginVerificationMode(
+      config.loginVerificationMode,
+    );
     this.cacheServerCapabilities(config);
   }
 
@@ -1165,6 +1264,7 @@ export class PluginSettingsRuntime {
     this.settings.organizationId = "";
     this.settings.cognitoUserPoolId = "";
     this.settings.cognitoClientId = "";
+    this.settings.loginVerificationMode = "disabled";
     this.settings.serverEdition = undefined;
     this.settings.serverFeatures = undefined;
     this.settings.serverFeaturesResolvedAt = undefined;

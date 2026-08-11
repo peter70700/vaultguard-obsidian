@@ -63,7 +63,7 @@ table below for the side-by-side comparison.
 
 ---
 
-## Repository-root vaults and Local Project Memory Mode
+## Repository folders and plaintext modes
 
 Local at-rest encryption is not safe for Obsidian vaults whose root is also a
 development repository root. In that layout, source files, package files,
@@ -71,10 +71,26 @@ tests, Terraform, docs, reports, and agent-memory files must remain plaintext
 for Git, editors, package managers, CI-style checks, and coding agents that
 read files directly from disk.
 
-Use [Local Project Memory Mode](LOCAL-PROJECT-MEMORY-MODE.md) for repo-root
-vaults. That mode disables the at-rest layer, encrypt-on-write behavior,
-encrypt-all/background migration jobs, sync, share links, server vault binding,
-and organization/company/team controls for the current vault.
+For a whole repo-root vault that must also remain local-only, use [Local Project
+Memory Mode](LOCAL-PROJECT-MEMORY-MODE.md). That explicit per-vault mode disables
+the at-rest layer, encrypt-on-write behavior, encrypt-all/background migration
+jobs, sync, share links, server vault binding, and organization/company/team
+controls for the current vault.
+
+For vault-root or nested repositories that should remain locally plaintext
+while cloud behavior stays active, enable **Detect Git repo folder**. This
+profile-wide desktop preference detects a direct `.git` directory or
+worktree-style `.git` file and excludes that repository root and its descendants
+from local at-rest encryption only. It does not add paths to the sync exclusion
+list or change cloud encryption, sync, permissions, sharing, authentication,
+server binding, or organization features.
+
+Repository discovery runs after raw adapter delegates are captured and before
+cipher initialization. After the cipher is ready, a targeted pass converts
+residual `VG1\0` files under detected roots to byte-identical plaintext. Mixed
+state reads still inspect raw bytes and route `VG1` text, binary, and media
+through the cipher; conversion failures restore the original bytes and report a
+vault-relative failure without returning ciphertext to Obsidian as content.
 
 "Local-only" by itself does not mean plaintext. Organization sharing and remote
 sync are cloud-layer features, while at-rest encryption is a separate local
@@ -256,9 +272,12 @@ The plugin never at-rest-encrypts:
   loads. Encrypting any of these would brick the install.
 - The `.trash/` directory — Obsidian's trash UX expects readable files.
 - Anything in the user's `excludedPaths` setting (sync exclusion list).
+- When **Detect Git repo folder** is enabled on desktop, each currently detected
+  repository root and its descendants. This is an at-rest-only exclusion and is
+  deliberately not copied into `excludedPaths`.
 
-The check is `isAtRestExcluded()` in `main.ts`, a superset of the
-sync-level `isPathExcluded()`.
+The check is `isAtRestExcluded()` in `src/plugin/at-rest-adapter-runtime.ts`, a
+superset of the sync-level `isPathExcluded()`.
 
 ### Protected plugin-cache envelopes
 
@@ -591,6 +610,34 @@ people. They are complementary, not redundant.
 
 ---
 
+## Agent semantic mutations
+
+AC-01 through AC-03 and template insertion/creation are `Implemented` through
+the Agent Bridge's injected plaintext dependencies. The bridge wiring supplies
+at-rest-safe `readText` and `writeText` helpers to
+`src/plugin/agent-semantic-mutation.ts`; note/property/task transforms in
+`src/plugin/agent-note-operations.ts` never call raw adapter methods or
+`processFrontMatter`. Expected hashes, confirmation, a post-confirmation
+reread, per-path serialization, exact readback, and content-redacted receipts
+remain part of that boundary.
+
+Governed automation may observe a postcondition through the same approved
+plaintext boundary, but raw Obsidian command execution is not a replacement
+for VaultGuard file authorization or at-rest helpers. Exact historical-version
+read/restore is different again: `src/api/client.ts` and the file Lambda use
+cloud DEKs and vault-scoped authenticated routes. The LAK described in this
+document is not sent to the history provider and is not used to decrypt S3
+versions. See [Agent Command Expansion](AGENT-COMMAND-EXPANSION.md) and
+[Vault Scoping](VAULTS.md).
+
+Representative automated seams are
+`tests/agent-semantic-mutation.test.ts`,
+`tests/agent-command-bridge-integration.test.ts`, and the at-rest runtime tests.
+No physical encrypted-vault Agent Bridge exercise was performed in this
+documentation pass.
+
+---
+
 ## Code map
 
 - `src/crypto/at-rest-cipher.ts` — owns the LAK, file format, recovery
@@ -611,6 +658,10 @@ people. They are complementary, not redundant.
   gate).
 - `src/plugin/settings.ts` — `renderAtRestSection()`,
   `renderAtRestStatusBadge()`.
+- `src/plugin/agent-bridge-wiring.ts`,
+  `src/plugin/agent-semantic-mutation.ts`, and
+  `src/plugin/agent-note-operations.ts` — at-rest-safe dependency injection,
+  optimistic semantic mutation coordination, and pure Markdown transforms.
 - `tests/at-rest-cipher.test.ts` — round-trip, format, recovery,
   tamper detection, format tolerance.
 

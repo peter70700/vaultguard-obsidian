@@ -481,6 +481,12 @@ export type SemanticIndexState =
 /** Provider-key storage boundary selected explicitly by the user. */
 export type ProviderKeyStorageMode = "vaultguard" | "obsidian";
 
+/** Status-bar presentation selected by the user. */
+export type StatusBarMode = "full" | "compact" | "hidden";
+
+/** Server-advertised one-time human-verification posture for fresh logins. */
+export type LoginVerificationMode = "disabled" | "observe" | "enforce";
+
 export interface VaultGuardSettings {
   /**
    * Per-vault UUID used only as a fallback binding ID when the runtime
@@ -513,6 +519,12 @@ export interface VaultGuardSettings {
   cognitoUserPoolId: string;
   /** Cognito App Client ID (auto-filled from org config or manual) */
   cognitoClientId: string;
+  /**
+   * Trusted public login-verification posture advertised by the resolved
+   * server config. Invalid, absent, and cleared values normalize to disabled;
+   * clients must never infer this mode from the presence of a secret or URL.
+   */
+  loginVerificationMode: LoginVerificationMode;
   /**
    * Last backend edition advertised by `GET /orgs/{slug}/config`.
    * Persisted so Community Edition UI gating survives plugin restarts.
@@ -554,13 +566,27 @@ export interface VaultGuardSettings {
   debugLogging: boolean;
   /** Maximum number of retry attempts for failed API calls */
   maxRetryAttempts: number;
-  /** Whether to show sync status in the status bar */
+  /**
+   * Legacy status-bar visibility mirror. New code reads `statusBarMode`; this
+   * field remains required so older VaultGuard versions and persisted data stay
+   * compatible during migration.
+   */
   showStatusBar: boolean;
   /**
-   * Whether the dedicated AI-chat + permissions-graph quick-access ribbon icons
-   * are shown. Defaults to true; the VaultGuard menu (shield) icon is always shown.
+   * Status-bar presentation. `compact` shortens only routine connection state;
+   * alarms, authentication state, permission loading, and long operations keep
+   * their full text. `hidden` replaces the legacy `showStatusBar: false` choice.
+   */
+  statusBarMode: StatusBarMode;
+  /**
+   * Legacy combined quick-access ribbon preference. New code reads the two
+   * granular fields below; this field remains for persisted-data compatibility.
    */
   showRibbonIcons: boolean;
+  /** Show the dedicated AI Chat ribbon icon. The VaultGuard shield is permanent. */
+  showAiChatRibbonIcon: boolean;
+  /** Show the dedicated permissions-graph ribbon icon. */
+  showPermissionsGraphRibbonIcon: boolean;
   /**
    * Plaintext repo-root mode for using an Obsidian vault as local project
    * memory. Disables local at-rest encryption, sync, sharing, and org/team
@@ -575,8 +601,8 @@ export interface VaultGuardSettings {
    */
   localProjectMemoryModeAutoEnableSuppressed: boolean;
   /**
-   * Mainstream installs start with advanced modules off. A one-time migration
-   * enables them for established installs that predate this preference.
+   * AI Chat and Permissions Graph start on; Agent Access can migrate on for
+   * established installs, while Secure Discovery always starts off.
    */
   optionalModules: OptionalModulePreferences;
   /** Second consent inside Secure Discovery; never enabled by migration. */
@@ -587,6 +613,17 @@ export interface VaultGuardSettings {
   semanticEmbeddingModel: string;
   /** Default bounded result count shared by the view and CLI. */
   discoveryResultLimit: number;
+  /**
+   * Human-managed, default-disabled semantic alias registry for governed
+   * desktop Obsidian command execution. Backing command identifiers remain
+   * private from agents.
+   */
+  automationRegistry: import("../plugin/agent-automation-registry").AutomationRegistrySettings;
+  /**
+   * Exact vault-relative Markdown template paths agents may use. Empty means
+   * no template is trusted; loading and saving normalize this list fail closed.
+   */
+  agentTemplateAllowlist: string[];
   /** Whether to use manual connection configuration instead of org slug auto-config */
   manualConfig?: boolean;
   /**
@@ -708,6 +745,11 @@ export interface VaultGuardSettings {
   openAiModel: string;
   /** ChatGPT subscription model id requested through the OpenAI Codex runtime. */
   codexModel: string;
+  /**
+   * Follow the newest account-visible ChatGPT subscription model automatically.
+   * Missing persisted values normalize to true; an explicit model choice disables it.
+   */
+  codexAutoSelectLatest?: boolean;
   /** Reasoning effort for OpenAI Responses API turns (default "medium"). */
   openAiReasoningEffort: OpenAiReasoningEffort;
   /** Text verbosity for OpenAI Responses API turns (default "medium"). */

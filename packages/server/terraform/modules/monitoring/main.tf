@@ -118,6 +118,27 @@ resource "aws_cloudwatch_metric_alarm" "kms_failures" {
   tags = { Name = "vaultguard-${var.stage}-kms-decrypt-failures" }
 }
 
+# Alarm: a durable vault mutation could not publish its activity/revision row.
+# Clients fail over to a full scan while the pending outbox row is reconciled,
+# but operators must investigate repeated occurrences.
+resource "aws_cloudwatch_metric_alarm" "vault_mutation_reconciliation" {
+  alarm_name          = "vaultguard-${var.stage}-mutation-reconciliation"
+  alarm_description   = "Durable vault mutations are awaiting activity/cursor reconciliation"
+  namespace           = "ObsidianVaultGuard"
+  metric_name         = "VaultMutationReconciliationRequired"
+  dimensions          = { Stage = var.stage }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.admin.arn]
+
+  tags = { Name = "vaultguard-${var.stage}-mutation-reconciliation" }
+}
+
 # Alarm: API 4xx error spike (scanning / credential stuffing)
 resource "aws_cloudwatch_metric_alarm" "api_4xx" {
   alarm_name        = "vaultguard-${var.stage}-api-4xx-spike"

@@ -7,7 +7,16 @@
 // the model as a tool_result and let the model re-plan. Only transport/auth
 // failures (raised by the AnthropicClient, not here) abort a turn.
 
-import type { AgentBridgeToolSurface } from "../../plugin/agent-bridge";
+import type {
+  AgentBridgeAutomationArgs,
+  AgentBridgeNoteArgs,
+  AgentBridgePropertyArgs,
+  AgentBridgeReadArgs,
+  AgentBridgeTaskArgs,
+  AgentBridgeTemplateArgs,
+  AgentBridgeToolSurface,
+} from "../../plugin/agent-bridge";
+import type { AgentInspectionQuery } from "../../plugin/agent-inspection-service";
 import type { GraphArgs } from "../../plugin/graph/graph-types";
 
 export interface ToolResult {
@@ -39,7 +48,7 @@ export class VaultToolRuntime {
             ),
           );
         case "vaultguard_read":
-          return ok(await this.surface.read(this.leaseId, input as { path: string; maxBytes?: number }));
+          return ok(await this.surface.read(this.leaseId, input as unknown as AgentBridgeReadArgs));
         case "vaultguard_get_vault_orientation":
           return ok(
             await this.surface.getVaultOrientation(
@@ -64,6 +73,26 @@ export class VaultToolRuntime {
           // Read-only structural navigation. Service errors (bad op, missing
           // path/tag, permission gate) still surface as { isError: true }.
           return ok(await this.surface.graph(this.leaseId, input as unknown as GraphArgs));
+        case "vaultguard_note":
+          return ok(await this.surface.note(this.leaseId, input as unknown as AgentBridgeNoteArgs));
+        case "vaultguard_property":
+          return ok(
+            await this.surface.property(this.leaseId, input as unknown as AgentBridgePropertyArgs),
+          );
+        case "vaultguard_task":
+          return ok(await this.surface.task(this.leaseId, input as unknown as AgentBridgeTaskArgs));
+        case "vaultguard_inspect":
+          return ok(await this.surface.inspect(this.leaseId, input as unknown as AgentInspectionQuery));
+        case "vaultguard_template":
+          return ok(
+            await this.surface.template(this.leaseId, input as unknown as AgentBridgeTemplateArgs),
+          );
+        case "vaultguard_sync_status":
+          return ok(await this.surface.syncStatus(this.leaseId, input as Record<string, never>));
+        case "vaultguard_automation":
+          return ok(
+            await this.surface.automation(this.leaseId, input as unknown as AgentBridgeAutomationArgs),
+          );
         case "vaultguard_access":
           // Permission/membership queries. Gate failures (lease lacks the
           // capability, ambiguous user, no connection, backend 403) surface as
@@ -117,7 +146,15 @@ export class VaultToolRuntime {
           return ok(
             await this.surface.files(
               this.leaseId,
-              input as { op: string; path?: string; limit?: number },
+              input as {
+                op: string;
+                path?: string;
+                limit?: number;
+                versionId?: string;
+                compareVersionId?: string;
+                expectedCurrentVersionId?: string;
+                maxBytes?: number;
+              },
             ),
           );
         case "vaultguard_share":

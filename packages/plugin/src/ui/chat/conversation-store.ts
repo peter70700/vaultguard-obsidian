@@ -12,6 +12,12 @@
 
 import type { AnthropicConversationMessage } from "./anthropic-client";
 import type { AgentBridgeAskUserArgs, AgentBridgeConfirmAction } from "../../plugin/agent-bridge";
+import {
+  MAX_DOCUMENT_BYTES,
+  MAX_DOCUMENT_PINS,
+  sanitizeAttachmentName,
+  type DocumentPin,
+} from "./attachment-model";
 
 const LOG_PREFIX = "[VaultGuard Chat]";
 const ENVELOPE_SUFFIX = ".json.envelope";
@@ -64,6 +70,52 @@ export interface Conversation {
    * instead of the session silently vanishing ("expired") after the first turn.
    */
   importSourceRoot?: string | null;
+  /** Reference metadata only; persisted solely inside this encrypted payload. */
+  documentPins?: DocumentPin[];
+}
+
+const DOCUMENT_FORMATS = new Set(["text", "html", "csv", "docx", "pdf"]);
+const DOCUMENT_PIN_KEYS = new Set([
+  "id", "displayName", "format", "mediaType", "byteLength", "sourcePath",
+  "canonicalPath", "addedAt", "state", "errorCode",
+]);
+
+export function normalizeStoredDocumentPins(value: unknown): DocumentPin[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.length > MAX_DOCUMENT_PINS) return undefined;
+  const pins: DocumentPin[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const record = raw as Record<string, unknown>;
+    if (Object.keys(record).some((key) => !DOCUMENT_PIN_KEYS.has(key))) continue;
+    if (
+      typeof record.id !== "string" || !record.id || record.id.length > 128 ||
+      typeof record.displayName !== "string" ||
+      typeof record.format !== "string" || !DOCUMENT_FORMATS.has(record.format) ||
+      typeof record.mediaType !== "string" || !record.mediaType ||
+      typeof record.byteLength !== "number" || !Number.isSafeInteger(record.byteLength) ||
+      record.byteLength < 0 || record.byteLength > MAX_DOCUMENT_BYTES ||
+      typeof record.sourcePath !== "string" || !record.sourcePath || record.sourcePath.includes("\0") ||
+      typeof record.canonicalPath !== "string" || !record.canonicalPath || record.canonicalPath.includes("\0") ||
+      typeof record.addedAt !== "number" || !Number.isFinite(record.addedAt)
+    ) continue;
+    const state = record.state === "unavailable" ? "unavailable" : "ready";
+    pins.push({
+      id: record.id,
+      displayName: sanitizeAttachmentName(record.displayName, "document"),
+      format: record.format as DocumentPin["format"],
+      mediaType: record.mediaType,
+      byteLength: record.byteLength,
+      sourcePath: record.sourcePath,
+      canonicalPath: record.canonicalPath,
+      addedAt: record.addedAt,
+      state,
+      ...(typeof record.errorCode === "string"
+        ? { errorCode: record.errorCode as DocumentPin["errorCode"] }
+        : {}),
+    });
+  }
+  return pins.length > 0 ? pins : undefined;
 }
 
 // A deferred confirmation attached to a paused question. When present, the
@@ -116,7 +168,11 @@ export class ConversationStore {
       return false;
     }
     try {
-      const plaintext = JSON.stringify(convo);
+      const persistable: Conversation = {
+        ...convo,
+        documentPins: normalizeStoredDocumentPins(convo.documentPins),
+      };
+      const plaintext = JSON.stringify(persistable);
       const cipherBytes = await this.cipher.encryptString(plaintext);
       await this.adapter.writeBinary(this.fileName(convo.id), cipherBytes);
       return true;
@@ -139,6 +195,7 @@ export class ConversationStore {
       const plaintext = await this.cipher.decryptString(bytes);
       const parsed = JSON.parse(plaintext) as Conversation;
       if (!parsed || typeof parsed.id !== "string") return null;
+      parsed.documentPins = normalizeStoredDocumentPins(parsed.documentPins);
       return parsed;
     } catch (err) {
       console.warn(`${LOG_PREFIX} Failed to load conversation ${id}:`, err);

@@ -84,8 +84,9 @@ export interface AtRestStorage {
    * Enumerate EVERY managed VG1-headed file for restore-time validation,
    * smallest-first (fast refusal). MUST THROW on any enumeration/read error —
    * the caller treats an error as "cannot verify" and refuses the restore
-   * (fail-closed). Do NOT swallow per-file read failures the way
-   * `hasExistingCiphertext` does (that swallow is tracked as SD-05-F5).
+   * (fail-closed). Production `hasExistingCiphertext` follows the same rule;
+   * implementations must never convert an unreadable candidate into proof
+   * that no ciphertext exists.
    * Implementations that omit this hook keep the legacy no-validation restore,
    * which is safe only for in-memory test mocks with no vault to scan.
    */
@@ -215,9 +216,20 @@ export class AtRestCipher {
       }
       // First-time provisioning: no envelope AND no existing ciphertext.
       const fresh = crypto.getRandomValues(new Uint8Array(KEY_LEN));
-      const blob = await this.wrapLak(fresh);
-      await this.storage.saveWrappedLak(blob);
-      this.lak = fresh;
+      try {
+        const blob = await this.wrapLak(fresh);
+        await this.storage.saveWrappedLak(blob);
+        this.lak = fresh;
+      } catch (error) {
+        fresh.fill(0);
+        this.status = {
+          kind: "needs-recovery",
+          reason: `Could not persist the newly generated local at-rest key safely: ${
+            error instanceof Error ? error.message : String(error)
+          }. No encrypted vault content was created. Fix local storage access and reopen the vault to retry.`,
+        };
+        return false;
+      }
     } else {
       try {
         this.lak = await this.unwrapLak(probe.blob);
@@ -298,11 +310,11 @@ export class AtRestCipher {
   async reset(): Promise<void> {
     this.lock();
     await this.storage.clearWrappedLak();
-    try {
-      await this.storage.clearFallbackKek?.();
-    } catch {
-      // Vault-local fallback storage unavailable in some hosts (tests) — ignore.
-    }
+    // Key deletion is part of reset's security result, not best-effort
+    // housekeeping. If the fallback KEK survives, a caller must receive a
+    // failure and present recovery guidance rather than being told that all
+    // on-disk key material was removed.
+    await this.storage.clearFallbackKek?.();
     this.status = { kind: "uninitialized" };
   }
 
@@ -498,22 +510,31 @@ export class AtRestCipher {
     // disk for an attacker with the entire profile dir) but still defeats
     // bare filesystem inspection of the vault folder.
     const kek = await this.getOrCreateFallbackKek();
-    const cryptoKek = await crypto.subtle.importKey(
-      "raw",
-      kek as BufferSource,
-      { name: "AES-GCM" },
-      false,
-      ["encrypt", "decrypt"]
-    );
-    const nonce = crypto.getRandomValues(new Uint8Array(NONCE_LEN));
-    const wrapped = new Uint8Array(
-      await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: nonce as BufferSource },
-        cryptoKek,
-        lak as BufferSource
-      )
-    );
-    return `ls:${this.bytesToBase64(nonce)}:${this.bytesToBase64(wrapped)}`;
+    try {
+      const cryptoKek = await crypto.subtle.importKey(
+        "raw",
+        kek as BufferSource,
+        { name: "AES-GCM" },
+        false,
+        ["encrypt", "decrypt"]
+      );
+      const nonce = crypto.getRandomValues(new Uint8Array(NONCE_LEN));
+      const wrapped = new Uint8Array(
+        await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv: nonce as BufferSource },
+          cryptoKek,
+          lak as BufferSource
+        )
+      );
+      try {
+        return `ls:${this.bytesToBase64(nonce)}:${this.bytesToBase64(wrapped)}`;
+      } finally {
+        nonce.fill(0);
+        wrapped.fill(0);
+      }
+    } finally {
+      kek.fill(0);
+    }
   }
 
   private async unwrapLak(blob: string): Promise<Uint8Array> {
@@ -526,9 +547,13 @@ export class AtRestCipher {
         );
       }
       const wrapped = this.base64ToBytes(blob.slice(3));
-      const decoded = this.safeStorage.decryptString(wrapped);
-      this.method = "safe-storage";
-      return this.base64ToBytes(decoded);
+      try {
+        const decoded = this.safeStorage.decryptString(wrapped);
+        this.method = "safe-storage";
+        return this.base64ToBytes(decoded);
+      } finally {
+        wrapped.fill(0);
+      }
     }
     if (blob.startsWith("ls:")) {
       const [, nonceB64, ctB64] = blob.split(":");
@@ -552,49 +577,56 @@ export class AtRestCipher {
       // still-recoverable KEK and PERMANENTLY orphan the LAK. A fresh random KEK
       // can never unwrap a pre-existing LAK anyway. If nothing unwraps we throw,
       // and init() routes to needs-recovery — non-destructive and retryable.
-      const candidates = await this.loadFallbackKekCandidates();
-      if (candidates.length === 0) {
-        throw new Error(
-          "The device-local fallback KEK is missing or unreadable — cannot unwrap the local at-rest key. This is usually transient (reopen the vault) or recoverable via your recovery code."
-        );
-      }
-      let lastErr: unknown = null;
-      for (const kek of candidates) {
-        try {
-          const cryptoKek = await crypto.subtle.importKey(
-            "raw",
-            kek as BufferSource,
-            { name: "AES-GCM" },
-            false,
-            ["encrypt", "decrypt"]
+      let candidates: Uint8Array[] = [];
+      try {
+        candidates = await this.loadFallbackKekCandidates();
+        if (candidates.length === 0) {
+          throw new Error(
+            "The device-local fallback KEK is missing or unreadable — cannot unwrap the local at-rest key. This is usually transient (reopen the vault) or recoverable via your recovery code."
           );
-          const lak = new Uint8Array(
-            await crypto.subtle.decrypt(
-              { name: "AES-GCM", iv: nonce as BufferSource },
-              cryptoKek,
-              ct as BufferSource
-            )
-          );
-          // Heal divergence: converge both homes on the KEK that actually works,
-          // so a poisoned/partial localStorage can't keep shadowing the good
-          // durable KEK on later loads. Best-effort — never blocks the unwrap.
-          if (this.storage.saveFallbackKek) {
-            try {
-              await this.storage.saveFallbackKek(this.bytesToBase64(kek));
-            } catch {
-              // ignore — the unwrap already succeeded
-            }
-          }
-          return lak;
-        } catch (err) {
-          lastErr = err;
         }
+        let lastErr: unknown = null;
+        for (const kek of candidates) {
+          try {
+            const cryptoKek = await crypto.subtle.importKey(
+              "raw",
+              kek as BufferSource,
+              { name: "AES-GCM" },
+              false,
+              ["encrypt", "decrypt"]
+            );
+            const lak = new Uint8Array(
+              await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: nonce as BufferSource },
+                cryptoKek,
+                ct as BufferSource
+              )
+            );
+            // Heal divergence: converge both homes on the KEK that actually works,
+            // so a poisoned/partial localStorage can't keep shadowing the good
+            // durable KEK on later loads. Best-effort — never blocks the unwrap.
+            if (this.storage.saveFallbackKek) {
+              try {
+                await this.storage.saveFallbackKek(this.bytesToBase64(kek));
+              } catch {
+                // ignore — the unwrap already succeeded
+              }
+            }
+            return lak;
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+        throw new Error(
+          `Could not unwrap the local at-rest key with any available device KEK: ${
+            lastErr instanceof Error ? lastErr.message : String(lastErr)
+          }`
+        );
+      } finally {
+        for (const candidate of candidates) candidate.fill(0);
+        nonce.fill(0);
+        ct.fill(0);
       }
-      throw new Error(
-        `Could not unwrap the local at-rest key with any available device KEK: ${
-          lastErr instanceof Error ? lastErr.message : String(lastErr)
-        }`
-      );
     }
     throw new Error("Unknown wrapped LAK envelope format.");
   }
@@ -643,7 +675,12 @@ export class AtRestCipher {
       return this.base64ToBytes(existing);
     }
     const fresh = crypto.getRandomValues(new Uint8Array(KEY_LEN));
-    await this.storage.saveFallbackKek(this.bytesToBase64(fresh));
+    try {
+      await this.storage.saveFallbackKek(this.bytesToBase64(fresh));
+    } catch (error) {
+      fresh.fill(0);
+      throw error;
+    }
     this.method = "localstorage-fallback";
     return fresh;
   }
@@ -727,108 +764,121 @@ export class AtRestCipher {
     const lakHex = body.slice(0, KEY_LEN * 2);
     const checksumHex = body.slice(KEY_LEN * 2);
     const candidate = this.hexToBytes(lakHex);
-    const expected = await this.recoveryChecksum(candidate);
-    if (this.bytesToHex(expected).toUpperCase() !== checksumHex) {
-      return { ok: false, reason: "malformed" };
-    }
+    const previousMethod = this.method;
+    let candidateAdopted = false;
+    let wrappingCommitted = false;
+    try {
+      const expected = await this.recoveryChecksum(candidate);
+      try {
+        if (this.bytesToHex(expected).toUpperCase() !== checksumHex) {
+          return { ok: false, reason: "malformed" };
+        }
+      } finally {
+        expected.fill(0);
+      }
 
-    // Probe safeStorage in case it wasn't probed yet (e.g. the cipher
-    // failed init and the caller is restoring directly).
-    if (!this.safeStorage) this.safeStorage = probeSafeStorage();
+      // Probe safeStorage in case it wasn't probed yet (e.g. the cipher
+      // failed init and the caller is restoring directly).
+      if (!this.safeStorage) this.safeStorage = probeSafeStorage();
 
     // ── Step 1: idempotency fast path ────────────────────────────────────────
     // The code that produced the CURRENT LAK. Nothing about the vault changes,
     // so skip validation AND the confirm gate; re-wrapping self-heals a damaged
     // envelope. The live key and any PIN enrollment are left exactly as they are.
-    if (this.lak && this.constantTimeEquals(candidate, this.lak)) {
-      const sameBlob = await this.wrapLakBytes(candidate);
-      await this.storage.saveWrappedLak(sameBlob);
-      candidate.fill(0);
-      this.status = { kind: "unlocked", method: this.method! };
-      return { ok: true, outcome: "restored", continuity: "same-key" };
-    }
+      if (this.lak && this.constantTimeEquals(candidate, this.lak)) {
+        const sameBlob = await this.wrapLakBytes(candidate);
+        await this.storage.saveWrappedLak(sameBlob);
+        wrappingCommitted = true;
+        this.status = { kind: "unlocked", method: this.method! };
+        return { ok: true, outcome: "restored", continuity: "same-key" };
+      }
 
     // ── Step 2: prove the candidate opens this vault's existing ciphertext ───
-    const list = this.storage.listCiphertextForValidation;
-    const canValidate = typeof list === "function";
-    let sampleCount = 0;
-    let continuity: AtRestRestoreContinuity = "unvalidated";
+      const list = this.storage.listCiphertextForValidation;
+      const canValidate = typeof list === "function";
+      let sampleCount = 0;
+      let continuity: AtRestRestoreContinuity = "unvalidated";
 
-    if (canValidate) {
-      let probeKey: CryptoKey;
-      try {
-        probeKey = await crypto.subtle.importKey(
-          "raw",
-          candidate as BufferSource,
-          { name: "AES-GCM" },
-          false,
-          ["decrypt"]
-        );
-      } catch {
-        // Cannot even build the probe key ⇒ cannot answer the question.
-        candidate.fill(0);
-        return { ok: false, reason: "validation-error" };
-      }
-
-      let mismatch = false;
-      try {
-        for await (const sample of list.call(this.storage)) {
-          sampleCount++;
-          try {
-            await this.probeDecryptWithKey(probeKey, sample.bytes);
-          } catch {
-            // Fail fast on the FIRST file this key cannot open. `break` ends the
-            // iterator cleanly, so a later enumeration error can no longer mask
-            // an already-proven mismatch.
-            mismatch = true;
-            break;
-          }
+      if (canValidate) {
+        let probeKey: CryptoKey;
+        try {
+          probeKey = await crypto.subtle.importKey(
+            "raw",
+            candidate as BufferSource,
+            { name: "AES-GCM" },
+            false,
+            ["decrypt"]
+          );
+        } catch {
+          // Cannot even build the probe key ⇒ cannot answer the question.
+          return { ok: false, reason: "validation-error" };
         }
-      } catch {
-        // Fail closed (DESIGN §3.4): an enumeration/read failure means we could
-        // not answer "does this key open every file?", so we refuse. Nothing has
-        // been persisted and the live key/status are untouched.
-        candidate.fill(0);
-        return { ok: false, reason: "validation-error" };
+
+        let mismatch = false;
+        try {
+          for await (const sample of list.call(this.storage)) {
+            sampleCount++;
+            try {
+              await this.probeDecryptWithKey(probeKey, sample.bytes);
+            } catch {
+              // Fail fast on the FIRST file this key cannot open. `break` ends the
+              // iterator cleanly, so a later enumeration error can no longer mask
+              // an already-proven mismatch.
+              mismatch = true;
+              break;
+            }
+          }
+        } catch {
+          // Fail closed (DESIGN §3.4): an enumeration/read failure means we could
+          // not answer "does this key open every file?", so we refuse. Nothing has
+          // been persisted and the live key/status are untouched.
+          return { ok: false, reason: "validation-error" };
+        }
+        if (mismatch) {
+          return { ok: false, reason: "key-mismatch" };
+        }
+        continuity = sampleCount > 0 ? "verified" : "replaced";
       }
-      if (mismatch) {
-        candidate.fill(0);
-        return { ok: false, reason: "key-mismatch" };
-      }
-      continuity = sampleCount > 0 ? "verified" : "replaced";
-    }
 
     // ── Step 3: healthy-replace confirm gate ─────────────────────────────────
     // Reachable ONLY when there was no ciphertext to validate against (step 2
     // proved nothing) and a working live key would be replaced. `confirmReplace`
     // is read here and nowhere else, so it can never skip step 2.
-    if (
-      canValidate &&
-      sampleCount === 0 &&
-      this.status.kind === "unlocked" &&
-      this.lak !== null &&
-      !opts?.confirmReplace
-    ) {
-      candidate.fill(0);
-      return { ok: false, reason: "needs-confirmation" };
+      if (
+        canValidate &&
+        sampleCount === 0 &&
+        this.status.kind === "unlocked" &&
+        this.lak !== null &&
+        !opts?.confirmReplace
+      ) {
+        return { ok: false, reason: "needs-confirmation" };
+      }
+
+      // ── Step 4: commit ───────────────────────────────────────────────────────
+      // Import first so a platform/import failure cannot occur after the new
+      // envelope has been persisted. Only after both import and persistence
+      // succeed do we atomically replace the in-memory LAK/CryptoKey pair.
+      const candidateCryptoKey = await crypto.subtle.importKey(
+        "raw",
+        candidate as BufferSource,
+        { name: "AES-GCM" },
+        false,
+        ["encrypt", "decrypt"]
+      );
+      const blob = await this.wrapLakBytes(candidate);
+      await this.storage.saveWrappedLak(blob);
+
+      if (this.lak) this.lak.fill(0);
+      this.lak = candidate;
+      this.cryptoKey = candidateCryptoKey;
+      candidateAdopted = true;
+      wrappingCommitted = true;
+      this.status = { kind: "unlocked", method: this.method! };
+      return { ok: true, outcome: "restored", continuity };
+    } finally {
+      if (!candidateAdopted) candidate.fill(0);
+      if (!wrappingCommitted) this.method = previousMethod;
     }
-
-    // ── Step 4: commit (persisting is the LAST thing that happens) ───────────
-    const blob = await this.wrapLakBytes(candidate);
-    await this.storage.saveWrappedLak(blob);
-
-    if (this.lak) this.lak.fill(0);
-    // `candidate` is adopted by reference from here on — never zero it below.
-    this.lak = candidate;
-    this.cryptoKey = await crypto.subtle.importKey(
-      "raw",
-      this.lak as BufferSource,
-      { name: "AES-GCM" },
-      false,
-      ["encrypt", "decrypt"]
-    );
-    this.status = { kind: "unlocked", method: this.method! };
-    return { ok: true, outcome: "restored", continuity };
   }
 
   /** Length-checked, branch-free byte compare (no early exit on first mismatch). */

@@ -48,12 +48,20 @@ export interface AnthropicImageBlock {
   type: "image";
   source: { type: "base64"; media_type: string; data: string };
 }
+/** Transient user-side PDF input. Document bytes are never persisted in chat history. */
+export interface AnthropicDocumentBlock {
+  type: "document";
+  source: { type: "base64"; media_type: "application/pdf"; data: string };
+  title?: string;
+  citations?: { enabled: boolean };
+}
 
 export type AnthropicContentBlock =
   | AnthropicTextBlock
   | AnthropicThinkingBlock
   | AnthropicToolUseBlock
-  | AnthropicImageBlock;
+  | AnthropicImageBlock
+  | AnthropicDocumentBlock;
 
 // A tool_result block is sent back to the model inside a user turn.
 export interface AnthropicToolResultBlock {

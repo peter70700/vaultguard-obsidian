@@ -385,7 +385,11 @@ export class RecoveryCenterModal extends Modal {
     );
     if (!confirmed) return;
     try {
-      await this.cfg.apiClient.restoreFileVersion(this.path, version.versionId);
+      const current = this.history.items.find((candidate) => candidate.isLatest);
+      if (!current?.versionId) {
+        throw new Error("Current version is unavailable; reload history before restoring.");
+      }
+      await this.cfg.apiClient.restoreFileVersion(this.path, version.versionId, current.versionId);
       await this.cfg.onRestored?.();
       new Notice(`VaultGuard: Restored a previous version of "${this.path}".`);
       await this.loadCurrent(false);

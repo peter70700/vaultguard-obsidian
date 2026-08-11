@@ -19,7 +19,6 @@ import {
   AdminGetUserCommand,
   CreateGroupCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
-import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import {
   docClient,
   logAudit,
@@ -48,13 +47,30 @@ import {
 import { EDITION, FEATURES } from '../shared/edition';
 import { sendMetaEvent } from '../shared/meta-capi';
 import { sendEmail } from '../email/handler';
+import {
+  loadTurnstileSecret,
+  verifyTurnstileProof,
+} from '../shared/turnstile';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 const REGION = process.env.AWS_REGION || 'eu-central-1';
 const USER_POOL_ID = process.env.USER_POOL_ID!;
 const CLIENT_ID = process.env.CLIENT_ID!;
+type LoginVerificationMode = 'disabled' | 'observe' | 'enforce';
+const LOGIN_VERIFICATION_MODE: LoginVerificationMode =
+  process.env.LOGIN_VERIFICATION_MODE === 'observe' ||
+  process.env.LOGIN_VERIFICATION_MODE === 'enforce'
+    ? process.env.LOGIN_VERIFICATION_MODE
+    : 'disabled';
 const TURNSTILE_SECRET_ARN = process.env.TURNSTILE_SECRET_ARN || '';
+const TURNSTILE_EXPECTED_HOSTNAMES = (
+  process.env.TURNSTILE_EXPECTED_HOSTNAMES ||
+  'admin.example.com,auth.example.com'
+)
+  .split(',')
+  .map(hostname => hostname.trim())
+  .filter(Boolean);
 
 // Fallback `event_source_url` for Meta events when the browser did not send one
 // (older admin-panel build, or a direct API call). Meta requires the field on
@@ -77,66 +93,33 @@ const cognitoClient = new CognitoIdentityProviderClient({ region: REGION });
 // When TURNSTILE_SECRET_ARN is empty (Community Edition / self-host without
 // Cloudflare), the secret resolver returns "" and verification is skipped.
 
-const smClient = new SecretsManagerClient({});
-let cachedTurnstileSecret: string | null = null;
-
 async function getTurnstileSecret(): Promise<string> {
-  if (cachedTurnstileSecret !== null) return cachedTurnstileSecret;
-  if (TURNSTILE_SECRET_ARN === '') {
-    // CE signal — do NOT cache so a redeploy that sets the ARN takes effect
-    // on the next cold start without code changes.
-    return '';
-  }
-
-  const result = await smClient.send(
-    new GetSecretValueCommand({ SecretId: TURNSTILE_SECRET_ARN })
-  );
-  if (!result.SecretString) {
-    throw new Error('Turnstile secret payload is empty');
-  }
-
-  let parsed: { secretKey?: string };
-  try {
-    parsed = JSON.parse(result.SecretString) as { secretKey?: string };
-  } catch (err) {
-    throw new Error(
-      `Failed to parse Turnstile secret JSON: ${(err as Error).message}`
-    );
-  }
-  if (!parsed.secretKey) {
-    throw new Error('Turnstile secret JSON is missing "secretKey" field');
-  }
-  cachedTurnstileSecret = parsed.secretKey;
-  return cachedTurnstileSecret;
+  return loadTurnstileSecret(TURNSTILE_SECRET_ARN);
 }
 
 async function verifyTurnstile(
   token: string,
-  remoteip: string | undefined
+  remoteip: string | undefined,
+  expectedCdata: string,
+  secret: string
 ): Promise<boolean> {
   try {
-    const secret = await getTurnstileSecret();
     if (!secret) return false;
 
-    const params = new URLSearchParams();
-    params.append('secret', secret);
-    params.append('response', token);
-    if (remoteip) params.append('remoteip', remoteip);
-
-    const response = await fetch(
-      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: params.toString(),
-      }
-    );
-    if (!response.ok) return false;
-
-    const data = (await response.json()) as { success?: boolean };
-    return data?.success === true;
-  } catch (err) {
-    console.error('[signup] Turnstile siteverify call failed', err);
+    const result = await verifyTurnstileProof({
+      secret,
+      token,
+      remoteIp: remoteip,
+      expectedHostnames: TURNSTILE_EXPECTED_HOSTNAMES,
+      expectedAction: 'vaultguard_signup',
+      expectedCdata,
+    });
+    return result.ok;
+  } catch {
+    // Keep the existing signup fail-closed behavior, but do not copy raw
+    // provider/backend errors into logs where tokens or request details may
+    // be attached by an SDK implementation.
+    console.error('[signup] Turnstile siteverify call failed');
     return false;
   }
 }
@@ -264,7 +247,13 @@ async function handleSignup(
       return formatTurnstileError('CAPTCHA challenge required.', requestId);
     }
     const remoteip = event.requestContext?.identity?.sourceIp;
-    const ok = await verifyTurnstile(turnstileToken, remoteip);
+    const expectedCdata = `signup:${String(body.orgSlug ?? '').trim().toLowerCase()}`;
+    const ok = await verifyTurnstile(
+      turnstileToken,
+      remoteip,
+      expectedCdata,
+      turnstileSecret
+    );
     if (!ok) {
       return formatTurnstileError(
         'CAPTCHA verification failed. Please try again.',
@@ -753,6 +742,7 @@ function buildWellKnownConfig(
     apiEndpoint: apiUrl || '',
     cognitoUserPoolId: USER_POOL_ID,
     cognitoClientId: CLIENT_ID,
+    loginVerificationMode: LOGIN_VERIFICATION_MODE,
     cognitoRegion: REGION,
     orgSlug: slug,
     edition: EDITION,
@@ -791,6 +781,7 @@ function buildOrgConfig(
     apiEndpoint: apiUrl || '',
     cognitoUserPoolId: USER_POOL_ID,
     cognitoClientId: CLIENT_ID,
+    loginVerificationMode: LOGIN_VERIFICATION_MODE,
     cognitoRegion: REGION,
     orgId,
     orgSlug: slug,

@@ -575,6 +575,7 @@ describe("VaultGuardPlugin uploadReconciledBinaryFile (BIN-A / D-07)", () => {
       "hash",
       "mustBeAbsent",
     ]);
+    expect(put.body.mustBeAbsent).toBe(true);
     expect(put.body.contentType).toBe("image/png");
     expect(put.options).toEqual({ timeoutMs: 120000 });
     // The ciphertext round-trips to the original bytes; hash matches computeHashBytes.
@@ -1507,27 +1508,18 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(mockRequestUrl.mock.calls[0][0].url).toContain("cognito-idp");
   });
 
-  it("recovers from an expired MFA challenge session by minting a fresh challenge (PL5)", async () => {
+  it("restarts human verification after an expired MFA challenge instead of initiating auth without a fresh permit", async () => {
     const plugin = makePlugin();
     plugin.pendingChallengeSession = "dead-challenge-session";
-    mockRequestUrl
-      // RespondToAuthChallenge with the ~3-minute-old session → expired.
-      .mockResolvedValueOnce({
-        status: 400,
-        json: {
-          __type: "NotAuthorizedException",
-          message: "Invalid session for the user, session is expired.",
-        },
-        text: "",
-        headers: {},
-      } as any)
-      // Automatic re-login mints a FRESH MFA challenge.
-      .mockResolvedValueOnce({
-        status: 200,
-        json: { ChallengeName: "SOFTWARE_TOKEN_MFA", Session: "fresh-challenge-session" },
-        text: "",
-        headers: {},
-      } as any);
+    mockRequestUrl.mockResolvedValueOnce({
+      status: 400,
+      json: {
+        __type: "NotAuthorizedException",
+        message: "Invalid session for the user, session is expired.",
+      },
+      text: "",
+      headers: {},
+    } as any);
 
     await expect(
       plugin.performLogin({
@@ -1535,17 +1527,15 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
         password: "pw-123456",
         mfaCode: "000000",
       })
-    ).rejects.toThrow(/MFA code expired/i);
+    ).rejects.toThrow("AUTH_RESTART_REQUIRED");
 
-    // The dead session is gone and the fresh one is armed — the next submit
-    // responds to the NEW challenge instead of replaying the dead one forever.
-    expect(plugin.pendingChallengeSession).toBe("fresh-challenge-session");
-    expect(mockRequestUrl).toHaveBeenCalledTimes(2);
-    const targets = mockRequestUrl.mock.calls.map(
-      (c) => (c[0].headers as Record<string, string>)["X-Amz-Target"]
-    );
-    expect(targets[0]).toContain("RespondToAuthChallenge");
-    expect(targets[1]).toContain("InitiateAuth");
+    // The dead session is cleared and no second InitiateAuth occurs without a
+    // new one-time verification permit. LoginModal handles the sentinel by
+    // wiping the challenge generation and returning to credentials.
+    expect(plugin.pendingChallengeSession).toBeNull();
+    expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+    expect((mockRequestUrl.mock.calls[0][0].headers as Record<string, string>)["X-Amz-Target"])
+      .toContain("RespondToAuthChallenge");
   });
 
   it("returns the REAL status for permanent HTTP failures without retrying (AC-API1)", async () => {
@@ -2074,6 +2064,39 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       expect.objectContaining({ expectedVersionId: "v1" })
     );
     expect(plugin.remoteFileState.getExpectedVersionId("a.md")).toBe("v2");
+  });
+
+  it("replays a queued known-absent create from persisted mutation intent", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.offlineQueue = [
+      {
+        operation: "write",
+        path: "new.md",
+        data: "queued create",
+        intent: { kind: "must-be-absent" },
+        timestamp: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: { path: "/new.md", versionId: "v-created" },
+      error: null,
+      requestId: "req-create",
+    });
+
+    await plugin.flushOfflineQueue();
+
+    expect(plugin.apiRequest).toHaveBeenCalledWith(
+      "PUT",
+      "/vaults/vault-abc/files/new.md",
+      expect.objectContaining({ mustBeAbsent: true })
+    );
+    const body = plugin.apiRequest.mock.calls[0][2];
+    expect(body.expectedVersionId).toBeUndefined();
+    expect(plugin.offlineQueue).toHaveLength(0);
   });
 
   it("keeps an offline queued write pending when replay hits a version conflict requiring user resolution", async () => {
@@ -3649,7 +3672,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.fileExplorerDecorations.disable).not.toHaveBeenCalled();
   });
 
-  it("disables file explorer decorations only when both indicator toggles are off", () => {
+  it("keeps permission-aware file hiding active when both visual indicators are off", () => {
     const plugin = makePlugin();
     plugin.session = makeSession();
     plugin.settings.serverVaultId = "vault-abc";
@@ -3667,8 +3690,13 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     plugin.settings.showOthersAccess = false;
     plugin.refreshFileExplorerDecorations();
 
-    expect(plugin.fileExplorerDecorations.disable).toHaveBeenCalledOnce();
-    expect(plugin.fileExplorerDecorations.enable).not.toHaveBeenCalled();
+    expect(plugin.fileExplorerDecorations.setDisplayOptions).toHaveBeenCalledWith({
+      showMyLevel: false,
+      showOthersAccess: false,
+    });
+    expect(plugin.fileExplorerDecorations.enable).toHaveBeenCalledOnce();
+    expect(plugin.fileExplorerDecorations.refresh).toHaveBeenCalledOnce();
+    expect(plugin.fileExplorerDecorations.disable).not.toHaveBeenCalled();
   });
 
   it("propagates a vault admin membership into live UI context for an org member", async () => {
@@ -3858,6 +3886,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
   it("uses the status bar to show durable logged-out feedback", () => {
     const plugin = makePlugin();
+    plugin.settings.statusBarMode = "compact";
     const statusBarEl = {
       setText: vi.fn(),
       setAttr: vi.fn(),
@@ -3877,9 +3906,196 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     );
   });
 
-  it("groups the ribbon icons shield -> chat -> graph and honours the show/hide setting", () => {
+  it("compacts only the routine connected/offline status text", () => {
     const plugin = makePlugin();
-    const makeEl = () => ({ insertAdjacentElement: vi.fn(), remove: vi.fn() });
+    plugin.session = makeSession();
+    plugin.settings.statusBarMode = "compact";
+    const statusBarEl = {
+      setText: vi.fn(),
+      setAttr: vi.fn(),
+      classList: { remove: vi.fn() },
+    };
+    plugin.statusBarEl = statusBarEl;
+    plugin.updateStatusBar = Object.getPrototypeOf(plugin).updateStatusBar.bind(plugin);
+
+    plugin.updateStatusBar();
+
+    expect(statusBarEl.setText).toHaveBeenCalledWith("VaultGuard ✗");
+    expect(statusBarEl.setAttr).toHaveBeenCalledWith(
+      "aria-label",
+      "VaultGuard Sync ✗ Offline",
+    );
+    expect(statusBarEl.setAttr).toHaveBeenCalledWith(
+      "title",
+      expect.stringContaining("VaultGuard Sync: Offline"),
+    );
+
+    plugin.settings.statusBarMode = "full";
+    plugin.updateStatusBar();
+    expect(statusBarEl.setText).toHaveBeenLastCalledWith("VaultGuard Sync ✗ Offline");
+  });
+
+  it("keeps the full recovery alarm in compact mode", () => {
+    const plugin = makePlugin();
+    plugin.settings.statusBarMode = "compact";
+    plugin.getAtRestStatus = () => ({ kind: "needs-recovery", reason: "key mismatch" });
+    const statusBarEl = {
+      setText: vi.fn(),
+      setAttr: vi.fn(),
+      removeAttribute: vi.fn(),
+      classList: { add: vi.fn(), remove: vi.fn() },
+    };
+    plugin.statusBarEl = statusBarEl;
+    plugin.updateStatusBar = Object.getPrototypeOf(plugin).updateStatusBar.bind(plugin);
+
+    plugin.updateStatusBar();
+
+    expect(statusBarEl.setText).toHaveBeenCalledWith("VaultGuard Sync 🔒 Encryption locked");
+    expect(statusBarEl.setAttr).toHaveBeenCalledWith(
+      "title",
+      expect.stringContaining("sync is paused"),
+    );
+  });
+
+  it("keeps permission-loading feedback explicit in compact mode", () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.settings.statusBarMode = "compact";
+    plugin.permissionWarmupInFlight = 1;
+    const statusBarEl = {
+      setText: vi.fn(),
+      setAttr: vi.fn(),
+      removeAttribute: vi.fn(),
+      classList: { add: vi.fn(), remove: vi.fn() },
+    };
+    plugin.statusBarEl = statusBarEl;
+    plugin.updateStatusBar = Object.getPrototypeOf(plugin).updateStatusBar.bind(plugin);
+
+    plugin.updateStatusBar();
+
+    expect(statusBarEl.setText).toHaveBeenCalledWith("VaultGuard Sync ↻ Loading permissions…");
+    expect(statusBarEl.setAttr).toHaveBeenCalledWith(
+      "title",
+      "VaultGuard Sync is loading file permissions.",
+    );
+  });
+
+  it("keeps long-operation progress visible in compact mode", () => {
+    const makeElement = (ownerDocument: { createElement(tag: string): any }): any => {
+      const children: any[] = [];
+      const attributes = new Map<string, string>();
+      return {
+        ownerDocument,
+        children,
+        attributes,
+        className: "",
+        textContent: "",
+        classList: { add: vi.fn(), remove: vi.fn() },
+        get firstChild() {
+          return children[0] ?? null;
+        },
+        appendChild(child: any) {
+          children.push(child);
+          return child;
+        },
+        removeChild(child: any) {
+          const index = children.indexOf(child);
+          if (index >= 0) children.splice(index, 1);
+          return child;
+        },
+        setAttribute(name: string, value: string) {
+          attributes.set(name, value);
+        },
+        setAttr(name: string, value: string) {
+          attributes.set(name, value);
+        },
+        removeAttribute(name: string) {
+          attributes.delete(name);
+        },
+      };
+    };
+    const ownerDocument = {
+      createElement(_tag: string) {
+        return makeElement(ownerDocument);
+      },
+    };
+    const statusBarEl = makeElement(ownerDocument);
+    const plugin = makePlugin();
+    plugin.settings.statusBarMode = "compact";
+    plugin.statusBarEl = statusBarEl;
+    plugin.longOperations = {
+      getPrimarySnapshot: () => ({
+        id: "op-1",
+        kind: "sync",
+        operationName: "Vault sync",
+        phase: "Uploading",
+        lifecycleState: "running",
+        placement: "background",
+        processedItems: 4,
+        totalItems: 10,
+        processedBytes: 0,
+        totalBytes: null,
+        percent: 40,
+        approximatePercent: false,
+        eta: {
+          remainingMs: 1_000,
+          approximate: false,
+          basis: "items",
+          confidence: "estimated",
+        },
+        throughput: { itemsPerSecond: 1, bytesPerSecond: null },
+        elapsedMs: 4_000,
+        startedAt: 0,
+        updatedAt: 4_000,
+        lastProgressAt: 4_000,
+        stallState: "working",
+        capabilities: { canPause: true, canCancel: true, protectedPhase: false },
+      }),
+    };
+    plugin.updateStatusBar = Object.getPrototypeOf(plugin).updateStatusBar.bind(plugin);
+
+    plugin.updateStatusBar();
+
+    expect(
+      statusBarEl.children.find((child: any) =>
+        child.className === "vaultguard-long-op-statusbar-label"
+      )?.textContent,
+    ).toBe("VaultGuard 40% Uploading");
+    expect(statusBarEl.attributes.get("title")).toContain("Vault sync: Running");
+  });
+
+  it("applies full, compact, and hidden status-bar modes live", () => {
+    const plugin = makePlugin();
+    const statusBarEl = {
+      addEventListener: vi.fn(),
+      remove: vi.fn(),
+    };
+    plugin.addStatusBarItem = vi.fn(() => statusBarEl);
+    plugin.statusBarEl = null;
+
+    plugin.settings.statusBarMode = "compact";
+    plugin.applyStatusBarMode();
+    expect(plugin.statusBarEl).toBe(statusBarEl);
+    expect(plugin.updateStatusBar).toHaveBeenCalledOnce();
+
+    plugin.settings.statusBarMode = "hidden";
+    plugin.applyStatusBarMode();
+    expect(statusBarEl.remove).toHaveBeenCalledOnce();
+    expect(plugin.statusBarEl).toBeNull();
+
+    plugin.settings.statusBarMode = "full";
+    plugin.applyStatusBarMode();
+    expect(plugin.addStatusBarItem).toHaveBeenCalledTimes(2);
+    expect(plugin.statusBarEl).toBe(statusBarEl);
+  });
+
+  it("groups retained ribbon icons and applies independent live visibility", () => {
+    const plugin = makePlugin();
+    const makeEl = () => ({
+      insertAdjacentElement: vi.fn(),
+      addClass: vi.fn(),
+      removeClass: vi.fn(),
+    });
     const shield = makeEl();
     const chat = makeEl();
     const graph = makeEl();
@@ -3889,20 +4105,29 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     // Default (shown): the icons are forced into a shield -> chat -> graph group,
     // regardless of whatever order Obsidian may have saved for the vault.
-    plugin.settings.showRibbonIcons = true;
+    plugin.settings.showAiChatRibbonIcon = true;
+    plugin.settings.showPermissionsGraphRibbonIcon = true;
     plugin.applyRibbonIconLayout();
     expect(shield.insertAdjacentElement).toHaveBeenCalledWith("afterend", chat);
     expect(chat.insertAdjacentElement).toHaveBeenCalledWith("afterend", graph);
-    expect(chat.remove).not.toHaveBeenCalled();
-    expect(graph.remove).not.toHaveBeenCalled();
+    expect(chat.removeClass).toHaveBeenCalledWith("vaultguard-ribbon-hidden");
+    expect(graph.removeClass).toHaveBeenCalledWith("vaultguard-ribbon-hidden");
 
-    // Hidden: the AI chat + permissions graph icons are removed; the shield stays.
-    plugin.settings.showRibbonIcons = false;
+    // Hiding Chat leaves Graph available, and both retained nodes can be shown
+    // again immediately without re-registering or reloading the plugin.
+    plugin.settings.showAiChatRibbonIcon = false;
+    plugin.settings.showPermissionsGraphRibbonIcon = true;
     plugin.applyRibbonIconLayout();
-    expect(chat.remove).toHaveBeenCalled();
-    expect(graph.remove).toHaveBeenCalled();
-    expect(plugin.vaultGuardChatRibbonEl).toBeNull();
-    expect(plugin.vaultGuardGraphRibbonEl).toBeNull();
+    expect(chat.addClass).toHaveBeenCalledWith("vaultguard-ribbon-hidden");
+    expect(graph.removeClass).toHaveBeenCalledWith("vaultguard-ribbon-hidden");
+    expect(plugin.vaultGuardChatRibbonEl).toBe(chat);
+    expect(plugin.vaultGuardGraphRibbonEl).toBe(graph);
+
+    plugin.settings.showAiChatRibbonIcon = true;
+    plugin.settings.showPermissionsGraphRibbonIcon = false;
+    plugin.applyRibbonIconLayout();
+    expect(chat.removeClass).toHaveBeenLastCalledWith("vaultguard-ribbon-hidden");
+    expect(graph.addClass).toHaveBeenCalledWith("vaultguard-ribbon-hidden");
   });
 
   it("marks the shield when logged out and all VaultGuard ribbon icons when signed in", () => {
@@ -5246,6 +5471,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     // unchanged.
     expect(put).toBeDefined();
     expect(Object.keys(put.body).sort()).toEqual(["content", "hash", "mustBeAbsent"]);
+    expect(put.body.mustBeAbsent).toBe(true);
     expect(put.body.contentType).toBeUndefined();
     expect(plugin.readPlainBinaryFromDisk).not.toHaveBeenCalled();
   });
@@ -5421,6 +5647,175 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(envelopeFiles.has(envelopePath)).toBe(false);
   });
 
+  it("clearLocalCache durably removes the persisted offline queue envelope", async () => {
+    const plugin = makePlugin();
+    const offlineEnvelopePath = ".obsidian/plugins/vaultguard-sync/offline-queue.envelope";
+    const remoteStateEnvelopePath = ".obsidian/plugins/vaultguard-sync/remote-file-state.envelope";
+    plugin.offlineQueue = [
+      {
+        operation: "write",
+        path: "notes/offline.md",
+        data: "pending",
+        timestamp: "2026-07-29T00:00:00.000Z",
+      },
+    ];
+    plugin.remoteFileState.recordPresent("notes/remote.md", { versionId: "v1" });
+    plugin.app.vault.adapter.exists = vi.fn(async (path: string) =>
+      path === offlineEnvelopePath || path === remoteStateEnvelopePath
+    );
+    plugin.app.vault.adapter.remove = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.clearLocalCache();
+
+    expect(plugin.offlineQueue).toEqual([]);
+    expect(plugin.remoteFileState.isEmpty()).toBe(true);
+    expect(plugin.app.vault.adapter.remove).toHaveBeenNthCalledWith(1, remoteStateEnvelopePath);
+    expect(plugin.app.vault.adapter.remove).toHaveBeenNthCalledWith(2, offlineEnvelopePath);
+    expect(plugin.offlineQueuePersistTimer).toBeNull();
+    expect(plugin.remoteFileStatePersistTimer).toBeNull();
+  });
+
+  it("a confirmed local sync-state reset survives restart without deleting vault files", async () => {
+    const offlineEnvelopePath = ".obsidian/plugins/vaultguard-sync/offline-queue.envelope";
+    const remoteStateEnvelopePath = ".obsidian/plugins/vaultguard-sync/remote-file-state.envelope";
+    const retainedVaultFilePath = "notes/keep.md";
+    const envelopeFiles = new Map<string, ArrayBuffer>();
+    const vaultFiles = new Set([retainedVaultFilePath]);
+    const vaultContentRemove = vi.fn().mockResolvedValue(undefined);
+    const adapterRemove = vi.fn(async (path: string) => {
+      if (envelopeFiles.has(path)) {
+        envelopeFiles.delete(path);
+        return;
+      }
+      vaultFiles.delete(path);
+    });
+
+    function makePersistentResetPlugin() {
+      const plugin = makePlugin();
+      plugin.manifest = { id: "vaultguard-sync" };
+      plugin.app.vault.configDir = ".obsidian";
+      plugin.app.vault.adapter = {
+        ...plugin.app.vault.adapter,
+        exists: vi.fn(async (path: string) =>
+          envelopeFiles.has(path) || vaultFiles.has(path)
+        ),
+        remove: adapterRemove,
+      };
+      plugin.originalAdapterMethods = {
+        read: null,
+        write: null,
+        list: null,
+        remove: vaultContentRemove,
+        rename: null,
+        readBinary: vi.fn(async (path: string) => envelopeFiles.get(path)!),
+        writeBinary: vi.fn(async (path: string, bytes: ArrayBuffer) => {
+          envelopeFiles.set(path, bytes);
+        }),
+      };
+      plugin.atRestCipher = {
+        isReady: () => true,
+        encryptString: vi.fn(async (value: string) => new TextEncoder().encode(value).buffer),
+        decryptString: vi.fn(async (value: ArrayBuffer) => new TextDecoder().decode(value)),
+      };
+      plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+      plugin.waitForCipherInit = vi.fn().mockResolvedValue(true);
+      return plugin;
+    }
+
+    const pluginBeforeReset = makePersistentResetPlugin();
+    pluginBeforeReset.offlineQueue = [
+      {
+        operation: "write",
+        path: "notes/offline.md",
+        data: "pending",
+        timestamp: "2026-07-30T00:00:00.000Z",
+      },
+    ];
+    pluginBeforeReset.remoteFileState.recordPresent("notes/remote.md", { versionId: "v1" });
+    await pluginBeforeReset.persistOfflineQueue();
+    await pluginBeforeReset.persistRemoteFileState();
+
+    expect(envelopeFiles.has(offlineEnvelopePath)).toBe(true);
+    expect(envelopeFiles.has(remoteStateEnvelopePath)).toBe(true);
+
+    // Settings invokes clearLocalCache only after the typed confirmation succeeds.
+    await expect(pluginBeforeReset.clearLocalCache()).resolves.toBeUndefined();
+
+    expect(envelopeFiles.has(offlineEnvelopePath)).toBe(false);
+    expect(envelopeFiles.has(remoteStateEnvelopePath)).toBe(false);
+
+    const pluginAfterRestart = makePersistentResetPlugin();
+    await pluginAfterRestart.loadPersistedOfflineQueue();
+    await pluginAfterRestart.loadPersistedRemoteFileState();
+
+    expect(pluginAfterRestart.offlineQueue).toEqual([]);
+    expect(pluginAfterRestart.remoteFileState.isEmpty()).toBe(true);
+    expect(vaultFiles.has(retainedVaultFilePath)).toBe(true);
+    expect(adapterRemove).not.toHaveBeenCalledWith(retainedVaultFilePath);
+    expect(vaultContentRemove).not.toHaveBeenCalled();
+  });
+
+  it("retains sync state and rejects reset when durable envelope deletion fails", async () => {
+    const plugin = makePlugin();
+    const offlineEnvelopePath = ".obsidian/plugins/vaultguard-sync/offline-queue.envelope";
+    plugin.offlineQueue = [
+      {
+        operation: "write",
+        path: "notes/offline.md",
+        data: "pending",
+        timestamp: "2026-07-29T00:00:00.000Z",
+      },
+    ];
+    plugin.remoteFileState.recordPresent("notes/remote.md", { versionId: "v1" });
+    plugin.app.vault.adapter.exists = vi.fn().mockResolvedValue(true);
+    plugin.app.vault.adapter.remove = vi.fn(async (path: string) => {
+      if (path === offlineEnvelopePath) throw new Error("disk denied");
+    });
+    plugin.scheduleOfflineQueuePersist = vi.fn();
+    plugin.scheduleRemoteFileStatePersist = vi.fn();
+
+    await expect(plugin.clearLocalCache()).rejects.toThrow("disk denied");
+
+    expect(plugin.offlineQueue).toEqual([
+      expect.objectContaining({ path: "notes/offline.md", data: "pending" }),
+    ]);
+    expect(plugin.remoteFileState.get("notes/remote.md")).toEqual(
+      expect.objectContaining({ state: "present", versionId: "v1" })
+    );
+    expect(plugin.scheduleOfflineQueuePersist).toHaveBeenCalledTimes(1);
+    expect(plugin.scheduleRemoteFileStatePersist).toHaveBeenCalledTimes(1);
+  });
+
+  it("orders reset deletion after an in-flight offline envelope writer", async () => {
+    const plugin = makePlugin();
+    const offlineEnvelopePath = ".obsidian/plugins/vaultguard-sync/offline-queue.envelope";
+    let releaseOldWriter!: () => void;
+    let offlineEnvelopePresent = false;
+    const oldWriter = new Promise<void>((resolve) => {
+      releaseOldWriter = () => {
+        offlineEnvelopePresent = true;
+        resolve();
+      };
+    });
+    plugin.offlineQueuePersistTail = oldWriter;
+    plugin.app.vault.adapter.exists = vi.fn(async (path: string) =>
+      path === offlineEnvelopePath && offlineEnvelopePresent
+    );
+    plugin.app.vault.adapter.remove = vi.fn(async (path: string) => {
+      if (path === offlineEnvelopePath) offlineEnvelopePresent = false;
+    });
+
+    const resetPromise = plugin.clearLocalCache();
+    await Promise.resolve();
+    expect(plugin.app.vault.adapter.remove).not.toHaveBeenCalledWith(offlineEnvelopePath);
+
+    releaseOldWriter();
+    await resetPromise;
+
+    expect(plugin.app.vault.adapter.remove).toHaveBeenCalledWith(offlineEnvelopePath);
+    expect(offlineEnvelopePresent).toBe(false);
+  });
+
   describe("offline-queue v2 envelope (BIN-A / D-09)", () => {
     const envelopePath = ".obsidian/plugins/vaultguard-sync/offline-queue.envelope";
     let envelopeFiles: Map<string, ArrayBuffer>;
@@ -5472,6 +5867,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
           path: "notes/a.md",
           data: "hello",
           timestamp: "2026-07-03T00:00:00.000Z",
+          intent: { kind: "must-be-absent" },
         },
         {
           operation: "write",
@@ -5494,7 +5890,12 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
       await plugin2.loadPersistedOfflineQueue();
 
       expect(plugin2.offlineQueue).toEqual([
-        expect.objectContaining({ operation: "write", path: "notes/a.md", data: "hello" }),
+        expect.objectContaining({
+          operation: "write",
+          path: "notes/a.md",
+          data: "hello",
+          intent: { kind: "must-be-absent" },
+        }),
         expect.objectContaining({
           operation: "write",
           path: "img/pic.png",
@@ -6378,7 +6779,7 @@ describe("VaultGuardPlugin vaultMemberRole persistence — 1.0.31 Issue A", () =
   });
 });
 
-describe("VaultGuardPlugin automatic Local Project Memory Mode", () => {
+describe("VaultGuardPlugin detected Git repository plaintext folders", () => {
   beforeEach(() => {
     mockNotice.mockReset();
     vi.stubGlobal("localStorage", makeMemoryStorage());
@@ -6389,153 +6790,163 @@ describe("VaultGuardPlugin automatic Local Project Memory Mode", () => {
     Object.assign(Platform, { isMobileApp: false });
   });
 
-  function prepareAutomaticPlugin(options: {
-    gitRootDetected?: boolean;
-    safety?: { safe: boolean; reason: string; inspectedFiles: number };
-  } = {}) {
+  function prepareDetectionPlugin() {
     const plugin = makePlugin();
-    plugin.settings.serverVaultId = "";
     plugin.settings.localProjectMemoryMode = false;
-    plugin.settings.localProjectMemoryModeAutoEnableSuppressed = false;
-    plugin.setAutomaticLocalProjectMemoryModeForGitRepos(true);
-    const getGitSummary = vi.fn(async () => ({
-      detected: options.gitRootDetected ?? true,
+    plugin.setDetectGitRepoFolderEnabled(true);
+    const refreshDetectedGitRepositoryRoots = vi.fn(async () => ({
+      roots: ["projects/demo"],
+      scannedEntries: 8,
+      complete: true,
     }));
-    const inspectAutomaticLocalProjectMemoryModeSafety = vi.fn(async () =>
-      options.safety ?? { safe: true, reason: "safe", inspectedFiles: 2 },
-    );
-    plugin.getVaultOrientationService = vi.fn(() => ({ getGitSummary }));
+    const convertDetectedGitRepositoryCiphertext = vi.fn(async () => ({
+      decrypted: 0,
+      alreadyPlaintext: 2,
+      failed: 0,
+      failures: [],
+    }));
     plugin.ensureAtRestAdapterRuntimeObject = vi.fn(() => ({
-      inspectAutomaticLocalProjectMemoryModeSafety,
+      refreshDetectedGitRepositoryRoots,
+      convertDetectedGitRepositoryCiphertext,
     }));
-    plugin.enableLocalProjectMemoryMode = vi.fn(async (source: string) => {
-      plugin.settings.localProjectMemoryMode = true;
-      expect(source).toBe("automatic");
-    });
-    return { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety };
+    return {
+      plugin,
+      refreshDetectedGitRepositoryRoots,
+      convertDetectedGitRepositoryCiphertext,
+    };
   }
 
-  it("activates a qualifying Git-root vault through the existing transition", async () => {
-    const { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety } =
-      prepareAutomaticPlugin();
+  it("refreshes repository roots without changing Local Project Memory Mode", async () => {
+    const { plugin, refreshDetectedGitRepositoryRoots } = prepareDetectionPlugin();
 
-    await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
-      kind: "enabled",
+    await expect(plugin.refreshDetectedGitRepositoryRoots()).resolves.toMatchObject({
+      roots: ["projects/demo"],
+      complete: true,
     });
 
-    expect(getGitSummary).toHaveBeenCalledWith({ includeStatus: false, forceRefresh: true });
-    expect(inspectAutomaticLocalProjectMemoryModeSafety).toHaveBeenCalledOnce();
-    expect(plugin.enableLocalProjectMemoryMode).toHaveBeenCalledWith("automatic");
+    expect(refreshDetectedGitRepositoryRoots).toHaveBeenCalledWith({
+      enabled: true,
+      mobile: false,
+    });
+    expect(plugin.settings.localProjectMemoryMode).toBe(false);
   });
 
-  it("evaluates automatic mode after adapter interception and before cipher initialization", () => {
+  it("detects after adapter interception, then initializes the cipher before conversion", () => {
     const source = readFileSync(new URL("../src/plugin/main.ts", import.meta.url), "utf8");
     const interceptIndex = source.indexOf("    this.interceptVaultAdapter();");
-    const automaticIndex = source.indexOf("    await this.maybeAutoEnableLocalProjectMemoryMode();");
-    const cipherIndex = source.indexOf("    await this.initAtRestCipher();");
+    const detectionIndex = source.indexOf(
+      "await this.refreshDetectedGitRepositoryRoots();",
+      interceptIndex,
+    );
+    const cipherIndex = source.indexOf("    await this.initAtRestCipher();", detectionIndex);
+    const conversionIndex = source.indexOf(
+      "await this.convertDetectedGitRepositoryCiphertext();",
+      cipherIndex,
+    );
 
     expect(interceptIndex).toBeGreaterThan(-1);
-    expect(automaticIndex).toBeGreaterThan(interceptIndex);
-    expect(cipherIndex).toBeGreaterThan(automaticIndex);
+    const automaticModeIndex = source.indexOf(
+      "await this.maybeAutoEnableLocalProjectMemoryMode();",
+      interceptIndex,
+    );
+    expect(automaticModeIndex).toBeGreaterThan(interceptIndex);
+    expect(detectionIndex).toBeGreaterThan(interceptIndex);
+    expect(detectionIndex).toBeGreaterThan(automaticModeIndex);
+    expect(cipherIndex).toBeGreaterThan(detectionIndex);
+    expect(conversionIndex).toBeGreaterThan(cipherIndex);
+    expect(source).toContain(
+      "Git repository folder detection was incomplete during startup",
+    );
+    expect(source).toContain(
+      "detected repository file(s) could not be converted to plaintext during startup",
+    );
   });
 
   it("shares the global preference between plugin instances in one desktop profile", () => {
     const first = makePlugin();
     const second = makePlugin();
 
-    expect(second.isAutomaticLocalProjectMemoryModeForGitReposEnabled()).toBe(false);
-    first.setAutomaticLocalProjectMemoryModeForGitRepos(true);
-    expect(second.isAutomaticLocalProjectMemoryModeForGitReposEnabled()).toBe(true);
-    second.setAutomaticLocalProjectMemoryModeForGitRepos(false);
-    expect(first.isAutomaticLocalProjectMemoryModeForGitReposEnabled()).toBe(false);
+    expect(second.isDetectGitRepoFolderEnabled()).toBe(false);
+    first.setDetectGitRepoFolderEnabled(true);
+    expect(second.isDetectGitRepoFolderEnabled()).toBe(true);
+    second.setDetectGitRepoFolderEnabled(false);
+    expect(first.isDetectGitRepoFolderEnabled()).toBe(false);
   });
 
-  it("skips mobile before running Git or protection probes", async () => {
+  it("passes the mobile boundary to detection without changing the preference", async () => {
     Object.assign(Platform, { isMobileApp: true });
-    const { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety } =
-      prepareAutomaticPlugin();
+    const { plugin, refreshDetectedGitRepositoryRoots } = prepareDetectionPlugin();
 
-    await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
-      kind: "mobile",
+    await plugin.refreshDetectedGitRepositoryRoots();
+    expect(refreshDetectedGitRepositoryRoots).toHaveBeenCalledWith({
+      enabled: true,
+      mobile: true,
     });
-    expect(getGitSummary).not.toHaveBeenCalled();
-    expect(inspectAutomaticLocalProjectMemoryModeSafety).not.toHaveBeenCalled();
+    expect(plugin.isDetectGitRepoFolderEnabled()).toBe(true);
   });
 
-  it("skips a server-bound vault before Git or protection probes", async () => {
-    const { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety } =
-      prepareAutomaticPlugin();
+  it("keeps server binding and cloud settings unchanged while detection runs", async () => {
+    const { plugin } = prepareDetectionPlugin();
     plugin.settings.serverVaultId = "vault-protected";
+    plugin.settings.syncInterval = 45;
 
-    await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
-      kind: "server-bound",
-    });
-    expect(getGitSummary).not.toHaveBeenCalled();
-    expect(inspectAutomaticLocalProjectMemoryModeSafety).not.toHaveBeenCalled();
+    await plugin.refreshDetectedGitRepositoryRoots();
+    expect(plugin.settings.serverVaultId).toBe("vault-protected");
+    expect(plugin.settings.syncInterval).toBe(45);
+    expect(plugin.settings.localProjectMemoryMode).toBe(false);
   });
 
-  it("skips non-root and protected repositories without enabling the mode", async () => {
-    const nonRoot = prepareAutomaticPlugin({ gitRootDetected: false });
-    await expect(nonRoot.plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
-      kind: "not-git-root",
-    });
+  it("runs targeted conversion without mutating mode or cloud state", async () => {
+    const { plugin, convertDetectedGitRepositoryCiphertext } = prepareDetectionPlugin();
+    plugin.settings.serverVaultId = "vault-protected";
+    plugin.settings.syncInterval = 45;
 
-    const protectedVault = prepareAutomaticPlugin({
-      safety: { safe: false, reason: "ciphertext", inspectedFiles: 1 },
+    await expect(plugin.convertDetectedGitRepositoryCiphertext()).resolves.toMatchObject({
+      decrypted: 0,
+      alreadyPlaintext: 2,
+      failed: 0,
     });
-    await expect(
-      protectedVault.plugin.maybeAutoEnableLocalProjectMemoryMode(),
-    ).resolves.toEqual({ kind: "protected" });
-    expect(protectedVault.plugin.enableLocalProjectMemoryMode).not.toHaveBeenCalled();
+    expect(convertDetectedGitRepositoryCiphertext).toHaveBeenCalledOnce();
+    expect(plugin.settings.localProjectMemoryMode).toBe(false);
+    expect(plugin.settings.serverVaultId).toBe("vault-protected");
+    expect(plugin.settings.syncInterval).toBe(45);
   });
 
-  it("fails closed when the protection inspector rejects unexpectedly", async () => {
-    const { plugin } = prepareAutomaticPlugin();
-    plugin.ensureAtRestAdapterRuntimeObject = vi.fn(() => ({
-      inspectAutomaticLocalProjectMemoryModeSafety: vi.fn(async () => {
-        throw new Error("probe failed");
-      }),
-    }));
-
-    await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
-      kind: "inspection-failed",
-    });
-    expect(plugin.enableLocalProjectMemoryMode).not.toHaveBeenCalled();
-  });
-
-  it("persists a per-vault suppression on manual disable and clears it on manual enable", async () => {
-    const plugin = makePlugin();
-    plugin.settings.serverVaultId = "";
+  it("skips targeted conversion while explicit Local Project Memory Mode is active", async () => {
+    const { plugin, convertDetectedGitRepositoryCiphertext } = prepareDetectionPlugin();
     plugin.settings.localProjectMemoryMode = true;
-    plugin.settings.localProjectMemoryModeAutoEnableSuppressed = false;
+
+    await expect(plugin.convertDetectedGitRepositoryCiphertext()).resolves.toEqual({
+      decrypted: 0,
+      alreadyPlaintext: 0,
+      failed: 0,
+      failures: [],
+    });
+    expect(convertDetectedGitRepositoryCiphertext).not.toHaveBeenCalled();
+    expect(plugin.settings.localProjectMemoryMode).toBe(true);
+  });
+
+  it("refreshes detected roots when explicit Local Project Memory Mode is disabled", async () => {
+    const plugin = makePlugin();
+    plugin.settings.localProjectMemoryMode = true;
     plugin.saveSettings = vi.fn(async () => undefined);
     plugin.restartSyncTimer = vi.fn();
+    plugin.refreshDetectedGitRepositoryRoots = vi.fn(async () => ({
+      roots: [""],
+      scannedEntries: 1,
+      complete: true,
+    }));
+    plugin.convertDetectedGitRepositoryCiphertext = vi.fn(async () => ({
+      decrypted: 0,
+      alreadyPlaintext: 0,
+      failed: 0,
+      failures: [],
+    }));
 
     await plugin.disableLocalProjectMemoryMode();
     expect(plugin.settings.localProjectMemoryMode).toBe(false);
-    expect(plugin.settings.localProjectMemoryModeAutoEnableSuppressed).toBe(true);
-
-    await plugin.enableLocalProjectMemoryMode();
-    expect(plugin.settings.localProjectMemoryMode).toBe(true);
-    expect(plugin.settings.localProjectMemoryModeAutoEnableSuppressed).toBe(false);
-  });
-
-  it("keeps a persisted per-vault suppression across two simulated startups", async () => {
-    for (let startup = 1; startup <= 2; startup += 1) {
-      const { plugin, getGitSummary, inspectAutomaticLocalProjectMemoryModeSafety } =
-        prepareAutomaticPlugin();
-      plugin.settings.localProjectMemoryModeAutoEnableSuppressed = true;
-
-      await expect(plugin.maybeAutoEnableLocalProjectMemoryMode()).resolves.toEqual({
-        kind: "suppressed",
-      });
-      expect(getGitSummary, `startup ${startup}`).not.toHaveBeenCalled();
-      expect(
-        inspectAutomaticLocalProjectMemoryModeSafety,
-        `startup ${startup}`,
-      ).not.toHaveBeenCalled();
-      expect(plugin.enableLocalProjectMemoryMode, `startup ${startup}`).not.toHaveBeenCalled();
-    }
+    expect(plugin.refreshDetectedGitRepositoryRoots).toHaveBeenCalledOnce();
+    expect(plugin.convertDetectedGitRepositoryCiphertext).toHaveBeenCalledOnce();
   });
 });
 

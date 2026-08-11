@@ -35,6 +35,7 @@ import {
   pathMatchesPattern,
   queryAllPages,
   getVaultMembership,
+  resolveVaultEvaluationRoles,
   listVaultMembers,
   logAudit,
   formatError,
@@ -45,10 +46,12 @@ import {
   getUserAgent,
   generateId,
   isAdmin,
-  recordVaultActivity,
+  beginVaultMutationIntent,
+  commitVaultMutationIntent,
   UserContext,
   VaultRecord,
   VaultMemberRecord,
+  VaultMutationIntent,
   PermissionRule,
   PermissionAction,
   AuthError,
@@ -70,8 +73,54 @@ const VALID_ACTIONS: PermissionAction[] = ['read', 'write', 'delete', 'admin', '
 /** Valid permission effects. */
 const VALID_EFFECTS = ['allow', 'deny'] as const;
 
+/** Permission rules may be long-lived, but accidental century-scale values are rejected. */
+const MAX_PERMISSION_EXPIRY_YEARS = 10;
+
+const ISO_8601_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-](\d{2}):(\d{2}))$/;
+
 /** Constant sort key for permission rule items. */
 const RULE_SK = 'RULE';
+
+/**
+ * Persist a permission-change outbox row before the DynamoDB mutation, then
+ * atomically publish the activity event and vault cursor only after the
+ * mutation succeeds. An ambiguous mutation or publication failure deliberately
+ * leaves the intent pending: sync clients will perform reconciliation instead
+ * of trusting an unchanged cursor.
+ */
+async function performPermissionMutation<T>(
+  params: {
+    orgId: string;
+    vaultId: string;
+    path: string;
+    actorUserId: string;
+  },
+  mutation: () => Promise<T>,
+): Promise<T> {
+  const intent: VaultMutationIntent = await beginVaultMutationIntent({
+    ...params,
+    action: 'permission_changed',
+    verification: { kind: 'permission-state' },
+  });
+
+  // Do not delete the intent when the SDK throws: the write outcome can be
+  // ambiguous after a transport failure. Reconciliation is the safe fallback.
+  const result = await mutation();
+  try {
+    await commitVaultMutationIntent(intent);
+  } catch {
+    console.error('[PERMISSIONS] permission mutation requires activity reconciliation', {
+      vaultId: params.vaultId,
+      intentId: intent.intentId,
+    });
+    throw new AuthError(
+      'Permission changed, but peer synchronization requires reconciliation. Retry shortly.',
+      503,
+      'ACTIVITY_RECONCILIATION_REQUIRED',
+    );
+  }
+  return result;
+}
 const USER_POOL_ID = process.env.USER_POOL_ID!;
 const COGNITO_REGION = process.env.AWS_REGION || 'eu-west-1';
 const cognitoClient = new CognitoIdentityProviderClient({ region: COGNITO_REGION });
@@ -440,9 +489,7 @@ async function handleCreatePermission(
   const effect = body.effect as string;
   const priority = (body.priority as number) || calculatePriority(pathPattern);
   const upsert = body.upsert === true;
-  const expiresAt = typeof body.expiresAt === 'string' && body.expiresAt
-    ? body.expiresAt
-    : undefined;
+  const expiresAt = normalizePermissionExpiry(body.expiresAt);
 
   // Validate actions
   for (const action of actions) {
@@ -503,7 +550,7 @@ async function handleCreatePermission(
       };
       if (body.priority !== undefined) updates.priority = priority;
       if (body.expiresAt !== undefined) {
-        updates.expiresAt = typeof body.expiresAt === 'string' ? body.expiresAt : null;
+        updates.expiresAt = expiresAt ?? null;
       }
       updates.updatedAt = new Date().toISOString();
 
@@ -517,14 +564,22 @@ async function handleCreatePermission(
         expressionAttributeValues[`:v${i}`] = updates[key];
       });
 
-      await docClient.send(
-        new UpdateCommand({
-          TableName: PERMISSIONS_TABLE,
-          Key: { pk: duplicate.id, sk: RULE_SK },
-          UpdateExpression: updateExpression,
-          ExpressionAttributeNames: expressionAttributeNames,
-          ExpressionAttributeValues: expressionAttributeValues,
-        })
+      await performPermissionMutation(
+        {
+          orgId: vault.orgId,
+          vaultId: vault.vaultId,
+          path: pathPattern,
+          actorUserId: user.userId,
+        },
+        () => docClient.send(
+          new UpdateCommand({
+            TableName: PERMISSIONS_TABLE,
+            Key: { pk: duplicate.id, sk: RULE_SK },
+            UpdateExpression: updateExpression,
+            ExpressionAttributeNames: expressionAttributeNames,
+            ExpressionAttributeValues: expressionAttributeValues,
+          }),
+        ),
       );
 
       const updatedRule = { ...duplicate, ...updates };
@@ -536,14 +591,6 @@ async function handleCreatePermission(
         vault.orgId,
         vault.vaultId
       );
-
-      await recordVaultActivity({
-        orgId: vault.orgId,
-        vaultId: vault.vaultId,
-        action: 'permission_changed',
-        path: pathPattern,
-        actorUserId: user.userId,
-      });
 
       await logAudit({
         userId: user.userId,
@@ -623,28 +670,24 @@ async function handleCreatePermission(
     delete item.role;
   }
 
-  await docClient.send(
-    new PutCommand({
-      TableName: PERMISSIONS_TABLE,
-      Item: item,
-    })
+  await performPermissionMutation(
+    {
+      orgId: vault.orgId,
+      vaultId: vault.vaultId,
+      path: pathPattern,
+      actorUserId: user.userId,
+    },
+    () => docClient.send(
+      new PutCommand({
+        TableName: PERMISSIONS_TABLE,
+        Item: item,
+      }),
+    ),
   );
 
   // Revoke leases whose scope overlaps the new permission path
   // (permission landscape changed — affected users should re-fetch leases)
   await revokeOverlappingLeases(pathPattern, userId, role, user.userId, vault.orgId, vault.vaultId);
-
-  // Bump the vault cursor so peer clients learn that the permission
-  // landscape moved. The warm-path sync recognises `permission_changed`
-  // events and falls back to a full S3 + permission re-evaluation pass,
-  // since a single rule can flip accessibility for many files at once.
-  await recordVaultActivity({
-    orgId: vault.orgId,
-    vaultId: vault.vaultId,
-    action: 'permission_changed',
-    path: pathPattern,
-    actorUserId: user.userId,
-  });
 
   await logAudit({
     userId: user.userId,
@@ -766,7 +809,7 @@ async function handleUpdatePermission(
     updates.role = typeof body.role === 'string' && body.role.trim() ? body.role : null;
   }
   if (body.expiresAt !== undefined) {
-    updates.expiresAt = typeof body.expiresAt === 'string' ? body.expiresAt : null;
+    updates.expiresAt = normalizePermissionExpiry(body.expiresAt);
   }
 
   if (Object.keys(updates).length === 0) {
@@ -787,6 +830,9 @@ async function handleUpdatePermission(
     (updates.userId as string) ??
     (await canonicalizeRuleUserId(existingRule.userId, vault.orgId)) ??
     existingRule.userId;
+  const resultingRole = Object.prototype.hasOwnProperty.call(updates, 'role')
+    ? updates.role as string | null
+    : existingRule.role ?? null;
   const { viaFileAdmin } = await authorizePermissionMutation(
     user, vault, updatedPath,
     {
@@ -794,7 +840,7 @@ async function handleUpdatePermission(
       // role normalization (WR-04): see handleSetLevel for the rationale —
       // DDB returns `role` as undefined when the row was written without
       // the attribute, so coalesce to null before passing to the helper.
-      role: (updates.role as string | null) ?? existingRule.role ?? null,
+      role: resultingRole,
       actions: (updates.actions as PermissionAction[]) ?? existingRule.actions,
       effect: (updates.effect as 'allow' | 'deny') ?? existingRule.effect,
     },
@@ -812,8 +858,9 @@ async function handleUpdatePermission(
   // of truth). Vault/org admins (viaFileAdmin === false) and same-path updates
   // are unaffected.
   if (viaFileAdmin && updates.pathPattern && updates.pathPattern !== existingRule.pathPattern) {
+    const evaluationRoles = await resolveVaultEvaluationRoles(user, vault.vaultId);
     const oldPathCheck = await evaluatePermission(
-      user.userId, user.roles, 'admin', existingRule.pathPattern,
+      user.userId, evaluationRoles, 'admin', existingRule.pathPattern,
       vault.orgId, vault.vaultId, { userAliases: user.email ? [user.email] : [] }
     );
     if (!oldPathCheck.allowed) {
@@ -851,14 +898,23 @@ async function handleUpdatePermission(
     removeClauses.length ? `REMOVE ${removeClauses.join(', ')}` : '',
   ].filter(Boolean).join(' ');
 
-  await docClient.send(
-    new UpdateCommand({
-      TableName: PERMISSIONS_TABLE,
-      Key: { pk: ruleId, sk: RULE_SK },
-      UpdateExpression: updateExpression,
-      ExpressionAttributeNames: expressionAttributeNames,
-      ExpressionAttributeValues: expressionAttributeValues,
-    })
+  const affectedPath = (updates.pathPattern as string) || existingRule.pathPattern;
+  await performPermissionMutation(
+    {
+      orgId: vault.orgId,
+      vaultId: vault.vaultId,
+      path: affectedPath,
+      actorUserId: user.userId,
+    },
+    () => docClient.send(
+      new UpdateCommand({
+        TableName: PERMISSIONS_TABLE,
+        Key: { pk: ruleId, sk: RULE_SK },
+        UpdateExpression: updateExpression,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+      }),
+    ),
   );
 
   const updatedRule = { ...existingRule, ...updates };
@@ -868,46 +924,35 @@ async function handleUpdatePermission(
   // unguarded throw in lease revocation or the activity cursor surfaced to the
   // client as "Internal server error" even though the edit had saved (create
   // never hits this path, which is why only edits appeared to fail).
-  const affectedPath = (updates.pathPattern as string) || existingRule.pathPattern;
   try {
-    // Revoke leases overlapping both old and new path patterns.
-    await revokeOverlappingLeases(
-      affectedPath,
-      existingRule.userId,
-      existingRule.role,
-      user.userId,
-      vault.orgId,
-      vault.vaultId
+    // Revoke the Cartesian union of old/new paths and old/new principals. A
+    // direct-user rule can be retargeted to another user or a role; sweeping
+    // only the stored principal leaves the replacement principal's lease row
+    // stale until its next refresh.
+    const paths = [...new Set([affectedPath, existingRule.pathPattern])];
+    const principalScopeKey = (principal: { userId: string; role: string | null }): string =>
+      principal.role ? `role:${principal.role}` : `user:${principal.userId}`;
+    const principals = [
+      { userId: existingRule.userId, role: existingRule.role ?? null },
+      { userId: targetUserId, role: resultingRole },
+    ].filter((principal, index, all) =>
+      all.findIndex((candidate) => principalScopeKey(candidate) === principalScopeKey(principal)) === index
     );
-    if (updates.pathPattern && updates.pathPattern !== existingRule.pathPattern) {
-      await revokeOverlappingLeases(
-        existingRule.pathPattern,
-        existingRule.userId,
-        existingRule.role,
-        user.userId,
-        vault.orgId,
-        vault.vaultId
-      );
+    for (const path of paths) {
+      for (const principal of principals) {
+        await revokeOverlappingLeases(
+          path,
+          principal.userId,
+          principal.role,
+          user.userId,
+          vault.orgId,
+          vault.vaultId
+        );
+      }
     }
   } catch (err) {
     console.error(
       '[PERMISSIONS] update: lease revocation failed (rule already updated)',
-      (err as Error).message
-    );
-  }
-
-  // Cursor bump — see handleCreatePermission for rationale. Best-effort.
-  try {
-    await recordVaultActivity({
-      orgId: vault.orgId,
-      vaultId: vault.vaultId,
-      action: 'permission_changed',
-      path: affectedPath,
-      actorUserId: user.userId,
-    });
-  } catch (err) {
-    console.error(
-      '[PERMISSIONS] update: recordVaultActivity failed (rule already updated)',
       (err as Error).message
     );
   }
@@ -997,12 +1042,20 @@ async function handleDeletePermission(
     existingRule
   );
 
-  // Delete the rule
-  await docClient.send(
-    new DeleteCommand({
-      TableName: PERMISSIONS_TABLE,
-      Key: { pk: ruleId, sk: RULE_SK },
-    })
+  // Delete the rule only after its reconciliation intent is durable.
+  await performPermissionMutation(
+    {
+      orgId: vault.orgId,
+      vaultId: vault.vaultId,
+      path: existingRule.pathPattern,
+      actorUserId: user.userId,
+    },
+    () => docClient.send(
+      new DeleteCommand({
+        TableName: PERMISSIONS_TABLE,
+        Key: { pk: ruleId, sk: RULE_SK },
+      }),
+    ),
   );
 
   // Revoke leases overlapping the deleted permission's path
@@ -1014,15 +1067,6 @@ async function handleDeletePermission(
     vault.orgId,
     vault.vaultId
   );
-
-  // Cursor bump — see handleCreatePermission for rationale.
-  await recordVaultActivity({
-    orgId: vault.orgId,
-    vaultId: vault.vaultId,
-    action: 'permission_changed',
-    path: existingRule.pathPattern,
-    actorUserId: user.userId,
-  });
 
   await logAudit({
     userId: user.userId,
@@ -1479,14 +1523,17 @@ async function handleSetLevel(
         expressionAttributeNames[`#k${i}`] = key;
         expressionAttributeValues[`:v${i}`] = updates[key];
       });
-      await docClient.send(
-        new UpdateCommand({
-          TableName: PERMISSIONS_TABLE,
-          Key: { pk: existing.id, sk: RULE_SK },
-          UpdateExpression: updateExpression,
-          ExpressionAttributeNames: expressionAttributeNames,
-          ExpressionAttributeValues: expressionAttributeValues,
-        })
+      await performPermissionMutation(
+        { orgId: vault.orgId, vaultId: vault.vaultId, path: pathPattern, actorUserId: user.userId },
+        () => docClient.send(
+          new UpdateCommand({
+            TableName: PERMISSIONS_TABLE,
+            Key: { pk: existing.id, sk: RULE_SK },
+            UpdateExpression: updateExpression,
+            ExpressionAttributeNames: expressionAttributeNames,
+            ExpressionAttributeValues: expressionAttributeValues,
+          }),
+        ),
       );
       resultRule = { ...existing, actions, effect, ...(requestedPriority !== undefined ? { priority: requestedPriority } : {}), updatedAt: now };
       decision = 'update';
@@ -1508,11 +1555,14 @@ async function handleSetLevel(
       };
       const item: Record<string, unknown> = { ...rule, pk: ruleId, sk: RULE_SK };
       if (item.role === null) delete item.role;
-      await docClient.send(
-        new PutCommand({
-          TableName: PERMISSIONS_TABLE,
-          Item: item,
-        })
+      await performPermissionMutation(
+        { orgId: vault.orgId, vaultId: vault.vaultId, path: pathPattern, actorUserId: user.userId },
+        () => docClient.send(
+          new PutCommand({
+            TableName: PERMISSIONS_TABLE,
+            Item: item,
+          }),
+        ),
       );
       resultRule = rule;
       decision = 'create';
@@ -1526,13 +1576,6 @@ async function handleSetLevel(
       vault.orgId,
       vault.vaultId
     );
-    await recordVaultActivity({
-      orgId: vault.orgId,
-      vaultId: vault.vaultId,
-      action: 'permission_changed',
-      path: pathPattern,
-      actorUserId: user.userId,
-    });
     await logAudit({
       userId: user.userId,
       userEmail: user.email,
@@ -1645,11 +1688,19 @@ async function handleSetLevel(
       },
       existing
     );
-    await docClient.send(
-      new DeleteCommand({
-        TableName: PERMISSIONS_TABLE,
-        Key: { pk: existing.id, sk: RULE_SK },
-      })
+    await performPermissionMutation(
+      {
+        orgId: vault.orgId,
+        vaultId: vault.vaultId,
+        path: existing.pathPattern,
+        actorUserId: user.userId,
+      },
+      () => docClient.send(
+        new DeleteCommand({
+          TableName: PERMISSIONS_TABLE,
+          Key: { pk: existing.id, sk: RULE_SK },
+        }),
+      ),
     );
     await revokeOverlappingLeases(
       existing.pathPattern,
@@ -1659,13 +1710,6 @@ async function handleSetLevel(
       vault.orgId,
       vault.vaultId
     );
-    await recordVaultActivity({
-      orgId: vault.orgId,
-      vaultId: vault.vaultId,
-      action: 'permission_changed',
-      path: existing.pathPattern,
-      actorUserId: user.userId,
-    });
     await logAudit({
       userId: user.userId,
       userEmail: user.email,
@@ -1738,14 +1782,17 @@ async function handleSetLevel(
       expressionAttributeNames[`#k${i}`] = key;
       expressionAttributeValues[`:v${i}`] = updates[key];
     });
-    await docClient.send(
-      new UpdateCommand({
-        TableName: PERMISSIONS_TABLE,
-        Key: { pk: existing.id, sk: RULE_SK },
-        UpdateExpression: updateExpression,
-        ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
-      })
+    await performPermissionMutation(
+      { orgId: vault.orgId, vaultId: vault.vaultId, path: pathPattern, actorUserId: user.userId },
+      () => docClient.send(
+        new UpdateCommand({
+          TableName: PERMISSIONS_TABLE,
+          Key: { pk: existing.id, sk: RULE_SK },
+          UpdateExpression: updateExpression,
+          ExpressionAttributeNames: expressionAttributeNames,
+          ExpressionAttributeValues: expressionAttributeValues,
+        }),
+      ),
     );
     resultRule = { ...existing, actions, effect, ...(requestedPriority !== undefined ? { priority: requestedPriority } : {}), updatedAt: now };
     decision = 'update';
@@ -1767,11 +1814,14 @@ async function handleSetLevel(
     };
     const item: Record<string, unknown> = { ...rule, pk: ruleId, sk: RULE_SK };
     if (item.role === null) delete item.role;
-    await docClient.send(
-      new PutCommand({
-        TableName: PERMISSIONS_TABLE,
-        Item: item,
-      })
+    await performPermissionMutation(
+      { orgId: vault.orgId, vaultId: vault.vaultId, path: pathPattern, actorUserId: user.userId },
+      () => docClient.send(
+        new PutCommand({
+          TableName: PERMISSIONS_TABLE,
+          Item: item,
+        }),
+      ),
     );
     resultRule = rule;
     decision = 'create';
@@ -1785,13 +1835,6 @@ async function handleSetLevel(
     vault.orgId,
     vault.vaultId
   );
-  await recordVaultActivity({
-    orgId: vault.orgId,
-    vaultId: vault.vaultId,
-    action: 'permission_changed',
-    path: pathPattern,
-    actorUserId: user.userId,
-  });
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
@@ -2397,6 +2440,61 @@ function parseOptionalPriority(value: unknown): number | undefined | null {
     return null;
   }
   return priority;
+}
+
+/**
+ * Normalizes an optional permission expiry to canonical UTC ISO-8601.
+ * `undefined` means unchanged/omitted and `null` explicitly removes expiry.
+ */
+function normalizePermissionExpiry(value: unknown, now = Date.now()): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== 'string') {
+    throw new ValidationError('expiresAt must be a valid ISO-8601 timestamp');
+  }
+
+  const match = ISO_8601_TIMESTAMP.exec(value);
+  if (!match) {
+    throw new ValidationError('expiresAt must be a valid ISO-8601 timestamp');
+  }
+
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, , zone, offsetHourText, offsetMinuteText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHour = offsetHourText === undefined ? 0 : Number(offsetHourText);
+  const offsetMinute = offsetMinuteText === undefined ? 0 : Number(offsetMinuteText);
+  const maxDay = month >= 1 && month <= 12
+    ? new Date(Date.UTC(year, month, 0)).getUTCDate()
+    : 0;
+  const validOffset = zone === 'Z' || (
+    offsetHour <= 14 &&
+    offsetMinute <= 59 &&
+    (offsetHour < 14 || offsetMinute === 0)
+  );
+  if (
+    month < 1 || month > 12 || day < 1 || day > maxDay ||
+    hour > 23 || minute > 59 || second > 59 || !validOffset
+  ) {
+    throw new ValidationError('expiresAt must be a valid ISO-8601 timestamp');
+  }
+
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new ValidationError('expiresAt must be a valid ISO-8601 timestamp');
+  }
+  if (parsed <= now) {
+    throw new ValidationError('expiresAt must be in the future');
+  }
+  const maximumExpiry = new Date(now);
+  maximumExpiry.setUTCFullYear(maximumExpiry.getUTCFullYear() + MAX_PERMISSION_EXPIRY_YEARS);
+  if (parsed > maximumExpiry.getTime()) {
+    throw new ValidationError('expiresAt cannot be more than 10 years in the future');
+  }
+  return new Date(parsed).toISOString();
 }
 
 /**

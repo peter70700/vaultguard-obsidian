@@ -189,6 +189,44 @@ describe("VaultGuardApiClient surface", () => {
     });
   });
 
+  it("sends mustBeAbsent for guarded file creates and rejects mixed intent locally", async () => {
+    const client = makeClient();
+    const fileBytes = new TextEncoder().encode("new file");
+
+    mockRequestUrl.mockResolvedValueOnce(
+      jsonResponse(200, {
+        path: "/docs/new.md",
+        hash: "abc",
+        versionId: "v-created",
+      })
+    );
+
+    await expect(
+      client.putFile(
+        "/docs/new.md",
+        fileBytes.buffer,
+        { encryptedKey: "wrapped-key" },
+        { mustBeAbsent: true }
+      )
+    ).resolves.toMatchObject({ versionId: "v-created" });
+
+    expect(JSON.parse(mockRequestUrl.mock.calls[0]![0].body as string)).toEqual({
+      content: Buffer.from(fileBytes).toString("base64"),
+      contentType: "application/octet-stream",
+      mustBeAbsent: true,
+    });
+
+    await expect(
+      client.putFile(
+        "/docs/new.md",
+        fileBytes.buffer,
+        { encryptedKey: "wrapped-key" },
+        { expectedVersionId: "v1", mustBeAbsent: true }
+      )
+    ).rejects.toThrow("mutually exclusive");
+    expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+  });
+
   it("sends expectedVersionId for guarded file deletes", async () => {
     const client = makeClient();
     mockRequestUrl.mockResolvedValueOnce(emptyResponse());

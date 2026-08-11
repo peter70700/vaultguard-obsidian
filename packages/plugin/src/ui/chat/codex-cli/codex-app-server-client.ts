@@ -5,6 +5,11 @@
 import { Platform } from "obsidian";
 
 import type { AiChatPermissionMode, OpenAiReasoningEffort } from "../../../types";
+import {
+  classifyUserFacingRecovery,
+  recoveryGuidanceMessage,
+} from "../../errors/user-facing-recovery";
+import type { AnthropicImageBlock } from "../anthropic-client";
 import type { ClaudeCliHandlers } from "../claude-cli/claude-cli-client";
 import {
   VAULTGUARD_MCP_TOOL_NAMES,
@@ -15,6 +20,25 @@ const TOKEN_ENV_PREFIX = "VAULTGUARD_CODEX_MCP_TOKEN_";
 const REMOTE_CONTROL_DISABLED_ENV = "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED";
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_STDERR_CHARS = 4_000;
+
+export type CodexTurnInput =
+  | { type: "text"; text: string }
+  | { type: "image"; url: string };
+
+export function buildCodexTurnInput(
+  text: string,
+  images?: ReadonlyArray<AnthropicImageBlock>,
+): CodexTurnInput[] {
+  const input: CodexTurnInput[] = [];
+  if (text.length > 0) input.push({ type: "text", text });
+  for (const image of images ?? []) {
+    input.push({
+      type: "image",
+      url: `data:${image.source.media_type};base64,${image.source.data}`,
+    });
+  }
+  return input;
+}
 
 export const CODEX_DISABLED_FEATURES: ReadonlyArray<string> = [
   "shell_tool",
@@ -263,13 +287,6 @@ function cleanText(value: string): string {
 
 export function codexTurnErrorMessage(error: unknown): string {
   const record = error && typeof error === "object" ? (error as Record<string, unknown>) : {};
-  const message = cleanText(
-    typeof record.message === "string"
-      ? record.message
-      : typeof error === "string"
-        ? error
-        : "Codex reported a turn error.",
-  );
   let info = "";
   try {
     info = JSON.stringify(record.codexErrorInfo ?? "");
@@ -277,17 +294,38 @@ export function codexTurnErrorMessage(error: unknown): string {
     // The typed protocol value is JSON, but fail closed if an unexpected host
     // object reaches this compatibility layer.
   }
-  const combined = `${info} ${message}`;
-  if (/UsageLimitExceeded|SessionBudgetExceeded|usage limit|quota|rate.?limit/i.test(combined)) {
-    return `Your ChatGPT/Codex usage limit was reached. Check your plan limits or retry later.${message ? ` (${message})` : ""}`;
+  let code = "";
+  if (/UsageLimitExceeded|SessionBudgetExceeded/i.test(info)) {
+    code = "RATE_LIMITED";
+  } else if (/Unauthorized|AuthenticationRequired/i.test(info)) {
+    code = "UNAUTHORIZED";
+  } else if (
+    /HttpConnectionFailed|ResponseStreamConnectionFailed|ResponseStreamDisconnected|ResponseTooManyFailedAttempts/i.test(
+      info,
+    )
+  ) {
+    code = "CONNECTION_FAILED";
   }
-  if (/Unauthorized|authentication|not logged in|\b401\b/i.test(combined)) {
+  const guidance = classifyUserFacingRecovery({ authenticated: true, code });
+  if (guidance.category === "rate_limited") {
+    return "Your ChatGPT/Codex usage limit was reached. Check your plan limits or retry later.";
+  }
+  if (guidance.category === "authentication_required") {
     return "The Codex ChatGPT login is no longer authorized. Run `codex login`, then retry.";
   }
-  if (/HttpConnectionFailed|ResponseStreamConnectionFailed|ResponseStreamDisconnected/i.test(combined)) {
-    return `Codex could not reach or keep a connection to OpenAI. Check the network and retry.${message ? ` (${message})` : ""}`;
+  if (guidance.category === "network_unavailable") {
+    return "Codex could not reach or keep a connection to OpenAI. Check the network and retry.";
   }
-  return message || "Codex reported a turn error.";
+  return recoveryGuidanceMessage(guidance);
+}
+
+function codexRetryStatusMessage(error: unknown): string {
+  const record = error && typeof error === "object" ? (error as Record<string, unknown>) : {};
+  const message = cleanText(typeof record.message === "string" ? record.message : "");
+  const progress = message.match(/\b(\d+)\s*\/\s*(\d+)\b/);
+  return progress
+    ? `Codex is reconnecting (${progress[1]}/${progress[2]})\u2026`
+    : "Codex is reconnecting\u2026";
 }
 
 function toolResultText(result: unknown): string {
@@ -406,6 +444,7 @@ export class CodexAppServerClient {
     text: string,
     handlers: ClaudeCliHandlers,
     signal?: AbortSignal,
+    images?: ReadonlyArray<AnthropicImageBlock>,
   ): Promise<void> {
     if (!this.deps || Platform.isMobileApp) {
       throw new Error("ChatGPT subscription mode needs desktop Obsidian.");
@@ -447,7 +486,7 @@ export class CodexAppServerClient {
     try {
       const response = await this.request("turn/start", {
         threadId,
-        input: [{ type: "text", text }],
+        input: buildCodexTurnInput(text, images),
         cwd: this.cwd,
         environments: [],
         approvalPolicy: "never",
@@ -756,6 +795,13 @@ export class CodexAppServerClient {
     }
     if (method === "error") {
       const error = params.error ?? params;
+      // App-server emits retryable error notifications while it reconnects to
+      // the provider. Keep the active turn and its scoped VaultGuard lease alive
+      // until a terminal error or turn/completed notification arrives.
+      if (params.willRetry === true) {
+        active.handlers.onStatus?.(codexRetryStatusMessage(error));
+        return;
+      }
       this.rejectActiveTurn(new Error(codexTurnErrorMessage(error)));
       return;
     }

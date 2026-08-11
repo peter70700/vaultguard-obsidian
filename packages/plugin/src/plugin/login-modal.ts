@@ -7,6 +7,14 @@ import {
   applyLoginStyleFallbackIfNeeded,
   clearLoginStyleFallback,
 } from "../ui/login-style-fallback";
+import {
+  createPluginAuthJourney,
+  isPluginAuthGenerationCurrent,
+  transitionPluginAuthJourney,
+  type PluginAuthJourneyState,
+  type PluginLoginVerificationResult,
+  type PluginVerificationBinding,
+} from "./auth-journey";
 
 export type EncryptionMode = 'server-managed' | 'hybrid-zk';
 
@@ -25,7 +33,17 @@ export interface LoginCredentials {
    * set-password sub-form is active.
    */
   newPassword?: string;
+  /** One-time metadata sent only with the initial Cognito authentication call. */
+  loginPermitMetadata?: Pick<PluginVerificationBinding, "attemptId" | "permit">;
 }
+
+export type ResolvePluginLoginVerification = (
+  organization: string,
+  email: string,
+  generation: number,
+  isGenerationCurrent: (generation: number) => boolean,
+  onVerificationRequired: () => void,
+) => Promise<PluginLoginVerificationResult>;
 
 export class LoginModal extends Modal {
   private readonly i18n = createI18n();
@@ -45,8 +63,15 @@ export class LoginModal extends Modal {
    * preference was cleared server-side.
    */
   private onRecoveryCode?: (email: string, code: string) => Promise<void>;
+  private resolveLoginVerification?: ResolvePluginLoginVerification;
   private submitBtn: ButtonComponent | null = null;
+  private backBtn: ButtonComponent | null = null;
+  private stepTitleEl: HTMLElement | null = null;
+  private subtitleEl: HTMLElement | null = null;
   private orgSlugContainer: HTMLElement | null = null;
+  private credentialsContainer: HTMLElement | null = null;
+  private humanVerificationContainer: HTMLElement | null = null;
+  private passwordInputEl: HTMLInputElement | null = null;
   private mfaContainer: HTMLElement | null = null;
   private mfaInputEl: HTMLInputElement | null = null;
   private mfaHintEl: HTMLElement | null = null;
@@ -76,6 +101,7 @@ export class LoginModal extends Modal {
   private styleFallbackApplied: boolean = false;
   private modalActive = false;
   private readonly deferredTimers = new Set<ReturnType<typeof setTimeout>>();
+  private journey: PluginAuthJourneyState;
 
   constructor(
     app: App,
@@ -88,7 +114,8 @@ export class LoginModal extends Modal {
     currentEmail: string = "",
     firstTimeSetup: boolean = false,
     requireOrgSlug: boolean = true,
-    onRecoveryCode?: (email: string, code: string) => Promise<void>
+    onRecoveryCode?: (email: string, code: string) => Promise<void>,
+    resolveLoginVerification?: ResolvePluginLoginVerification
   ) {
     super(app);
     this.onSubmit = onSubmit;
@@ -103,6 +130,15 @@ export class LoginModal extends Modal {
     this.firstTimeSetup = firstTimeSetup;
     this.requireOrgSlug = requireOrgSlug;
     this.onRecoveryCode = onRecoveryCode;
+    this.resolveLoginVerification = resolveLoginVerification;
+    this.journey = createPluginAuthJourney({
+      requireOrganization: requireOrgSlug,
+      loginVerificationMode: resolveLoginVerification ? "unresolved" : "disabled",
+      loginVerificationResolverAvailable: Boolean(resolveLoginVerification),
+      encryptionMode,
+      organization: currentOrgSlug,
+      email: currentEmail,
+    });
   }
 
   onOpen(): void {
@@ -130,9 +166,15 @@ export class LoginModal extends Modal {
     createShieldIcon(iconWrap);
 
     // Title
-    contentEl.createEl("h2", { text: "VaultGuard Login", cls: "vaultguard-login-title" });
-    contentEl.createEl("p", {
-      text: "Sign in to access your secured vault.",
+    const organizationStep = this.journey.step === "organization";
+    this.stepTitleEl = contentEl.createEl("h2", {
+      text: organizationStep ? "Choose your organization" : "VaultGuard Login",
+      cls: "vaultguard-login-title",
+    });
+    this.subtitleEl = contentEl.createEl("p", {
+      text: organizationStep
+        ? "Enter the organization slug your administrator gave you."
+        : "Sign in to access your secured vault.",
       cls: "vaultguard-login-subtitle",
     });
 
@@ -145,7 +187,7 @@ export class LoginModal extends Modal {
 
     // Organization slug field (hidden if already configured)
     this.orgSlugContainer = form.createDiv({ cls: "vaultguard-field-group" });
-    if (this.currentOrgSlug || !this.requireOrgSlug) {
+    if (!organizationStep || this.currentOrgSlug || !this.requireOrgSlug) {
       this.orgSlugContainer.hide();
     }
     this.orgSlugContainer.createEl("label", { text: "Organization", cls: "vaultguard-field-label" });
@@ -161,8 +203,14 @@ export class LoginModal extends Modal {
     orgSlugInput.addEventListener("input", () => { this.orgSlug = orgSlugInput.value.trim().toLowerCase(); });
     orgSlugInput.addEventListener("keydown", (e) => { if (e.key === "Enter") this.handleSubmit(); });
 
+    // Credential fields are grouped so every later step can remove the whole
+    // account step from focus and the accessibility tree in one operation.
+    this.credentialsContainer = form.createDiv({ cls: "vaultguard-login-credentials-step" });
+    if (organizationStep) this.credentialsContainer.hide();
+
     // Email field
-    const emailGroup = form.createDiv({ cls: "vaultguard-field-group" });
+    const emailGroup = this.credentialsContainer.createDiv({ cls: "vaultguard-field-group" });
+    if (organizationStep) emailGroup.hide();
     emailGroup.createEl("label", { text: "Email", cls: "vaultguard-field-label" });
     const emailInput = emailGroup.createEl("input", {
       cls: "vaultguard-field-input",
@@ -175,25 +223,43 @@ export class LoginModal extends Modal {
     emailInput.addEventListener("keydown", (e) => { if (e.key === "Enter") this.handleSubmit(); });
 
     // Password field
-    const passGroup = form.createDiv({ cls: "vaultguard-field-group" });
+    const passGroup = this.credentialsContainer.createDiv({ cls: "vaultguard-field-group" });
+    if (organizationStep) passGroup.hide();
     passGroup.createEl("label", { text: "Password", cls: "vaultguard-field-label" });
     const passInput = passGroup.createEl("input", {
       cls: "vaultguard-field-input",
       attr: { type: "password", placeholder: "Password" },
     });
+    this.passwordInputEl = passInput;
     passInput.addEventListener("input", () => { this.password = passInput.value; });
     passInput.addEventListener("keydown", (e) => { if (e.key === "Enter") this.handleSubmit(); });
     this.addPasswordToggle(passInput);
 
     // Forgot password link
     if (this.onForgotPassword && this.onConfirmReset) {
-      const forgotLink = form.createDiv({ cls: "vaultguard-forgot-link" });
+      const forgotLink = this.credentialsContainer.createDiv({ cls: "vaultguard-forgot-link" });
+      if (organizationStep) forgotLink.hide();
       forgotLink.createEl("a", { text: "Forgot password?", href: "#" });
       forgotLink.addEventListener("click", (e) => {
         e.preventDefault();
         this.showForgotPasswordForm();
       });
     }
+
+    // Plugin verification happens in the trusted system browser. This panel
+    // replaces the credential controls while the initiating modal retains the
+    // polling verifier and waits for the one-time permit.
+    this.humanVerificationContainer = form.createDiv({
+      cls: "vaultguard-field-group vaultguard-human-verification-container",
+    });
+    this.humanVerificationContainer.createEl("strong", {
+      text: "Complete human verification",
+    });
+    this.humanVerificationContainer.createEl("span", {
+      text: "Finish the check in your browser, then return to Obsidian. Your password is sent only to Cognito.",
+      cls: "vaultguard-field-hint",
+    });
+    this.humanVerificationContainer.hide();
 
     // MFA field (hidden by default)
     this.mfaContainer = form.createDiv({ cls: "vaultguard-field-group vaultguard-mfa-container" });
@@ -224,7 +290,7 @@ export class LoginModal extends Modal {
 
     // Passphrase field (hybrid-zk mode only)
     this.passphraseContainer = form.createDiv({ cls: "vaultguard-field-group vaultguard-passphrase-container" });
-    if (this.encryptionMode !== 'hybrid-zk') {
+    if (this.journey.step !== "local_unlock" || this.encryptionMode !== 'hybrid-zk') {
       this.passphraseContainer.hide();
     }
 
@@ -318,8 +384,18 @@ export class LoginModal extends Modal {
       .setButtonText("Cancel")
       .onClick(() => this.close());
 
+    if (!organizationStep && this.requireOrgSlug && !this.currentOrgSlug) {
+      this.backBtn = new ButtonComponent(actionRow)
+        .setButtonText("Change organization")
+        .onClick(() => {
+          this.journey = transitionPluginAuthJourney(this.journey, { type: "back" });
+          this.resetTransientCredentialState();
+          this.onOpen();
+        });
+    }
+
     this.submitBtn = new ButtonComponent(actionRow)
-      .setButtonText("Sign in")
+      .setButtonText(organizationStep ? "Continue" : "Sign in")
       .setCta()
       .onClick(() => this.handleSubmit());
 
@@ -344,7 +420,7 @@ export class LoginModal extends Modal {
 
     // Focus first visible input on open
     this.scheduleWhileOpen(() => {
-      if (this.currentOrgSlug || !this.requireOrgSlug) {
+      if (!organizationStep) {
         emailInput.focus();
       } else {
         orgSlugInput.focus();
@@ -370,6 +446,8 @@ export class LoginModal extends Modal {
     this.modalEl.removeClass("vaultguard-login-modal");
     this.contentEl.removeClass("vaultguard-login-modal-content");
     this.contentEl.empty();
+    this.journey = transitionPluginAuthJourney(this.journey, { type: "close" });
+    this.resetTransientCredentialState();
   }
 
   private scheduleWhileOpen(callback: () => void, delayMs: number): void {
@@ -399,12 +477,45 @@ export class LoginModal extends Modal {
     this.recoveryMode = false;
   }
 
+  private hideInactiveLoginSteps(): void {
+    this.orgSlugContainer?.hide();
+    this.credentialsContainer?.hide();
+    this.humanVerificationContainer?.hide();
+    this.passphraseContainer?.hide();
+    this.newPasswordContainer?.hide();
+    this.mfaContainer?.hide();
+  }
+
+  private clearAccountPassword(): void {
+    this.password = "";
+    if (this.passwordInputEl) this.passwordInputEl.value = "";
+  }
+
+  private showHumanVerificationStep(): void {
+    this.hideInactiveLoginSteps();
+    this.humanVerificationContainer?.show();
+    this.stepTitleEl?.setText("Verify you're human");
+    this.subtitleEl?.setText("Step 3 of 3 — complete the browser check to continue.");
+    this.backBtn?.setButtonText("Back to sign in");
+  }
+
   showMfaPrompt(): void {
+    this.hideInactiveLoginSteps();
+    this.clearAccountPassword();
     this.showMfa = true;
+    this.showNewPassword = false;
     this.recoveryMode = false;
+    this.newPasswordValue = "";
+    this.newPasswordConfirm = "";
+    this.newPasswordContainer?.querySelectorAll("input").forEach(input => {
+      input.value = "";
+    });
     if (this.mfaContainer) {
       this.mfaContainer.show();
     }
+    this.stepTitleEl?.setText("Enter your MFA code");
+    this.subtitleEl?.setText("Complete the identity-provider challenge to continue.");
+    this.backBtn?.setButtonText("Back to sign in");
     this.applyMfaModeUi();
     this.showError("");
     if (this.submitBtn) {
@@ -419,10 +530,19 @@ export class LoginModal extends Modal {
    * submit button so the same Sign-in action drives the challenge response.
    */
   private showNewPasswordPrompt(): void {
+    this.hideInactiveLoginSteps();
+    this.clearAccountPassword();
+    this.showMfa = false;
     this.showNewPassword = true;
+    this.recoveryMode = false;
+    this.mfaCode = "";
+    if (this.mfaInputEl) this.mfaInputEl.value = "";
     if (this.newPasswordContainer) {
       this.newPasswordContainer.show();
     }
+    this.stepTitleEl?.setText("Choose a new password");
+    this.subtitleEl?.setText("Replace the temporary password before continuing.");
+    this.backBtn?.setButtonText("Back to sign in");
     this.showError("");
     if (this.submitBtn) {
       this.submitBtn.setButtonText("Set password & sign in");
@@ -469,13 +589,23 @@ export class LoginModal extends Modal {
 
   /** Flips the MFA panel between TOTP-code entry and recovery-code entry. */
   private toggleRecoveryMode(): void {
-    this.recoveryMode = !this.recoveryMode;
+    const useRecovery = !this.recoveryMode;
+    this.journey = transitionPluginAuthJourney(this.journey, {
+      type: useRecovery ? "use_recovery" : "use_mfa",
+    });
+    this.recoveryMode = useRecovery;
     // Stale input from the other mode would silently submit, so clear it.
     this.mfaCode = "";
     if (this.mfaInputEl) {
       this.mfaInputEl.value = "";
     }
     this.applyMfaModeUi();
+    this.stepTitleEl?.setText(this.recoveryMode ? "Use a recovery code" : "Enter your MFA code");
+    this.subtitleEl?.setText(
+      this.recoveryMode
+        ? "Use one saved recovery code to reset the unavailable authenticator."
+        : "Complete the identity-provider challenge to continue.",
+    );
     this.showError("");
     if (this.submitBtn) {
       this.submitBtn.setButtonText(this.recoveryMode ? "Use Recovery Code" : "Verify MFA");
@@ -568,6 +698,22 @@ export class LoginModal extends Modal {
       return;
     }
 
+    if (this.journey.step === "organization") {
+      if (this.requireOrgSlug && !this.orgSlug) {
+        this.showError("Please enter your organization slug.");
+        return;
+      }
+      this.journey = transitionPluginAuthJourney(this.journey, {
+        type: "confirm_organization",
+        organization: this.orgSlug,
+      });
+      this.onOpen();
+      return;
+    }
+
+    const isChallengeContinuation = ["new_password", "mfa_setup", "mfa", "recovery"]
+      .includes(this.journey.step);
+
     if (this.requireOrgSlug && !this.orgSlug) {
       this.showError("Please enter your organization slug.");
       return;
@@ -576,7 +722,7 @@ export class LoginModal extends Modal {
       this.showError("Please enter your email address.");
       return;
     }
-    if (!this.password) {
+    if (!isChallengeContinuation && !this.password) {
       this.showError("Please enter your password.");
       return;
     }
@@ -594,7 +740,7 @@ export class LoginModal extends Modal {
         return;
       }
     }
-    if (this.encryptionMode === 'hybrid-zk') {
+    if (this.encryptionMode === 'hybrid-zk' && this.journey.step === "local_unlock") {
       if (!this.passphrase) {
         this.showError("Please enter your encryption passphrase.");
         return;
@@ -622,15 +768,90 @@ export class LoginModal extends Modal {
     }
 
     try {
+      let loginPermitMetadata: LoginCredentials["loginPermitMetadata"];
+      if (!isChallengeContinuation) {
+        this.journey = transitionPluginAuthJourney(this.journey, {
+          type: "submit_credentials",
+          email: this.email,
+          password: this.password,
+        });
+        if (this.journey.step === "human_verification") {
+          if (!this.resolveLoginVerification) {
+            throw new Error("Human-verification policy could not be resolved safely.");
+          }
+          const generation = this.journey.generation;
+          const verificationResult = await this.resolveLoginVerification(
+            this.orgSlug,
+            this.email,
+            generation,
+            candidate => isPluginAuthGenerationCurrent(this.journey, candidate),
+            () => {
+              if (
+                this.modalActive &&
+                isPluginAuthGenerationCurrent(this.journey, generation)
+              ) {
+                this.showHumanVerificationStep();
+              }
+            },
+          );
+          if (!isPluginAuthGenerationCurrent(this.journey, generation)) {
+            throw new Error("Human verification was cancelled because the login context changed.");
+          }
+          if (verificationResult.mode === "disabled") {
+            if ("binding" in verificationResult) {
+              throw new Error("Disabled human verification returned an unexpected login permit.");
+            }
+            this.journey = transitionPluginAuthJourney(this.journey, {
+              type: "verification_disabled",
+            });
+          } else if (
+            verificationResult.mode === "observe" ||
+            verificationResult.mode === "enforce"
+          ) {
+            const binding = verificationResult.binding;
+            if (!binding || typeof binding !== "object") {
+              throw new Error("Required human verification did not return a login permit.");
+            }
+            this.journey = transitionPluginAuthJourney(this.journey, {
+              type: "verification_accepted",
+              mode: verificationResult.mode,
+              ...binding,
+            });
+            loginPermitMetadata = {
+              attemptId: binding.attemptId,
+              permit: binding.permit,
+            };
+          } else {
+            throw new Error("Human-verification policy returned an unsupported mode.");
+          }
+        }
+      }
+
       await this.onSubmit({
         orgSlug: this.orgSlug,
         email: this.email,
-        password: this.password,
-        mfaCode: this.mfaCode,
-        passphrase: this.passphrase,
+        password: isChallengeContinuation ? "" : this.password,
+        mfaCode: this.journey.step === "mfa" ? this.mfaCode : "",
+        passphrase: this.journey.step === "local_unlock" ? this.passphrase : "",
         zkSetup: this.isZkSetup,
-        newPassword: this.showNewPassword ? this.newPasswordValue : undefined,
+        newPassword: this.journey.step === "new_password" ? this.newPasswordValue : undefined,
+        loginPermitMetadata,
       });
+      if (isChallengeContinuation) {
+        this.journey = transitionPluginAuthJourney(this.journey, {
+          type: "challenge_succeeded",
+        });
+      } else {
+        this.journey = transitionPluginAuthJourney(this.journey, {
+          type: "authentication_succeeded",
+        });
+      }
+      if (this.journey.step === "local_unlock") {
+        this.journey = transitionPluginAuthJourney(this.journey, {
+          type: "submit_local_unlock",
+          passphrase: this.passphrase,
+        });
+      }
       if (!this.modalActive) return;
       this.close();
     } catch (error) {
@@ -639,13 +860,49 @@ export class LoginModal extends Modal {
 
       // The NEW_PASSWORD_REQUIRED sentinel must be matched BEFORE the generic
       // "mfa"/"challenge"/"2fa" test so the word "password" routes here.
-      if (msg === "NEW_PASSWORD_REQUIRED") {
+      if (msg === "AUTH_RESTART_REQUIRED") {
+        // A Cognito challenge session expired. Re-running InitiateAuth here
+        // would be a brand-new credential attempt and therefore needs a fresh
+        // one-time permit. Return to credentials and invalidate every prior
+        // challenge/proof instead of silently reusing consumed metadata.
+        this.journey = transitionPluginAuthJourney(this.journey, { type: "back" });
+        this.resetTransientCredentialState();
+        this.onOpen();
+        this.showError("Your sign-in challenge expired. Enter your credentials and verify again.");
+      } else if (msg === "NEW_PASSWORD_REQUIRED") {
+        if (this.journey.step === "authenticating") {
+          this.journey = transitionPluginAuthJourney(this.journey, {
+            type: "authentication_challenge",
+            challenge: "new_password",
+          });
+        } else if (this.journey.step !== "new_password") {
+          this.journey = transitionPluginAuthJourney(this.journey, {
+            type: "challenge_succeeded",
+            nextChallenge: "new_password",
+          });
+        }
         this.showNewPasswordPrompt();
       } else if (msg.toLowerCase().includes("mfa") || msg.toLowerCase().includes("challenge") || msg.toLowerCase().includes("2fa")) {
+        if (this.journey.step === "authenticating") {
+          this.journey = transitionPluginAuthJourney(this.journey, {
+            type: "authentication_challenge",
+            challenge: "mfa",
+          });
+        } else if (this.journey.step !== "mfa") {
+          this.journey = transitionPluginAuthJourney(this.journey, {
+            type: "challenge_succeeded",
+            nextChallenge: "mfa",
+          });
+        }
         this.showMfaPrompt();
       } else if (msg.toLowerCase().includes("incorrect passphrase")) {
         this.showError("Incorrect encryption passphrase. If you have lost your passphrase, contact your organization administrator for key recovery.");
       } else {
+        if (this.journey.step === "human_verification" || this.journey.step === "authenticating") {
+          this.journey = transitionPluginAuthJourney(this.journey, { type: "verification_expired" });
+          this.resetTransientCredentialState();
+          this.onOpen();
+        }
         this.showError(msg);
       }
     } finally {
@@ -885,15 +1142,11 @@ export class LoginModal extends Modal {
     try {
       await this.onRecoveryCode(this.email, code);
       if (!this.modalActive) return;
-      // Reset MFA state: the next login will hit MFA_SETUP and the modal's
-      // owner will reopen the setup modal automatically.
-      this.recoveryMode = false;
-      this.showMfa = false;
-      this.mfaCode = "";
-      if (this.mfaInputEl) this.mfaInputEl.value = "";
-      if (this.mfaContainer) this.mfaContainer.hide();
-      this.applyMfaModeUi();
-      this.submitBtn?.setButtonText("Sign in");
+      // Reset the authoritative journey and rebuild only the account step. The
+      // next login will hit MFA_SETUP after Cognito sees the cleared factor.
+      this.journey = transitionPluginAuthJourney(this.journey, { type: "back" });
+      this.resetTransientCredentialState();
+      this.onOpen();
       this.showError("");
       // Display a transient success message via the error banner (re-used as
       // an info banner) — keeps the modal lightweight.

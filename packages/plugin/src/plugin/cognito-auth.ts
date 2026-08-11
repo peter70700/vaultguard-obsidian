@@ -169,6 +169,12 @@ export interface CognitoAuthResult {
   session?: string;
 }
 
+/** Opaque, one-time metadata consumed only by Cognito Pre Authentication. */
+export interface CognitoLoginPermitMetadata {
+  attemptId: string;
+  permit: string;
+}
+
 /**
  * Sentinel pool id that puts the plugin into local dev-server auth mode.
  * Matches the value documented in docs/SETUP.md (Option A) and the admin
@@ -240,7 +246,8 @@ export async function cognitoLogin(
   userPoolId: string,
   clientId: string,
   email: string,
-  password: string
+  password: string,
+  loginPermitMetadata?: CognitoLoginPermitMetadata,
 ): Promise<CognitoAuthResult> {
   const region = userPoolId.split("_")[0];
   const endpoint = `https://cognito-idp.${region}.amazonaws.com/`;
@@ -260,6 +267,13 @@ export async function cognitoLogin(
           USERNAME: email,
           PASSWORD: password,
         },
+        ...(loginPermitMetadata ? {
+          ClientMetadata: {
+            vaultguardAttemptId: loginPermitMetadata.attemptId,
+            vaultguardLoginPermit: loginPermitMetadata.permit,
+            vaultguardClientSurface: "plugin",
+          },
+        } : {}),
       }),
       throw: false,
     })

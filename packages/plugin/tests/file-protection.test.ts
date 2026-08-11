@@ -581,6 +581,23 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(plugin.offlineQueue[0].baseVersionId).toBe('v-base');
     });
 
+    it('persists create intent for offline writes based on known-absent remote state', async () => {
+      plugin.session = makeSession('editor');
+      plugin.permissionCache.set('new-note.md', PermissionLevel.WRITE);
+      plugin.connectionState.status = 'offline';
+      plugin.remoteFileState.recordAbsent('new-note.md');
+
+      await plugin.interceptedWrite('new-note.md', 'offline create');
+
+      expect(plugin.offlineQueue).toHaveLength(1);
+      expect(plugin.offlineQueue[0]).toMatchObject({
+        operation: 'write',
+        path: 'new-note.md',
+        intent: { kind: 'must-be-absent' },
+      });
+      expect(plugin.offlineQueue[0].baseVersionId).toBeUndefined();
+    });
+
     it('sends expectedVersionId for online writes with known remote state', async () => {
       plugin.session = makeSession('editor');
       plugin.permissionCache.set('notes.md', PermissionLevel.WRITE);
@@ -609,6 +626,26 @@ describe('File Protection: Vault Adapter Interception', () => {
       );
       expect(plugin.remoteFileState.getExpectedVersionId('notes.md')).toBe('v2');
       expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledOnce();
+    });
+
+    it('sends mustBeAbsent for online text creates with known-absent remote state', async () => {
+      plugin.session = makeSession('editor');
+      plugin.permissionCache.set('new-note.md', PermissionLevel.WRITE);
+      plugin.connectionState.status = 'online';
+      plugin.keyLease = makeKeyLease();
+      plugin.remoteFileState.recordAbsent('new-note.md');
+      plugin.apiRequest = vi.fn().mockResolvedValue({
+        success: true,
+        data: { path: '/new-note.md', versionId: 'v-created' },
+        error: null,
+        requestId: 'req-create',
+      });
+
+      await plugin.interceptedWrite('new-note.md', 'online create');
+
+      const body = plugin.apiRequest.mock.calls[0][2];
+      expect(body).toEqual(expect.objectContaining({ mustBeAbsent: true }));
+      expect(body.expectedVersionId).toBeUndefined();
     });
 
     it('routes online write 409 responses to conflict handling without writing or queuing blindly', async () => {
@@ -726,6 +763,30 @@ describe('File Protection: Vault Adapter Interception', () => {
       // CR-1 ordering: successful/queued PUT first, local VG1 write second.
       expect(callOrder).toEqual(['PUT', 'writeBinary']);
       expect(plugin.remoteFileState.getExpectedVersionId('img/pic.png')).toBe('v2');
+    });
+
+    it('sends mustBeAbsent for online binary creates with known-absent remote state', async () => {
+      plugin.session = makeSession('editor');
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = 'online';
+      plugin.permissionCache.set('img/new.png', PermissionLevel.WRITE);
+      plugin.remoteFileState.recordAbsent('img/new.png');
+      const bytes = PNG();
+      let putBody: any;
+      plugin.apiRequest = vi.fn(async (_method: string, _endpoint: string, body: any) => {
+        putBody = body;
+        return {
+          success: true,
+          data: { versionId: 'v-created' },
+          error: null,
+          requestId: 'req-create',
+        };
+      });
+
+      await plugin.interceptedWriteBinary('img/new.png', bytes.buffer);
+
+      expect(putBody.mustBeAbsent).toBe(true);
+      expect(putBody.expectedVersionId).toBeUndefined();
     });
 
     it('queues an in-size binary (base64 + encoding + contentType) and writes VG1 when offline', async () => {
@@ -915,7 +976,7 @@ describe('File Protection: Vault Adapter Interception', () => {
       plugin.keyLease = makeKeyLease();
       plugin.connectionState.status = 'online';
       plugin.permissionCache.set('img/new.png', PermissionLevel.WRITE);
-      plugin.remoteFileState.recordPresent('img/new.png', { versionId: 'v-new-base' });
+      plugin.remoteFileState.recordAbsent('img/new.png');
       plugin.remoteFileState.recordPresent('img/old.png', { versionId: 'v-old-base' });
 
       const bytes = PNG();
@@ -935,7 +996,8 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(puts).toHaveLength(1);
       expect(puts[0].endpoint).toContain('img%2Fnew.png');
       expect(puts[0].body.contentType).toBe('image/png');
-      expect(puts[0].body.expectedVersionId).toBe('v-new-base');
+      expect(puts[0].body.mustBeAbsent).toBe(true);
+      expect(puts[0].body.expectedVersionId).toBeUndefined();
       expect(puts[0].options).toEqual({ timeoutMs: 120_000 });
       expect(calls.find((c) => c.method === 'DELETE')?.body).toEqual({
         expectedVersionId: 'v-old-base',
@@ -952,7 +1014,7 @@ describe('File Protection: Vault Adapter Interception', () => {
       plugin.session = makeSession('editor');
       plugin.connectionState.status = 'offline';
       plugin.permissionCache.set('img/new.png', PermissionLevel.WRITE);
-      plugin.remoteFileState.recordPresent('img/new.png', { versionId: 'v-new-base' });
+      plugin.remoteFileState.recordAbsent('img/new.png');
       plugin.remoteFileState.recordPresent('img/old.png', { versionId: 'v-old-base' });
 
       const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
@@ -969,8 +1031,9 @@ describe('File Protection: Vault Adapter Interception', () => {
         path: 'img/new.png',
         encoding: 'base64',
         contentType: 'image/png',
-        baseVersionId: 'v-new-base',
+        intent: { kind: 'must-be-absent' },
       });
+      expect(writeOp.baseVersionId).toBeUndefined();
       expect(deleteOp).toMatchObject({ path: 'img/old.png', baseVersionId: 'v-old-base' });
       // The queued base64 decodes back to the original bytes.
       expect(new Uint8Array(Buffer.from(writeOp.data, 'base64'))).toEqual(bytes);
@@ -1231,6 +1294,7 @@ describe('File Protection: Vault Adapter Interception', () => {
         action: 'delete',
         path: '/trash/old.md',
       }));
+      expect(plugin.apiRequest.mock.calls[0][2]).not.toHaveProperty('roles');
       expect(plugin.originalAdapterMethods.remove).toHaveBeenCalledWith('trash/old.md');
     });
 

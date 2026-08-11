@@ -11,6 +11,12 @@ export const CODEX_MCP_ENABLED_TOOLS = [
   "create",
   "delete",
   "rename",
+  "note",
+  "property",
+  "task",
+  "inspect",
+  "template",
+  "sync_status",
 ] as const;
 
 export interface CodexConfigOptions {
@@ -80,10 +86,10 @@ export function buildCodexAgentsGuidance(): string {
   return [
     "## VaultGuard-Protected Obsidian Vaults",
     "",
-    "Do not inspect protected vault contents through raw filesystem reads, shell commands, or editor file tools. Use the configured VaultGuard MCP server: `mcp__vaultguard__get_vault_orientation/list/search/graph/read/apply_patch/create/delete/rename`.",
+    "Do not inspect protected vault contents through raw filesystem reads, shell commands, or editor file tools. Use the configured VaultGuard MCP server: `mcp__vaultguard__get_vault_orientation/list/search/graph/read/apply_patch/create/delete/rename/note/property/task/inspect/template/sync_status`.",
     "",
     "Call `mcp__vaultguard__get_vault_orientation` first when a task may involve multiple vaults, protected/encrypted content, Git state, connector readiness, or write safety. Treat the active vault as the default target unless the user names another vault, and confirm the target vault before cross-vault writes.",
     "",
-    "Launch Codex from an empty temporary working directory for protected-vault work. Treat `VG1\\0` bytes as ciphertext. All writes must go through VaultGuard MCP mutation tools and may require Obsidian confirmation.",
+    "Prefer note/property/task/template for supported semantic changes and use apply_patch only when no semantic operation matches. Inspection is permission-filtered, templates are trusted and script-free, and sync_status is local observation rather than a sync trigger. Launch Codex from an empty temporary working directory for protected-vault work. Treat `VG1\\0` bytes as ciphertext. All writes must go through VaultGuard MCP mutation tools and may require Obsidian confirmation.",
   ].join("\n");
 }

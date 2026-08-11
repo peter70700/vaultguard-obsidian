@@ -6,6 +6,61 @@
 # requests from admin.example.com to api.example.com.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Public pre-login verification exchange. Browser completion can only mark an
+# attempt verified; the initiating client must possess the polling verifier to
+# receive a permit, which Cognito then consumes exactly once.
+resource "aws_api_gateway_resource" "auth_human_verification" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.auth.id
+  path_part   = "human-verification"
+}
+
+resource "aws_api_gateway_resource" "auth_human_verification_attempts" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.auth_human_verification.id
+  path_part   = "attempts"
+}
+
+resource "aws_api_gateway_resource" "auth_human_verification_complete" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.auth_human_verification.id
+  path_part   = "complete"
+}
+
+resource "aws_api_gateway_resource" "auth_human_verification_poll" {
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  parent_id   = aws_api_gateway_resource.auth_human_verification.id
+  path_part   = "poll"
+}
+
+locals {
+  human_verification_post_resources = {
+    attempts = aws_api_gateway_resource.auth_human_verification_attempts.id
+    complete = aws_api_gateway_resource.auth_human_verification_complete.id
+    poll     = aws_api_gateway_resource.auth_human_verification_poll.id
+  }
+}
+
+resource "aws_api_gateway_method" "auth_human_verification_post" {
+  for_each = local.human_verification_post_resources
+
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = each.value
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "auth_human_verification_post" {
+  for_each = local.human_verification_post_resources
+
+  rest_api_id             = aws_api_gateway_rest_api.vaultguard.id
+  resource_id             = each.value
+  http_method             = aws_api_gateway_method.auth_human_verification_post[each.key].http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = var.auth_lambda_invoke_arn
+}
+
 locals {
   cors_resources = {
     vaults                     = aws_api_gateway_resource.vaults.id
@@ -34,6 +89,9 @@ locals {
     auth_recovery_codes        = aws_api_gateway_resource.auth_recovery_codes.id
     auth_recovery_codes_verify = aws_api_gateway_resource.auth_recovery_codes_verify.id
     auth_ai_key                = aws_api_gateway_resource.auth_ai_key.id
+    auth_human_verification_attempts = aws_api_gateway_resource.auth_human_verification_attempts.id
+    auth_human_verification_complete = aws_api_gateway_resource.auth_human_verification_complete.id
+    auth_human_verification_poll     = aws_api_gateway_resource.auth_human_verification_poll.id
     files                      = aws_api_gateway_resource.files.id
     files_sync                 = aws_api_gateway_resource.files_sync.id
     files_path                 = aws_api_gateway_resource.files_path.id
@@ -104,6 +162,11 @@ resource "aws_api_gateway_integration" "cors_options" {
   type        = "MOCK"
 
   request_templates = { "application/json" = "{\"statusCode\": 200}" }
+
+  # The deployment already hashes every cors_options integration. This
+  # transitive dependency ensures the public POST routes exist before that
+  # deployment snapshot without duplicating deployment ownership here.
+  depends_on = [aws_api_gateway_integration.auth_human_verification_post]
 }
 
 resource "aws_api_gateway_method_response" "cors_options" {

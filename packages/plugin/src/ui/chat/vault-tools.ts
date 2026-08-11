@@ -6,7 +6,13 @@
 // required constraints — but using the long `vaultguard_*` names the in-process
 // tool runtime dispatches on.
 
+import {
+  AGENT_COMMAND_SCHEMAS,
+  type AgentCommandToolName,
+} from "../../plugin/agent-command-schemas";
+
 export type VaultToolName =
+  | AgentCommandToolName
   | "vaultguard_list"
   | "vaultguard_search"
   | "vaultguard_read"
@@ -35,6 +41,17 @@ export interface VaultToolDef {
   description: string;
   input_schema: Record<string, unknown>;
 }
+
+// These definitions intentionally retain the exact schema object references
+// used by the Agent Bridge. New in-app command surfaces therefore cannot drift
+// from the loopback MCP schemas through a second hand-maintained copy.
+const AGENT_COMMAND_VAULT_TOOL_DEFS: readonly VaultToolDef[] = (
+  Object.keys(AGENT_COMMAND_SCHEMAS) as AgentCommandToolName[]
+).map((name) => ({
+  name,
+  description: AGENT_COMMAND_SCHEMAS[name].description,
+  input_schema: AGENT_COMMAND_SCHEMAS[name].inputSchema,
+}));
 
 export const VAULT_TOOL_DEFS = [
   {
@@ -77,6 +94,11 @@ export const VAULT_TOOL_DEFS = [
       required: ["path"],
       properties: {
         path: { type: "string", description: "Vault-relative path (e.g. project-x/Plan.md)." },
+        offsetBytes: {
+          type: "integer",
+          minimum: 0,
+          description: "UTF-8 byte offset returned as nextOffsetBytes by a previous read.",
+        },
         maxBytes: { type: "integer", minimum: 1, description: "Truncate the response to at most this many UTF-8 bytes." },
       },
       additionalProperties: false,
@@ -312,19 +334,58 @@ export const VAULT_TOOL_DEFS = [
       "(metadata-only vault summary: file/folder counts, total size, largest " +
       "files, extension breakdown — admin-only), 'deleted' (list soft-deleted " +
       "files that can be restored — admin-only), 'restore' (UNDELETE a soft-" +
-      "deleted file — needs `path`, admin-only; pops a confirmation and the file " +
-      "re-appears locally on the next sync). The backend authorizes every op, so " +
-      "a non-admin caller gets an authorization error rather than data.",
+      "deleted file), 'version_read' (read one exact historical plaintext " +
+      "version), 'version_diff' (bounded diff against current content or another " +
+      "exact version), and 'version_restore' (restore an exact version only when " +
+      "the supplied current version still matches). Restore operations are " +
+      "always confirmed. The backend authorizes every op, so a non-admin caller " +
+      "gets an authorization error rather than data.",
     input_schema: {
       type: "object",
       required: ["op"],
       properties: {
-        op: { type: "string", enum: ["history", "overview", "deleted", "restore"] },
+        op: {
+          type: "string",
+          enum: [
+            "history",
+            "overview",
+            "deleted",
+            "restore",
+            "version_read",
+            "version_diff",
+            "version_restore",
+          ],
+        },
         path: {
           type: "string",
-          description: "Vault-relative file path (required for op=history and op=restore).",
+          description:
+            "Vault-relative file path (required for history, restore, and exact-version operations).",
         },
         limit: { type: "integer", minimum: 1, description: "Max entries for op=deleted." },
+        versionId: {
+          type: "string",
+          minLength: 1,
+          maxLength: 1_024,
+          description: "Exact historical version identifier for version_read, version_diff, or version_restore.",
+        },
+        compareVersionId: {
+          type: "string",
+          minLength: 1,
+          maxLength: 1_024,
+          description: "Optional second exact version for version_diff; omit to compare against current content.",
+        },
+        expectedCurrentVersionId: {
+          type: "string",
+          minLength: 1,
+          maxLength: 1_024,
+          description: "Required optimistic current-version precondition for version_restore.",
+        },
+        maxBytes: {
+          type: "integer",
+          minimum: 1,
+          maximum: 262_144,
+          description: "Maximum plaintext or diff bytes for version_read and version_diff.",
+        },
       },
       additionalProperties: false,
     },
@@ -473,4 +534,5 @@ export const VAULT_TOOL_DEFS = [
       additionalProperties: false,
     },
   },
+  ...AGENT_COMMAND_VAULT_TOOL_DEFS,
 ] as const satisfies readonly VaultToolDef[];

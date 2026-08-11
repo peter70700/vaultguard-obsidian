@@ -32,7 +32,7 @@ const REGION = process.env.AWS_REGION || 'eu-west-1';
 export const SECURITY_METRIC_NAMESPACE = 'ObsidianVaultGuard';
 
 /**
- * The five custom security metrics. Each name MUST equal the `metric_name` of
+ * Custom security and integrity metrics. Each name MUST equal the `metric_name` of
  * its `aws_cloudwatch_metric_alarm` in terraform/modules/monitoring/main.tf,
  * or that alarm stays dead. Adding a name here without an alarm (or vice-versa)
  * is a silent no-op.
@@ -42,7 +42,8 @@ export type SecurityMetricName =
   | 'FileAccessCount'
   | 'OffHoursPermissionChange'
   | 'RevokedSessionAccess'
-  | 'KMSDecryptFailure';
+  | 'KMSDecryptFailure'
+  | 'VaultMutationReconciliationRequired';
 
 // Lazy so merely importing this module (e.g. in unit tests, or in a handler on
 // a code path that never emits) constructs no client and touches no network.
