@@ -56,6 +56,14 @@ export interface ClaudeCliHandlers {
   onToolResult?(name: string, result: { content: string; isError: boolean }): void;
   /** Terminal result for the turn: cost (USD) + the session id to resume. */
   onResult?(info: { costUsd?: number; sessionId?: string }): void;
+  /**
+   * The concrete model the CLI resolved for this session. We request a tier
+   * alias (`opus`), which Anthropic resolves to the newest model of that tier
+   * (`claude-opus-5`) — that indirection is what keeps the plugin from needing a
+   * release per model launch, but it also means only the CLI can say what
+   * actually answered. Fired once per session from the `system/init` event.
+   */
+  onModelResolved?(model: string): void;
   /** Transport progress/status from the Claude CLI (not assistant transcript). */
   onStatus?(message: string): void;
   /** A fatal error (non-zero exit, error result subtype, or stderr). */
@@ -334,6 +342,9 @@ export class ClaudeCliClient {
   private readonly deps: ClientNodeDeps | null;
   // Threaded from the first `result` so follow-up turns keep context.
   private sessionId: string | null = null;
+  // The concrete model behind the requested tier alias, as reported by the CLI.
+  // Kept so onModelResolved fires only when it actually changes.
+  private resolvedModel: string | null = null;
   // ONE stable working directory for the whole client lifetime. Claude Code
   // scopes session history by cwd, so `--resume` only works if every turn runs
   // in the SAME directory. Created lazily on the first turn; removed on reset().
@@ -542,6 +553,10 @@ export class ClaudeCliClient {
     switch (parsed.kind) {
       case "init":
         if (parsed.sessionId) this.sessionId = parsed.sessionId;
+        if (parsed.model && parsed.model !== this.resolvedModel) {
+          this.resolvedModel = parsed.model;
+          handlers.onModelResolved?.(parsed.model);
+        }
         break;
       case "text_delta":
         handlers.onTextDelta?.(parsed.text);

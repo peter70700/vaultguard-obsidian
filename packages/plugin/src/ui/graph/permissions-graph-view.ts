@@ -142,6 +142,7 @@ const LEGEND_CHIP_OFF_CLS = "is-off";
 const LEGEND_SWATCH_CLS = "vaultguard-pg-legend-swatch";
 const DEPTH_ROW_CLS = "vaultguard-pg-depth";
 const DEPTH_LABEL_CLS = "vaultguard-pg-depth-label";
+const LAYOUT_CYCLE_CLS = "vaultguard-pg-layout-cycle";
 const BODY_CLS = "vaultguard-pg-body";
 const CANVAS_CLS = "vaultguard-pg-canvas";
 const EXPLAIN_CLS = "vaultguard-pg-explain";
@@ -190,6 +191,48 @@ const LEGEND_ITEMS: Array<{ key: string; label: string; swatch: "user" | "file" 
 ];
 
 const DEFAULT_DEPTH = 1;
+
+// Order the compact toolbar button cycles through. Kept next to
+// LAYOUT_MODE_PRESENTATION so a new layout mode can't be added to one without
+// the other noticing (the regression test pins both).
+export const LAYOUT_CYCLE_ORDER: Array<GraphRuntimeOptions["layoutMode"]> = [
+  "auto",
+  "radial",
+  "force",
+  "grid",
+  "folder",
+  "sections",
+];
+
+/**
+ * Icon + human label per layout mode.
+ *
+ * Every `icon` MUST be an id Obsidian actually registers. `setIcon()` with an
+ * unknown id *empties* the element, so a typo renders a zero-width, unclickable
+ * span rather than failing loudly — and because this button is the only compact
+ * control that cycles the layout, a mode whose icon doesn't resolve becomes a
+ * one-way trap you can't click your way out of.
+ *
+ * That is exactly what "grid-2x2" did here (2026-08-11): Obsidian normalizes
+ * Lucide's `Grid2X2` to `grid-2x-2`, so Grid and Sections both rendered nothing
+ * and pinned affected vaults to a rectangular graph. Icon ids are verified
+ * against Obsidian's registry — see tests/permissions-graph-layout-icon.test.ts,
+ * which fails on any id outside the vetted set.
+ *
+ * `label` matches the Graph Studio "Layout" dropdown wording so the compact
+ * button and the full control name modes identically.
+ */
+export const LAYOUT_MODE_PRESENTATION: Record<
+  GraphRuntimeOptions["layoutMode"],
+  { icon: string; label: string }
+> = {
+  auto: { icon: "wand-2", label: "Auto" },
+  radial: { icon: "target", label: "Radial" },
+  force: { icon: "git-fork", label: "Force" },
+  grid: { icon: "grid-2x-2", label: "Grid" },
+  folder: { icon: "folder-tree", label: "Folder hierarchy" },
+  sections: { icon: "rows-3", label: "Sections" },
+};
 
 interface ViewerContext {
   userId: string;
@@ -645,29 +688,25 @@ export class PermissionsGraphView extends ItemView {
     setIcon(refreshBtn, "refresh-cw");
     refreshBtn.addEventListener("click", () => void this.forceReload());
 
-    // Compact layout cycle mirrors the Graph Studio layout control.
-    const layoutBtn = depthRow.createSpan({
-      cls: "clickable-icon",
-      attr: { "aria-label": "Cycle layout", title: "Cycle layout" },
-    });
+    // Compact layout cycle mirrors the Graph Studio layout control. It carries
+    // its own class so CSS can keep a hit target even if the glyph is empty —
+    // an invisible cycle button strands the user in whatever mode they're in.
+    const layoutBtn = depthRow.createSpan({ cls: `clickable-icon ${LAYOUT_CYCLE_CLS}` });
     const syncLayoutIcon = (): void => {
-      const layout = this.graphOptions.layoutMode;
-      setIcon(
-        layoutBtn,
-        layout === "force"
-          ? "git-fork"
-          : layout === "grid" || layout === "sections"
-            ? "grid-2x2"
-            : layout === "folder"
-              ? "folder-tree"
-              : "target",
-      );
+      const presentation = LAYOUT_MODE_PRESENTATION[this.graphOptions.layoutMode];
+      setIcon(layoutBtn, presentation.icon);
+      // Name the active mode rather than just the action: the glyph alone never
+      // said which layout you were on, and a text label keeps the control
+      // discoverable if an icon id ever stops resolving.
+      const name = `Layout: ${presentation.label} — click to cycle`;
+      layoutBtn.setAttribute("aria-label", name);
+      layoutBtn.setAttribute("title", name);
     };
     syncLayoutIcon();
     layoutBtn.addEventListener("click", () => {
-      const order: GraphRuntimeOptions["layoutMode"][] = ["auto", "radial", "force", "grid", "folder", "sections"];
-      const idx = order.indexOf(this.graphOptions.layoutMode);
-      this.updateGraphStudioOptions({ layoutMode: order[(idx + 1) % order.length] }, true);
+      const idx = LAYOUT_CYCLE_ORDER.indexOf(this.graphOptions.layoutMode);
+      const next = LAYOUT_CYCLE_ORDER[(idx + 1) % LAYOUT_CYCLE_ORDER.length];
+      this.updateGraphStudioOptions({ layoutMode: next }, true);
       this.renderGraphStudioControls();
       syncLayoutIcon();
     });

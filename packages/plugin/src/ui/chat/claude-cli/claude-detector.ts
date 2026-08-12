@@ -5,12 +5,20 @@
 // OAuth/subscription token.
 //
 // SECURITY BOUNDARY: the only things this module does are
-//   (a) locate the `claude` binary on PATH / common install dirs, and
-//   (b) run `claude auth status --json` and parse the result.
+//   (a) locate the `claude` binary on PATH / common install dirs,
+//   (b) run `claude auth status --json` and parse the result, and
+//   (c) answer "does a `claude` binary appear to be installed?" WITHOUT running
+//       anything (`claudeBinaryLikelyInstalled` — pure fs.existsSync).
 // It NEVER reads, stores, logs, or transmits a token; the spawned `claude`
 // authenticates itself from its own keychain. No fs access beyond `which`-style
 // PATH resolution. Desktop-only — `child_process` does not exist in the mobile
 // (web) Obsidian runtime, so on mobile every call returns "unsupported".
+//
+// (a) and (b) SPAWN, so they are strictly user-triggered (SD-13-F1): sending a
+// message, or explicitly opting into the subscription provider. (c) spawns
+// nothing, so it is the only probe safe to run as a side effect of opening the
+// chat panel — it cannot execute an attacker-planted binary, which was the whole
+// exploitation trigger SD-13-F1 closed.
 //
 // The parse function `parseAuthStatus` is pure and exhaustively unit-tested with
 // fake JSON (valid subscription, API-key login, logged-out, malformed, exit-1).
@@ -30,6 +38,16 @@ const COMMON_CLAUDE_PATHS: ReadonlyArray<string> = [
   "/opt/homebrew/bin/claude",
   "/usr/local/bin/claude",
   "/usr/bin/claude",
+];
+
+// Home-relative install locations used by the native installer and the common
+// package managers. Kept separate from COMMON_CLAUDE_PATHS because they need the
+// home directory resolved at call time.
+const HOME_RELATIVE_CLAUDE_PATHS: ReadonlyArray<string> = [
+  ".claude/local/claude",
+  ".local/bin/claude",
+  ".bun/bin/claude",
+  ".npm-global/bin/claude",
 ];
 
 // ─── Result shapes ───────────────────────────────────────────────────────────
@@ -207,6 +225,54 @@ export function parseAuthStatus(
 }
 
 // ─── Binary resolution + live detection ──────────────────────────────────────
+
+/** Deps for the no-spawn presence probe. `homeDir` is a test seam. */
+export interface ClaudePresenceDeps {
+  fs: FsModule;
+  /** Explicit home directory; omit to resolve from the environment. */
+  homeDir?: string | null;
+}
+
+function resolveHomeDir(): string | null {
+  if (typeof process === "undefined") return null;
+  return process.env?.HOME || process.env?.USERPROFILE || null;
+}
+
+/**
+ * Does a `claude` binary appear to be installed? SPAWNS NOTHING — this is a
+ * pure `fs.existsSync` sweep over the known install locations, so it is the one
+ * Claude Code probe that is safe to run without a user action (SD-13-F1: the
+ * finding was the drive-by *execution* of a PATH-resolved binary, which this
+ * cannot do). It deliberately does NOT consult PATH, because resolving PATH
+ * means spawning `which`.
+ *
+ * A `true` result means "Claude Code is probably installed", NOT "signed in" —
+ * login state still requires the real, user-triggered `getClaudeAuthStatus()`.
+ * A `false` result is a hint, not proof: a PATH-only install (nvm, a custom
+ * prefix, Windows) reads as absent, which is why the chat panel also offers an
+ * explicit "Use my Claude subscription" action that runs the full detector.
+ *
+ * Desktop-only — returns false on mobile and when the Node bridge is absent.
+ */
+export function claudeBinaryLikelyInstalled(deps?: ClaudePresenceDeps): boolean {
+  if (Platform.isMobileApp) return false;
+  const fs = deps?.fs ?? loadDeps()?.fs;
+  if (!fs) return false;
+
+  const homeDir = deps && "homeDir" in deps ? deps.homeDir : resolveHomeDir();
+  const homeCandidates = homeDir
+    ? HOME_RELATIVE_CLAUDE_PATHS.map((rel) => `${homeDir.replace(/[/\\]+$/, "")}/${rel}`)
+    : [];
+
+  for (const candidate of [...COMMON_CLAUDE_PATHS, ...homeCandidates]) {
+    try {
+      if (fs.existsSync(candidate)) return true;
+    } catch {
+      // Unreadable path — keep trying the rest.
+    }
+  }
+  return false;
+}
 
 /**
  * Locate the `claude` binary. Tries `which claude` (PATH) first, then a small

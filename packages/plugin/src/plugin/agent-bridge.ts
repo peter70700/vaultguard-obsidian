@@ -1127,7 +1127,12 @@ interface McpToolDefinition {
 // (e.g. `mcp__vaultguard__read`), so we drop the redundant `vaultguard_`.
 // The internal AgentBridgeToolName stays the long form so the existing
 // /rpc surface and tests are unchanged.
-const MCP_TOOLS: Record<string, McpToolDefinition> = {
+//
+// Exported so the Claude Code allow-list can be checked against it: a tool
+// advertised here but missing from `VAULTGUARD_MCP_TOOL_NAMES` is denied by
+// `--permission-mode dontAsk` before it ever reaches this server, which reads to
+// the user as a broken tool rather than a missing allow-list entry.
+export const MCP_TOOLS: Record<string, McpToolDefinition> = {
   list: {
     internal: "vaultguard_list",
     description:

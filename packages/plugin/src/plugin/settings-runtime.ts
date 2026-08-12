@@ -1,4 +1,4 @@
-import { Notice, requestUrl } from "obsidian";
+import { Notice, Platform, requestUrl } from "obsidian";
 import { VaultGuardApiClient } from "../api/client";
 import {
   normalizeVaultGuardApiBaseUrl,
@@ -7,6 +7,7 @@ import {
 import { probeSafeStorage } from "../crypto/safe-storage";
 import {
   ASSUMED_SERVER_FEATURES,
+  type AiChatProvider,
   ConflictResolutionStrategy,
   type ServerEdition,
   type ServerFeatures,
@@ -22,6 +23,10 @@ import {
   SAAS_DEFAULTS,
   normalizeAgentTemplateAllowlist,
 } from "./settings";
+import {
+  DEFAULT_CLAUDE_SUBSCRIPTION_MODEL,
+  claudeTierAliasFor,
+} from "../ui/chat/models";
 import { normalizeAutomationRegistry } from "./agent-automation-registry";
 import { deriveConnectionConfigFromTokenPayload } from "./session-config";
 import type { PluginSettingsRuntimeContext } from "./plugin-runtime-types";
@@ -46,6 +51,46 @@ export function normalizeCodexAutoSelectLatest(
   return typeof rawData.codexAutoSelectLatest === "boolean"
     ? rawData.codexAutoSelectLatest
     : true;
+}
+
+/**
+ * Resolve the Claude-subscription model, which holds a TIER ALIAS rather than a
+ * pinned model id so the CLI can keep resolving it to the newest model of that
+ * tier. A saved alias wins. Otherwise the tier is derived from whatever pinned
+ * id the vault already had (`claude-sonnet-4-6` → `sonnet`), so migrating to
+ * self-updating models preserves the user's choice instead of moving everyone to
+ * Opus. Unrecognized values fall back to the default tier.
+ */
+export function normalizeClaudeSubscriptionModel(
+  rawData: Pick<Partial<VaultGuardSettings>, "claudeSubscriptionModel" | "aiChatModel">,
+): string {
+  const saved =
+    typeof rawData.claudeSubscriptionModel === "string"
+      ? claudeTierAliasFor(rawData.claudeSubscriptionModel)
+      : null;
+  if (saved) return saved;
+  const inherited =
+    typeof rawData.aiChatModel === "string" ? claudeTierAliasFor(rawData.aiChatModel) : null;
+  return inherited ?? DEFAULT_CLAUDE_SUBSCRIPTION_MODEL;
+}
+
+/**
+ * Resolve the AI provider for the running platform. `subscription` (Claude Code)
+ * and `codex` (ChatGPT) drive a local CLI through Node `child_process`, which
+ * does not exist in the mobile (web) Obsidian runtime — so on mobile they can
+ * never work and are resolved to the API-key transport, which does.
+ *
+ * This matters because `subscription` is the shipped default: without it, a
+ * mobile install would open the chat in a mode it cannot execute. The user's
+ * stored value is left untouched, so the same vault synced back to desktop still
+ * uses their CLI provider.
+ */
+export function normalizeAiChatProvider(
+  provider: AiChatProvider,
+  isMobile: boolean,
+): AiChatProvider {
+  if (!isMobile) return provider;
+  return provider === "subscription" || provider === "codex" ? "apiKey" : provider;
 }
 
 /** Fail closed to the migration-safe server default for untrusted/stale data. */
@@ -336,6 +381,11 @@ export class PluginSettingsRuntime {
     this.settings.loginVerificationMode = normalizeLoginVerificationMode(
       data.loginVerificationMode,
     );
+    this.settings.aiChatProvider = normalizeAiChatProvider(
+      this.settings.aiChatProvider,
+      Platform.isMobileApp,
+    );
+    this.settings.claudeSubscriptionModel = normalizeClaudeSubscriptionModel(data);
     this.settings.excludedPaths = this.withRequiredExcludedPaths(this.settings.excludedPaths);
     this.settings.apiEndpoint = normalizeVaultGuardApiBaseUrl(this.settings.apiEndpoint);
     this.ctx.setConfiguredApiEndpoint(this.settings.apiEndpoint);

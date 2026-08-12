@@ -52,6 +52,7 @@ import { DocumentReferenceService } from "./document-reference-service";
 import { ChatRuntime } from "./chat-runtime";
 import { ClaudeCliClient } from "./claude-cli/claude-cli-client";
 import {
+  claudeBinaryLikelyInstalled,
   getClaudeAuthStatus,
   type ClaudeAuthStatus,
 } from "./claude-cli/claude-detector";
@@ -129,11 +130,14 @@ import {
   OPENAI_CHAT_MODELS,
   OPENAI_REASONING_EFFORTS,
   chatPermissionWriteMode,
+  claudeTierAliasFor,
   permissionModeLabel,
+  type ChatModelOption,
 } from "./models";
 import {
   providerModelCatalog,
   type ProviderModelCatalogProvider,
+  type ResolvedModelCatalog,
 } from "./model-catalog";
 import type { AiChatEffort, AiChatPermissionMode, AiChatProvider } from "../../types";
 import {
@@ -397,7 +401,7 @@ export class VaultGuardChatView extends ItemView {
           onRemoveDocumentPin: (id) => this.removeDocumentPin(id),
           onCancel: () => this.handleCancel(),
           onSlash: (cmd) => this.handleSlash(cmd),
-          onUnknownSlash: (raw) => new Notice(`VaultGuard Chat: unknown command "${raw}".`),
+          onUnknownSlash: (raw) => this.noticeUnknownCommand(raw),
           getMentionCandidates: (query) => this.mentionCandidates(query),
           getSlashCommands: () => this.slashCommandSuggestions(),
           resolveTemplate: (name, arg, prefix) => this.resolveTemplate(name, arg, prefix),
@@ -431,19 +435,20 @@ export class VaultGuardChatView extends ItemView {
       return;
     }
 
-    // SD-13-F1 (Option C): do NOT probe for a Claude Code subscription on panel
-    // open. Auto-detection silently spawned `claude` — a binary resolved from the
-    // user's unrestricted PATH — with no user action, i.e. a drive-by child
-    // process on every panel open. Detection is now strictly user-triggered: the
-    // user opts in by choosing a CLI subscription in Settings → AI provider,
-    // which is what runs the detector (settings.ts, gated on that choice). This
-    // removes the exploitation trigger (passive PATH-resolved spawn) and is a
-    // privacy win — a fresh install launches no child process until the user
-    // opts in. renderInitialEmptyState() stays best-effort and must never block
-    // first paint, so it is fired-and-forgotten with its own error boundary.
-    void this.renderInitialEmptyState().catch((e) =>
-      console.error("[VaultGuard Chat] initial empty state failed", e),
-    );
+    // SD-13-F1 (Option C): panel open must NEVER spawn `claude`. Auto-detection
+    // used to run the full detector here, executing a binary resolved from the
+    // user's unrestricted PATH with no user action — a drive-by child process on
+    // every open. That stays gone: the only Claude Code probe on this path is
+    // applyDesktopSubscriptionDefault(), a pure fs.existsSync presence check that
+    // executes nothing. Login state is still resolved only by user-triggered
+    // calls (first send, or the explicit opt-in button in the connect banner).
+    //
+    // Both steps are best-effort and must never block first paint, so they are
+    // fired-and-forgotten behind one error boundary. The default is applied
+    // before the empty state so the banner reflects the resolved provider.
+    void this.applyDesktopSubscriptionDefault()
+      .then(() => this.renderInitialEmptyState())
+      .catch((e) => console.error("[VaultGuard Chat] initial empty state failed", e));
 
     // Resolve which conversation this leaf shows. Defer one tick so a setState()
     // that Obsidian fires alongside onOpen during workspace restore lands first
@@ -527,11 +532,32 @@ export class VaultGuardChatView extends ItemView {
     const icon = empty.createDiv({ cls: "vaultguard-chat-empty-icon" });
     setIcon(icon, "message-square");
     empty.createEl("p", { text: "Connect Claude to chat about your vault." });
+
+    // Desktop users with a Claude subscription should not have to buy API
+    // credits. The on-open default (applyDesktopSubscriptionDefault) already
+    // catches installs at known locations without spawning anything; this button
+    // is the explicit path for the rest — a PATH-only install the presence check
+    // can't see, or a CLI that needs signing in. The click IS the user action
+    // that authorises running the detector (SD-13-F1).
+    if (!Platform.isMobileApp) {
+      const action = empty.createEl("button", {
+        cls: "mod-cta vaultguard-chat-empty-action",
+        text: "Use my Claude subscription",
+      });
+      action.addEventListener("click", () => void this.optInToClaudeSubscription(action));
+      empty.createEl("p", {
+        cls: "vaultguard-chat-empty-hint",
+        text:
+          "Chats through the Claude Code CLI with your Claude.ai login — no API key, no per-token charges. " +
+          "You can also pick it any time under AI provider in VaultGuard settings → AI Chat.",
+      });
+    }
+
     empty.createEl("p", {
       cls: "vaultguard-chat-empty-hint",
       text:
-        "Add your Anthropic API key in VaultGuard settings → AI Chat. " +
-        "Until you do, this panel stays fully offline and makes no network calls.",
+        "Prefer to pay per token? Add your Anthropic API key in VaultGuard settings → AI Chat. " +
+        "Until you connect one of the two, this panel stays fully offline and makes no network calls.",
     });
     empty.createEl("p", {
       cls: "vaultguard-chat-empty-hint",
@@ -539,6 +565,54 @@ export class VaultGuardChatView extends ItemView {
         "On mobile? A key you saved on desktop appears here automatically when " +
         "“Sync API key to your other devices” is on and you're signed in to the same vault.",
     });
+  }
+
+  /**
+   * Explicit, user-clicked opt-in to the Claude subscription provider. Running
+   * the detector here is exactly the "user-triggered" case SD-13-F1 allows — the
+   * spawn is the direct result of a click, not a side effect of opening a panel.
+   * On success the provider choice is persisted and marked explicit, so nothing
+   * silently reverts it later.
+   */
+  private async optInToClaudeSubscription(button: HTMLButtonElement): Promise<void> {
+    button.disabled = true;
+    const original = button.textContent ?? "Use my Claude subscription";
+    button.textContent = "Checking Claude Code…";
+
+    let status: ClaudeAuthStatus;
+    try {
+      status = await this.probeClaudeAuth();
+    } catch (e) {
+      if (!this.listEl) return;
+      button.disabled = false;
+      button.textContent = original;
+      new Notice(`VaultGuard Chat: could not check Claude Code — ${(e as Error).message}`);
+      return;
+    }
+
+    // The view can close while the detector runs.
+    if (!this.listEl) return;
+
+    if (status.classification !== "logged-in-subscription") {
+      button.disabled = false;
+      button.textContent = original;
+      this.renderSubscriptionConnectState(status);
+      return;
+    }
+
+    this.plugin.settings.aiChatProvider = "subscription";
+    this.plugin.settings.aiChatProviderExplicit = true;
+    await this.plugin.saveSettings();
+    this.plugin.notifyAiChatProviderChanged();
+
+    if (!this.listEl) return;
+    this.listEl.querySelector(`.${EMPTY_CLS}`)?.remove();
+    this.renderWelcomeState();
+    new Notice(
+      status.subscriptionType
+        ? `VaultGuard Chat: using your Claude ${status.subscriptionType} subscription.`
+        : "VaultGuard Chat: using your Claude subscription.",
+    );
   }
 
   private renderWelcomeState(): void {
@@ -582,6 +656,32 @@ export class VaultGuardChatView extends ItemView {
       cls: "vaultguard-chat-empty-hint",
       text: "Type / for commands, $ for writing skills, @ to reference a note",
     });
+    welcome.createEl("p", {
+      cls: "vaultguard-chat-empty-hint",
+      text: this.providerHint(),
+    });
+  }
+
+  /**
+   * One muted line naming the transport this panel will use and where to change
+   * it. Users had no way to tell from the panel which provider was active, or
+   * that a Claude subscription was an option at all — the choice lives in a
+   * settings dropdown they had to already know about.
+   */
+  private providerHint(): string {
+    const settingsPath = "Change this in VaultGuard settings → AI Chat → AI provider.";
+    switch (this.currentProvider()) {
+      case "subscription":
+        return `Using your Claude subscription through the Claude Code CLI — no API key needed. ${settingsPath}`;
+      case "codex":
+        return `Using your ChatGPT subscription through the Codex runtime — no API key needed. ${settingsPath}`;
+      case "openai":
+        return `Using your OpenAI API key (billed per token). ${settingsPath}`;
+      default:
+        return Platform.isMobileApp
+          ? `Using your Anthropic API key (billed per token). ${settingsPath}`
+          : `Using your Anthropic API key (billed per token). Have a Claude Pro/Max plan? Pick “Claude subscription (Claude Code CLI)” under AI provider in VaultGuard settings → AI Chat to use it instead.`;
+    }
   }
 
   private currentProvider(): AiChatProvider {
@@ -595,9 +695,12 @@ export class VaultGuardChatView extends ItemView {
   }
 
   private currentCatalogProvider(): ProviderModelCatalogProvider {
-    return this.currentProvider() === "codex"
-      ? "codex"
-      : this.currentApiKeyProvider();
+    if (this.currentProvider() === "codex") return "codex";
+    // The subscription transport picks from tier aliases the CLI resolves to the
+    // newest model — not from the Anthropic API's model list, which it has no
+    // credential for anyway.
+    if (this.currentProvider() === "subscription") return "claude-cli";
+    return this.currentApiKeyProvider();
   }
 
   private currentEffort(): AiChatEffort {
@@ -607,11 +710,16 @@ export class VaultGuardChatView extends ItemView {
   }
 
   private currentModelSetting(): string {
-    return this.currentProvider() === "codex"
-      ? this.plugin.settings.codexModel
-      : this.currentProvider() === "openai"
-        ? this.plugin.settings.openAiModel
-        : this.plugin.settings.aiChatModel;
+    switch (this.currentProvider()) {
+      case "codex":
+        return this.plugin.settings.codexModel;
+      case "openai":
+        return this.plugin.settings.openAiModel;
+      case "subscription":
+        return this.plugin.settings.claudeSubscriptionModel;
+      default:
+        return this.plugin.settings.aiChatModel;
+    }
   }
 
   private syncModelFromSettings(): void {
@@ -650,6 +758,50 @@ export class VaultGuardChatView extends ItemView {
     return this.currentApiKeyProvider() === "openai"
       ? this.ensureOpenAiApiKey()
       : this.ensureAnthropicApiKey();
+  }
+
+  /**
+   * Migration for installs that predate the `subscription` default. Fresh vaults
+   * now start there via DEFAULT_SETTINGS, but any vault created earlier has
+   * `"apiKey"` *persisted* in data.json, which no default change can reach — and
+   * that is exactly the population stranded when the SD-13-F1 fix removed the
+   * on-open detector probe and left nothing in its place.
+   *
+   * The security property is preserved by splitting the question in two:
+   * presence is answered here by claudeBinaryLikelyInstalled(), a pure
+   * fs.existsSync check that EXECUTES NOTHING, while login state is left to the
+   * real detector on the user-triggered send path. The worst case of a wrong
+   * guess is therefore the "sign in to Claude Code" banner instead of a spawned
+   * process — never a drive-by execution of a PATH-resolved binary.
+   *
+   * Fires only when every condition holds, so it can neither override a decision
+   * the user already made nor strand someone who is set up for API-key chat:
+   *   - desktop (the CLI cannot run in the mobile runtime)
+   *   - no explicit provider choice on record (settings.ts sets that flag)
+   *   - on `apiKey`, not a deliberate `openai`/`codex` pick
+   *   - no Anthropic key stored on this device
+   *   - a `claude` binary is present at a known install location
+   */
+  private async applyDesktopSubscriptionDefault(): Promise<void> {
+    if (Platform.isMobileApp) return;
+    const settings = this.plugin.settings;
+    if (settings.aiChatProviderExplicit === true) return;
+    if (settings.aiChatProvider !== "apiKey") return;
+    if (this.hasCurrentProviderKey()) return;
+    if (!claudeBinaryLikelyInstalled()) return;
+
+    settings.aiChatProvider = "subscription";
+    await this.plugin.saveSettings();
+  }
+
+  /**
+   * The single Claude Code detector call site in this panel. Both callers are
+   * user-triggered — submitting a subscription turn, and clicking "Use my Claude
+   * subscription" in the connect banner — so routing them through one method
+   * keeps that spawn auditable in one place (SD-13-F1).
+   */
+  private async probeClaudeAuth(): Promise<ClaudeAuthStatus> {
+    return getClaudeAuthStatus();
   }
 
   /**
@@ -1178,7 +1330,7 @@ export class VaultGuardChatView extends ItemView {
     } else {
       let status: ClaudeAuthStatus;
       try {
-        status = await getClaudeAuthStatus();
+        status = await this.probeClaudeAuth();
       } catch (error) {
         this.renderError(`Could not check Claude Code: ${(error as Error).message}`);
         return;
@@ -1324,6 +1476,7 @@ export class VaultGuardChatView extends ItemView {
               this.statusPanel?.recordCostUsd(info.costUsd);
             }
           },
+          onModelResolved: (model) => this.onCliModelResolved(model),
           onStatus: (message) => this.onCliStatus(message),
           onError: (message) => this.renderError(message),
         },
@@ -1437,6 +1590,13 @@ export class VaultGuardChatView extends ItemView {
     const icon = empty.createDiv({ cls: "vaultguard-chat-empty-icon" });
     setIcon(icon, "message-square");
 
+    // Reachable without the user ever having picked this provider (the desktop
+    // default in applyDesktopSubscriptionDefault can land someone here whose CLI
+    // is installed but signed in with an API key), so always name the way out.
+    const apiKeyFallbackHint =
+      "Prefer an API key? Choose “Anthropic API key” under AI provider in VaultGuard " +
+      "settings → AI Chat.";
+
     if (status.classification === "not-installed") {
       empty.createEl("p", { text: "Install Claude Code to chat with your subscription." });
       empty.createEl("p", {
@@ -1445,6 +1605,19 @@ export class VaultGuardChatView extends ItemView {
           "The Claude Code CLI isn't installed. Install it (see code.claude.com/docs/setup), " +
           "then sign in from VaultGuard settings → AI Chat.",
       });
+      empty.createEl("p", { cls: "vaultguard-chat-empty-hint", text: apiKeyFallbackHint });
+      return;
+    }
+
+    if (status.classification === "logged-in-apikey") {
+      empty.createEl("p", { text: "Claude Code is signed in with an API key." });
+      empty.createEl("p", {
+        cls: "vaultguard-chat-empty-hint",
+        text:
+          "That spends per-token credit rather than your subscription. Open VaultGuard " +
+          "settings → AI Chat and click “Sign in with subscription” to switch.",
+      });
+      empty.createEl("p", { cls: "vaultguard-chat-empty-hint", text: apiKeyFallbackHint });
       return;
     }
 
@@ -1455,6 +1628,7 @@ export class VaultGuardChatView extends ItemView {
         "Open VaultGuard settings → AI Chat and click Sign in. Until you do, this panel stays " +
         "fully offline and spawns no Claude Code process.",
     });
+    empty.createEl("p", { cls: "vaultguard-chat-empty-hint", text: apiKeyFallbackHint });
   }
 
   private handleCancel(): void {
@@ -1514,6 +1688,17 @@ export class VaultGuardChatView extends ItemView {
     }
   }
 
+  // Name only the command token — echoing the whole line back put the user's
+  // arguments in a toast — and point at the palette that lists the real ones.
+  private noticeUnknownCommand(raw: string): void {
+    const token = raw.trim().split(/\s+/)[0] || raw.trim();
+    const prefix = token.startsWith("$") ? "$" : "/";
+    new Notice(
+      `VaultGuard Chat: unknown command "${token}". Type ${prefix} to see the available ones.`,
+      6000,
+    );
+  }
+
   private renderCodexConnectState(status: CodexAuthStatus): void {
     if (!this.listEl) return;
     this.listEl.querySelector(`.${EMPTY_CLS}`)?.remove();
@@ -1547,14 +1732,29 @@ export class VaultGuardChatView extends ItemView {
   }
 
   private async handleModelCommand(model: string): Promise<void> {
-    const catalog = await this.resolveCurrentModelCatalog();
-    if (!this.listEl || catalog.provider !== this.currentCatalogProvider()) return;
-    if (!catalog.options.some((option) => option.id === model)) {
-      new Notice(`VaultGuard Chat: model "${model}" is not available to this provider account.`);
+    // `/model` with no id is a request to choose one, not a malformed command.
+    if (!model.trim()) {
+      await this.openModelMenuFromCommand();
       return;
     }
-    this.setModel(model);
-    new Notice(`VaultGuard Chat: switched to ${model} for this session.`);
+
+    const catalog = await this.resolveCurrentModelCatalog();
+    if (!this.listEl || catalog.provider !== this.currentCatalogProvider()) return;
+    const resolved = resolveCommandModelId(model, catalog);
+    if (!resolved) {
+      new Notice(
+        `VaultGuard Chat: model "${model.trim()}" is not available to this provider account. ` +
+          availableModelsHint(catalog.options),
+        8000,
+      );
+      return;
+    }
+    if (resolved === this.model) {
+      new Notice(`VaultGuard Chat: already using ${resolved}.`);
+      return;
+    }
+    this.setModel(resolved);
+    new Notice(`VaultGuard Chat: switched to ${resolved} for this session.`);
   }
 
   // ─── /format-vault: agent-driven Obsidian Markdown cleanup ────────────────
@@ -2639,6 +2839,18 @@ export class VaultGuardChatView extends ItemView {
     this.scrollToBottom();
   }
 
+  /**
+   * Show the model that actually answered. The stored setting is a tier alias
+   * (`opus`) so it keeps tracking the newest release; the footer would otherwise
+   * read "Opus" with no way to tell whether that meant Opus 4.8 or Opus 5. The
+   * SETTING is deliberately not rewritten — pinning the resolved id here would
+   * re-introduce exactly the staleness the alias exists to avoid.
+   */
+  private onCliModelResolved(model: string): void {
+    if (this.currentProvider() !== "subscription") return;
+    this.statusPanel?.setModel(model);
+  }
+
   async askUserFromAgent(
     request: AgentBridgeAskUserArgs & { delivery?: AgentBridgeAskUserDelivery },
   ): Promise<AgentBridgeAskUserResult> {
@@ -2900,8 +3112,36 @@ export class VaultGuardChatView extends ItemView {
   private async openModelMenu(evt: MouseEvent): Promise<void> {
     const catalog = await this.resolveCurrentModelCatalog();
     if (!this.listEl || catalog.provider !== this.currentCatalogProvider()) return;
-    const menu = new Menu();
+    const menu = this.buildModelMenu(catalog);
+    if (!menu) return;
+    if (catalog.warning) new Notice(`VaultGuard Chat: ${catalog.warning}`);
+    menu.showAtMouseEvent(evt);
+  }
 
+  // Keyboard entry point for the same picker (`/model` with no id). Anchored on
+  // the footer chip so it appears where a click would have opened it; when the
+  // chip has no layout the ids are listed in a Notice instead, so the command
+  // still tells the user what they can switch to.
+  private async openModelMenuFromCommand(): Promise<void> {
+    const catalog = await this.resolveCurrentModelCatalog();
+    if (!this.listEl || catalog.provider !== this.currentCatalogProvider()) return;
+    if (catalog.warning) new Notice(`VaultGuard Chat: ${catalog.warning}`);
+
+    const anchor = this.statusPanel?.modelAnchorPoint() ?? null;
+    const menu = anchor ? this.buildModelMenu(catalog) : null;
+    if (menu && anchor) {
+      menu.showAtPosition(anchor);
+      return;
+    }
+    new Notice(
+      `VaultGuard Chat: current model is ${this.model}. ${availableModelsHint(catalog.options)}`,
+      8000,
+    );
+  }
+
+  private buildModelMenu(catalog: ResolvedModelCatalog): Menu | null {
+    if (catalog.options.length === 0) return null;
+    const menu = new Menu();
     for (const m of catalog.options) {
       menu.addItem((item) =>
         item
@@ -2912,9 +3152,7 @@ export class VaultGuardChatView extends ItemView {
           }),
       );
     }
-
-    if (catalog.warning) new Notice(`VaultGuard Chat: ${catalog.warning}`);
-    menu.showAtMouseEvent(evt);
+    return menu;
   }
 
   private async resolveCurrentModelCatalog() {
@@ -3039,6 +3277,10 @@ export class VaultGuardChatView extends ItemView {
       }
     } else if (this.currentProvider() === "openai") {
       this.plugin.settings.openAiModel = model;
+    } else if (this.currentProvider() === "subscription") {
+      // A tier alias — must never land in aiChatModel, which the Messages API
+      // transport sends verbatim and which rejects bare aliases.
+      this.plugin.settings.claudeSubscriptionModel = model;
     } else {
       this.plugin.settings.aiChatModel = model;
     }
@@ -3520,6 +3762,38 @@ export class VaultGuardChatView extends ItemView {
     this.pendingIndicator?.remove();
     this.pendingIndicator = null;
   }
+}
+
+/**
+ * Canonical catalog id for a `/model <id>` argument, or null when this provider
+ * account has nothing matching it.
+ *
+ * Typed ids are matched case-insensitively — the catalog id is the truth, the
+ * user's casing is not. The subscription transport gets one extra step: its
+ * catalog holds TIER ALIASES (`opus`, `sonnet`, …) that the CLI resolves to the
+ * newest model of that tier, so a full model id like `claude-sonnet-4-6` is
+ * folded to its alias exactly as the settings migration does, instead of being
+ * rejected as unavailable.
+ */
+export function resolveCommandModelId(
+  requested: string,
+  catalog: Pick<ResolvedModelCatalog, "provider" | "options">,
+): string | null {
+  const wanted = requested.trim().toLowerCase();
+  if (!wanted) return null;
+  const direct = catalog.options.find((option) => option.id.toLowerCase() === wanted);
+  if (direct) return direct.id;
+  if (catalog.provider !== "claude-cli") return null;
+  const alias = claudeTierAliasFor(wanted);
+  return alias && catalog.options.some((option) => option.id === alias) ? alias : null;
+}
+
+/** Bounded "here is what you can pick" tail for the model-command notices. */
+export function availableModelsHint(options: ReadonlyArray<ChatModelOption>): string {
+  if (options.length === 0) return "No models are available for this provider yet.";
+  const shown = options.slice(0, 8).map((option) => option.id);
+  const rest = options.length - shown.length;
+  return `Available: ${shown.join(", ")}${rest > 0 ? `, +${rest} more` : ""}.`;
 }
 
 // First user prompt's text in a message list (handles string + image turns).

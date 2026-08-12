@@ -739,6 +739,14 @@ export interface VaultGuardSettings {
   openAiSecretId?: string;
   /** Anthropic model id for the AI Chat panel (default "claude-opus-4-8"). */
   aiChatModel: string;
+  /**
+   * Claude-subscription model for the Claude Code CLI transport. Holds a TIER
+   * ALIAS (`opus` / `sonnet` / `haiku` / `fable`), which the CLI resolves to the
+   * newest model of that tier — so a new Anthropic release needs no plugin
+   * update. Deliberately separate from `aiChatModel`: the Messages API rejects
+   * bare aliases, so the two transports cannot share one field.
+   */
+  claudeSubscriptionModel: string;
   /** Adaptive-thinking effort level for AI Chat turns (default "high"). */
   aiChatEffort: AnthropicEffort;
   /** OpenAI Responses API model id for the AI Chat panel (default "gpt-5.5"). */

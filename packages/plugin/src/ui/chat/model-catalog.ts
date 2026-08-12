@@ -8,12 +8,19 @@ import {
 } from "./codex-cli/codex-model-discovery";
 import {
   AI_CHAT_MODELS,
+  CLAUDE_SUBSCRIPTION_MODELS,
   OPENAI_CHAT_MODELS,
   humanizeModelId,
   type ChatModelOption,
 } from "./models";
 
-export type ProviderModelCatalogProvider = "anthropic" | "openai" | "codex";
+// "claude-cli" is the Claude-subscription transport. Unlike the other three it
+// has nothing to discover: the CLI exposes no model-listing command, and its
+// `--model` argument takes a TIER ALIAS that Anthropic resolves to the newest
+// model of that tier at request time. So the catalog is the fixed alias set —
+// version-free by construction, which is the property that keeps it from going
+// stale — and requires neither a credential nor a network call.
+export type ProviderModelCatalogProvider = "anthropic" | "openai" | "codex" | "claude-cli";
 export type ModelCatalogSource = "live" | "cache" | "fallback";
 
 export const MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -78,6 +85,9 @@ export class ProviderModelCatalogService {
     anthropic: 0,
     openai: 0,
     codex: 0,
+    // Present for type completeness only — the claude-cli catalog is static, so
+    // it is answered before any cache/generation bookkeeping runs.
+    "claude-cli": 0,
   };
   private readonly loaders: ProviderModelCatalogLoaders;
 
@@ -97,6 +107,17 @@ export class ProviderModelCatalogService {
   async resolve(input: ResolveModelCatalogInput): Promise<ResolvedModelCatalog> {
     const selectedModel = normalizeModelId(input.selectedModel);
     const fallback = () => mergeSelected(selectedModel, fallbackOptions(input.provider));
+
+    // The subscription transport's catalog is complete without any lookup, so
+    // it never touches the credential/cache/in-flight machinery below.
+    if (input.provider === "claude-cli") {
+      return {
+        provider: "claude-cli",
+        ...resolveSelection(selectedModel, { options: CLAUDE_SUBSCRIPTION_MODELS }),
+        source: "live",
+      };
+    }
+
     const cached = this.cache.get(input.provider);
     const credential =
       input.provider === "codex" ? input.codexBinaryPath?.trim() : input.apiKey?.trim();
@@ -355,6 +376,7 @@ function resolveSelection(
 
 function fallbackOptions(provider: ProviderModelCatalogProvider): ReadonlyArray<ChatModelOption> {
   if (provider === "anthropic") return AI_CHAT_MODELS;
+  if (provider === "claude-cli") return CLAUDE_SUBSCRIPTION_MODELS;
   // A ChatGPT subscription catalog is account- and workspace-specific. Never
   // present the API-key provider's bundled choices as if Codex reported them.
   // mergeSelected() still preserves the user's saved value as an explicitly
@@ -363,6 +385,11 @@ function fallbackOptions(provider: ProviderModelCatalogProvider): ReadonlyArray<
 }
 
 function discoveryWarning(provider: ProviderModelCatalogProvider): string {
+  if (provider === "claude-cli") {
+    // Unreachable in practice (the claude-cli catalog cannot fail), but the
+    // label must never read "Anthropic API".
+    return "Could not refresh Claude subscription models.";
+  }
   if (provider === "codex") {
     return "Could not refresh ChatGPT subscription models; showing only the saved selection.";
   }

@@ -37,6 +37,43 @@ export const AI_CHAT_MODELS: ReadonlyArray<ChatModelOption> = [
   { id: "claude-fable-5", label: "Claude Fable 5" },
 ];
 
+// Claude-subscription (Claude Code CLI) models. These are TIER ALIASES, not
+// model ids: `claude --model opus` resolves to the newest Opus server-side, so a
+// new Anthropic release reaches users without a plugin update. Verified against
+// claude 2.1.181 on 2026-08-11 — opus → claude-opus-5, sonnet → claude-sonnet-5,
+// haiku → claude-haiku-4-5-20251001, fable → claude-fable-5. The CLI reports the
+// resolved id in its `system/init` event, which the chat panel displays.
+//
+// These ids are ONLY valid as a `--model` argument to the CLI. The Anthropic
+// Messages API rejects bare aliases, which is why the subscription transport has
+// its own `claudeSubscriptionModel` setting instead of sharing `aiChatModel`.
+export const CLAUDE_SUBSCRIPTION_MODELS: ReadonlyArray<ChatModelOption> = [
+  { id: "opus", label: "Opus — newest available (default)" },
+  { id: "sonnet", label: "Sonnet — newest available" },
+  { id: "haiku", label: "Haiku — newest available" },
+  { id: "fable", label: "Fable — newest available" },
+];
+
+export const DEFAULT_CLAUDE_SUBSCRIPTION_MODEL = "opus";
+
+/**
+ * The tier alias a pinned model id belongs to, or null when it names no known
+ * tier. Used to migrate an existing pinned choice (e.g. `claude-sonnet-4-6`) to
+ * its self-updating equivalent (`sonnet`) rather than resetting everyone to Opus.
+ */
+export function claudeTierAliasFor(modelId: string): string | null {
+  const id = modelId.trim().toLowerCase();
+  if (!id) return null;
+  // Already an alias.
+  const alias = CLAUDE_SUBSCRIPTION_MODELS.find((option) => option.id === id);
+  if (alias) return alias.id;
+  const match = /^claude-([a-z]+)(?:-|$)/.exec(id);
+  const tier = match?.[1];
+  return tier && CLAUDE_SUBSCRIPTION_MODELS.some((option) => option.id === tier)
+    ? tier
+    : null;
+}
+
 export const AI_CHAT_EFFORTS: ReadonlyArray<{ id: AnthropicEffort; label: string }> = [
   { id: "low", label: "Low" },
   { id: "medium", label: "Medium" },

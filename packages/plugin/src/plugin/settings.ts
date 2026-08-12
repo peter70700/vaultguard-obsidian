@@ -38,6 +38,8 @@ import {
   AI_CHAT_MODELS,
   AI_CHAT_EFFORTS,
   AI_CHAT_PERMISSION_MODES,
+  CLAUDE_SUBSCRIPTION_MODELS,
+  DEFAULT_CLAUDE_SUBSCRIPTION_MODEL,
   OPENAI_CHAT_MODELS,
   OPENAI_REASONING_EFFORTS,
   OPENAI_VERBOSITIES,
@@ -281,6 +283,8 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   agentTemplateAllowlist: [],
   excludedPaths: [...DEFAULT_EXCLUDED_PATHS],
   aiChatModel: "claude-opus-4-8",
+  // A tier alias, not a version — the CLI resolves it to the newest Opus.
+  claudeSubscriptionModel: DEFAULT_CLAUDE_SUBSCRIPTION_MODEL,
   aiChatEffort: "high",
   openAiModel: "gpt-5.5",
   codexModel: "gpt-5.5",
@@ -297,7 +301,13 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   // re-entry. Stored server-side ONLY as a DEK-wrapped envelope (zero-knowledge).
   aiChatKeySyncEnabled: true,
   aiChatPermissionMode: "confirm",
-  aiChatProvider: "apiKey",
+  // Claude subscription first: a fresh desktop install should spend the user's
+  // existing Claude Pro/Max login, not ask them to buy API credits. Nothing is
+  // spawned or called until the user sends a message, and the panel explains how
+  // to install/sign in — or switch to an API key — if the CLI isn't ready.
+  // Mobile cannot run a CLI at all, so normalizeAiChatProvider() resolves this
+  // to "apiKey" there at load time.
+  aiChatProvider: "subscription",
   permissionsGraphDefaults: {
     schemaVersion: 2,
     renderMode: "auto",
@@ -1666,31 +1676,39 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
 
     // ── Model ───────────────────────────────────────────────────────────────
-    const anthropicModelSetting = new Setting(containerEl)
-      .setName("Model")
-      .setDesc("Anthropic model used for AI chat turns. Available models load from your API account.")
-      .addDropdown((dropdown) => {
-        this.populateModelSelect(
-          dropdown.selectEl,
-          AI_CHAT_MODELS,
-          this.plugin.settings.aiChatModel,
-        );
-        dropdown
-          .setValue(this.plugin.settings.aiChatModel)
-          .onChange(async (value) => {
-            this.plugin.settings.aiChatModel = value;
-            await this.plugin.saveSettings();
-          });
+    if (this.plugin.settings.aiChatProvider === "subscription") {
+      // Tier aliases, not versions. `claude --model opus` resolves to the newest
+      // Opus at request time, so this list never needs a plugin release to keep
+      // up with Anthropic. The concrete model is shown in the chat footer once
+      // the CLI reports it for the session.
+      this.renderClaudeSubscriptionModelSetting(containerEl);
+    } else {
+      const anthropicModelSetting = new Setting(containerEl)
+        .setName("Model")
+        .setDesc("Anthropic model used for AI chat turns. Available models load from your API account.")
+        .addDropdown((dropdown) => {
+          this.populateModelSelect(
+            dropdown.selectEl,
+            AI_CHAT_MODELS,
+            this.plugin.settings.aiChatModel,
+          );
+          dropdown
+            .setValue(this.plugin.settings.aiChatModel)
+            .onChange(async (value) => {
+              this.plugin.settings.aiChatModel = value;
+              await this.plugin.saveSettings();
+            });
+        });
+      const anthropicModelStatus = anthropicModelSetting.descEl.createDiv({
+        cls: "vaultguard-model-catalog-status",
+        text: hasKey ? "Loading models available to this Anthropic key…" : "Add an API key to load account models.",
       });
-    const anthropicModelStatus = anthropicModelSetting.descEl.createDiv({
-      cls: "vaultguard-model-catalog-status",
-      text: hasKey ? "Loading models available to this Anthropic key…" : "Add an API key to load account models.",
-    });
-    void this.refreshProviderModelSelect(
-      "anthropic",
-      anthropicModelSetting.controlEl.querySelector("select"),
-      anthropicModelStatus,
-    );
+      void this.refreshProviderModelSelect(
+        "anthropic",
+        anthropicModelSetting.controlEl.querySelector("select"),
+        anthropicModelStatus,
+      );
+    }
 
     // ── Effort ──────────────────────────────────────────────────────────────
     new Setting(containerEl)
@@ -1968,6 +1986,44 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+  }
+
+  /**
+   * Model picker for the Claude-subscription transport. It lists TIERS, not
+   * versions: the CLI resolves `opus` to whatever the newest Opus is at request
+   * time, so a new Anthropic release reaches users without a plugin update —
+   * which a pinned list (`claude-opus-4-8`) could never do.
+   *
+   * Bound to `claudeSubscriptionModel`, never `aiChatModel`: the Messages API
+   * transport sends that field verbatim and rejects bare aliases.
+   */
+  private renderClaudeSubscriptionModelSetting(containerEl: HTMLElement): void {
+    const setting = new Setting(containerEl)
+      .setName("Model")
+      .setDesc(
+        "Which Claude your subscription chat uses. Each option tracks the newest model in " +
+          "that family automatically, so it stays current without a plugin update.",
+      )
+      .addDropdown((dropdown) => {
+        this.populateModelSelect(
+          dropdown.selectEl,
+          CLAUDE_SUBSCRIPTION_MODELS,
+          this.plugin.settings.claudeSubscriptionModel,
+        );
+        dropdown
+          .setValue(
+            this.plugin.settings.claudeSubscriptionModel || DEFAULT_CLAUDE_SUBSCRIPTION_MODEL,
+          )
+          .onChange(async (value) => {
+            this.plugin.settings.claudeSubscriptionModel = value;
+            await this.plugin.saveSettings();
+            this.plugin.notifyAiChatProviderChanged();
+          });
+      });
+    setting.descEl.createDiv({
+      cls: "vaultguard-model-catalog-status",
+      text: "The chat footer shows the exact model Claude Code resolved for the session.",
+    });
   }
 
   private populateModelSelect(

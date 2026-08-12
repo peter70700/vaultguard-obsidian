@@ -111,8 +111,8 @@ export const BUILT_IN_SLASH_COMMANDS: ReadonlyArray<SlashCommandSuggestion> = [
   },
   {
     name: "model",
-    description: "Switch model for future replies.",
-    argumentHint: "<model-id>",
+    description: "Switch model for future replies; no id opens the picker.",
+    argumentHint: "[model-id]",
     source: "built-in",
   },
 ];
@@ -226,7 +226,9 @@ export function parseSlash(text: string): ParsedSlash | null {
     case "format-all-documents":
       return { kind: "format-vault", arg };
     case "model":
-      if (!arg) return { kind: "unknown", raw: trimmed, name, arg };
+      // An empty argument is a valid invocation, not a typo: accepting `/model`
+      // from the `/` palette inserts exactly that, and the next Enter used to
+      // land on "unknown command". Bare `/model` opens the picker instead.
       return { kind: "model", model: arg };
     default:
       return { kind: "unknown", raw: trimmed, name, arg };

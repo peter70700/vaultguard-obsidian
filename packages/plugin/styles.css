@@ -6100,6 +6100,14 @@ button .vaultguard-btn-spinner:only-child {
   font-size: 12px;
   color: var(--text-faint);
 }
+.vaultguard-chat-empty-action {
+  margin: 4px 0 10px;
+  cursor: pointer;
+}
+.vaultguard-chat-empty-action:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
 .vaultguard-chat-welcome {
   max-width: 380px;
   margin: 0 auto;
@@ -7511,6 +7519,18 @@ button .vaultguard-btn-spinner:only-child {
 
 .vaultguard-pg-depth input[type="range"] {
   width: 90px;
+}
+
+/* The layout-cycle button must keep a hit target even if its glyph is empty.
+   `setIcon()` with an unregistered id empties the element, and an icon-only span
+   with no content collapses to zero width — invisible AND unclickable. Since
+   this button is the only compact control that cycles the layout, that stranded
+   users in whatever mode they had reached ("grid-2x2" typo, fixed 2026-08-11).
+   The icon id is now pinned by a test; this floor is the belt-and-braces so a
+   future bad id degrades to a blank-but-clickable button instead of a trap. */
+.vaultguard-pg-layout-cycle {
+  min-width: var(--icon-size, 18px);
+  min-height: var(--icon-size, 18px);
 }
 
 /* --- Free-text filter ----------------------------------------------------- */

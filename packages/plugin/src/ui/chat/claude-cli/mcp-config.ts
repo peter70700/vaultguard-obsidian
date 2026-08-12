@@ -27,6 +27,12 @@ import type { AiChatPermissionMode } from "../../../types";
 // flags), so listing them is not an over-grant. Without this, the CLI denied
 // import_list before it reached the ready MCP server and /import-knowledge was
 // blocked.
+// A tool the bridge advertises but that is missing HERE is denied by
+// --permission-mode dontAsk before it reaches the server, and the user sees
+// "Permission to use mcp__vaultguard__… has been denied" — indistinguishable
+// from a real authorization result. `tests/claude-stream-parser.test.ts` derives
+// the expected set from agent-bridge's MCP_TOOLS so an omission fails a test
+// instead of shipping.
 export const VAULTGUARD_MCP_TOOL_NAMES: ReadonlyArray<string> = [
   "mcp__vaultguard__list",
   "mcp__vaultguard__search",
@@ -36,6 +42,10 @@ export const VAULTGUARD_MCP_TOOL_NAMES: ReadonlyArray<string> = [
   "mcp__vaultguard__delete",
   "mcp__vaultguard__rename",
   "mcp__vaultguard__graph",
+  // Metadata-only orientation snapshot. Always-on for the chat lease and the
+  // system prompt tells the model to call it first on multi-vault / protected /
+  // Git-adjacent tasks, so omitting it here denied the model's *first* action.
+  "mcp__vaultguard__get_vault_orientation",
   // Agent Command Expansion tools. The semantic/read tools are ordinary
   // lease-scoped MCP capabilities; automation remains server-gated to the
   // trusted, session-bound desktop chat lease and a human-approved registry.
@@ -88,6 +98,7 @@ export const VAULTGUARD_MCP_TOOL_NAMES: ReadonlyArray<string> = [
 const BASE_VAULTGUARD_CLI_SYSTEM_PROMPT = [
   "You are VaultGuard's assistant, embedded in the user's end-to-end-encrypted Obsidian vault.",
   "The vault is reachable ONLY through the mcp__vaultguard__* tools — they are your sole interface to vault content and they enforce the user's per-file permissions and the at-rest encryption:",
+  "- mcp__vaultguard__get_vault_orientation — metadata-only snapshot of the active vault, its protection state, connector readiness, and bounded Git status; call it before tasks that may involve multiple vaults, protected/encrypted content, Git state, or write safety",
   "- mcp__vaultguard__list — list vault files visible to you",
   "- mcp__vaultguard__search — search note text for a substring",
   "- mcp__vaultguard__read — read a note as plaintext",

@@ -154,6 +154,18 @@ export class StatusPanel {
     this.renderModel();
   }
 
+  /**
+   * Where to open the model picker when it is invoked from the keyboard (the
+   * `/model` command) rather than from a click on the chip. Returns null when
+   * the chip has no layout yet — the caller then falls back to a text list.
+   */
+  modelAnchorPoint(): { x: number; y: number } | null {
+    const rect = this.modelEl.getBoundingClientRect?.();
+    if (!rect) return null;
+    // Open below the chip, matching where a click on it would place the menu.
+    return { x: rect.left, y: rect.bottom };
+  }
+
   setEffort(effort: AiChatEffort): void {
     this.effort = effort;
     this.renderEffort();
