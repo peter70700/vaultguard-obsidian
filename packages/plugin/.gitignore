@@ -9,6 +9,9 @@ landing/brand-export/
 build/
 *.log
 
+# Coverage output (`npm run test:coverage`) — regenerated, never committed
+coverage/
+
 # Dependencies
 node_modules/
 

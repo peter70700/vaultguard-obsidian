@@ -17,6 +17,102 @@ resource "aws_wafv2_web_acl" "vaultguard" {
     allow {}
   }
 
+  # Keep unauthenticated JSON endpoints small without restoring the global
+  # SizeRestrictions_BODY breakage for encrypted file uploads. MATCH is
+  # deliberate: a body larger than WAF's inspection window is blocked instead
+  # of being truncated and passed to Lambda. The exact PUT file-path exclusion
+  # keeps the legacy CloudFront endpoint aligned with the REGIONAL API ACL.
+  rule {
+    name     = "SmallPublicJsonBodyLimit"
+    priority = 0
+
+    action {
+      block {}
+    }
+
+    statement {
+      and_statement {
+        statement {
+          size_constraint_statement {
+            comparison_operator = "GT"
+            size                = 16384
+
+            field_to_match {
+              body {
+                oversize_handling = "MATCH"
+              }
+            }
+
+            text_transformation {
+              priority = 0
+              type     = "NONE"
+            }
+          }
+        }
+
+        statement {
+          regex_match_statement {
+            regex_string = "^/(signup|auth/(forgot-password|confirm-reset|recovery-codes/verify|human-verification/(attempts|complete|poll)))$"
+
+            field_to_match {
+              uri_path {}
+            }
+
+            text_transformation {
+              priority = 0
+              type     = "NONE"
+            }
+          }
+        }
+
+        statement {
+          not_statement {
+            statement {
+              and_statement {
+                statement {
+                  byte_match_statement {
+                    positional_constraint = "EXACTLY"
+                    search_string         = "PUT"
+
+                    field_to_match {
+                      method {}
+                    }
+
+                    text_transformation {
+                      priority = 0
+                      type     = "NONE"
+                    }
+                  }
+                }
+
+                statement {
+                  regex_match_statement {
+                    regex_string = "^/vaults/[^/]+/files/.+$"
+
+                    field_to_match {
+                      uri_path {}
+                    }
+
+                    text_transformation {
+                      priority = 0
+                      type     = "NONE"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "SmallPublicJsonBodyLimit"
+      sampled_requests_enabled   = true
+    }
+  }
+
   # AWS Managed Rules - Common Rule Set
   rule {
     name     = "AWSManagedRulesCommonRuleSet"

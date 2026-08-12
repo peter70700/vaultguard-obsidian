@@ -3422,8 +3422,39 @@ export class SyncRuntime {
       !response.success &&
       (response.error?.statusCode === 404 || response.error?.statusCode === 410);
 
+    // A 404/410 is authoritative absence ONLY when it came back through the
+    // plain `/files` route. `fetchRemoteFileContent` routes every lease-less or
+    // carve-out-denied read to `/files-decrypted`, and that endpoint answers a
+    // permission deny with 404 BY DESIGN (D-02) so a caller cannot probe for
+    // existence — its own comment says "indistinguishable from permission deny".
+    // Trusting that 404 as proof of deletion is the never-wipe-on-ambiguity
+    // violation: under KEEP_REMOTE it hard-deleted local content that the server
+    // still holds and the user has merely lost READ access to (a deny rule can
+    // scope `read` alone, and the write gate is evaluated independently — so the
+    // PUT still 409s into this handler).
+    //
+    // The predicate is copied VERBATIM from fetchRemoteFileContent's route
+    // selector so the two cannot drift, the same discipline the SD-06-F1
+    // absence-recording predicate applies to its own copy. `applyRemoteChange`
+    // already carries this guard; this sibling call site was missing it.
+    const absenceIsAmbiguous =
+      remoteDeleted &&
+      (!this.hasValidKeyLease() || this.ctx.isPathDeniedByKeyLease(normalizedPath));
+
     if (remoteDeleted) {
-      this.ctx.recordRemoteFileAbsent(normalizedPath);
+      // Only a plain-route 404 is positive evidence of absence. Recording an
+      // ambiguous one poisons the manifest with a permission artifact and makes
+      // the user's next save declare `mustBeAbsent` against a file that exists —
+      // the T-16-11 trap the SD-06-F1 predicate already excludes 401/403 for.
+      //
+      // Deliberately NOT symmetric with applyRemoteDeletion's own internal
+      // record: once a strategy HAS removed the file locally, recording it
+      // absent is consistent with local state. This site fires for every
+      // strategy including the ones that keep the file — ASK_USER (the default)
+      // and KEEP_LOCAL — where the record would be pure poisoning.
+      if (!absenceIsAmbiguous) {
+        this.ctx.recordRemoteFileAbsent(normalizedPath);
+      }
     } else {
       if (!response.success || !response.data) {
         throw new Error(
@@ -3522,7 +3553,12 @@ export class SyncRuntime {
 
       case ConflictResolutionStrategy.KEEP_REMOTE:
         if (remoteDeleted) {
-          await this.ctx.applyRemoteDeletion(normalizedPath, false);
+          // `inferred` already means exactly "we cannot be certain the remote is
+          // really gone", which routes the delete through trash-or-refuse
+          // instead of a hard delete. An authoritative plain-route 404 still
+          // takes the hard-delete branch, so genuine remote deletions converge
+          // unchanged.
+          await this.ctx.applyRemoteDeletion(normalizedPath, absenceIsAmbiguous);
         } else if (remoteContent !== null) {
           await this.ctx.writeLocalFileFromRemote(normalizedPath, remoteContent);
         } else {
@@ -3535,7 +3571,10 @@ export class SyncRuntime {
         const conflictPath = this.generateConflictPath(normalizedPath);
         await this.ctx.writePlainToDisk(conflictPath, localContent);
         if (remoteDeleted) {
-          await this.ctx.applyRemoteDeletion(normalizedPath, false);
+          // Same ambiguity gate as KEEP_REMOTE above. This lane already wrote a
+          // conflict copy, so the local bytes survive either way — passing the
+          // flag keeps the two branches honest rather than relying on that.
+          await this.ctx.applyRemoteDeletion(normalizedPath, absenceIsAmbiguous);
         } else if (remoteContent !== null) {
           await this.ctx.writeLocalFileFromRemote(normalizedPath, remoteContent);
         } else {
@@ -3636,7 +3675,7 @@ export class SyncRuntime {
    * Phase 12 NON-NEGOTIABLE #2: this monitor deliberately SURVIVES the vault
    * lock — enterLockState stops the sync + key-renewal timers but never this
    * one. The heartbeat depends only on the session (not the LAK/lease), so a
-   * revoked/offboarded user or the 24h maxSessionDurationHours cap still drives
+   * revoked/offboarded user or the configured maxSessionDurationHours cap still drives
    * checkRevocationHeartbeat → handleServerRevocation → a REAL forceLogout while
    * the vault is merely locked. A locked session can never resurrect a
    * revoked/expired one. Do NOT add an isVaultLocked guard here.

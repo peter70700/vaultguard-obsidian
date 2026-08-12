@@ -63,19 +63,19 @@ module "cognito" {
 
   production_hardening = var.production_hardening
 
-  stage                  = var.stage
-  is_prod                = local.is_prod
-  callback_urls          = var.cognito_callback_urls
-  logout_urls            = var.cognito_logout_urls
-  ses_sender_email       = var.sender_email
-  mfa_configuration      = var.cognito_mfa_configuration
-  advanced_security_mode = var.cognito_advanced_security_mode
+  stage                         = var.stage
+  is_prod                       = local.is_prod
+  callback_urls                 = var.cognito_callback_urls
+  logout_urls                   = var.cognito_logout_urls
+  ses_sender_email              = var.sender_email
+  mfa_configuration             = var.cognito_mfa_configuration
+  advanced_security_mode        = var.cognito_advanced_security_mode
   login_verification_mode       = var.login_verification_mode
   login_verification_client_ids = var.login_verification_client_ids
   sessions_table_name           = module.dynamodb.sessions_table_name
   sessions_table_arn            = module.dynamodb.sessions_table_arn
-  kms_key_arn                    = module.kms.key_arn
-  turnstile_secret_arn          = var.turnstile_secret_arn != "" ? var.turnstile_secret_arn : ""
+  kms_key_arn                   = module.kms.key_arn
+  turnstile_secret_arn          = var.turnstile_secret_arn
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,6 +87,7 @@ module "lambda" {
 
   stage                            = var.stage
   is_prod                          = local.is_prod
+  production_hardening             = var.production_hardening
   kms_key_arn                      = module.kms.key_arn
   kms_key_id                       = module.kms.key_id
   vault_bucket_name                = module.s3.bucket_name
@@ -141,13 +142,9 @@ module "lambda" {
   vaultguard_edition               = var.vaultguard_edition
   allow_public_signup              = var.vaultguard_allow_public_signup
   billing_exempt_domains           = var.billing_exempt_domains
-  # Pro/managed SaaS: hardcoded to the prod Turnstile Secrets Manager ARN.
-  # This root module is the Pro production deployment for example.com —
-  # CE consumers depend on `modules/lambda` directly with their own root and
-  # inherit the module default ("") for fail-open behavior. The top-level
-  # `var.turnstile_secret_arn` (default "") lets non-prod stages or test
-  # tfvars override this without editing main.tf.
-  turnstile_secret_arn = var.turnstile_secret_arn != "" ? var.turnstile_secret_arn : ""
+  # Stage credentials are explicit inputs. Never fall back from an omitted
+  # non-production value to the production Turnstile secret.
+  turnstile_secret_arn = var.turnstile_secret_arn
   # Meta Conversions API. Both default to "" — Meta events stay off until an
   # operator sets them. See docs/META-CAPI-SETUP.md.
   meta_dataset_id      = var.meta_dataset_id
@@ -215,11 +212,20 @@ module "waf" {
 
 module "cloudfront" {
   source = "./modules/cloudfront"
+  count  = var.legacy_api_cdn_enabled ? 1 : 0
 
   stage             = var.stage
   api_gateway_url   = module.apigateway.api_url
   api_gateway_stage = var.stage
   waf_acl_arn       = module.waf.web_acl_arn
+}
+
+# Adding the retirement count changes the module address. Preserve the existing
+# distribution at index zero so the default-enabled migration is state-only and
+# cannot replace the CDN during an otherwise unrelated apply.
+moved {
+  from = module.cloudfront
+  to   = module.cloudfront[0]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -266,6 +272,19 @@ module "monitoring" {
   kms_key_arn       = module.kms.key_arn
   api_gateway_name  = module.apigateway.api_name
   api_gateway_stage = var.stage
+
+  # The Cognito Pre Authentication trigger lives in the cognito module, not the
+  # lambda module, so it has to be appended explicitly — it is on the login path
+  # and is exactly the function whose failures must page.
+  lambda_function_names = concat(
+    module.lambda.all_function_names,
+    [module.cognito.pre_authentication_function_name],
+  )
+  lambda_log_group_names = module.lambda.all_log_group_names
+
+  reencryption_dlq_name    = module.lambda.reencryption_dlq_name
+  reconciler_function_name = module.lambda.reconciler_function_name
+  detector_function_name   = module.lambda.detector_function_name
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

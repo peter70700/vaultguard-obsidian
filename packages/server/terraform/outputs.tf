@@ -4,8 +4,8 @@ output "api_url" {
 }
 
 output "cloudfront_url" {
-  description = "VaultGuard CloudFront API CDN URL (backward compat for existing plugin installs)"
-  value       = module.cloudfront.distribution_url
+  description = "Legacy CloudFront API CDN URL, or an empty string after its controlled retirement"
+  value       = var.legacy_api_cdn_enabled ? module.cloudfront[0].distribution_url : ""
 }
 
 output "user_pool_id" {

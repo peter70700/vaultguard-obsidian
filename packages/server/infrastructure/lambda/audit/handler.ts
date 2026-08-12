@@ -69,6 +69,8 @@ const ANOMALY_THRESHOLD_DENIED = parseInt(process.env.ANOMALY_THRESHOLD_DENIED |
 export const CE_AUDIT_RETENTION_DAYS = 30;
 
 const ANOMALY_THRESHOLD_BULK = parseInt(process.env.ANOMALY_THRESHOLD_BULK || '50', 10);
+const ANOMALY_THRESHOLD_SYNC_CHANGES = parseInt(process.env.ANOMALY_THRESHOLD_SYNC_CHANGES || '100', 10);
+const ANOMALY_THRESHOLD_SYNC_DELETIONS = parseInt(process.env.ANOMALY_THRESHOLD_SYNC_DELETIONS || '25', 10);
 const ANOMALY_WINDOW_MINUTES = parseInt(process.env.ANOMALY_WINDOW_MINUTES || '10', 10);
 const ANOMALY_THRESHOLD_DISTINCT_IPS = parseInt(process.env.ANOMALY_THRESHOLD_DISTINCT_IPS || '3', 10);
 const ANOMALY_THRESHOLD_DISTINCT_PATHS = parseInt(process.env.ANOMALY_THRESHOLD_DISTINCT_PATHS || '12', 10);
@@ -95,7 +97,8 @@ const BRIDGE_AUDIT_ACTION_ALLOWLIST: ReadonlySet<string> = new Set([
 // Bridge-audit payload cap. 4 KB is large enough for a tool_invoked row
 // (lease id + agent name + tool name + path + a handful of stats) while
 // being too small to ship raw file content or diff bodies — those would
-// leak plaintext into an immutable audit log on a runaway agent.
+// leak plaintext into the durable server-side audit table on a runaway agent.
+// The table has TTL/PITR but is not WORM or independently tamper-evident.
 const BRIDGE_AUDIT_MAX_BODY_BYTES = 4096;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -105,7 +108,7 @@ interface SecurityAlert {
   id: string;
   orgId: string;
   vaultId: string;
-  type: 'revoked_access_attempt' | 'unusual_pattern' | 'bulk_download' | 'repeated_denial' | 'off_hours_access';
+  type: 'revoked_access_attempt' | 'unusual_pattern' | 'bulk_download' | 'bulk_sync_change' | 'repeated_denial' | 'off_hours_access';
   severity: 'low' | 'medium' | 'high' | 'critical';
   userId: string;
   description: string;
@@ -473,6 +476,7 @@ async function handleFileAccess(
  * - revoked_access_attempt: A user whose access was revoked tried to authenticate
  * - unusual_pattern: Abnormal behavior detected (time, volume, pattern)
  * - bulk_download: Excessive file reads in a short window
+ * - bulk_sync_change: A sync response exposed or propagated an unusually large change set
  * - repeated_denial: Multiple permission-denied events for same user
  * - off_hours_access: Access attempts outside normal working hours
  *
@@ -959,10 +963,17 @@ export async function detectAnomaliesForScope(scope: {
     }
   }
 
-  // Detect: Bulk downloads
+  // Detect: Bulk content access. Direct-download issuance is the last
+  // authoritative server-side signal before S3 serves the encrypted object;
+  // consumption requires an independently deployed S3 access-log trail.
+  const contentAccessActions = new Set([
+    'files.read',
+    'files.readDecrypted',
+    'files.directDownload.issue',
+  ]);
   const readsByUser = new Map<string, AuditEntry[]>();
   for (const entry of recentEntries) {
-    if (entry.action === 'files.read' && entry.outcome === 'success') {
+    if (contentAccessActions.has(entry.action) && entry.outcome === 'success') {
       const existing = readsByUser.get(entry.userId) || [];
       existing.push(entry);
       readsByUser.set(entry.userId, existing);
@@ -978,16 +989,48 @@ export async function detectAnomaliesForScope(scope: {
         type: 'bulk_download',
         severity: 'high',
         userId,
-        description: `User ${userId} read ${reads.length} files in the last ${ANOMALY_WINDOW_MINUTES} minutes (threshold: ${ANOMALY_THRESHOLD_BULK})`,
+        description: `User ${userId} accessed or requested ${reads.length} file payloads in the last ${ANOMALY_WINDOW_MINUTES} minutes (threshold: ${ANOMALY_THRESHOLD_BULK})`,
         timestamp: new Date().toISOString(),
         metadata: {
           readCount: reads.length,
           vaultId,
           uniquePaths: [...new Set(reads.map((r) => r.resourcePath))].length,
+          actions: [...new Set(reads.map((r) => r.action))],
         },
         acknowledged: false,
       });
     }
+  }
+
+  // Detect unusually large sync result sets. This is deliberately based on
+  // the server-produced audit row, so a client cannot suppress the signal by
+  // omitting individual file reads. Deletion propagation uses a lower
+  // threshold because it has destructive local impact.
+  for (const entry of recentEntries) {
+    if (entry.action !== 'files.sync' || entry.outcome !== 'success') continue;
+    const deltaCount = numericMetadata(entry.metadata?.deltaCount);
+    const deleted = numericMetadata(entry.metadata?.deleted);
+    const modified = numericMetadata(entry.metadata?.modified);
+    if (deltaCount < ANOMALY_THRESHOLD_SYNC_CHANGES && deleted < ANOMALY_THRESHOLD_SYNC_DELETIONS) continue;
+
+    alerts.push({
+      id: buildAlertId('bulk_sync_change', orgId, vaultId, entry.userId, entry.id, String(windowBucket)),
+      orgId,
+      vaultId,
+      type: 'bulk_sync_change',
+      severity: deleted >= ANOMALY_THRESHOLD_SYNC_DELETIONS ? 'high' : 'medium',
+      userId: entry.userId,
+      description: `User ${entry.userId} received a sync result with ${deltaCount} changes (${deleted} deletions)`,
+      timestamp: entry.timestamp,
+      metadata: {
+        deltaCount,
+        deleted,
+        modified,
+        mode: entry.metadata?.mode,
+        resourcePath: entry.resourcePath,
+      },
+      acknowledged: false,
+    });
   }
 
   // Detect: Revoked user access attempts
@@ -1106,6 +1149,10 @@ function clampLimit(rawLimit: string | undefined, fallback: number, max: number)
     return fallback;
   }
   return Math.min(parsed, max);
+}
+
+function numericMetadata(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 function normalizeStartTimestamp(value?: string): string | undefined {
@@ -1414,21 +1461,24 @@ function buildAlertId(...parts: string[]): string {
   return `alert_${Buffer.from(seed, 'utf8').toString('base64url').slice(0, 180)}`;
 }
 
-async function persistAlert(alert: SecurityAlert): Promise<void> {
+async function persistAlert(alert: SecurityAlert): Promise<'persisted' | 'duplicate'> {
   try {
     await docClient.send(new PutCommand({
       TableName: ALERTS_TABLE,
       Item: alert,
       ConditionExpression: 'attribute_not_exists(id)',
     }));
+    return 'persisted';
   } catch (err) {
     const errorName = (err as { name?: string }).name;
-    if (errorName !== 'ConditionalCheckFailedException') {
-      console.error('[AUDIT_ALERT_PERSIST_ERROR]', (err as Error).message, {
-        alertId: alert.id,
-        type: alert.type,
-      });
+    if (errorName === 'ConditionalCheckFailedException') {
+      return 'duplicate';
     }
+    console.error('[AUDIT_ALERT_PERSIST_ERROR]', (err as Error).message, {
+      alertId: alert.id,
+      type: alert.type,
+    });
+    throw err;
   }
 }
 

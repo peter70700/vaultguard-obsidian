@@ -889,9 +889,18 @@ class RevokeAccessModal extends Modal {
 
   private async handleRevoke(): Promise<void> {
     try {
-      await this.apiClient.revokeUser(this.user.id);
+      const result = await this.apiClient.revokeUser(this.user.id);
       if (!this.active) return;
-      new Notice(`Access revoked for ${this.user.displayName}. All sessions terminated.`);
+      if (result?.reEncryptionJobId === null) {
+        new Notice(
+          `Access revoked for ${this.user.displayName}, but vault-key rotation could not start. Trigger re-encryption manually.`,
+          10_000,
+        );
+      } else {
+        new Notice(
+          `Access revoked for ${this.user.displayName}. All sessions terminated${result?.reEncryptionJobId ? "; vault-key rotation started" : ""}.`,
+        );
+      }
       await this.onRevoked();
       if (!this.active) return;
       this.close();

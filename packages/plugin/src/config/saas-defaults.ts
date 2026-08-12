@@ -49,6 +49,13 @@ export interface SaasDefaults {
    * rather than rendering a dead one.
    */
   readonly docsSetupUrl: string;
+  /**
+   * Hosted registration URL shown on the login modal so a first-run user who
+   * has no account yet is not dead-ended at a password prompt. Empty string
+   * hides the link — self-hosted builds provision users through their own
+   * admin, not through Cloud signup.
+   */
+  readonly signupUrl: string;
 }
 
 export const SAAS_DEFAULTS: SaasDefaults = {
@@ -64,4 +71,5 @@ export const SAAS_DEFAULTS: SaasDefaults = {
   apiHostname: "api.vaultguard.cloud",
   adminBaseUrl: "https://admin.vaultguard.cloud",
   docsSetupUrl: "https://vaultguard.cloud/#/docs/setup",
+  signupUrl: "https://admin.vaultguard.cloud/#/signup",
 };

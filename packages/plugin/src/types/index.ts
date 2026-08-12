@@ -960,22 +960,6 @@ export interface EncryptedPayload {
   ciphertext: Uint8Array;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Key Manager Types
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Configuration for the KeyManager. */
-export interface KeyManagerConfig {
-  /** How often to refresh the lease (ms) */
-  refreshIntervalMs?: number;
-  /** How long the key remains valid without server contact (ms) */
-  gracePeriodMs?: number;
-  /** Buffer time before expiry to trigger refresh (ms) */
-  refreshBufferMs?: number;
-  /** Default server vault for scoped key leases */
-  vaultId?: string;
-}
-
 /** Generic server response wrapper for key operations. */
 export interface ServerResponse<T> {
   success: boolean;

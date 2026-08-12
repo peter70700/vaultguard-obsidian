@@ -83,6 +83,11 @@ resource "aws_api_gateway_gateway_response" "cors_4xx" {
     "gatewayresponse.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
     "gatewayresponse.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id,X-VG-Agent-Name,X-VG-Lease-Id'"
     "gatewayresponse.header.Access-Control-Allow-Methods" = "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+    "gatewayresponse.header.X-Content-Type-Options"       = "'nosniff'"
+    "gatewayresponse.header.X-Frame-Options"              = "'DENY'"
+    "gatewayresponse.header.Strict-Transport-Security"    = "'max-age=31536000; includeSubDomains'"
+    "gatewayresponse.header.Cache-Control"                = "'no-store'"
+    "gatewayresponse.header.Referrer-Policy"              = "'strict-origin-when-cross-origin'"
   }
 
   # Match AWS's built-in default; otherwise the API silently re-applies it on
@@ -100,6 +105,11 @@ resource "aws_api_gateway_gateway_response" "cors_5xx" {
     "gatewayresponse.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
     "gatewayresponse.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id,X-VG-Agent-Name,X-VG-Lease-Id'"
     "gatewayresponse.header.Access-Control-Allow-Methods" = "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+    "gatewayresponse.header.X-Content-Type-Options"       = "'nosniff'"
+    "gatewayresponse.header.X-Frame-Options"              = "'DENY'"
+    "gatewayresponse.header.Strict-Transport-Security"    = "'max-age=31536000; includeSubDomains'"
+    "gatewayresponse.header.Cache-Control"                = "'no-store'"
+    "gatewayresponse.header.Referrer-Policy"              = "'strict-origin-when-cross-origin'"
   }
 
   response_templates = {
@@ -1637,7 +1647,10 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.auth_ai_key_get.id,
       aws_api_gateway_integration.auth_ai_key_put.id,
       aws_api_gateway_integration.auth_ai_key_delete.id,
-      aws_api_gateway_integration.auth_human_verification_post.id,
+      # for_each'd over attempts/complete/poll (see cors.tf), so it has no
+      # single .id — splat every instance, matching the cors_options handling
+      # below, so a change to any one of the three still forces a redeployment.
+      values(aws_api_gateway_integration.auth_human_verification_post)[*].id,
       aws_api_gateway_integration.users_get.id,
       aws_api_gateway_integration.users_roles_get.id,
       aws_api_gateway_integration.users_invite_post.id,
@@ -1794,6 +1807,102 @@ resource "aws_wafv2_web_acl" "api_regional" {
 
   default_action {
     allow {}
+  }
+
+  # Small unauthenticated JSON routes have no reason to accept file-sized
+  # bodies. WAF's body inspection limit is treated as a match so truncation can
+  # never bypass the cap. The explicit PUT file-path exclusion documents and
+  # preserves the encrypted JSON upload route that requires the managed common
+  # rule's SizeRestrictions_BODY count override below.
+  rule {
+    name     = "SmallPublicJsonBodyLimit"
+    priority = 0
+
+    action {
+      block {}
+    }
+
+    statement {
+      and_statement {
+        statement {
+          size_constraint_statement {
+            comparison_operator = "GT"
+            size                = 16384
+
+            field_to_match {
+              body {
+                oversize_handling = "MATCH"
+              }
+            }
+
+            text_transformation {
+              priority = 0
+              type     = "NONE"
+            }
+          }
+        }
+
+        statement {
+          regex_match_statement {
+            regex_string = "^/(signup|auth/(forgot-password|confirm-reset|recovery-codes/verify|human-verification/(attempts|complete|poll)))$"
+
+            field_to_match {
+              uri_path {}
+            }
+
+            text_transformation {
+              priority = 0
+              type     = "NONE"
+            }
+          }
+        }
+
+        statement {
+          not_statement {
+            statement {
+              and_statement {
+                statement {
+                  byte_match_statement {
+                    positional_constraint = "EXACTLY"
+                    search_string         = "PUT"
+
+                    field_to_match {
+                      method {}
+                    }
+
+                    text_transformation {
+                      priority = 0
+                      type     = "NONE"
+                    }
+                  }
+                }
+
+                statement {
+                  regex_match_statement {
+                    regex_string = "^/vaults/[^/]+/files/.+$"
+
+                    field_to_match {
+                      uri_path {}
+                    }
+
+                    text_transformation {
+                      priority = 0
+                      type     = "NONE"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "SmallPublicJsonBodyLimit"
+      sampled_requests_enabled   = true
+    }
   }
 
   # AWS Managed Rules - Common Rule Set

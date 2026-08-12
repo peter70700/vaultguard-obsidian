@@ -97,6 +97,12 @@ export class LoginModal extends Modal {
   private firstTimeSetup: boolean;
   /** Whether the hosted org slug field is required before login. */
   private requireOrgSlug: boolean;
+  /**
+   * Whether to offer the hosted registration link. False for self-hosted /
+   * manual builds, whose users are provisioned by their own admin and must not
+   * be pointed at Cloud signup.
+   */
+  private showHostedSignup: boolean;
   /** True only when Obsidian failed to attach the shipped plugin stylesheet. */
   private styleFallbackApplied: boolean = false;
   private modalActive = false;
@@ -115,9 +121,11 @@ export class LoginModal extends Modal {
     firstTimeSetup: boolean = false,
     requireOrgSlug: boolean = true,
     onRecoveryCode?: (email: string, code: string) => Promise<void>,
-    resolveLoginVerification?: ResolvePluginLoginVerification
+    resolveLoginVerification?: ResolvePluginLoginVerification,
+    showHostedSignup: boolean = false
   ) {
     super(app);
+    this.showHostedSignup = showHostedSignup;
     this.onSubmit = onSubmit;
     this.encryptionMode = encryptionMode;
     this.isZkSetup = isZkSetup;
@@ -405,17 +413,39 @@ export class LoginModal extends Modal {
     // example.com link. Empty means this build has no hosted docs, so render
     // no link at all rather than a broken one.
     const docsSetupUrl = SAAS_DEFAULTS.docsSetupUrl.trim();
-    if (docsSetupUrl) {
+    // Registration lives on the hosted admin panel — the plugin has no signup
+    // surface, so without this link a fresh install from the community
+    // directory dead-ends at a password prompt for an account the user has no
+    // way to create. Only offered on the account step (the org step is a
+    // self-hosted/legacy path) and only for builds that ship a hosted signup.
+    const signupUrl = this.showHostedSignup ? SAAS_DEFAULTS.signupUrl.trim() : "";
+    const showSignupLink = Boolean(signupUrl) && !organizationStep;
+    if (docsSetupUrl || showSignupLink) {
       const footer = contentEl.createDiv({ cls: "vaultguard-login-footer" });
-      const docsLink = footer.createEl("a", {
-        text: "Setup guide",
-        cls: "vaultguard-login-docs-link",
-        href: "#",
-      });
-      docsLink.addEventListener("click", (e) => {
-        e.preventDefault();
-        window.open(docsSetupUrl, "_blank", "noopener,noreferrer");
-      });
+      if (showSignupLink) {
+        const signupRow = footer.createDiv({ cls: "vaultguard-login-signup" });
+        signupRow.createSpan({ text: "New to VaultGuard? " });
+        const signupLink = signupRow.createEl("a", {
+          text: "Create an account",
+          cls: "vaultguard-login-signup-link",
+          href: "#",
+        });
+        signupLink.addEventListener("click", (e) => {
+          e.preventDefault();
+          window.open(signupUrl, "_blank", "noopener,noreferrer");
+        });
+      }
+      if (docsSetupUrl) {
+        const docsLink = footer.createEl("a", {
+          text: "Setup guide",
+          cls: "vaultguard-login-docs-link",
+          href: "#",
+        });
+        docsLink.addEventListener("click", (e) => {
+          e.preventDefault();
+          window.open(docsSetupUrl, "_blank", "noopener,noreferrer");
+        });
+      }
     }
 
     // Focus first visible input on open

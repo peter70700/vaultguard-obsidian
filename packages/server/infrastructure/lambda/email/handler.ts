@@ -611,7 +611,7 @@ function buildTrialActivationEmail(params: TrialActivationParams): { subject: st
 
     ${renderInfoCard('What you get during the trial', `
       <ul style="margin:0;padding-left:20px;font-size:14px;color:${TEXT_COLOR};line-height:1.7;">
-        <li>Share links + share-bridge for outside collaborators</li>
+        <li>Share links for vault members who already have file-read permission</li>
         <li>Advanced audit dashboards, alerts, and CSV export</li>
         <li>Hosted web admin panel for non-technical admins</li>
         <li>Up to 100 users and 100 GB of vault storage</li>

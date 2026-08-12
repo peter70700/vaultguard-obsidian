@@ -3,7 +3,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, develop]
+  schedule:
+    - cron: "17 4 * * 1"
 
 permissions:
   contents: read
@@ -13,6 +15,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  scheduled-readiness:
+    if: github.event_name == 'schedule' && github.repository == 'peter70700/vaultguard-obsidian-plugin'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install nested dependencies
+        run: npm run setup:test-deps
+
+      - name: Audit production dependencies
+        run: |
+          npm audit --omit=dev --audit-level=high
+          npm --prefix infrastructure audit --omit=dev --audit-level=high
+          npm --prefix admin-panel audit --omit=dev --audit-level=high
+          npm --prefix landing audit --omit=dev --audit-level=high
+          npm --prefix share-bridge audit --omit=dev --audit-level=high
+
+      - name: Check public export drift (read-only)
+        run: npm run check:public-drift
+
+      # The API host comes from a repository variable, never a literal. This
+      # file is exported verbatim into the public monorepo (D-40), where the
+      # export validator hard-fails on any production identifier in workflow
+      # YAML. The job is private-repo + schedule only, so the variable is only
+      # ever read here. The emptiness guard is load-bearing: the test body is
+      # `describe.skipIf(!API_URL)`, so an unset variable would turn this step
+      # into a silent green no-op rather than a failure.
+      - name: Check public API routes (read-only verbs only)
+        env:
+          API_URL: ${{ vars.READINESS_API_URL }}
+          LIVE_ROUTE_READ_ONLY_ONLY: "true"
+        run: |
+          set -euo pipefail
+          if [ -z "${API_URL}" ]; then
+            echo "::error::vars.READINESS_API_URL is not set — the live-route readiness check would silently skip."
+            exit 1
+          fi
+          npx vitest run tests/live-route-check.test.ts
+
   forbidden-artifacts:
     # Standalone and intentionally independent of the build jobs. The regex
     # handles both the private flat layout and the exported public monorepo.
@@ -37,6 +89,61 @@ jobs:
             exit 1
           fi
           echo "OK: no forbidden Terraform artifacts in tree."
+
+  terraform-validate:
+    # Standalone, like forbidden-artifacts. Nothing in CI parsed the Terraform
+    # before this job, so a configuration that could not even `terraform
+    # validate` sat on the branch undetected: a for_each'd integration was
+    # referenced as `.id` without an instance key, which fails the whole
+    # configuration. That defect is invisible to Vitest (the test suite reads
+    # the .tf files as TEXT) and only surfaces at apply time — i.e. during a
+    # deploy, which is the worst moment to discover it.
+    #
+    # `validate` needs a provider schema, so `init -backend=false` runs first:
+    # it downloads providers without touching remote state and needs no AWS
+    # credentials, keeping this job safe to run on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.14.5"
+          terraform_wrapper: false
+
+      - name: Locate Terraform root
+        id: tfroot
+        run: |
+          set -euo pipefail
+          # Like the forbidden-artifacts regex above, this must handle BOTH
+          # layouts: this file is copied verbatim into the public monorepo
+          # (export-public-monorepo.mjs), where terraform lives at
+          # packages/server/terraform/ rather than terraform/. Hardcoding the
+          # private path would make the exported job fail on a missing
+          # directory — the recurring "works privately, breaks on export" trap.
+          for candidate in terraform packages/server/terraform; do
+            if [[ -f "$candidate/main.tf" ]]; then
+              echo "dir=$candidate" >> "$GITHUB_OUTPUT"
+              echo "Terraform root: $candidate"
+              exit 0
+            fi
+          done
+          echo "::error::No Terraform root found (looked for terraform/ and packages/server/terraform/)"
+          exit 1
+
+      - name: Terraform fmt
+        working-directory: ${{ steps.tfroot.outputs.dir }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init (no backend)
+        working-directory: ${{ steps.tfroot.outputs.dir }}
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform validate
+        working-directory: ${{ steps.tfroot.outputs.dir }}
+        run: terraform validate
 
   private-build-test-lint:
     # The private source repo has a flat root plus nested infrastructure and

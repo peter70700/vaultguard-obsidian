@@ -395,6 +395,10 @@ describe("VaultGuardApiClient agent-bridge context", () => {
 // two re-encryption jobs). Only idempotent verbs auto-retry; the 401-refresh
 // path stays safe for every verb (pre-execution rejection).
 describe("VaultGuardApiClient retry idempotency (AC-API3)", () => {
+  beforeEach(() => {
+    mockRequestUrl.mockReset();
+  });
+
   function makeClient() {
     const idToken = makeJwt({ sub: "user-123" });
     return new VaultGuardApiClient({
@@ -443,5 +447,50 @@ describe("VaultGuardApiClient retry idempotency (AC-API3)", () => {
       String(c[0].url).includes("/orgs/org-123/settings")
     );
     expect(settingsCalls).toHaveLength(2);
+  });
+
+  it("retries a rate-limited GET but never replays a rate-limited POST", async () => {
+    const getClient = makeClient();
+    mockRequestUrl
+      .mockResolvedValueOnce(jsonResponse(200, { vaults: [] }))
+      .mockResolvedValueOnce(jsonResponse(429, { message: "slow down" }))
+      .mockResolvedValueOnce(jsonResponse(200, { orgId: "org-123" }));
+
+    await expect(getClient.getOrgSettings()).resolves.toMatchObject({ orgId: "org-123" });
+    expect(
+      mockRequestUrl.mock.calls.filter((c) =>
+        String(c[0].url).includes("/orgs/org-123/settings"),
+      ),
+    ).toHaveLength(2);
+
+    mockRequestUrl.mockReset();
+    const postClient = makeClient();
+    mockRequestUrl
+      .mockResolvedValueOnce(jsonResponse(200, { vaults: [] }))
+      .mockResolvedValueOnce(jsonResponse(429, { message: "slow down" }));
+
+    await expect(postClient.triggerReEncryption("user-9")).rejects.toThrow(/slow down/);
+    expect(
+      mockRequestUrl.mock.calls.filter((c) =>
+        String(c[0].url).includes("/re-encryption/trigger"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("uses capped exponential backoff with bounded jitter", () => {
+    const client = new VaultGuardApiClient({
+      baseUrl: "https://api.vaultguard.test",
+      orgId: "org-123",
+      baseRetryDelayMs: 100,
+      maxRetryDelayMs: 500,
+    });
+    const calculate = (client as unknown as { calculateBackoff(attempt: number): number })
+      .calculateBackoff.bind(client);
+
+    expect(calculate(0)).toBeGreaterThanOrEqual(100);
+    expect(calculate(0)).toBeLessThanOrEqual(110);
+    expect(calculate(1)).toBeGreaterThanOrEqual(200);
+    expect(calculate(1)).toBeLessThanOrEqual(220);
+    expect(calculate(3)).toBe(500);
   });
 });

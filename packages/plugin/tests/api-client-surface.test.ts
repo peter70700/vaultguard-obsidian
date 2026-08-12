@@ -590,6 +590,37 @@ describe("VaultGuardApiClient surface", () => {
     ]);
   });
 
+  it("threads share-list limit/cursor options and preserves the next opaque cursor", async () => {
+    const client = makeClient();
+    mockRequestUrl.mockResolvedValueOnce(
+      jsonResponse(200, {
+        shares: [{
+          shareId: "older-share",
+          vaultId: "vault-abc",
+          relPath: "Archive/old.md",
+          createdAt: "2025-01-01T00:00:00.000Z",
+          createdBy: "user-1",
+          url: "https://share.vaultguard.test/s/older-share?v=vault-abc",
+        }],
+        count: 1,
+        nextCursor: "next-cursor-token",
+        hasMore: true,
+      }),
+    );
+
+    const page = await client.listSharesPage({ limit: 25, cursor: "current+cursor" });
+
+    expect(page).toMatchObject({ count: 1, nextCursor: "next-cursor-token", hasMore: true });
+    expect(page.shares[0].shareId).toBe("older-share");
+    expect(mockRequestUrl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "GET",
+        url:
+          "https://api.vaultguard.test/vaults/vault-abc/shares?limit=25&cursor=current%2Bcursor",
+      }),
+    );
+  });
+
   it("flushes queued requests when the client comes back online", async () => {
     const client = makeClient();
 

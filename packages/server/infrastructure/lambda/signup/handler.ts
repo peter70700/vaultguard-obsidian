@@ -10,7 +10,7 @@
  * - GET  /.well-known/vaultguard.json — Public config for single-org self-hosts
  */
 
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import {
   CognitoIdentityProviderClient,
   AdminCreateUserCommand,
@@ -38,8 +38,9 @@ import {
   VAULT_MEMBERS_TABLE,
   SUBSCRIPTIONS_TABLE,
   PLAN_LIMITS,
-  VaultRecord,
-  VaultMemberRecord,
+  ValidationError,
+  type VaultRecord,
+  type VaultMemberRecord,
   parseExemptDomains,
   isBillingExemptEmail,
   isReservedGroupName,
@@ -76,6 +77,7 @@ const TURNSTILE_EXPECTED_HOSTNAMES = (
 // (older admin-panel build, or a direct API call). Meta requires the field on
 // website events, so it must never be empty.
 const ADMIN_BASE_URL = process.env.BASE_URL || 'https://admin.example.com';
+const SIGNUP_JSON_BODY_MAX_BYTES = 16 * 1024;
 
 // Email domains flagged as internal/company accounts. LA6: a domain match is
 // NOT proof of mailbox ownership (signup never verifies email), so it no
@@ -210,6 +212,26 @@ function readOptionalString(value: unknown, maxLength: number): string {
   return trimmed.length > maxLength ? '' : trimmed;
 }
 
+function readRequiredSignupString(
+  body: Record<string, unknown>,
+  field: string,
+  maxLength: number,
+  trim: boolean = true
+): string {
+  const value = body[field];
+  if (typeof value !== 'string') {
+    throw new ValidationError(`${field} must be a string`, field);
+  }
+  const normalized = trim ? value.trim() : value;
+  if (!normalized) {
+    throw new ValidationError(`Missing required field: ${field}`, field);
+  }
+  if (normalized.length > maxLength) {
+    throw new ValidationError(`${field} exceeds the maximum allowed length`, field);
+  }
+  return normalized;
+}
+
 async function handleSignup(
   event: APIGatewayProxyEvent,
   requestId: string
@@ -229,7 +251,7 @@ async function handleSignup(
     }
   }
 
-  const body = parseBody(event);
+  const body = parseBody(event, SIGNUP_JSON_BODY_MAX_BYTES);
 
   // Turnstile CAPTCHA verification.
   //   Pro / managed SaaS: TURNSTILE_SECRET_ARN is set → token required + verified.
@@ -264,22 +286,23 @@ async function handleSignup(
 
   validateRequiredFields(body, ['orgName', 'orgSlug', 'email', 'password', 'displayName']);
 
-  const orgName = (body.orgName as string).trim();
-  const orgSlug = (body.orgSlug as string).trim().toLowerCase();
-  const email = (body.email as string).trim().toLowerCase();
-  const password = body.password as string;
-  const displayName = (body.displayName as string).trim();
+  const orgName = readRequiredSignupString(body, 'orgName', 128);
+  const orgSlug = readRequiredSignupString(body, 'orgSlug', 48).toLowerCase();
+  const email = readRequiredSignupString(body, 'email', 320).toLowerCase();
+  const password = readRequiredSignupString(body, 'password', 1024, false);
+  const displayName = readRequiredSignupString(body, 'displayName', 128);
 
   // Meta ad attribution, all optional and all attacker-controlled — they are
   // marketing metadata only and never influence auth, tier, or provisioning.
   // Bounded so a hostile client cannot bloat the org record.
+  const marketingConsent = body.marketingConsent === true;
   const metaAttribution = {
-    eventId: readOptionalString(body.metaEventId, 128),
-    fbp: readOptionalString(body.metaFbp, 256),
-    fbc: readOptionalString(body.metaFbc, 512),
-    sourceUrl: readOptionalString(body.metaSourceUrl, 1024),
-    clientIp: getClientIp(event),
-    clientUserAgent: getUserAgent(event),
+    eventId: marketingConsent ? readOptionalString(body.metaEventId, 128) : null,
+    fbp: marketingConsent ? readOptionalString(body.metaFbp, 256) : null,
+    fbc: marketingConsent ? readOptionalString(body.metaFbc, 512) : null,
+    sourceUrl: marketingConsent ? readOptionalString(body.metaSourceUrl, 1024) : null,
+    clientIp: marketingConsent ? getClientIp(event) : null,
+    clientUserAgent: marketingConsent ? getUserAgent(event) : null,
   };
 
   // Validate slug format: alphanumeric + hyphens, 3-48 chars
@@ -452,6 +475,7 @@ async function handleSignup(
     createdAt: now,
     updatedAt: now,
     status: 'active',
+    ...(marketingConsent ? { metaMarketingConsent: true } : {}),
   };
 
   // Persist Meta ad attribution captured in the browser. StartTrial and Purchase
@@ -589,19 +613,21 @@ async function handleSignup(
   // the same event_id and Meta collapses the pair; the redundancy covers ad
   // blockers on one side and request failures on the other. sendMetaEvent never
   // throws — a marketing event must not fail a completed signup.
-  await sendMetaEvent({
-    eventName: 'CompleteRegistration',
-    eventId: metaAttribution.eventId || `reg-${orgId}`,
-    eventSourceUrl: metaAttribution.sourceUrl || `${ADMIN_BASE_URL}/#/signup`,
-    userData: {
-      email,
-      externalId: orgId,
-      fbp: metaAttribution.fbp,
-      fbc: metaAttribution.fbc,
-      clientIp: metaAttribution.clientIp,
-      clientUserAgent: metaAttribution.clientUserAgent,
-    },
-  });
+  if (marketingConsent) {
+    await sendMetaEvent({
+      eventName: 'CompleteRegistration',
+      eventId: metaAttribution.eventId || `reg-${orgId}`,
+      eventSourceUrl: metaAttribution.sourceUrl || `${ADMIN_BASE_URL}/#/signup`,
+      userData: {
+        email,
+        externalId: orgId,
+        fbp: metaAttribution.fbp,
+        fbc: metaAttribution.fbc,
+        clientIp: metaAttribution.clientIp,
+        clientUserAgent: metaAttribution.clientUserAgent,
+      },
+    });
+  }
 
   return formatSuccess(
     201,

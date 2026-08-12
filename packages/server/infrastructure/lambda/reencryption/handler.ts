@@ -56,6 +56,7 @@ import {
   ROTATION_CONTROL_SK,
   type RotationLease,
 } from '../shared/rotation-fence';
+import { emitSecurityMetric } from '../shared/metrics';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -74,6 +75,8 @@ const AUTH_TAG_LENGTH = 16;
 const AES_ALGORITHM = 'aes-256-gcm';
 const QUERY_MAX_PAGES = 100;
 const QUERY_MAX_ITEMS = 10_000;
+const MAX_FILE_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = Number(process.env.REENCRYPTION_RETRY_BASE_DELAY_MS ?? 250);
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -82,12 +85,14 @@ interface ReEncryptionJob {
   orgId: string;
   targetUserId: string;
   triggeredBy: string;
-  status: 'pending' | 'in_progress' | 'completed' | 'failed';
+  status: 'pending' | 'in_progress' | 'completed' | 'partial' | 'failed';
   totalFiles: number;
   processedFiles: number;
   failedFiles: number;
   errors: string[];
   scopeResults?: ReEncryptionScopeResult[];
+  rotatedScopes?: AffectedVaultScope[];
+  rolledBackScopes?: AffectedVaultScope[];
   startedAt: string;
   completedAt?: string;
   /** TTL: auto-delete 90 days after completion */
@@ -227,6 +232,7 @@ interface EventBridgeEvent {
     targetUserId: string;
     orgId: string;
     triggeredBy: string;
+    jobId?: string;
     reason: string;
   };
 }
@@ -244,9 +250,9 @@ function isEventBridgeEvent(event: unknown): event is EventBridgeEvent {
 // ─── EventBridge Trigger ────────────────────────────────────────────────────
 
 async function handleEventBridgeTrigger(event: EventBridgeEvent): Promise<void> {
-  const { targetUserId, orgId, triggeredBy } = event.detail;
+  const { targetUserId, orgId, triggeredBy, jobId } = event.detail;
   console.info(`[REENCRYPTION] EventBridge trigger: re-encrypt files for revoked user ${targetUserId}`);
-  await executeReEncryptionJob(targetUserId, orgId, triggeredBy);
+  await executeReEncryptionJob(targetUserId, orgId, triggeredBy, jobId);
 }
 
 // ─── POST /re-encryption/trigger ────────────────────────────────────────────
@@ -323,9 +329,10 @@ async function handleGetJobStatus(
 async function executeReEncryptionJob(
   targetUserId: string,
   orgId: string,
-  triggeredBy: string
+  triggeredBy: string,
+  presetJobId?: string,
 ): Promise<string> {
-  const jobId = generateId();
+  const jobId = presetJobId || generateId();
   const now = new Date().toISOString();
 
   const job: ReEncryptionJob = {
@@ -405,7 +412,6 @@ async function executeReEncryptionJob(
     // Step 4: Re-encrypt each file
     let processedFiles = 0;
     let failedFiles = 0;
-    let jobFailed = false;
 
     for (const plan of plans) {
       const prefix = vaultS3Prefix(orgId, plan.vaultId);
@@ -416,7 +422,7 @@ async function executeReEncryptionJob(
       for (const s3Key of plan.s3Keys) {
         try {
           const vaultPath = '/' + s3Key.replace(prefix, '');
-          await reEncryptFile(
+          await reEncryptFileWithRetry(
             s3Key,
             vaultPath,
             orgId,
@@ -429,7 +435,6 @@ async function executeReEncryptionJob(
           processedFiles++;
         } catch (err) {
           planFailed = true;
-          jobFailed = true;
           planFailedFiles++;
           failedFiles++;
           const errMsg = boundedJobError(`${s3Key}: ${err instanceof Error ? err.message : String(err)}`);
@@ -450,7 +455,7 @@ async function executeReEncryptionJob(
             // Rollback: re-encrypt back to the OLD key, so the object's
             // `vaultguard-key-id` Metadata should reflect the OLD keyId
             // (the DEK the file is now wrapped with after rollback).
-            await reEncryptFile(
+            await reEncryptFileWithRetry(
               s3Key,
               vaultPath,
               orgId,
@@ -497,7 +502,6 @@ async function executeReEncryptionJob(
             failedFiles: 0,
           });
         } catch (commitError) {
-          jobFailed = true;
           const commitMessage = boundedJobError(
             `Vault ${plan.vaultId} scope ${plan.scope}: key commit failed: ${
               commitError instanceof Error ? commitError.message : String(commitError)
@@ -510,7 +514,7 @@ async function executeReEncryptionJob(
           for (const s3Key of processedPlanKeys) {
             try {
               const vaultPath = '/' + s3Key.replace(prefix, '');
-              await reEncryptFile(
+              await reEncryptFileWithRetry(
                 s3Key,
                 vaultPath,
                 orgId,
@@ -546,8 +550,15 @@ async function executeReEncryptionJob(
       }
     }
 
-    // Finalize
-    const finalStatus: ReEncryptionJob['status'] = jobFailed ? 'failed' : 'completed';
+    // Finalize with scope truth. A partial rotation must never be reported as
+    // completed while any scope still uses (or may use) the revoked DEK.
+    const rotatedScopes = scopeResults
+      .filter((result) => result.status === 'committed')
+      .map(({ vaultId, scope }) => ({ vaultId, scope }));
+    const rolledBackScopes = scopeResults
+      .filter((result) => result.status !== 'committed')
+      .map(({ vaultId, scope }) => ({ vaultId, scope }));
+    const finalStatus = finalizeReEncryptionStatus(scopeResults);
     const completedAt = new Date().toISOString();
     const ttl = Math.floor(new Date(completedAt).getTime() / 1000) + 90 * 24 * 60 * 60;
 
@@ -556,6 +567,8 @@ async function executeReEncryptionJob(
       failedFiles,
       errors,
       scopeResults,
+      rotatedScopes,
+      rolledBackScopes,
       completedAt,
       expiresAtTtl: ttl,
     });
@@ -566,10 +579,32 @@ async function executeReEncryptionJob(
       action: 'reencryption.completed',
       resourcePath: `/re-encryption/${jobId}`,
       outcome: finalStatus === 'completed' ? 'success' : 'error',
-      metadata: { jobId, targetUserId, totalFiles, processedFiles, failedFiles, scopeResults },
+      metadata: {
+        jobId,
+        targetUserId,
+        totalFiles,
+        processedFiles,
+        failedFiles,
+        finalStatus,
+        scopeResults,
+        rotatedScopes,
+        rolledBackScopes,
+      },
     });
 
-    console.info(`[REENCRYPTION] Job ${jobId}: ${processedFiles} re-encrypted, ${failedFiles} failed`);
+    // A job that ends anything other than `completed` left files readable with
+    // the offboarded user's old DEK. Awaited, not fire-and-forget: this is the
+    // rare/critical path the metrics module documents, its alarm fires at >= 1,
+    // and losing the data point would silently restore the pre-fix behaviour
+    // where a partial rotation looked exactly like a successful one.
+    if (finalStatus !== 'completed') {
+      await emitSecurityMetric('ReEncryptionIncomplete');
+    }
+
+    console.info(
+      `[REENCRYPTION] Job ${jobId} ${finalStatus}: ${processedFiles} re-encrypted, ` +
+      `${failedFiles} failed, ${rolledBackScopes.length} scope(s) incomplete`,
+    );
     return jobId;
   } catch (err) {
     await updateJobStatus(jobId, 'failed', {
@@ -577,6 +612,11 @@ async function executeReEncryptionJob(
       scopeResults,
       completedAt: new Date().toISOString(),
     });
+    // Same signal as the finalize path above. A job that dies mid-flight is the
+    // most incomplete outcome there is, and it is also the path that reaches
+    // the async retry/DLQ machinery — emit before rethrowing so the page fires
+    // even when every retry ultimately fails.
+    await emitSecurityMetric('ReEncryptionIncomplete');
     throw err;
   } finally {
     // Recovered and freshly generated DEKs are process-memory secrets. Wipe
@@ -596,6 +636,14 @@ async function executeReEncryptionJob(
       }
     }
   }
+}
+
+export function finalizeReEncryptionStatus(
+  scopeResults: Array<Pick<ReEncryptionScopeResult, 'status'>>,
+): ReEncryptionJob['status'] {
+  const committed = scopeResults.filter((result) => result.status === 'committed').length;
+  if (committed === scopeResults.length) return 'completed';
+  return committed === 0 ? 'failed' : 'partial';
 }
 
 // ─── DEK Recovery ───────────────────────────────────────────────────────────
@@ -853,6 +901,24 @@ async function reEncryptFile(
     reEncrypted?.fill(0);
     encryptedPayload.fill(0);
   }
+}
+
+async function reEncryptFileWithRetry(
+  ...args: Parameters<typeof reEncryptFile>
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MAX_FILE_ATTEMPTS; attempt++) {
+    try {
+      await reEncryptFile(...args);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < MAX_FILE_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_BASE_DELAY_MS * attempt));
+      }
+    }
+  }
+  throw lastError;
 }
 
 // ─── Vault/Key Discovery ─────────────────────────────────────────────────────

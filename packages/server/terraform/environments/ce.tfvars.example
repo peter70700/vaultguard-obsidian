@@ -23,3 +23,7 @@ session_duration_seconds   = 28800  # 8 hours
 max_file_size_bytes        = 26214400  # 25 MiB
 vaultguard_edition              = "community"
 vaultguard_allow_public_signup  = false
+
+# Community Edition explicitly selects no managed Turnstile secret. This is
+# valid only while managed signup/login verification controls stay disabled.
+turnstile_secret_arn = ""

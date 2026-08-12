@@ -540,11 +540,11 @@ class PermissionRuleModal extends Modal {
   }
 
   private normalizeRulePath(path: string): string {
-    const trimmed = path.trim();
-    if (!trimmed) {
-      return trimmed;
+    const normalized = path.trim().replace(/\/+/g, "/");
+    if (!normalized) {
+      return normalized;
     }
-    return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+    return normalized.startsWith("/") ? normalized : `/${normalized}`;
   }
 
   private levelFromRule(rule: PermissionRule): PermissionLevel {

@@ -9,12 +9,18 @@
  */
 
 import { App, ButtonComponent, Modal, Notice } from "obsidian";
-import type { ShareRecord, VaultGuardApiClient } from "../api/client";
+import type {
+  ShareListPage,
+  ShareRecord,
+  VaultGuardApiClient,
+} from "../api/client";
 import { OperationOwner } from "../ui/operation-owner";
 
 export class ShareManagementModal extends Modal {
   private apiClient: VaultGuardApiClient;
   private shares: ShareRecord[] = [];
+  private nextCursor: string | null = null;
+  private readonly seenCursors = new Set<string>();
   private readonly lifecycleOwner = new OperationOwner();
 
   constructor(app: App, apiClient: VaultGuardApiClient) {
@@ -24,6 +30,9 @@ export class ShareManagementModal extends Modal {
 
   async onOpen(): Promise<void> {
     this.lifecycleOwner.activate();
+    this.shares = [];
+    this.nextCursor = null;
+    this.seenCursors.clear();
     const operation = this.lifecycleOwner.begin();
     const { contentEl } = this;
     contentEl.empty();
@@ -44,9 +53,10 @@ export class ShareManagementModal extends Modal {
     listEl.createEl("p", { text: "Loading…", cls: "setting-item-description" });
 
     try {
-      const shares = await this.apiClient.listShares();
+      const page = await this.requestSharePage();
       if (!operation.isCurrent()) return;
-      this.shares = shares;
+      this.shares = page.shares;
+      this.nextCursor = page.nextCursor;
     } catch (err) {
       if (!operation.isCurrent()) return;
       listEl.empty();
@@ -63,12 +73,20 @@ export class ShareManagementModal extends Modal {
   }
 
   private renderShares(parent: HTMLElement): void {
-    if (this.shares.length === 0) {
+    parent.empty();
+    if (this.shares.length === 0 && !this.nextCursor) {
       parent.createEl("p", {
         text: "No active share links. Right-click any file → \"VaultGuard: Copy share link\" to create one.",
         cls: "setting-item-description",
       });
       return;
+    }
+
+    if (this.shares.length === 0) {
+      parent.createEl("p", {
+        text: "No links on this page are visible to you. More results are available.",
+        cls: "setting-item-description",
+      });
     }
 
     for (const share of this.shares) {
@@ -111,10 +129,7 @@ export class ShareManagementModal extends Modal {
             if (this.lifecycleOwner.isClosed) return;
             this.shares = this.shares.filter((s) => s.shareId !== share.shareId);
             const parentEl = row.parentElement;
-            row.remove();
-            if (parentEl && this.shares.length === 0) {
-              this.renderShares(parentEl);
-            }
+            if (parentEl) this.renderShares(parentEl);
             new Notice("Share link revoked.");
           } catch (err) {
             if (this.lifecycleOwner.isClosed) return;
@@ -123,10 +138,55 @@ export class ShareManagementModal extends Modal {
           }
         });
     }
+
+    if (this.nextCursor) {
+      new ButtonComponent(parent)
+        .setButtonText("Load more share links")
+        .onClick(async () => this.loadMore(parent));
+    }
+  }
+
+  private async requestSharePage(cursor?: string): Promise<ShareListPage> {
+    // Compatibility with older client fakes/integrations during rolling
+    // upgrades: they still provide the original first-page array method.
+    const paginatedClient = this.apiClient as VaultGuardApiClient & {
+      listSharesPage?: VaultGuardApiClient["listSharesPage"];
+    };
+    if (typeof paginatedClient.listSharesPage === "function") {
+      return paginatedClient.listSharesPage({ limit: 50, ...(cursor ? { cursor } : {}) });
+    }
+    const shares = await this.apiClient.listShares();
+    return { shares, count: shares.length, nextCursor: null, hasMore: false };
+  }
+
+  private async loadMore(parent: HTMLElement): Promise<void> {
+    const cursor = this.nextCursor;
+    if (!cursor || this.seenCursors.has(cursor)) {
+      this.nextCursor = null;
+      this.renderShares(parent);
+      return;
+    }
+    this.seenCursors.add(cursor);
+    const operation = this.lifecycleOwner.begin();
+    try {
+      const page = await this.requestSharePage(cursor);
+      if (!operation.isCurrent()) return;
+      const known = new Set(this.shares.map((share) => share.shareId));
+      this.shares.push(...page.shares.filter((share) => !known.has(share.shareId)));
+      this.nextCursor =
+        page.nextCursor && !this.seenCursors.has(page.nextCursor) ? page.nextCursor : null;
+      this.renderShares(parent);
+    } catch (err) {
+      if (!operation.isCurrent()) return;
+      this.seenCursors.delete(cursor);
+      const msg = err instanceof Error ? err.message : String(err);
+      new Notice(`Failed to load more share links: ${msg}`, 6000);
+    }
   }
 
   onClose(): void {
     this.lifecycleOwner.close();
+    this.seenCursors.clear();
     this.contentEl.empty();
   }
 }

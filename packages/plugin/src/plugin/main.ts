@@ -268,6 +268,20 @@ const MAX_RETRY_INTERVAL_MS = 2 * 60 * 1000;
 /** Base retry interval for exponential backoff (5 seconds) */
 const BASE_RETRY_INTERVAL_MS = 5 * 1000;
 
+/**
+ * SD-02-F1: anti-storm floor between server-session re-mint ATTEMPTS in
+ * `ensureServerSessionId` — successful or not. A client whose persisted session
+ * carries no `sessionId` issues authenticated requests continuously (the
+ * reconnect backoff probe alone produced 9,706 headerless samples from one user
+ * in 7 days); without this floor, a heal that keeps failing would turn every one
+ * of those into an extra `POST /auth/session`.
+ *
+ * 60 s is deliberately BELOW `MAX_RETRY_INTERVAL_MS` (120 s), the cap of the
+ * connection-retry backoff, so a healthy retry loop is never throttled by it:
+ * by the time the next probe fires the cooldown has already elapsed.
+ */
+const SESSION_REMINT_MIN_INTERVAL_MS = 60 * 1000;
+
 /** Minimum spacing between repeated login-required notices */
 const AUTH_REQUIRED_NOTICE_THROTTLE_MS = 5 * 1000;
 
@@ -754,6 +768,31 @@ export default class VaultGuardPlugin extends Plugin {
    * (heartbeat/sync timers) into one logout.
    */
   private terminalRefreshLogoutInProgress = false;
+
+  /**
+   * SD-02-F1: the single in-flight `ensureServerSessionId` attempt, or null.
+   *
+   * It is TWO guards in one:
+   *   1. Concurrency collapse — many callers (sync timer, heartbeat, reconnect
+   *      probe, UI action) can hit the headerless branch within the same tick;
+   *      they all join this one promise instead of each starting a mint.
+   *   2. Recursion brake — the mint itself travels through `apiRequest`, whose
+   *      header block re-enters `ensureServerSessionId`. `openServerSession`
+   *      opts out via `suppressSessionHeader` (the primary brake), and this
+   *      field is the second, independent one. NOTE the ordering constraint:
+   *      the field is assigned BEFORE the closure is awaited, so a re-entrant
+   *      caller sees a non-null promise and returns it rather than awaiting a
+   *      mint that has not been started yet.
+   */
+  private sessionReMintInFlight: Promise<void> | null = null;
+
+  /**
+   * SD-02-F1: timestamp of the last re-mint ATTEMPT (armed even when the attempt
+   * throws), floored by `SESSION_REMINT_MIN_INTERVAL_MS`. A permanently failing
+   * heal therefore costs at most one `POST /auth/session` per minute while every
+   * request still proceeds headerless exactly as it does today.
+   */
+  private lastSessionReMintAttemptAt = 0;
 
   /**
    * Phase 12 (vault idle-lock): true while the vault is cryptographically locked
@@ -4340,9 +4379,9 @@ export default class VaultGuardPlugin extends Plugin {
    * @param options.prefillEmail   Email to prefill (used for invite redemption).
    * @param options.firstTimeSetup When true, opens the modal directly in the
    *                               "set your password" form for new invitees.
-   * @param options.requireOrgSlug  When true, the hosted slug field is required
-   *                                before Cognito login. Cloud defaults make
-   *                                this optional for first-run SaaS users.
+   * @param options.requireOrgSlug  When true, the org-slug step runs before the
+   *                                account step. A build that ships bundled
+   *                                Cloud auth never needs it — see below.
    */
   private handleLogin(options?: {
     prefillEmail?: string;
@@ -4350,8 +4389,22 @@ export default class VaultGuardPlugin extends Plugin {
     requireOrgSlug?: boolean;
   }): void {
     const manualMode = this.settings.manualConfig === true;
+    // The org slug is NOT identity-bearing on Cloud, so asking for it up front
+    // is pure friction. Every tenant shares one Cognito pool + app client (the
+    // /orgs/{slug}/config response returns the same env-var pair for all orgs),
+    // this build already ships them in SAAS_DEFAULTS, and the account's
+    // custom:org claim supplies tenancy AFTER Cognito validates the password —
+    // see the PL1 note in the submit handler below. Org metadata is re-fetched
+    // post-login by org id in completeLogin(). The managed admin web login is
+    // account-first for exactly these reasons.
+    //
+    // So: only require the slug when the build has no bundled Cognito pool to
+    // fall back on. Manual/self-hosted keeps its own slug + /.well-known flow.
+    const hasBundledCloudAuth =
+      Boolean(SAAS_DEFAULTS.cognitoUserPoolId) &&
+      Boolean(SAAS_DEFAULTS.cognitoClientId);
     const requireOrgSlug =
-      options?.requireOrgSlug ?? !manualMode;
+      options?.requireOrgSlug ?? (!manualMode && !hasBundledCloudAuth);
 
     const modal = new LoginModal(
       this.app,
@@ -4445,19 +4498,24 @@ export default class VaultGuardPlugin extends Plugin {
             isGenerationCurrent,
             onVerificationRequired,
           ) => {
+            // Account-first Cloud login carries no slug, so an empty value is
+            // normal here and must not throw: the bundled Cloud defaults supply
+            // the endpoint and client, and the server binds the attempt to the
+            // account rather than an org. Resolve org config only when a slug
+            // WAS supplied (saved org, invite redemption, self-hosted).
             const slug = organization.trim().toLowerCase();
-            if (!slug) {
-              throw new Error("Organization configuration could not be resolved. Check the slug and try again.");
-            }
-            if (slug !== this.settings.orgSlug || !this.serverFeatures) {
+            if (slug && (slug !== this.settings.orgSlug || !this.serverFeatures)) {
               await this.resolveOrgConfig(slug);
             }
             const cfg = this.getEffectiveConfig();
-            if (!cfg.apiEndpoint || !cfg.cognitoClientId) {
-              throw new Error("Human verification is temporarily unavailable. Please try again.");
-            }
+            // Check the policy before the config guard — when verification is
+            // off there is nothing to fail on, and a missing endpoint must not
+            // block a login that never needed a permit.
             if (cfg.loginVerificationMode === "disabled") {
               return { mode: "disabled" } as const;
+            }
+            if (!cfg.apiEndpoint || !cfg.cognitoClientId) {
+              throw new Error("Human verification is temporarily unavailable. Please try again.");
             }
             onVerificationRequired();
             const binding = await completePluginHumanVerification({
@@ -4469,7 +4527,10 @@ export default class VaultGuardPlugin extends Plugin {
               isGenerationCurrent,
             });
             return { mode: cfg.loginVerificationMode, binding };
-          }
+          },
+      // Self-hosted users are provisioned by their own admin, so only managed
+      // Cloud builds point at hosted registration.
+      !manualMode
     );
     modal.open();
   }
@@ -5703,6 +5764,145 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     return response.data;
+  }
+
+  /**
+   * SD-02-F1: mints a replacement server session id for a live session that has
+   * none, so the client stops issuing headerless authenticated requests.
+   *
+   * THE FINDING. A session persisted before the session-header work carries no
+   * `sessionId` at all. `resolveRequestSessionId()` therefore returns `null`
+   * forever and EVERY authenticated request goes out without
+   * `X-VaultGuard-Session-Id` — permanently, with no path back, because nothing
+   * in the running plugin ever re-mints mid-session. Production evidence: 9,965
+   * server-side `[SESSION_TELEMETRY]` headerless samples over 7 days, 9,706 of
+   * them (97%) from one real external user, all `GET /vaults` — the signature of
+   * `attemptReconnection`'s backoff probe looping headerless against a session
+   * that can never heal itself.
+   *
+   * WHY IT IS NOT `restoreServerSession`'S JOB. That method's else-branch (see
+   * ~L5960) already re-mints ON THE HAPPY PATH and is deliberately left alone:
+   * it also serves the stale-but-PRESENT `sessionId` case, which this method's
+   * fast exit refuses by design (a present id is never re-minted here). This
+   * method is the fallback for every path where that restore never ran, ran
+   * before the id was needed, or failed — which is exactly the production
+   * signature above.
+   *
+   * BEST-EFFORT BY CONTRACT. It is quiet on failure (a breadcrumb and a debug
+   * log, no Notice), never rethrows, never calls `forceLogout`,
+   * `handleServerRevocation` or `clearSession`, never nulls `this.session`, and
+   * never blocks startup — `restoreSession()` does not call it, so offline
+   * startup is byte-identical to before. A failed heal simply degrades to
+   * today's headerless behavior and is retried on a later request.
+   *
+   * It also deliberately does NOT touch `this.keyLease` (unlike
+   * `restoreServerSession`, this runs mid-session and must not evict a live
+   * lease), starts/stops no monitor, and does not move the connection status.
+   */
+  private async ensureServerSessionId(): Promise<void> {
+    if (!this.session) return;
+    // THE hot path: a healthy session costs exactly this one truthiness check
+    // and is never re-minted. Everything below is unreachable in steady state.
+    if (this.session.sessionId) return;
+    // A revocation logout owns the session right now — do not race it.
+    if (this.terminalRefreshLogoutInProgress) return;
+
+    // Join the attempt already running instead of starting a second one. This is
+    // also the recursion brake if anything re-enters through `apiRequest`.
+    if (this.sessionReMintInFlight) {
+      return this.sessionReMintInFlight;
+    }
+
+    if (
+      Date.now() - this.lastSessionReMintAttemptAt <
+      SESSION_REMINT_MIN_INTERVAL_MS
+    ) {
+      this.syncDiagnostics.record("ensureServerSessionId.cooldown");
+      return;
+    }
+
+    this.sessionReMintInFlight = (async () => {
+      // FIRST statement: a throwing attempt must still arm the cooldown.
+      this.lastSessionReMintAttemptAt = Date.now();
+
+      const session = this.session;
+      if (!session) return;
+
+      if (this.isSessionTokenExpiring(session)) {
+        const refreshResult = await this.refreshAccessToken(session);
+        if (!refreshResult.ok) {
+          // Deliberately does NOT escalate `refreshResult.terminal` to
+          // handleServerRevocation/forceLogout. This is a background heal; the
+          // existing apiRequest / resumeStoredSession terminal paths already own
+          // that decision and will reach it through their own flow.
+          this.syncDiagnostics.record("ensureServerSessionId.refreshDeferred", {
+            message: refreshResult.message ?? "token refresh failed",
+          });
+          return;
+        }
+      }
+
+      // Re-read across the await: refreshAccessToken reassigns `this.session`,
+      // and a concurrent restoreServerSession may have won the race and already
+      // supplied an id — in which case there is nothing left to heal.
+      const live = this.session;
+      if (!live || live.sessionId) return;
+
+      // The plan's try/catch in promise form: the mint MUST NOT rethrow into the
+      // caller (an apiRequest that would otherwise have simply gone out
+      // headerless), and must leave the session exactly as it found it.
+      const serverSession = await this.openServerSession(live.idToken).catch(
+        (error: unknown) => {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          this.log(
+            `Server session re-mint failed, keeping the existing session: ${message}`
+          );
+          this.syncDiagnostics.record("ensureServerSessionId.mintFailed", {
+            message,
+          });
+          return null;
+        }
+      );
+      if (!serverSession) return;
+
+      const current = this.session;
+      if (!current || current.sessionId) return;
+
+      // Identity fields mapped exactly as restoreServerSession's else-branch:
+      // role/roles come from the SERVER response, never widened locally.
+      this.session = {
+        ...current,
+        sessionId: serverSession.sessionId,
+        userId: serverSession.userId || current.userId,
+        email: serverSession.email || current.email,
+        role: this.derivePrimaryRole({}, serverSession.roles ?? current.roles),
+        roles: serverSession.roles?.length ? serverSession.roles : current.roles,
+      };
+      this.clearLogoutAuthState();
+      this.applyOrgSettings(serverSession.orgSettings ?? this.orgSettings);
+      this.initializeApiClientFromSession(this.session);
+      await this.persistSession(this.session);
+      this.syncDiagnostics.record("ensureServerSessionId.minted");
+    })().catch((error: unknown) => {
+      // Belt and braces. Nothing above is expected to throw, but the stored
+      // promise is awaited by concurrent joiners too, so it must never reject:
+      // a best-effort heal may not turn into a failed user request.
+      this.logError(
+        "Server session re-mint failed unexpectedly (session kept)",
+        error
+      );
+      this.syncDiagnostics.record("ensureServerSessionId.unexpectedError", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+    try {
+      await this.sessionReMintInFlight;
+    } finally {
+      // Cleared so a later trigger can retry once the cooldown has elapsed.
+      this.sessionReMintInFlight = null;
+    }
   }
 
   private async resumeStoredSession(): Promise<void> {
@@ -7344,7 +7544,7 @@ export default class VaultGuardPlugin extends Plugin {
    * tokens, and (crucially) the revocation heartbeat.
    *
    * NON-NEGOTIABLE #2: the heartbeat MUST keep running so server revocation
-   * (60s heartbeat / terminal token-refresh) and the 24h maxSessionDurationHours
+   * (60s heartbeat / terminal token-refresh) and the configured maxSessionDurationHours
    * cap still force a REAL forceLogout even while locked — a locked session can
    * never resurrect a revoked/expired one. Only sync + key-renewal stop here.
    */
@@ -7499,9 +7699,29 @@ export default class VaultGuardPlugin extends Plugin {
     return this.pinLockManager?.isEnrolled() ?? false;
   }
 
-  /** The effective org idle action ("lock" | "logout") for the settings UI. */
+  /**
+   * The effective org idle action ("lock" | "logout") for the settings UI and
+   * the PIN-onboarding gate.
+   *
+   * The fallback MUST match what `lockSessionForInactivity` actually does with
+   * an absent field, and it does NOT log out: only an EXPLICIT, deployed
+   * "logout" reaches the forceLogout branch — an undefined idleAction falls
+   * through to the PIN lock (2) or session-kept (3) branches. This accessor
+   * predates that rule (it was written in 12-05, three days before quick
+   * 260711-l2e flipped the server default to "lock" and taught the runtime to
+   * read the raw field) and kept the very `?? "logout"` collapse the runtime
+   * comment calls out by name as the old "nonstop logout" bug.
+   *
+   * The visible symptom was the Vault-lock settings panel telling a user on an
+   * undeployed org that their idle action is "logout" when the runtime would
+   * never log them out.
+   *
+   * NOTE: `maybeOfferPinOnboarding` deliberately does NOT use this accessor —
+   * see the comment there. Prompt suppression while the policy is unknown is
+   * intentional; describing the policy wrongly was not.
+   */
   effectiveIdleAction(): "lock" | "logout" {
-    return this.orgSettings?.idleAction ?? "logout";
+    return this.orgSettings?.idleAction ?? "lock";
   }
 
   /**
@@ -7513,9 +7733,16 @@ export default class VaultGuardPlugin extends Plugin {
    * idempotent behind the persisted `pinOnboardingPromptShown` flag.
    */
   private maybeOfferPinOnboarding(): void {
+    // Reads the RAW field rather than effectiveIdleAction() on purpose (AC4).
+    // `orgSettings` is also null before the policy has loaded, so an absent
+    // value means "policy unknown", not "policy is lock" — surfacing an
+    // onboarding modal in that window would race the settings fetch. The
+    // runtime already nudges this user toward a PIN with a Notice from the
+    // session-kept branch of lockSessionForInactivity, so nothing is lost by
+    // waiting for an explicit policy here.
     if (
       this.session &&
-      this.effectiveIdleAction() === "lock" &&
+      this.orgSettings?.idleAction === "lock" &&
       !this.pinLockEnrolled() &&
       !this.settings.pinOnboardingPromptShown
     ) {
@@ -10390,9 +10617,49 @@ export default class VaultGuardPlugin extends Plugin {
     // Session creation is the one authenticated bootstrap that must never carry
     // a restored/stale server-session id. `openServerSession` opts out explicitly;
     // every other protected request keeps using the single resolver.
-    const requestSessionId = options?.suppressSessionHeader
+    let requestSessionId = options?.suppressSessionHeader
       ? null
       : this.resolveRequestSessionId();
+
+    // SD-02-F1: THE client-side choke point. Reaching here with an AUTHENTICATED
+    // request and no id to send means the live session has none AT ALL — a
+    // session persisted before the session-header work — and nothing else in a
+    // running plugin ever repairs that, so this client would stay headerless
+    // forever. Heal it here, before the request goes out, instead of only
+    // leaving a breadcrumb behind it.
+    //
+    // `attemptReconnection`'s `/vaults` probe — the exact loop behind the
+    // 9,706-sample production signature — deliberately gets NO hook of its own:
+    // it is an `apiRequest` call, so it heals right here, before the probe is
+    // sent. Same for every other plugin-issued authenticated request.
+    //
+    // Awaiting here is safe and bounded:
+    //   * the hot path is a single truthiness check — `ensureServerSessionId`
+    //     fast-exits on any session that already has an id, so a healthy client
+    //     pays nothing and issues no extra request;
+    //   * the mint opts out via `suppressSessionHeader`, so the mint can never
+    //     trigger a mint. That check is LOAD-BEARING: without it the heal
+    //     re-enters itself and deadlocks awaiting its own in-flight promise. The
+    //     in-flight guard is the second, independent brake;
+    //   * in-flight collapse plus the 60 s cooldown bound a FAILING heal to one
+    //     attempt per minute, and the request still proceeds headerless exactly
+    //     as it does today.
+    if (!requestSessionId && idToken && !options?.suppressSessionHeader) {
+      await this.ensureServerSessionId();
+      // Re-resolve from live state — the heal may have landed a fresh id.
+      requestSessionId = this.resolveRequestSessionId();
+      // The heal can also refresh the Cognito tokens underneath us, and the
+      // Authorization header above was built from the pre-heal value. Only for
+      // session-derived tokens: an explicit override is the caller's choice and
+      // is never second-guessed.
+      if (idTokenOverride === undefined) {
+        const healedIdToken = this.session?.idToken;
+        if (healedIdToken && healedIdToken !== idToken) {
+          headers["Authorization"] = healedIdToken;
+        }
+      }
+    }
+
     if (requestSessionId) {
       headers["X-VaultGuard-Session-Id"] = requestSessionId;
     } else if (idToken) {
@@ -10401,9 +10668,12 @@ export default class VaultGuardPlugin extends Plugin {
       // line — the two halves answer the same question from opposite ends, and a
       // future enforcement flip is only safe once both go quiet.
       //
-      // After this plan the only expected hit is the `/auth/session` mint itself
-      // (no id exists yet, M12) and a legacy persisted session that carries no
-      // sessionId at all — which this makes visible instead of silent.
+      // After the self-heal above, the only expected hits are the `/auth/session`
+      // mint itself (no id exists yet, M12, and it opts out of the heal) and the
+      // requests a heal could not rescue in time — an offline/failed mint, a
+      // deferred token refresh, or a request landing inside the 60 s cooldown of
+      // a previous failure. A legacy session no longer produces a SUSTAINED
+      // stream here; a persistent one now means the mint itself is failing.
       //
       // The query string is STRIPPED: the restore lease call puts the session id in
       // its query string, and this buffer is user-copyable ("Copy sync diagnostics").

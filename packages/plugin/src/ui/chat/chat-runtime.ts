@@ -87,15 +87,37 @@ export interface ChatRuntimeDeps {
   progress?: ChatProgress;
 }
 
-// Thin console logger used when no progress callback is supplied.
-function defaultProgress(): ChatProgress {
+export interface ChatDiagnosticLogger {
+  log(message: string): void;
+  warn(message: string): void;
+}
+
+function inputFieldCount(input: unknown): number {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return 0;
+  return Object.keys(input).length;
+}
+
+/**
+ * Metadata-only progress logger used by headless diagnostics. The model and
+ * tool payloads can contain vault plaintext, paths, or secrets, so diagnostics
+ * report only event names, status, lengths, and counts.
+ */
+export function createMetadataOnlyChatProgress(
+  logger: ChatDiagnosticLogger = console,
+): ChatProgress {
   return {
-    onText: (text) => console.log(`${LOG_PREFIX} ${text}`),
-    onToolCall: (name, input) => console.log(`${LOG_PREFIX} tool_use ${name}`, input),
+    onText: (text) => logger.log(`${LOG_PREFIX} event=assistant_text length=${text.length}`),
+    onToolCall: (name, input) =>
+      logger.log(
+        `${LOG_PREFIX} event=tool_use name=${name} input_count=${inputFieldCount(input)}`,
+      ),
     onToolResult: (name, result) =>
-      console.log(`${LOG_PREFIX} tool_result ${name} (isError=${result.isError})`, result.content),
-    onRefusal: () => console.warn(`${LOG_PREFIX} model refused the request`),
-    onStepLimit: () => console.warn(`${LOG_PREFIX} reached the step limit for one turn`),
+      logger.log(
+        `${LOG_PREFIX} event=tool_result name=${name} status=${result.isError ? "error" : "ok"} length=${result.content.length}`,
+      ),
+    onRefusal: () => logger.warn(`${LOG_PREFIX} event=refusal status=refused`),
+    onStepLimit: () =>
+      logger.warn(`${LOG_PREFIX} event=step_limit status=stopped count=${MAX_STEPS}`),
   };
 }
 
@@ -163,7 +185,7 @@ export class ChatRuntime {
     this.client = deps.client;
     this.toolRuntime = deps.toolRuntime;
     this.config = deps.config ?? {};
-    this.progress = deps.progress ?? defaultProgress();
+    this.progress = deps.progress ?? createMetadataOnlyChatProgress();
   }
 
   getMessages(): AnthropicConversationMessage[] {

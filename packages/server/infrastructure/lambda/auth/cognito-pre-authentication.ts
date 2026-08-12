@@ -23,6 +23,23 @@ interface PreAuthenticationDependencies {
   logger?: Pick<Console, 'info'>;
 }
 
+/**
+ * Lambda invokes handlers as `(event, context, callback)`, so whatever lands in
+ * the second parameter at runtime is the Cognito context — never injected
+ * dependencies. Without this check `deps` binds to that context, `deps.mode`
+ * reads `undefined`, the `disabled` short-circuit never fires and the trigger
+ * throws on `managedClientIds.length`, which fails every sign-in closed.
+ * Structural validation keeps the test seam usable and makes the runtime
+ * context unusable as configuration.
+ */
+function asDependencies(value: unknown): PreAuthenticationDependencies | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const candidate = value as Partial<PreAuthenticationDependencies>;
+  return typeof candidate.mode === 'string' && Array.isArray(candidate.managedClientIds)
+    ? (value as PreAuthenticationDependencies)
+    : undefined;
+}
+
 function parseMode(value: string | undefined): LoginVerificationMode {
   if (value === undefined || value === '' || value === 'disabled') return 'disabled';
   if (value === 'observe' || value === 'enforce') return value;
@@ -69,7 +86,7 @@ export async function cognitoPreAuthenticationHandler<T extends CognitoPreAuthen
 ): Promise<T> {
   let deps: PreAuthenticationDependencies;
   try {
-    deps = suppliedDeps ?? await runtimeDependencies();
+    deps = asDependencies(suppliedDeps) ?? await runtimeDependencies();
   } catch {
     reject();
   }
@@ -118,9 +135,13 @@ export async function cognitoPreAuthenticationHandler<T extends CognitoPreAuthen
         permit,
         attemptId,
         purpose: 'login',
-        bindingPolicy: boundClientSurface === 'web'
-          ? 'allow_account'
-          : 'require_organization',
+        // Both managed surfaces are account-first, so accept an account-scoped
+        // permit from either. This is not a relaxation of the org binding:
+        // `orgId` below comes from the trusted custom:org Cognito attribute and
+        // is still required (see the `valid` guard above), and allow_account
+        // still matches organization-bound records — so an older plugin build
+        // that mints an org-scoped permit keeps working unchanged.
+        bindingPolicy: 'allow_account',
         orgId,
         normalizedEmail: email,
         clientId,

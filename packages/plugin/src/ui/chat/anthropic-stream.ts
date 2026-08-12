@@ -107,7 +107,7 @@ export interface StreamHandlers {
  */
 export function parseSseEvent(raw: string): SseEvent | null {
   const dataLines: string[] = [];
-  for (const line of raw.split("\n")) {
+  for (const line of raw.split(/\r?\n/)) {
     // Per the SSE spec a value after "data:" may carry one leading space.
     if (line.startsWith("data:")) {
       dataLines.push(line.slice("data:".length).replace(/^ /, ""));
@@ -277,10 +277,20 @@ function parseToolInput(partialJson: string): Record<string, unknown> {
   if (!partialJson) return {};
   try {
     const parsed = JSON.parse(partialJson);
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Tool input must be a JSON object.");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new NetworkError(`Anthropic streamed invalid tool input: ${detail}`);
   }
+}
+
+/** Return the first complete SSE frame boundary, accepting LF and CRLF. */
+function findSseFrameBoundary(buffer: string): { index: number; length: number } | null {
+  const match = /\r?\n\r?\n/.exec(buffer);
+  return match ? { index: match.index, length: match[0].length } : null;
 }
 
 function safeJson(text: string): unknown {
@@ -426,11 +436,12 @@ export function streamMessages(
         resp.setEncoding("utf8");
         resp.on("data", (chunk: string) => {
           buf += chunk;
-          // SSE framing: events separated by "\n\n".
-          let idx: number;
-          while ((idx = buf.indexOf("\n\n")) !== -1) {
-            const raw = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
+          // SSE permits both LF and CRLF line endings. Preserve an incomplete
+          // delimiter across chunks, then consume every complete frame.
+          let boundary: { index: number; length: number } | null;
+          while ((boundary = findSseFrameBoundary(buf)) !== null) {
+            const raw = buf.slice(0, boundary.index);
+            buf = buf.slice(boundary.index + boundary.length);
             const event = parseSseEvent(raw);
             if (!event) continue;
             // AC3: a mid-stream `error` event means the reply is truncated —
@@ -445,7 +456,21 @@ export function streamMessages(
             assembler.ingest(event);
           }
         });
-        resp.on("end", () => finish(() => resolve(assembler.finalize())));
+        resp.on("end", () => {
+          // A non-empty tail is a truncated SSE frame. Resolving it would turn
+          // a cut-off reply (including partial tool JSON) into apparent success.
+          if (buf.trim().length > 0) {
+            finish(() => reject(new NetworkError("Anthropic stream ended with an incomplete SSE frame.")));
+            return;
+          }
+          finish(() => {
+            try {
+              resolve(assembler.finalize());
+            } catch (error) {
+              reject(error);
+            }
+          });
+        });
         resp.on("error", (e: Error) =>
           finish(() => reject(new NetworkError(`Anthropic stream failed: ${e.message}`))),
         );

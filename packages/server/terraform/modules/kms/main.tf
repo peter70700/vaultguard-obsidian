@@ -17,6 +17,31 @@ resource "aws_kms_key" "master" {
         Principal = { AWS = "arn:aws:iam::${var.account_id}:root" }
         Action    = "kms:*"
         Resource  = "*"
+      },
+      # CloudWatch must be able to use this key to publish alarm notifications.
+      #
+      # The alerting SNS topic (modules/monitoring) is encrypted with this CMK,
+      # and CloudWatch alarms are its ONLY publisher — nothing else calls
+      # sns:Publish on it. A KMS key policy does not grant anything implicitly:
+      # the root statement above enables delegation to IAM principals *in this
+      # account*, but an AWS service principal is not one of those and needs its
+      # own statement. Without this, every alarm's Publish fails inside SNS and
+      # the notification is dropped — the alarms evaluate and transition
+      # normally, the email subscription stays confirmed, and no page is ever
+      # delivered. That is a silent failure of the entire alerting path, which
+      # is exactly the class of bug the alarms exist to prevent.
+      #
+      # Deliberately unconditioned, matching AWS's documented form for this
+      # grant. A speculative SourceAccount/SourceArn condition that CloudWatch
+      # does not populate would fail CLOSED and silently — restoring the very
+      # outage-in-the-dark this statement removes — and the two actions are the
+      # minimum SNS needs to encrypt a message under this key.
+      {
+        Sid       = "AllowCloudWatchAlarmsToPublishToEncryptedSns"
+        Effect    = "Allow"
+        Principal = { Service = "cloudwatch.amazonaws.com" }
+        Action    = ["kms:Decrypt", "kms:GenerateDataKey*"]
+        Resource  = "*"
       }
     ]
   })

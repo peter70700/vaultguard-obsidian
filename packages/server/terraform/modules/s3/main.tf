@@ -102,8 +102,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "vault" {
     filter {}
 
     noncurrent_version_expiration {
-      noncurrent_days           = var.production_hardening ? 365 : 30
-      newer_noncurrent_versions = var.production_hardening ? 10 : 3
+      noncurrent_days = var.production_hardening ? 365 : 30
+      # Keep a deep rollback window in hardened stacks. Ten overwrites is easy
+      # for a runaway sync loop (or an attacker with write access) to exhaust
+      # before an operator can respond; 100 preserves bounded lifecycle cost
+      # while making version history a meaningful recovery control.
+      newer_noncurrent_versions = var.production_hardening ? 100 : 3
     }
   }
 

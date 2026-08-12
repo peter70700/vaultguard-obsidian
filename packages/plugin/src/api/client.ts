@@ -220,6 +220,18 @@ export interface ShareRecord {
   url: string;
 }
 
+export interface ShareListPage {
+  shares: ShareRecord[];
+  count: number;
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+export interface ShareListOptions {
+  limit?: number;
+  cursor?: string;
+}
+
 /** Server response for resolving a share token to a concrete (vault, path) pair. */
 export interface ResolvedShare {
   shareId: string;
@@ -386,6 +398,16 @@ export interface ReEncryptionJob {
 
 export interface ReEncryptionJobStatusResponse {
   job?: ReEncryptionJob | null;
+}
+
+export interface RevokeUserResult {
+  message: string;
+  userId: string;
+  status: string;
+  invalidatedSessions: number;
+  revokedLeases: number;
+  revokedAt: string;
+  reEncryptionJobId?: string | null;
 }
 
 export interface PermissionCheckEntry {
@@ -1333,12 +1355,40 @@ export class VaultGuardApiClient {
     return { ...response.share, url: response.url };
   }
 
-  async listShares(): Promise<ShareRecord[]> {
-    const response = await this.request<{ shares: ShareRecord[] }>(
+  async listSharesPage(options: ShareListOptions = {}): Promise<ShareListPage> {
+    const query = new URLSearchParams();
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
+    if (options.cursor) query.set("cursor", options.cursor);
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    const response = await this.request<{
+      shares?: ShareRecord[];
+      count?: number;
+      nextCursor?: string | null;
+      hasMore?: boolean;
+    }>(
       "GET",
-      `${this.vaultBase()}/shares`
+      `${this.vaultBase()}/shares${suffix}`
     );
-    return response.shares ?? [];
+    if (
+      response.nextCursor !== undefined &&
+      response.nextCursor !== null &&
+      typeof response.nextCursor !== "string"
+    ) {
+      throw new Error("Share-list cursor is malformed.");
+    }
+    const shares = response.shares ?? [];
+    const nextCursor = response.nextCursor ?? null;
+    return {
+      shares,
+      count: typeof response.count === "number" ? response.count : shares.length,
+      nextCursor,
+      hasMore: nextCursor !== null && response.hasMore !== false,
+    };
+  }
+
+  /** Backward-compatible first-page convenience for existing callers. */
+  async listShares(): Promise<ShareRecord[]> {
+    return (await this.listSharesPage()).shares;
   }
 
   async resolveShare(vaultId: string, shareId: string): Promise<ResolvedShare> {
@@ -1382,8 +1432,8 @@ export class VaultGuardApiClient {
     await this.request<void>("PUT", `/users/${encodeURIComponent(userId)}/role`, { role });
   }
 
-  async revokeUser(userId: string): Promise<void> {
-    await this.request<void>("POST", `/users/${encodeURIComponent(userId)}/revoke`);
+  async revokeUser(userId: string): Promise<RevokeUserResult> {
+    return this.request<RevokeUserResult>("POST", `/users/${encodeURIComponent(userId)}/revoke`);
   }
 
   async reactivateUser(userId: string): Promise<void> {

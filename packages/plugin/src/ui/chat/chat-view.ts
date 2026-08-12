@@ -103,6 +103,7 @@ import {
 } from "./render/user-question-renderer";
 import { extractThinking, renderThinking } from "./render/thinking-renderer";
 import { StreamController } from "./stream-controller";
+import { chatStreamingEnabled } from "./streaming-policy";
 import {
   defaultTitle,
   newConversationId,
@@ -3089,7 +3090,10 @@ export class VaultGuardChatView extends ItemView {
   // Tier-2 streaming is opt-in (settings toggle) AND desktop-only. On mobile —
   // or with the toggle off — this returns false and the turn uses Tier-1 send().
   private streamingEnabled(): boolean {
-    return this.plugin.settings.aiChatStreaming === true && !Platform.isMobileApp;
+    return chatStreamingEnabled(
+      this.plugin.settings.aiChatStreaming === true,
+      Platform.isMobileApp,
+    );
   }
 
   private makeStreamController(): StreamController | null {

@@ -3,7 +3,9 @@
 // Registers a debugLogging-guarded Obsidian command that proves the
 // encryption-safe tool path end-to-end with NO UI: it mints a read-only lease,
 // builds VaultToolRuntime + AnthropicClient + ChatRuntime, runs one hardcoded
-// prompt, and logs the transcript to the console (AI-CHAT-PANEL.md §15 Phase 2).
+// prompt, and logs metadata-only progress to the console (AI-CHAT-PANEL.md §15
+// Phase 2). Assistant and tool payloads can contain vault plaintext and never
+// cross the diagnostics boundary.
 //
 // The Anthropic API key now comes from the encrypted AnthropicKeyStore (set in
 // VaultGuard settings → AI Chat), and the model + effort come from settings.
@@ -15,7 +17,7 @@ import { Notice } from "obsidian";
 import type VaultGuardPlugin from "../../plugin/main";
 import { AnthropicClient } from "./anthropic-client";
 import { AnthropicKeyStore } from "./api-key-store";
-import { ChatRuntime } from "./chat-runtime";
+import { ChatRuntime, createMetadataOnlyChatProgress } from "./chat-runtime";
 import { VaultToolRuntime } from "./vault-tool-runtime";
 
 const LOG_PREFIX = "[VaultGuard Chat]";
@@ -84,20 +86,16 @@ async function runDebugTurn(plugin: VaultGuardPlugin): Promise<void> {
       client,
       toolRuntime,
       config: { system: DEBUG_SYSTEM_PROMPT },
-      progress: {
-        onText: (text) => console.log(`${LOG_PREFIX} assistant: ${text}`),
-        onToolCall: (name, input) => console.log(`${LOG_PREFIX} tool_use ${name}`, input),
-        onToolResult: (name, result) =>
-          console.log(`${LOG_PREFIX} tool_result ${name} (isError=${result.isError})`, result.content),
-        onRefusal: () => console.warn(`${LOG_PREFIX} model refused the request`),
-        onStepLimit: () => console.warn(`${LOG_PREFIX} reached the step limit for one turn`),
-      },
+      progress: createMetadataOnlyChatProgress(),
     });
 
-    console.log(`${LOG_PREFIX} running headless debug turn: ${DEBUG_PROMPT}`);
+    console.log(`${LOG_PREFIX} event=debug_turn status=running length=${DEBUG_PROMPT.length}`);
     await runtime.runTurn(DEBUG_PROMPT);
-    console.log(`${LOG_PREFIX} debug turn complete; ${runtime.getMessages().length} conversation messages.`);
+    console.log(
+      `${LOG_PREFIX} event=debug_turn status=complete count=${runtime.getMessages().length}`,
+    );
   } catch (e) {
-    console.error(`${LOG_PREFIX} debug turn failed:`, e);
+    const errorType = e instanceof Error ? "Error" : typeof e;
+    console.error(`${LOG_PREFIX} event=debug_turn status=failed error=${errorType}`);
   }
 }

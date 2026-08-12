@@ -27,7 +27,7 @@ import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwat
 const REGION = process.env.AWS_REGION || 'eu-west-1';
 
 // Matches every alarm's `namespace` in terraform/modules/monitoring/main.tf.
-// Changing this string silently dead-alarms all five metrics — change the
+// Changing this string silently dead-alarms every custom metric — change the
 // Terraform in lockstep or not at all.
 export const SECURITY_METRIC_NAMESPACE = 'ObsidianVaultGuard';
 
@@ -42,8 +42,18 @@ export type SecurityMetricName =
   | 'FileAccessCount'
   | 'OffHoursPermissionChange'
   | 'RevokedSessionAccess'
+  | 'SessionRejection'
   | 'KMSDecryptFailure'
-  | 'VaultMutationReconciliationRequired';
+  | 'DetectorSweepCompleted'
+  | 'DetectorSweepFailed'
+  | 'DetectorVaultFailure'
+  | 'VaultMutationReconciliationRequired'
+  // A re-encryption job ended without rotating every file. The rotation fence
+  // already refuses to record a partial rotation as `completed`; this metric is
+  // what turns that correct bookkeeping into an operator page, because an
+  // incompletely re-encrypted vault means an offboarded user's old DEK still
+  // opens files.
+  | 'ReEncryptionIncomplete';
 
 // Lazy so merely importing this module (e.g. in unit tests, or in a handler on
 // a code path that never emits) constructs no client and touches no network.
@@ -58,7 +68,7 @@ function getClient(): CloudWatchClient {
 /**
  * Emit one data point for a security metric (default value 1 = one event).
  *
- * Returns a Promise that NEVER rejects:
+ * Returns whether CloudWatch accepted the metric and NEVER rejects:
  *  - hot paths (e.g. FileAccessCount on every read) SHOULD `void` this so the
  *    response is never delayed by PutMetricData latency;
  *  - rare / critical paths (revoked-session access, KMS decrypt failure) MAY
@@ -68,11 +78,11 @@ function getClient(): CloudWatchClient {
 export async function emitSecurityMetric(
   metricName: SecurityMetricName,
   value = 1
-): Promise<void> {
+): Promise<boolean> {
   const stage = process.env.STAGE;
   // No stage wired up (unit tests / local) → never touch CloudWatch.
   if (!stage) {
-    return;
+    return true;
   }
 
   try {
@@ -90,9 +100,11 @@ export async function emitSecurityMetric(
         ],
       })
     );
+    return true;
   } catch (err) {
     // Never rethrow — a metrics failure must not break the request or the
     // audit write it rides alongside. Mirrors logAudit's [AUDIT_LOG_FAILURE].
     console.error('[SECURITY_METRIC_EMIT_FAILURE]', metricName, (err as Error).message);
+    return false;
   }
 }

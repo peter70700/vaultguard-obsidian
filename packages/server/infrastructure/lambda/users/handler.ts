@@ -23,6 +23,7 @@ import {
   CognitoIdentityProviderClient,
   ListUsersCommand,
   AdminCreateUserCommand,
+  AdminDeleteUserCommand,
   AdminAddUserToGroupCommand,
   AdminRemoveUserFromGroupCommand,
   AdminListGroupsForUserCommand,
@@ -70,8 +71,6 @@ import {
   PermissionAction,
   listVaultsForOrg,
   getActiveOrg,
-  checkUserLimit,
-  updateOrgUserCount,
   UserContext,
   requireOrgId,
   UpdateCommand,
@@ -142,6 +141,279 @@ async function bestEffortSeatSync(orgId: string): Promise<void> {
     // Best-effort: never fail a user mutation on Stripe outage.
     console.error('[SEAT_SYNC_FAILURE]', orgId, (err as Error).message);
   }
+}
+
+function isConditionalCheckFailure(error: unknown): boolean {
+  return (error as { name?: string })?.name === 'ConditionalCheckFailedException';
+}
+
+async function consumeAdminActionRateLimit(params: {
+  action: 'invite' | 'resend';
+  orgId: string;
+  adminUserId: string;
+  scope?: string;
+  windowMs: number;
+  limit: number;
+}): Promise<boolean> {
+  const windowStart = Math.floor(Date.now() / params.windowMs) * params.windowMs;
+  const sessionId = [
+    'admin-action-rate',
+    params.action,
+    params.orgId,
+    params.adminUserId,
+    (params.scope || 'all').trim().toLowerCase(),
+    String(windowStart),
+  ].join('#');
+  try {
+    await docClient.send(new UpdateCommand({
+      TableName: SESSIONS_TABLE,
+      Key: { sessionId },
+      UpdateExpression: 'SET expiresAtTtl = :ttl, recordType = :recordType ADD requestCount :one',
+      ConditionExpression: 'attribute_not_exists(requestCount) OR requestCount < :limit',
+      ExpressionAttributeValues: {
+        ':ttl': Math.ceil((windowStart + params.windowMs * 2) / 1000),
+        ':recordType': 'admin-action-rate-limit',
+        ':one': 1,
+        ':limit': params.limit,
+      },
+    }));
+    return true;
+  } catch (error) {
+    if (isConditionalCheckFailure(error)) return false;
+    throw error;
+  }
+}
+
+/**
+ * Atomically reserves one org seat before Cognito provisioning. The temporary
+ * token makes compensation idempotent: only the request that owns the token
+ * can release the reservation, and a repeated release cannot decrement twice.
+ */
+async function reserveInviteSeat(org: OrgRecord, token: string): Promise<boolean> {
+  try {
+    await docClient.send(new UpdateCommand({
+      TableName: ORGANIZATIONS_TABLE,
+      Key: { slug: org.slug },
+      UpdateExpression: 'SET updatedAt = :now ADD currentUsers :one, activeSeatReservations :tokens',
+      ConditionExpression: [
+        'attribute_exists(slug)',
+        'attribute_exists(currentUsers)',
+        'attribute_exists(maxUsers)',
+        '(maxUsers < :zero OR currentUsers < maxUsers)',
+        '(attribute_not_exists(activeSeatReservations) OR NOT contains(activeSeatReservations, :token))',
+      ].join(' AND '),
+      ExpressionAttributeValues: {
+        ':now': new Date().toISOString(),
+        ':one': 1,
+        ':zero': 0,
+        ':tokens': new Set([token]),
+        ':token': token,
+      },
+    }));
+    return true;
+  } catch (error) {
+    if (isConditionalCheckFailure(error)) return false;
+    throw error;
+  }
+}
+
+async function commitInviteSeatReservation(org: OrgRecord, token: string): Promise<void> {
+  await docClient.send(new UpdateCommand({
+    TableName: ORGANIZATIONS_TABLE,
+    Key: { slug: org.slug },
+    UpdateExpression: 'SET updatedAt = :now DELETE activeSeatReservations :tokens',
+    ConditionExpression: 'contains(activeSeatReservations, :token)',
+    ExpressionAttributeValues: {
+      ':now': new Date().toISOString(),
+      ':tokens': new Set([token]),
+      ':token': token,
+    },
+  }));
+}
+
+async function releaseInviteSeatReservation(org: OrgRecord, token: string): Promise<void> {
+  try {
+    await docClient.send(new UpdateCommand({
+      TableName: ORGANIZATIONS_TABLE,
+      Key: { slug: org.slug },
+      UpdateExpression: 'SET updatedAt = :now ADD currentUsers :minusOne DELETE activeSeatReservations :tokens',
+      ConditionExpression: 'currentUsers > :zero AND contains(activeSeatReservations, :token)',
+      ExpressionAttributeValues: {
+        ':now': new Date().toISOString(),
+        ':minusOne': -1,
+        ':zero': 0,
+        ':tokens': new Set([token]),
+        ':token': token,
+      },
+    }));
+  } catch (error) {
+    // A missing token means this exact reservation was already released.
+    if (!isConditionalCheckFailure(error)) throw error;
+  }
+}
+
+/**
+ * Releases a user's seat exactly once. The subject set is mutated in the same
+ * conditional update as the counter, so concurrent/repeated revocations cannot
+ * drive the counter below the number of active users.
+ */
+async function releaseRevokedUserSeat(org: OrgRecord, subjectId: string): Promise<boolean> {
+  try {
+    await docClient.send(new UpdateCommand({
+      TableName: ORGANIZATIONS_TABLE,
+      Key: { slug: org.slug },
+      UpdateExpression: 'SET updatedAt = :now ADD currentUsers :minusOne, revokedSeatUserIds :subjects',
+      ConditionExpression: [
+        'currentUsers > :zero',
+        '(attribute_not_exists(revokedSeatUserIds) OR NOT contains(revokedSeatUserIds, :subject))',
+      ].join(' AND '),
+      ExpressionAttributeValues: {
+        ':now': new Date().toISOString(),
+        ':minusOne': -1,
+        ':zero': 0,
+        ':subjects': new Set([subjectId]),
+        ':subject': subjectId,
+      },
+    }));
+    return true;
+  } catch (error) {
+    if (isConditionalCheckFailure(error)) return false;
+    throw error;
+  }
+}
+
+async function ensureRevokedSeatIdentity(org: OrgRecord, subjectId: string): Promise<void> {
+  await docClient.send(new UpdateCommand({
+    TableName: ORGANIZATIONS_TABLE,
+    Key: { slug: org.slug },
+    UpdateExpression: 'SET updatedAt = :now ADD revokedSeatUserIds :subjects',
+    ExpressionAttributeValues: {
+      ':now': new Date().toISOString(),
+      ':subjects': new Set([subjectId]),
+    },
+  }));
+}
+
+async function reserveReactivatedUserSeat(org: OrgRecord, subjectId: string): Promise<boolean> {
+  try {
+    await docClient.send(new UpdateCommand({
+      TableName: ORGANIZATIONS_TABLE,
+      Key: { slug: org.slug },
+      UpdateExpression: 'SET updatedAt = :now ADD currentUsers :one DELETE revokedSeatUserIds :subjects',
+      ConditionExpression: [
+        'contains(revokedSeatUserIds, :subject)',
+        'attribute_exists(currentUsers)',
+        'attribute_exists(maxUsers)',
+        '(maxUsers < :zero OR currentUsers < maxUsers)',
+      ].join(' AND '),
+      ExpressionAttributeValues: {
+        ':now': new Date().toISOString(),
+        ':one': 1,
+        ':zero': 0,
+        ':subjects': new Set([subjectId]),
+        ':subject': subjectId,
+      },
+    }));
+    return true;
+  } catch (error) {
+    if (isConditionalCheckFailure(error)) return false;
+    throw error;
+  }
+}
+
+function requiredCognitoSubjectId(
+  attributes: Array<{ Name?: string; Value?: string }> | undefined
+): string {
+  const subjectId = attributes?.find((attribute) => attribute.Name === 'sub')?.Value?.trim();
+  if (!subjectId) {
+    throw new Error('Cognito user is missing the required sub attribute');
+  }
+  return subjectId;
+}
+
+type RevocationMarker = {
+  userId: string;
+  revokedAt?: string;
+  revokedBy?: string;
+  reason?: string;
+  transitionState?: 'revoking' | 'revoked' | 'reactivating';
+  transitionId?: string;
+};
+
+async function getRevocationMarker(subjectId: string): Promise<RevocationMarker | undefined> {
+  const result = await docClient.send(new GetCommand({
+    TableName: REVOKED_KEYS_TABLE,
+    Key: { userId: subjectId },
+  }));
+  return result.Item as RevocationMarker | undefined;
+}
+
+async function claimRevocationTransition(params: {
+  subjectId: string;
+  adminUserId: string;
+  transitionId: string;
+  revokedAt: string;
+}): Promise<boolean> {
+  try {
+    await docClient.send(new PutCommand({
+      TableName: REVOKED_KEYS_TABLE,
+      Item: {
+        userId: params.subjectId,
+        revokedAt: params.revokedAt,
+        revokedBy: params.adminUserId,
+        reason: 'admin_user_revoked',
+        transitionState: 'revoking',
+        transitionId: params.transitionId,
+      },
+      ConditionExpression: 'attribute_not_exists(userId)',
+    }));
+    return true;
+  } catch (error) {
+    if (isConditionalCheckFailure(error)) return false;
+    throw error;
+  }
+}
+
+async function claimReactivationTransition(
+  subjectId: string,
+  transitionId: string
+): Promise<boolean> {
+  try {
+    await docClient.send(new UpdateCommand({
+      TableName: REVOKED_KEYS_TABLE,
+      Key: { userId: subjectId },
+      UpdateExpression: 'SET transitionState = :reactivating, transitionId = :transitionId, reactivationStartedAt = :now',
+      ConditionExpression: 'attribute_exists(userId) AND (attribute_not_exists(transitionState) OR transitionState = :revoked)',
+      ExpressionAttributeValues: {
+        ':reactivating': 'reactivating',
+        ':revoked': 'revoked',
+        ':transitionId': transitionId,
+        ':now': new Date().toISOString(),
+      },
+    }));
+    return true;
+  } catch (error) {
+    if (isConditionalCheckFailure(error)) return false;
+    throw error;
+  }
+}
+
+async function restoreRevocationMarker(params: {
+  subjectId: string;
+  adminUserId: string;
+  revokedAt: string;
+  reason: string;
+}): Promise<void> {
+  await docClient.send(new PutCommand({
+    TableName: REVOKED_KEYS_TABLE,
+    Item: {
+      userId: params.subjectId,
+      revokedAt: params.revokedAt,
+      revokedBy: params.adminUserId,
+      reason: params.reason,
+      transitionState: 'revoked',
+    },
+  }));
 }
 
 // ─── Main Handler ────────────────────────────────────────────────────────────
@@ -428,18 +700,15 @@ async function handleInviteUser(
   if (!orgCheck.allowed) {
     return formatError(403, orgCheck.reason || 'Organization access denied', requestId);
   }
-  if (orgCheck.org) {
-    const limitCheck = checkUserLimit(orgCheck.org);
-    if (!limitCheck.allowed) {
-      return formatError(402, limitCheck.reason || 'User limit exceeded', requestId);
-    }
-
-    const orgSettings = buildOrgSettings(admin.orgId, orgCheck.org);
-    if (!isEmailAllowedForOrg(email, orgSettings)) {
-      throw new ValidationError(
-        `Invitations are restricted to these domains: ${orgSettings.allowedDomains.join(', ')}`
-      );
-    }
+  if (!orgCheck.org) {
+    return formatError(403, 'Organization access denied', requestId);
+  }
+  const org = orgCheck.org;
+  const orgSettings = buildOrgSettings(admin.orgId, org);
+  if (!isEmailAllowedForOrg(email, orgSettings)) {
+    throw new ValidationError(
+      `Invitations are restricted to these domains: ${orgSettings.allowedDomains.join(', ')}`
+    );
   }
 
   if (accessKind === 'guest') {
@@ -461,53 +730,112 @@ async function handleInviteUser(
     guestVaults = requestedVaultIds.map((vaultId) => byId.get(vaultId)!);
   }
 
+  if (!await consumeAdminActionRateLimit({
+    action: 'invite',
+    orgId: admin.orgId,
+    adminUserId: admin.userId,
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+  })) {
+    return formatError(429, 'Too many invitations. Wait before inviting more users.', requestId);
+  }
+
   // Ensure the role group exists in Cognito
   assertNotReservedGroup(role);
   await ensureGroupExists(role);
 
+  const seatReservationToken = `${requestId}:${email}:${generateId()}`;
+  if (!await reserveInviteSeat(org, seatReservationToken)) {
+    return formatError(
+      402,
+      `User limit reached (${org.currentUsers}/${org.maxUsers}). Upgrade your plan to add more users.`,
+      requestId
+    );
+  }
+
   // Create user in Cognito — org is ALWAYS taken from authenticated admin context.
   // ALWAYS suppress Cognito's default email (which sends from no-reply@verificationemail.com
   // with the temp password in plaintext). We send our own branded email instead.
-  const createResult = await cognitoClient.send(
-    new AdminCreateUserCommand({
-      UserPoolId: USER_POOL_ID,
-      Username: email,
-      UserAttributes: [
-        { Name: 'email', Value: email },
-        { Name: 'email_verified', Value: 'true' },
-        ...(displayName ? [{ Name: 'name', Value: displayName }] : []),
-        ...(givenName ? [{ Name: 'given_name', Value: givenName }] : []),
-        ...(familyName ? [{ Name: 'family_name', Value: familyName }] : []),
-        { Name: 'custom:role', Value: role },
-        { Name: 'custom:org', Value: admin.orgId },
-      ],
-      MessageAction: MessageActionType.SUPPRESS,
-    })
-  );
+  let cognitoUsername: string | undefined;
+  let userId: string;
+  try {
+    const createResult = await cognitoClient.send(
+      new AdminCreateUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: email,
+        UserAttributes: [
+          { Name: 'email', Value: email },
+          { Name: 'email_verified', Value: 'true' },
+          ...(displayName ? [{ Name: 'name', Value: displayName }] : []),
+          ...(givenName ? [{ Name: 'given_name', Value: givenName }] : []),
+          ...(familyName ? [{ Name: 'family_name', Value: familyName }] : []),
+          { Name: 'custom:role', Value: role },
+          { Name: 'custom:org', Value: admin.orgId },
+        ],
+        MessageAction: MessageActionType.SUPPRESS,
+      })
+    );
 
-  const userId = createResult.User?.Username!;
+    cognitoUsername = createResult.User?.Username;
+    if (!cognitoUsername) {
+      throw new Error('Cognito did not return a username for the invited user');
+    }
 
-  // Add user to role group
-  await cognitoClient.send(
-    new AdminAddUserToGroupCommand({
-      UserPoolId: USER_POOL_ID,
-      Username: userId,
-      GroupName: role,
-    })
-  );
+    let subjectAttributes = createResult.User?.Attributes;
+    if (!subjectAttributes?.some((attribute) => attribute.Name === 'sub' && attribute.Value)) {
+      const createdUser = await getCognitoUserByUsername(cognitoUsername);
+      subjectAttributes = createdUser.UserAttributes;
+    }
+    userId = requiredCognitoSubjectId(subjectAttributes);
 
-  // Increment org user count
-  const orgResult = await getActiveOrg(admin.orgId);
-  if (orgResult.org) {
-    await updateOrgUserCount(orgResult.org.slug, 1);
-    await bestEffortSeatSync(admin.orgId);
+    // Cognito APIs require Username, while every VaultGuard identity row and
+    // response uses the immutable JWT subject.
+    await cognitoClient.send(
+      new AdminAddUserToGroupCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: cognitoUsername,
+        GroupName: role,
+      })
+    );
+  } catch (error) {
+    if (cognitoUsername) {
+      await cognitoClient.send(new AdminDeleteUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: cognitoUsername,
+      })).catch((deleteError) => {
+        console.error('[USERS_INVITE_COMPENSATION_DELETE_FAILED]', {
+          orgId: admin.orgId,
+          cognitoUsername,
+          error: (deleteError as Error).message,
+        });
+      });
+    }
+    await releaseInviteSeatReservation(org, seatReservationToken).catch((releaseError) => {
+      console.error('[USERS_INVITE_COMPENSATION_SEAT_FAILED]', {
+        orgId: admin.orgId,
+        seatReservationToken,
+        error: (releaseError as Error).message,
+      });
+    });
+    throw error;
   }
+
+  await commitInviteSeatReservation(org, seatReservationToken).catch((error) => {
+    // The user and the count are already correct. A stale reservation token
+    // cannot release itself and is safe to reconcile out-of-band.
+    console.error('[USERS_INVITE_RESERVATION_CLEANUP_FAILED]', {
+      orgId: admin.orgId,
+      seatReservationToken,
+      error: (error as Error).message,
+    });
+  });
+  await bestEffortSeatSync(admin.orgId);
 
   // Send our own branded invitation email (no plaintext password — user sets
   // their password via the "Forgot Password" flow in the plugin on first login)
   if (sendWelcomeEmail) {
-    const orgName = orgResult.org?.name as string || admin.orgId;
-    const orgSlug = (orgResult.org?.slug as string) || '';
+    const orgName = org.name || admin.orgId;
+    const orgSlug = org.slug;
     const inviterName = admin.email;
     await sendEmail('invitation', {
       email,
@@ -826,72 +1154,160 @@ async function handleRevokeUser(
     'Cannot modify user from another organization'
   );
 
-  // Disable user in Cognito (prevents all sign-ins)
-  await cognitoClient.send(
-    new AdminDisableUserCommand({
-      UserPoolId: USER_POOL_ID,
-      Username: target.username,
-    })
-  );
+  const existingMarker = await getRevocationMarker(target.subjectId);
+  if (existingMarker) {
+    if (target.user.Enabled !== false) {
+      throw new AuthError('User revocation is already in progress', 409);
+    }
+    if (existingMarker.transitionState === 'reactivating') {
+      throw new AuthError('User reactivation is already in progress', 409);
+    }
+    if (existingMarker.transitionState === 'revoked' || !existingMarker.transitionState) {
+      return formatSuccess(200, {
+        message: `Access is already revoked for user ${target.username}`,
+        userId: target.subjectId,
+        status: 'revoked',
+        idempotent: true,
+        revokedAt: existingMarker.revokedAt || null,
+        reEncryptionJobId: null,
+      }, requestId);
+    }
+  } else if (target.user.Enabled === false) {
+    throw new AuthError('User is disabled without a VaultGuard revocation record', 409);
+  }
 
-  // Remove from all role groups
   const currentGroups = await cognitoClient.send(
     new AdminListGroupsForUserCommand({
       UserPoolId: USER_POOL_ID,
       Username: target.username,
     })
   );
+  const originalGroups = (currentGroups.Groups || [])
+    .map((group) => group.GroupName)
+    .filter((group): group is string => !!group);
+  const transitionId = generateId();
+  const revokedAt = existingMarker?.revokedAt || new Date().toISOString();
+  if (!existingMarker && !await claimRevocationTransition({
+    subjectId: target.subjectId,
+    adminUserId: admin.userId,
+    transitionId,
+    revokedAt,
+  })) {
+    throw new AuthError('User revocation is already in progress', 409);
+  }
 
-  for (const group of currentGroups.Groups || []) {
+  const orgResult = await getActiveOrg(admin.orgId);
+  if (!orgResult.allowed || !orgResult.org) {
+    if (!existingMarker) {
+      await docClient.send(new DeleteCommand({
+        TableName: REVOKED_KEYS_TABLE,
+        Key: { userId: target.subjectId },
+      }));
+    }
+    throw new AuthError(orgResult.reason || 'Organization access denied', 403);
+  }
+
+  let revocationCommitted = false;
+  try {
+    // Disable user in Cognito (prevents all sign-ins).
     await cognitoClient.send(
-      new AdminRemoveUserFromGroupCommand({
+      new AdminDisableUserCommand({
         UserPoolId: USER_POOL_ID,
         Username: target.username,
-        GroupName: group.GroupName!,
       })
     );
-  }
 
-  // Decrement org user count
-  const orgResult = await getActiveOrg(admin.orgId);
-  if (orgResult.org) {
-    await updateOrgUserCount(orgResult.org.slug, -1);
-    await bestEffortSeatSync(admin.orgId);
-  }
+    // Remove from all role groups.
+    for (const group of originalGroups) {
+      await cognitoClient.send(
+        new AdminRemoveUserFromGroupCommand({
+          UserPoolId: USER_POOL_ID,
+          Username: target.username,
+          GroupName: group,
+        })
+      );
+    }
 
-  const cryptoRevocation = await revokeUserCryptoAccess({
-    targetUserId: target.subjectId,
-    adminUserId: admin.userId,
-    orgId: admin.orgId,
-    reason: 'admin_user_revoked',
-  });
+    await releaseRevokedUserSeat(orgResult.org, target.subjectId);
+    revocationCommitted = true;
 
-  await logAudit({
-    userId: admin.userId,
-    userEmail: admin.email,
-    orgId: admin.orgId,
-    action: 'admin.user_removed',
-    resourcePath: `/users/${targetUserId}`,
-    outcome: 'success',
-    ipAddress: getClientIp(event),
-    userAgent: getUserAgent(event),
-    metadata: {
+    const cryptoRevocation = await revokeUserCryptoAccess({
       targetUserId: target.subjectId,
-      targetUsername: target.username,
-      action: 'revoked',
+      adminUserId: admin.userId,
+      orgId: admin.orgId,
+      reason: 'admin_user_revoked',
+      revokedAt,
+    });
+
+    await bestEffortSeatSync(admin.orgId);
+
+    await logAudit({
+      userId: admin.userId,
+      userEmail: admin.email,
+      orgId: admin.orgId,
+      action: 'admin.user_removed',
+      resourcePath: `/users/${targetUserId}`,
+      outcome: 'success',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: {
+        targetUserId: target.subjectId,
+        targetUsername: target.username,
+        action: 'revoked',
+        invalidatedSessions: cryptoRevocation.invalidatedSessions,
+        revokedLeases: cryptoRevocation.revokedLeases,
+      },
+    });
+
+    return formatSuccess(200, {
+      message: `Access revoked for user ${target.username}`,
+      userId: target.subjectId,
+      status: 'revoked',
       invalidatedSessions: cryptoRevocation.invalidatedSessions,
       revokedLeases: cryptoRevocation.revokedLeases,
-    },
-  });
-
-  return formatSuccess(200, {
-    message: `Access revoked for user ${target.username}`,
-    userId: target.subjectId,
-    status: 'revoked',
-    invalidatedSessions: cryptoRevocation.invalidatedSessions,
-    revokedLeases: cryptoRevocation.revokedLeases,
-    revokedAt: cryptoRevocation.revokedAt,
-  }, requestId);
+      revokedAt: cryptoRevocation.revokedAt,
+      reEncryptionJobId: cryptoRevocation.reEncryptionJobId,
+    }, requestId);
+  } catch (error) {
+    if (!revocationCommitted) {
+      // No crypto revocation has run yet, so the Cognito mutation is safely
+      // compensatable. Restore the original groups and enabled state.
+      for (const group of originalGroups) {
+        await cognitoClient.send(new AdminAddUserToGroupCommand({
+          UserPoolId: USER_POOL_ID,
+          Username: target.username,
+          GroupName: group,
+        })).catch((rollbackError) => {
+          console.error('[USERS_REVOKE_GROUP_ROLLBACK_FAILED]', {
+            username: target.username,
+            group,
+            error: (rollbackError as Error).message,
+          });
+        });
+      }
+      await cognitoClient.send(new AdminEnableUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: target.username,
+      })).catch((rollbackError) => {
+        console.error('[USERS_REVOKE_ENABLE_ROLLBACK_FAILED]', {
+          username: target.username,
+          error: (rollbackError as Error).message,
+        });
+      });
+      if (!existingMarker) {
+        await docClient.send(new DeleteCommand({
+          TableName: REVOKED_KEYS_TABLE,
+          Key: { userId: target.subjectId },
+        })).catch((rollbackError) => {
+          console.error('[USERS_REVOKE_MARKER_ROLLBACK_FAILED]', {
+            userId: target.subjectId,
+            error: (rollbackError as Error).message,
+          });
+        });
+      }
+    }
+    throw error;
+  }
 }
 
 async function revokeUserCryptoAccess(params: {
@@ -899,8 +1315,14 @@ async function revokeUserCryptoAccess(params: {
   adminUserId: string;
   orgId: string;
   reason: string;
-}): Promise<{ invalidatedSessions: number; revokedLeases: number; revokedAt: string }> {
-  const revokedAt = new Date().toISOString();
+  revokedAt: string;
+}): Promise<{
+  invalidatedSessions: number;
+  revokedLeases: number;
+  revokedAt: string;
+  reEncryptionJobId: string | null;
+}> {
+  const revokedAt = params.revokedAt;
 
   const sessionsResult = await docClient.send(
     new QueryCommand({
@@ -971,10 +1393,12 @@ async function revokeUserCryptoAccess(params: {
         revokedAt,
         revokedBy: params.adminUserId,
         reason: params.reason,
+        transitionState: 'revoked',
       },
     })
   );
 
+  let reEncryptionJobId: string | null = generateId();
   try {
     await eventBridgeClient.send(
       new PutEventsCommand({
@@ -987,12 +1411,14 @@ async function revokeUserCryptoAccess(params: {
               orgId: params.orgId,
               triggeredBy: params.adminUserId,
               reason: params.reason,
+              jobId: reEncryptionJobId,
             }),
           },
         ],
       })
     );
   } catch (err) {
+    reEncryptionJobId = null;
     console.error('[USERS_REVOKE] EventBridge publish failed:', err);
   }
 
@@ -1000,6 +1426,7 @@ async function revokeUserCryptoAccess(params: {
     invalidatedSessions: activeSessions.length,
     revokedLeases: activeLeases.length,
     revokedAt,
+    reEncryptionJobId,
   };
 }
 
@@ -1029,38 +1456,146 @@ async function handleReactivateUser(
     throw new ValidationError(`Invalid role: ${role}. Must be one of: ${VALID_ROLES.join(', ')}`);
   }
 
-  // Re-enable user in Cognito
-  await cognitoClient.send(
-    new AdminEnableUserCommand({
-      UserPoolId: USER_POOL_ID,
-      Username: target.username,
-    })
-  );
+  if (target.user.Enabled !== false) {
+    throw new AuthError('Only a revoked user can be reactivated', 409);
+  }
+  if (
+    role !== 'viewer' &&
+    await hasStoredGuestMembership([
+      target.subjectId,
+      target.username,
+      target.requestedUserId,
+    ])
+  ) {
+    throw new ValidationError(
+      'Guest users are viewer-only. Remove their guest memberships and invite them as a member instead.'
+    );
+  }
 
-  // Add back to a role group
-  assertNotReservedGroup(role);
-  await ensureGroupExists(role);
-  await cognitoClient.send(
-    new AdminAddUserToGroupCommand({
+  const marker = await getRevocationMarker(target.subjectId);
+  if (!marker || (marker.transitionState && marker.transitionState !== 'revoked')) {
+    throw new AuthError('Only a fully revoked user can be reactivated', 409);
+  }
+
+  const orgResult = await getActiveOrg(admin.orgId);
+  if (!orgResult.allowed || !orgResult.org) {
+    throw new AuthError(orgResult.reason || 'Organization access denied', 403);
+  }
+
+  const transitionId = generateId();
+  if (!await claimReactivationTransition(target.subjectId, transitionId)) {
+    throw new AuthError('User reactivation is already in progress', 409);
+  }
+
+  // Backfill the idempotency set for users revoked before this seat-transition
+  // protocol existed, then consume it atomically with the counter increment.
+  let seatReserved = false;
+  try {
+    await ensureRevokedSeatIdentity(orgResult.org, target.subjectId);
+    seatReserved = await reserveReactivatedUserSeat(orgResult.org, target.subjectId);
+  } catch (error) {
+    await releaseRevokedUserSeat(orgResult.org, target.subjectId).catch((rollbackError) => {
+      console.error('[USERS_REACTIVATE_SEAT_UNCERTAIN_ROLLBACK_FAILED]', {
+        userId: target.subjectId,
+        error: (rollbackError as Error).message,
+      });
+    });
+    await restoreRevocationMarker({
+      subjectId: target.subjectId,
+      adminUserId: marker.revokedBy || admin.userId,
+      revokedAt: marker.revokedAt || new Date().toISOString(),
+      reason: marker.reason || 'admin_user_revoked',
+    });
+    throw error;
+  }
+  if (!seatReserved) {
+    await restoreRevocationMarker({
+      subjectId: target.subjectId,
+      adminUserId: marker.revokedBy || admin.userId,
+      revokedAt: marker.revokedAt || new Date().toISOString(),
+      reason: marker.reason || 'admin_user_revoked',
+    });
+    return formatError(
+      402,
+      `User limit reached (${orgResult.org.currentUsers}/${orgResult.org.maxUsers}). Upgrade your plan to add more users.`,
+      requestId
+    );
+  }
+
+  try {
+    // Add back to a role group, using Cognito Username only at the Cognito API.
+    assertNotReservedGroup(role);
+    await ensureGroupExists(role);
+    await cognitoClient.send(
+      new AdminEnableUserCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: target.username,
+      })
+    );
+    await cognitoClient.send(
+      new AdminAddUserToGroupCommand({
+        UserPoolId: USER_POOL_ID,
+        Username: target.username,
+        GroupName: role,
+      })
+    );
+
+    await docClient.send(
+      new DeleteCommand({
+        TableName: REVOKED_KEYS_TABLE,
+        Key: { userId: target.subjectId },
+        ConditionExpression: 'transitionState = :reactivating AND transitionId = :transitionId',
+        ExpressionAttributeValues: {
+          ':reactivating': 'reactivating',
+          ':transitionId': transitionId,
+        },
+      })
+    );
+  } catch (error) {
+    // Restore the revoked state and release the just-reserved seat. These
+    // operations are themselves idempotent, so an uncertain SDK retry cannot
+    // double-decrement the counter.
+    await cognitoClient.send(new AdminRemoveUserFromGroupCommand({
       UserPoolId: USER_POOL_ID,
       Username: target.username,
       GroupName: role,
-    })
-  );
-
-  await docClient.send(
-    new DeleteCommand({
-      TableName: REVOKED_KEYS_TABLE,
-      Key: { userId: target.subjectId },
-    })
-  );
-
-  // Increment org user count
-  const orgResult = await getActiveOrg(admin.orgId);
-  if (orgResult.org) {
-    await updateOrgUserCount(orgResult.org.slug, 1);
-    await bestEffortSeatSync(admin.orgId);
+    })).catch((rollbackError) => {
+      console.error('[USERS_REACTIVATE_GROUP_ROLLBACK_FAILED]', {
+        username: target.username,
+        role,
+        error: (rollbackError as Error).message,
+      });
+    });
+    await cognitoClient.send(new AdminDisableUserCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: target.username,
+    })).catch((rollbackError) => {
+      console.error('[USERS_REACTIVATE_DISABLE_ROLLBACK_FAILED]', {
+        username: target.username,
+        error: (rollbackError as Error).message,
+      });
+    });
+    await releaseRevokedUserSeat(orgResult.org, target.subjectId).catch((rollbackError) => {
+      console.error('[USERS_REACTIVATE_SEAT_ROLLBACK_FAILED]', {
+        userId: target.subjectId,
+        error: (rollbackError as Error).message,
+      });
+    });
+    await restoreRevocationMarker({
+      subjectId: target.subjectId,
+      adminUserId: marker.revokedBy || admin.userId,
+      revokedAt: marker.revokedAt || new Date().toISOString(),
+      reason: marker.reason || 'admin_user_revoked',
+    }).catch((rollbackError) => {
+      console.error('[USERS_REACTIVATE_MARKER_ROLLBACK_FAILED]', {
+        userId: target.subjectId,
+        error: (rollbackError as Error).message,
+      });
+    });
+    throw error;
   }
+
+  await bestEffortSeatSync(admin.orgId);
 
   await logAudit({
     userId: admin.userId,
@@ -1114,6 +1649,25 @@ async function handleResendInvite(
   const email = target.attributes['email'] || '';
   if (!email) {
     return formatError(400, 'User has no email address', requestId);
+  }
+
+  const actorAllowed = await consumeAdminActionRateLimit({
+    action: 'resend',
+    orgId: admin.orgId,
+    adminUserId: admin.userId,
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+  });
+  const targetAllowed = actorAllowed && await consumeAdminActionRateLimit({
+    action: 'resend',
+    orgId: admin.orgId,
+    adminUserId: admin.userId,
+    scope: target.subjectId,
+    windowMs: 5 * 60 * 1000,
+    limit: 1,
+  });
+  if (!actorAllowed || !targetAllowed) {
+    return formatError(429, 'Invitation was recently sent. Wait before resending.', requestId);
   }
 
   // Look up org name for the email
@@ -1490,11 +2044,12 @@ async function resolveTargetUserForOrg(
   if (attributes['custom:org'] !== orgId) {
     throw new AuthError(crossOrgMessage, 403);
   }
+  const subjectId = requiredCognitoSubjectId(user.UserAttributes);
 
   return {
     requestedUserId,
     username,
-    subjectId: attributes.sub || username,
+    subjectId,
     user,
     attributes,
   };

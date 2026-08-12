@@ -1,5 +1,6 @@
 variable "stage" { type = string }
 variable "is_prod" { type = bool }
+variable "production_hardening" { type = bool }
 variable "kms_key_arn" { type = string }
 variable "kms_key_id" { type = string }
 variable "vault_bucket_name" { type = string }
@@ -188,17 +189,23 @@ locals {
     # Every authenticated Lambda reads this in `assertSubscriptionAllowsAccess`
     # (the SaaS subscription gate). Signup also writes a `pending_checkout`
     # row here. Promoted to common_env so a new handler can't forget it.
-    SUBSCRIPTIONS_TABLE      = var.subscriptions_table_name
-    KMS_KEY_ID               = var.kms_key_id
-    COGNITO_USER_POOL_ID     = var.cognito_user_pool_id
-    COGNITO_CLIENT_ID        = var.cognito_client_id
-    VAULTGUARD_EDITION       = var.vaultguard_edition
-    SENDER_EMAIL             = var.sender_email
-    ALLOWED_CORS_ORIGIN      = var.domain_name != "" ? "https://admin.${var.domain_name}" : "http://localhost:5173"
-    SHARE_BASE_URL           = var.domain_name != "" ? "https://share.${var.domain_name}" : "http://localhost:5176"
-    NODE_OPTIONS             = "--enable-source-maps"
+    SUBSCRIPTIONS_TABLE  = var.subscriptions_table_name
+    KMS_KEY_ID           = var.kms_key_id
+    COGNITO_USER_POOL_ID = var.cognito_user_pool_id
+    COGNITO_CLIENT_ID    = var.cognito_client_id
+    VAULTGUARD_EDITION   = var.vaultguard_edition
+    SENDER_EMAIL         = var.sender_email
+    ALLOWED_CORS_ORIGIN  = var.domain_name != "" ? "https://admin.${var.domain_name}" : "http://localhost:5173"
+    SHARE_BASE_URL       = var.domain_name != "" ? "https://share.${var.domain_name}" : "http://localhost:5176"
+    NODE_OPTIONS         = "--enable-source-maps"
   }
-  log_retention = var.is_prod ? 365 : 7
+  # SD-12-F12: gated on production_hardening, NOT is_prod. The live production
+  # stack (example.com) runs with stage = "dev", so an `is_prod` gate left
+  # production Lambda logs at 7 days — too short for incident forensics and far
+  # shorter than the 365-day API access logs beside them. production_hardening
+  # exists precisely to express "this stack holds real data" independently of
+  # the stage name; see terraform/variables.tf.
+  log_retention = var.production_hardening ? 365 : 7
 }
 
 # ─── Lambda Source Packaging ─────────────────────────────────────────────────
@@ -298,11 +305,10 @@ data "aws_iam_policy_document" "lambda_assume" {
 data "aws_iam_policy_document" "lambda_logging" {
   statement {
     actions = [
-      "logs:CreateLogGroup",
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:*"]
+    resources = ["arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/vaultguard-*-${var.stage}:*"]
   }
 }
 
@@ -458,22 +464,22 @@ resource "aws_lambda_function" "auth" {
   timeout       = 30
 
   filename         = data.archive_file.auth_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/auth/handler.js")
+  source_code_hash = data.archive_file.auth_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
   environment {
     variables = merge(local.common_env, {
-      KMS_KEY_ARN                = var.kms_key_arn
-      KEY_LEASE_DURATION_SECONDS = tostring(var.key_lease_duration_seconds)
-      SESSION_DURATION_SECONDS   = tostring(var.session_duration_seconds)
-      USER_POOL_ID               = var.cognito_user_pool_id
-      CLIENT_ID                  = var.cognito_client_id
-      LOGIN_VERIFICATION_MODE        = var.login_verification_mode
-      LOGIN_VERIFICATION_BROWSER_URL = var.login_verification_browser_url
+      KMS_KEY_ARN                        = var.kms_key_arn
+      KEY_LEASE_DURATION_SECONDS         = tostring(var.key_lease_duration_seconds)
+      SESSION_DURATION_SECONDS           = tostring(var.session_duration_seconds)
+      USER_POOL_ID                       = var.cognito_user_pool_id
+      CLIENT_ID                          = var.cognito_client_id
+      LOGIN_VERIFICATION_MODE            = var.login_verification_mode
+      LOGIN_VERIFICATION_BROWSER_URL     = var.login_verification_browser_url
       LOGIN_VERIFICATION_ALLOWED_ORIGINS = join(",", [for hostname in split(",", var.turnstile_expected_hostnames) : "https://${trimspace(hostname)}"])
-      TURNSTILE_EXPECTED_HOSTNAMES    = var.turnstile_expected_hostnames
-      TURNSTILE_SECRET_ARN            = var.turnstile_secret_arn
+      TURNSTILE_EXPECTED_HOSTNAMES       = var.turnstile_expected_hostnames
+      TURNSTILE_SECRET_ARN               = var.turnstile_secret_arn
     })
   }
 
@@ -598,7 +604,7 @@ resource "aws_lambda_function" "files" {
   timeout       = 60
 
   filename         = data.archive_file.files_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/files/handler.js")
+  source_code_hash = data.archive_file.files_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -729,7 +735,7 @@ resource "aws_lambda_function" "permissions" {
   timeout       = 30
 
   filename         = data.archive_file.permissions_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/permissions/handler.js")
+  source_code_hash = data.archive_file.permissions_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -797,6 +803,11 @@ data "aws_iam_policy_document" "audit_lambda" {
   statement {
     actions   = ["kms:Decrypt", "kms:DescribeKey"]
     resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${data.aws_region.current.name}.amazonaws.com"]
+    }
   }
 }
 
@@ -817,7 +828,7 @@ resource "aws_lambda_function" "audit" {
   timeout       = 30
 
   filename         = data.archive_file.audit_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/audit/handler.js")
+  source_code_hash = data.archive_file.audit_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -874,11 +885,19 @@ data "aws_iam_policy_document" "billing_lambda" {
   statement {
     actions   = ["kms:Decrypt"]
     resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values = [
+        "dynamodb.${data.aws_region.current.name}.amazonaws.com",
+        "secretsmanager.${data.aws_region.current.name}.amazonaws.com",
+      ]
+    }
   }
   # DynamoDB — audit
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
-    resources = [var.audit_table_arn, "${var.audit_table_arn}/index/*"]
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.audit_table_arn]
   }
   # DynamoDB — subscriptions
   statement {
@@ -924,7 +943,7 @@ resource "aws_lambda_function" "billing" {
   timeout       = 30
 
   filename         = data.archive_file.billing_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/billing/handler.js")
+  source_code_hash = data.archive_file.billing_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -1060,7 +1079,7 @@ resource "aws_lambda_function" "signup" {
   timeout       = 30
 
   filename         = data.archive_file.signup_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/signup/handler.js")
+  source_code_hash = data.archive_file.signup_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -1081,6 +1100,15 @@ resource "aws_lambda_function" "signup" {
       BASE_URL             = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
     })
   }
+
+  lifecycle {
+    precondition {
+      condition     = var.vaultguard_edition != "pro" || var.turnstile_secret_arn != ""
+      error_message = "Pro signup requires an explicit stage-specific turnstile_secret_arn; production fallback credentials are forbidden."
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.signup_lambda]
 
   tags = { Name = "vaultguard-signup-${var.stage}" }
 }
@@ -1106,6 +1134,9 @@ data "aws_iam_policy_document" "users_lambda" {
   statement {
     actions = [
       "cognito-idp:AdminCreateUser",
+      # Invite compensation deletes a just-created Cognito user when the
+      # mandatory sub or downstream group assignment cannot be established.
+      "cognito-idp:AdminDeleteUser",
       "cognito-idp:AdminGetUser",
       "cognito-idp:AdminSetUserPassword",
       "cognito-idp:AdminAddUserToGroup",
@@ -1134,14 +1165,31 @@ data "aws_iam_policy_document" "users_lambda" {
     actions = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"]
     resources = [
       var.organizations_table_arn, "${var.organizations_table_arn}/index/*",
-      var.audit_table_arn, "${var.audit_table_arn}/index/*",
       var.sessions_table_arn, "${var.sessions_table_arn}/index/*",
     ]
   }
-  # Revoked keys: PutItem when an admin revokes a user, DeleteItem on
-  # reactivate. Mirrors the auth Lambda's grant — same table, narrower ops.
+  # Audit producers are append-only at the IAM boundary. Readers use the
+  # dedicated audit Lambda rather than the user-management role.
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.audit_table_arn]
+  }
+  # Documented exception to the append-only rule above: GET /users/{userId}/activity
+  # (handleGetActivity, users/handler.ts) queries userId-index directly from THIS
+  # role to render the admin panel's per-user activity view, so the index ARN is
+  # required alongside the table. Query only — no Scan, no GetItem on the base
+  # table, no mutation — so append-only still holds for every write path. Dropping
+  # this grant returns AccessDenied on that route and blanks the activity view.
+  # Relocating the route behind the audit Lambda would restore the pure rule.
+  statement {
+    actions   = ["dynamodb:Query"]
+    resources = [var.audit_table_arn, "${var.audit_table_arn}/index/*"]
+  }
+  # Revoked keys: PutItem when an admin revokes a user, conditional UpdateItem
+  # to claim reactivation, DeleteItem on successful reactivate. Mirrors the
+  # auth Lambda's grant — same table, narrower ops.
+  statement {
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"]
     resources = [var.revoked_keys_table_arn]
   }
   # Leases: handleRevoke queries userId-index to find the offboarded user's
@@ -1213,7 +1261,7 @@ resource "aws_lambda_function" "users" {
   timeout       = 30
 
   filename         = data.archive_file.users_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/users/handler.js")
+  source_code_hash = data.archive_file.users_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -1223,6 +1271,8 @@ resource "aws_lambda_function" "users" {
       STRIPE_SECRET_ARN = var.stripe_secret_arn
     })
   }
+
+  depends_on = [aws_iam_role_policy.users_lambda]
 
   tags = { Name = "vaultguard-users-${var.stage}" }
 }
@@ -1307,6 +1357,13 @@ data "aws_iam_policy_document" "reencryption_lambda" {
     actions   = ["cognito-idp:GetUser"]
     resources = [var.cognito_user_pool_arn]
   }
+  # SQS — write the on-failure destination record. Lambda writes to an async
+  # destination using the FUNCTION's execution role (not a queue policy), so
+  # without this the destination silently fails and the event is lost anyway.
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.reencryption_dlq.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "reencryption_lambda" {
@@ -1326,7 +1383,7 @@ resource "aws_lambda_function" "reencryption" {
   timeout       = 300
 
   filename         = data.archive_file.reencryption_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/reencryption/handler.js")
+  source_code_hash = data.archive_file.reencryption_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -1354,10 +1411,96 @@ resource "aws_cloudwatch_event_rule" "user_access_revoked" {
   })
 }
 
+# ─── Revocation durability (dead-letter queue) ───────────────────────────────
+# Offboarding is the one pipeline whose silent failure breaks a security
+# guarantee: if a UserAccessRevoked event is lost, the user is offboarded but
+# their files are never re-encrypted, and nothing records it. Two independent
+# failure classes have to be caught, so both paths dead-letter to this queue:
+#
+#   1. DELIVERY failure — EventBridge cannot hand the event to Lambda
+#      (throttling, permissions, function deleted). Covered by the target's
+#      dead_letter_config + retry_policy below.
+#   2. EXECUTION failure — Lambda accepts the event and the handler throws.
+#      After the async retries, the event is discarded unless an on-failure
+#      destination exists. Covered by aws_lambda_function_event_invoke_config.
+#
+# The DLQ is a durable record, not a recovery mechanism: an operator re-drives
+# it. The monitoring module alarms on depth >= 1 so it is never just a bucket
+# that silently fills.
+resource "aws_sqs_queue" "reencryption_dlq" {
+  name = "vaultguard-${var.stage}-reencryption-dlq"
+
+  # Long retention: a dropped revocation may not be noticed immediately, and the
+  # event must survive a weekend before an operator can re-drive it.
+  message_retention_seconds = 1209600 # 14 days (SQS maximum)
+
+  # SSE-SQS (AWS-managed key), deliberately NOT the project CMK. The CMK's key
+  # policy grants only the account root principal, and an AWS *service*
+  # principal is not covered by root delegation — it needs its own key-policy
+  # statement. EventBridge would therefore fail to write the dead-letter message
+  # and the event would be lost silently, which is the precise failure this
+  # queue exists to prevent. Coupling a durability backstop's correctness to a
+  # production key-policy edit is the wrong trade; SSE-SQS still encrypts at
+  # rest, and the payload is revocation *metadata* (userId/orgId/vaultId), never
+  # vault content or key material.
+  sqs_managed_sse_enabled = true
+
+  tags = { Name = "vaultguard-${var.stage}-reencryption-dlq" }
+}
+
+data "aws_iam_policy_document" "reencryption_dlq" {
+  statement {
+    sid       = "AllowEventBridgeDeadLetter"
+    effect    = "Allow"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.reencryption_dlq.arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+
+    # Scope to this rule only — a bare service principal would let any
+    # EventBridge rule in the account write to this queue.
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values   = [aws_cloudwatch_event_rule.user_access_revoked.arn]
+    }
+  }
+}
+
+resource "aws_sqs_queue_policy" "reencryption_dlq" {
+  queue_url = aws_sqs_queue.reencryption_dlq.id
+  policy    = data.aws_iam_policy_document.reencryption_dlq.json
+}
+
 resource "aws_cloudwatch_event_target" "reencryption_user_access_revoked" {
   rule      = aws_cloudwatch_event_rule.user_access_revoked.name
   target_id = "vaultguard-reencryption-${var.stage}"
   arn       = aws_lambda_function.reencryption.arn
+
+  dead_letter_config {
+    arn = aws_sqs_queue.reencryption_dlq.arn
+  }
+
+  retry_policy {
+    maximum_retry_attempts       = 4
+    maximum_event_age_in_seconds = 3600
+  }
+}
+
+# Execution-failure destination. Without this the async retries exhaust and the
+# event is dropped with no trace — the exact silent-offboarding failure above.
+resource "aws_lambda_function_event_invoke_config" "reencryption" {
+  function_name          = aws_lambda_function.reencryption.function_name
+  maximum_retry_attempts = 2
+
+  destination_config {
+    on_failure {
+      destination = aws_sqs_queue.reencryption_dlq.arn
+    }
+  }
 }
 
 resource "aws_lambda_permission" "allow_eventbridge_reencryption" {
@@ -1409,11 +1552,19 @@ data "aws_iam_policy_document" "reconciler_lambda" {
     resources = [var.audit_table_arn]
   }
   # KMS — Organizations / Subscriptions / Audit tables are encrypted with the
-  # project master key; without Decrypt/GenerateDataKey, the first table
+  # project master key; without service-scoped Decrypt, the first table
   # access errors.
   statement {
-    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+    actions   = ["kms:Decrypt", "kms:DescribeKey"]
     resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values = [
+        "dynamodb.${data.aws_region.current.name}.amazonaws.com",
+        "secretsmanager.${data.aws_region.current.name}.amazonaws.com",
+      ]
+    }
   }
   # Secrets Manager — Stripe key retrieval inside syncStripeSeats.
   # Skipped on Community Edition where stripe_secret_arn = "" (FEATURES.billing
@@ -1444,7 +1595,7 @@ resource "aws_lambda_function" "reconciler" {
   timeout       = 300
 
   filename         = data.archive_file.reconciler_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/reconciler/handler.js")
+  source_code_hash = data.archive_file.reconciler_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -1516,12 +1667,28 @@ data "aws_iam_policy_document" "detector_lambda" {
     actions   = ["dynamodb:PutItem"]
     resources = [var.alerts_table_arn]
   }
+  # Detector health heartbeats and partial-sweep failures. PutMetricData has
+  # no resource ARN, so constrain it to VaultGuard's namespace.
+  statement {
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["ObsidianVaultGuard"]
+    }
+  }
   # KMS — audit / alerts / vaults tables are SSE-KMS encrypted with the project
-  # master key; without Decrypt/GenerateDataKey the first table access errors
+  # master key; without service-scoped Decrypt the first table access errors
   # (same rationale as the reconciler role).
   statement {
-    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+    actions   = ["kms:Decrypt", "kms:DescribeKey"]
     resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${data.aws_region.current.name}.amazonaws.com"]
+    }
   }
 }
 
@@ -1542,7 +1709,7 @@ resource "aws_lambda_function" "detector" {
   timeout       = 300
 
   filename         = data.archive_file.detector_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/detector/handler.js")
+  source_code_hash = data.archive_file.detector_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -1551,6 +1718,8 @@ resource "aws_lambda_function" "detector" {
       DETECTOR_LOOKBACK_MINUTES = tostring(var.detector_lookback_minutes)
     })
   }
+
+  depends_on = [aws_iam_role_policy.detector_lambda]
 
   tags = { Name = "vaultguard-detector-${var.stage}" }
 }
@@ -1655,8 +1824,13 @@ data "aws_iam_policy_document" "vaults_lambda" {
   }
   # KMS — needed because tables use customer-managed keys
   statement {
-    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+    actions   = ["kms:Decrypt", "kms:DescribeKey"]
     resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${data.aws_region.current.name}.amazonaws.com"]
+    }
   }
 }
 
@@ -1677,7 +1851,7 @@ resource "aws_lambda_function" "vaults" {
   timeout       = 30
 
   filename         = data.archive_file.vaults_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/vaults/handler.js")
+  source_code_hash = data.archive_file.vaults_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -1718,9 +1892,10 @@ data "aws_iam_policy_document" "shares_lambda" {
     actions   = ["dynamodb:GetItem"]
     resources = [var.subscriptions_table_arn]
   }
-  # Shares table — full CRUD + GSI query for listing per-vault.
+  # Shares table — full CRUD + GSI query for listing per-vault. Quota state and
+  # share rows change atomically so concurrent creators cannot exceed the cap.
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:TransactWriteItems"]
     resources = [var.shares_table_arn, "${var.shares_table_arn}/index/*"]
   }
   # Vaults & members — read for requireVaultMember.
@@ -1754,8 +1929,13 @@ data "aws_iam_policy_document" "shares_lambda" {
   }
   # KMS — DynamoDB tables use the customer-managed key.
   statement {
-    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+    actions   = ["kms:Decrypt", "kms:DescribeKey"]
     resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${data.aws_region.current.name}.amazonaws.com"]
+    }
   }
 }
 
@@ -1776,13 +1956,15 @@ resource "aws_lambda_function" "shares" {
   timeout       = 30
 
   filename         = data.archive_file.shares_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/shares/handler.js")
+  source_code_hash = data.archive_file.shares_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
   environment {
     variables = local.common_env
   }
+
+  depends_on = [aws_iam_role_policy.shares_lambda]
 
   tags = { Name = "vaultguard-shares-${var.stage}" }
 }
@@ -1868,8 +2050,16 @@ data "aws_iam_policy_document" "superadmin_lambda" {
   }
   # KMS — DynamoDB tables use the customer-managed key.
   statement {
-    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+    actions   = ["kms:Decrypt", "kms:DescribeKey"]
     resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values = [
+        "dynamodb.${data.aws_region.current.name}.amazonaws.com",
+        "secretsmanager.${data.aws_region.current.name}.amazonaws.com",
+      ]
+    }
   }
 }
 
@@ -1890,7 +2080,7 @@ resource "aws_lambda_function" "superadmin" {
   timeout       = 30
 
   filename         = data.archive_file.superadmin_lambda.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/superadmin/handler.js")
+  source_code_hash = data.archive_file.superadmin_lambda.output_base64sha256
 
   tracing_config { mode = "Active" }
 
@@ -1975,3 +2165,52 @@ output "reencryption_function_name" { value = aws_lambda_function.reencryption.f
 
 output "reconciler_function_arn" { value = aws_lambda_function.reconciler.arn }
 output "reconciler_function_name" { value = aws_lambda_function.reconciler.function_name }
+
+output "detector_function_name" { value = aws_lambda_function.detector.function_name }
+
+output "reencryption_dlq_name" { value = aws_sqs_queue.reencryption_dlq.name }
+output "reencryption_dlq_arn" { value = aws_sqs_queue.reencryption_dlq.arn }
+
+# Every function in this module, for the monitoring module's per-function
+# Errors/Throttles alarms. Adding a Lambda here without adding it to this list
+# leaves it unmonitored, so the list is derived from the resources themselves
+# rather than hand-maintained as strings.
+output "all_function_names" {
+  value = [
+    aws_lambda_function.auth.function_name,
+    aws_lambda_function.files.function_name,
+    aws_lambda_function.permissions.function_name,
+    aws_lambda_function.audit.function_name,
+    aws_lambda_function.billing.function_name,
+    aws_lambda_function.signup.function_name,
+    aws_lambda_function.users.function_name,
+    aws_lambda_function.reencryption.function_name,
+    aws_lambda_function.reconciler.function_name,
+    aws_lambda_function.detector.function_name,
+    aws_lambda_function.vaults.function_name,
+    aws_lambda_function.shares.function_name,
+    aws_lambda_function.superadmin.function_name,
+  ]
+}
+
+# Concrete log-group dependencies for monitoring metric filters. Passing names
+# from these resources (rather than reconstructing conventional strings in the
+# monitoring module) prevents apply-time races where a filter is created before
+# its Lambda log group exists.
+output "all_log_group_names" {
+  value = [
+    aws_cloudwatch_log_group.auth.name,
+    aws_cloudwatch_log_group.files.name,
+    aws_cloudwatch_log_group.permissions.name,
+    aws_cloudwatch_log_group.audit.name,
+    aws_cloudwatch_log_group.billing.name,
+    aws_cloudwatch_log_group.signup.name,
+    aws_cloudwatch_log_group.users.name,
+    aws_cloudwatch_log_group.reencryption.name,
+    aws_cloudwatch_log_group.reconciler.name,
+    aws_cloudwatch_log_group.detector.name,
+    aws_cloudwatch_log_group.vaults.name,
+    aws_cloudwatch_log_group.shares.name,
+    aws_cloudwatch_log_group.superadmin.name,
+  ]
+}

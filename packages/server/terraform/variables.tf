@@ -26,7 +26,7 @@ variable "production_hardening" {
     body tracing is DISABLED (so plaintext key-lease DEKs are never written to
     CloudWatch), the vault S3 bucket is force_destroy=false, DynamoDB tables get
     PITR + deletion protection, Secrets Manager / KMS use 30-day recovery
-    windows, and S3 keeps 365-day / 10-version noncurrent history.
+    windows, and S3 keeps 365-day / 100-version noncurrent history.
 
     Set to false ONLY for genuinely disposable stacks (ephemeral CI, throwaway
     local test envs) that must be torn down freely. Does NOT change any
@@ -35,6 +35,19 @@ variable "production_hardening" {
   EOT
   type        = bool
   default     = true
+}
+
+variable "confirm_disposable_stack" {
+  description = "Explicit acknowledgement required before disabling production_hardening. Set true only for a disposable stack whose data may be destroyed."
+  type        = bool
+  default     = false
+}
+
+check "disposable_stack_acknowledged" {
+  assert {
+    condition     = var.production_hardening || var.confirm_disposable_stack
+    error_message = "production_hardening=false disables PITR/deletion protection, enables S3 force-destroy, and removes recovery windows. Set confirm_disposable_stack=true explicitly only for a disposable stack."
+  }
 }
 
 variable "session_enforcement_mode" {
@@ -60,14 +73,20 @@ variable "cognito_mfa_configuration" {
 }
 
 variable "cognito_advanced_security_mode" {
-  description = "Explicit Cognito threat-protection posture. AUDIT/ENFORCED can incur cost and require operator approval; the safe local default is OFF."
+  description = "Explicit Cognito threat-protection posture. AUDIT is the non-blocking production-safe baseline; ENFORCED requires an operator-approved rollout."
   type        = string
-  default     = "OFF"
+  default     = "AUDIT"
 
   validation {
     condition     = contains(["OFF", "AUDIT", "ENFORCED"], var.cognito_advanced_security_mode)
     error_message = "cognito_advanced_security_mode must be OFF, AUDIT, or ENFORCED."
   }
+}
+
+variable "legacy_api_cdn_enabled" {
+  description = "Keep the legacy CloudFront API distribution until access logs prove no supported client still uses it. Set false only through the retirement runbook."
+  type        = bool
+  default     = true
 }
 
 variable "login_verification_mode" {
@@ -195,9 +214,16 @@ variable "billing_exempt_domains" {
 }
 
 variable "turnstile_secret_arn" {
-  description = "Secrets Manager ARN for the Cloudflare Turnstile secret key (JSON shape {\"secretKey\":\"...\"}). Empty on Community Edition disables CAPTCHA (fail-open). The root terraform/main.tf hardcodes the prod ARN at the module invocation; override via tfvars for non-prod stages or leave this default for CE deploys driven from the root."
+  description = "Stage-specific Secrets Manager ARN for the Cloudflare Turnstile secret key (JSON shape {\"secretKey\":\"...\"}). Required for Pro signup and observe/enforce login verification; empty is permitted only for Community Edition with those managed controls disabled."
   type        = string
-  default     = ""
+
+  validation {
+    condition = var.turnstile_secret_arn == "" || can(regex(
+      "^arn:(aws|aws-us-gov|aws-cn):secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
+      var.turnstile_secret_arn,
+    ))
+    error_message = "Set turnstile_secret_arn to an explicit stage-specific Secrets Manager secret ARN, or explicitly set it to an empty string only for Community Edition with managed verification disabled."
+  }
 }
 
 # ─── Meta advertising (Conversions API) ──────────────────────────────────────

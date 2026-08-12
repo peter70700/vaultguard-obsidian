@@ -485,13 +485,16 @@ async function handleCreatePermission(
   let userId = (body.userId as string) || '*';
   const role = (body.role as string) || null;
   const pathPattern = body.pathPattern as string;
-  const actions = body.actions as string[];
+  const actions = body.actions;
   const effect = body.effect as string;
-  const priority = (body.priority as number) || calculatePriority(pathPattern);
+  const requestedPriority = parseOptionalPriority(body.priority);
   const upsert = body.upsert === true;
   const expiresAt = normalizePermissionExpiry(body.expiresAt);
 
   // Validate actions
+  if (!Array.isArray(actions) || actions.length === 0 || actions.some((action) => typeof action !== 'string')) {
+    return formatError(400, 'actions must be a non-empty array of permission action strings', requestId);
+  }
   for (const action of actions) {
     if (!VALID_ACTIONS.includes(action as PermissionAction)) {
       return formatError(
@@ -508,9 +511,13 @@ async function handleCreatePermission(
   }
 
   // Validate path pattern
-  if (!pathPattern.startsWith('/')) {
+  if (typeof pathPattern !== 'string' || !pathPattern.startsWith('/')) {
     return formatError(400, 'pathPattern must start with /', requestId);
   }
+  if (requestedPriority === null) {
+    return formatError(400, 'priority must be a non-negative whole number', requestId);
+  }
+  const priority = requestedPriority ?? calculatePriority(pathPattern);
 
   if (!role) {
     const canonicalUserId = await canonicalizeRuleUserId(userId, vault.orgId);
@@ -975,7 +982,7 @@ async function handleUpdatePermission(
           return acc;
         }, {} as Record<string, unknown>),
         viaFileAdmin,
-        targetPrincipal: existingRule.role ? `role:${existingRule.role}` : existingRule.userId,
+        targetPrincipal: resultingRole ? `role:${resultingRole}` : targetUserId,
         resultingLevel: ruleLevelRank(
           (updates.actions as PermissionAction[]) ?? existingRule.actions,
           (updates.effect as 'allow' | 'deny') ?? existingRule.effect

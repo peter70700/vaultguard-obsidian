@@ -203,11 +203,16 @@ export async function handleHumanVerificationRequest(
         return fail(400);
       }
 
-      // The admin web login is account-first: Cognito supplies the trusted
-      // organization after it validates the credentials. Legacy web clients,
-      // plugin logins, and non-login purposes remain organization-bound.
+      // Login is account-first on every managed surface: Cognito supplies the
+      // trusted organization after it validates the credentials, so a client
+      // that does not know the slug up front is normal, not suspicious. The
+      // pre-authentication trigger still requires the trusted custom:org
+      // attribute before it will consume the permit — dropping the slug moves
+      // where tenancy comes from, it does not remove the org binding.
+      // Clients that still send a slug (older plugin builds, legacy web) and
+      // every non-login purpose stay organization-bound.
       const bindingScope: LoginPermitBindingScope =
-        purpose === 'login' && clientSurface === 'web' && !orgSlug
+        purpose === 'login' && !orgSlug
           ? 'account'
           : 'organization_account';
       let orgId: string | undefined;

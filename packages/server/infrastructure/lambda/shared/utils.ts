@@ -25,7 +25,7 @@ import {
 import type { QueryCommandInput } from '@aws-sdk/lib-dynamodb';
 import { AdminGetUserCommand, CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import { EDITION } from './edition';
 import { emitSecurityMetric } from './metrics';
@@ -668,6 +668,7 @@ export async function assertUserNotRevoked(user: UserContext): Promise<void> {
   );
 
   if (result.Item) {
+    await emitSecurityMetric('RevokedSessionAccess');
     throw new AuthError('Access has been revoked. Contact your administrator.', 403);
   }
 }
@@ -713,6 +714,7 @@ async function assertTokenNewerThanLogoutCutoff(user: UserContext): Promise<void
   if (typeof tokenIssuedSec !== 'number') return;
 
   if (tokenIssuedSec * 1000 < logoutAt) {
+    await emitSecurityMetric('RevokedSessionAccess');
     throw new AuthError('Session ended. Please sign in again.', 401);
   }
 }
@@ -738,10 +740,12 @@ async function assertSessionActiveIfPresent(
     session.userId !== user.userId ||
     session.orgId !== user.orgId
   ) {
+    await emitSecurityMetric('RevokedSessionAccess');
     throw new AuthError('Session has been revoked. Please sign in again.', 401);
   }
 
   if (new Date(session.expiresAt) <= new Date()) {
+    await emitSecurityMetric('SessionRejection');
     throw new AuthError('Session expired. Please sign in again.', 401);
   }
 }
@@ -795,6 +799,7 @@ export function assertSessionAgePolicy(user: UserContext, settings: OrgSettings)
 
   const authAgeMs = Date.now() - user.authTime * 1000;
   if (authAgeMs > getSessionDurationMs(settings)) {
+    void emitSecurityMetric('SessionRejection');
     throw new AuthError(
       'Session duration limit reached. Please sign in again.',
       401
@@ -916,6 +921,7 @@ export async function applySessionHeaderPolicy(
       return;
     }
     if (mode === 'enforce') {
+      await emitSecurityMetric('SessionRejection');
       throw new AuthError(
         'A VaultGuard session is required. Please sign in again.',
         401
@@ -1640,7 +1646,7 @@ function extractAgentHeaders(
 export async function logAudit(
   entry: Omit<AuditEntry, 'id' | 'timestamp'> & { id?: string; timestamp?: string },
   event?: APIGatewayProxyEvent
-): Promise<void> {
+): Promise<boolean> {
   const id = entry.id || generateId();
   const timestamp = entry.timestamp || new Date().toISOString();
   const dateStr = timestamp.split('T')[0]; // YYYY-MM-DD
@@ -1659,7 +1665,7 @@ export async function logAudit(
     }
   }
   if (orgSettings?.disabledAuditActions?.includes(entry.action)) {
-    return;
+    return true;
   }
 
   const expiresAtTtl = computeAuditExpiryTtl(orgSettings, timestamp);
@@ -1706,10 +1712,17 @@ export async function logAudit(
         Item: auditEntry,
       })
     );
+    return true;
   } catch (err) {
     // Audit logging should never block the main operation.
-    // Log the failure for monitoring but don't throw.
-    console.error('[AUDIT_LOG_FAILURE]', err, { action: auditEntry.action, userId: auditEntry.userId, orgId: auditEntry.orgId });
+    // Signal the failure independently and return a truthful delivery outcome,
+    // but don't throw into the business operation.
+    console.error('[AUDIT_LOG_FAILURE]', (err as Error).message, {
+      action: auditEntry.action,
+      userId: auditEntry.userId,
+      orgId: auditEntry.orgId,
+    });
+    return false;
   }
 }
 
@@ -1901,22 +1914,46 @@ export function validateRequiredFields(
   }
 }
 
+/** API Gateway's hard request-body ceiling. Route handlers should pass a lower cap when possible. */
+export const API_GATEWAY_BODY_MAX_BYTES = 10 * 1024 * 1024;
+
 /**
- * Safely parses the event body as JSON.
- * Returns an empty object if body is null or invalid JSON.
+ * Safely parses the event body as a JSON object.
+ *
+ * The byte limit is checked before base64 decoding and JSON parsing. The
+ * default preserves the encrypted file-upload surface (which legitimately
+ * approaches API Gateway's 10 MiB ceiling); small JSON handlers pass a lower
+ * route-specific limit. Arrays, null, and scalar JSON values are rejected so
+ * downstream field validation can never turn a malformed body into a 500.
  *
  * @param event - The API Gateway event
+ * @param maxBytes - Maximum decoded UTF-8 body size accepted by this route
  * @returns Parsed body object
  */
-export function parseBody(event: APIGatewayProxyEvent): Record<string, unknown> {
+export function parseBody(
+  event: APIGatewayProxyEvent,
+  maxBytes: number = API_GATEWAY_BODY_MAX_BYTES
+): Record<string, unknown> {
   if (!event.body) return {};
 
   try {
+    const bodyBytes = event.isBase64Encoded
+      ? Buffer.byteLength(event.body, 'base64')
+      : Buffer.byteLength(event.body, 'utf8');
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || bodyBytes > maxBytes) {
+      throw new ValidationError(`Request body exceeds the ${maxBytes}-byte limit`);
+    }
+
     const body = event.isBase64Encoded
       ? Buffer.from(event.body, 'base64').toString('utf-8')
       : event.body;
-    return JSON.parse(body);
-  } catch {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new ValidationError('Request body must be a JSON object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof ValidationError) throw err;
     throw new ValidationError('Invalid JSON in request body');
   }
 }
@@ -2199,7 +2236,6 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
 
 export const DISABLEABLE_AUDIT_ACTIONS = [
   'files.list',
-  'files.read',
   'files.history',
   'files.sync',
   'vault.overview',

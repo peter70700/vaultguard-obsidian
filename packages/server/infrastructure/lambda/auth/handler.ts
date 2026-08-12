@@ -17,7 +17,7 @@
  * - POST /auth/confirm-reset   — Verify reset code and set new password (no auth required)
  */
 
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { KMSClient, GenerateDataKeyCommand, DecryptCommand } from '@aws-sdk/client-kms';
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
 import type { QueryCommandInput } from '@aws-sdk/lib-dynamodb';
@@ -46,8 +46,8 @@ import {
   getVaultMembership,
   AuthError,
   ValidationError,
-  UserContext,
-  OrgSettings,
+  type UserContext,
+  type OrgSettings,
   pathMatchesPattern,
   GetCommand,
   PutCommand,
@@ -87,6 +87,8 @@ const KEY_LEASE_DURATION_SECONDS = parseInt(process.env.KEY_LEASE_DURATION_SECON
 // the stack but the lambda wasn't redeployed.
 const REVOKED_KEYS_TABLE = process.env.REVOKED_KEYS_TABLE!;
 const MAX_CONCURRENT_LEASES = parseInt(process.env.MAX_CONCURRENT_LEASES || '10', 10);
+/** Small JSON-only auth routes never need file-upload-sized request bodies. */
+const AUTH_JSON_BODY_MAX_BYTES = 16 * 1024;
 // ESCROW_TABLE is only used by ZK recovery flows (not the login hot path).
 // Keep the silent fallback for now so a stack-deploy gap doesn't break the
 // auth lambda at module load; the recovery flow will fail loudly on its own
@@ -95,6 +97,30 @@ const ESCROW_TABLE = process.env.ESCROW_TABLE || 'VaultGuard-Escrow';
 
 const kmsClient = new KMSClient({ region: process.env.AWS_REGION || 'eu-west-1' });
 const eventBridgeClient = new EventBridgeClient({ region: process.env.AWS_REGION || 'eu-west-1' });
+
+function parseAuthBody(event: APIGatewayProxyEvent): Record<string, unknown> {
+  return parseBody(event, AUTH_JSON_BODY_MAX_BYTES);
+}
+
+function readRequiredBodyString(
+  body: Record<string, unknown>,
+  field: string,
+  maxLength: number,
+  trim: boolean = true
+): string {
+  const value = body[field];
+  if (typeof value !== 'string') {
+    throw new ValidationError(`${field} must be a string`, field);
+  }
+  const normalized = trim ? value.trim() : value;
+  if (!normalized) {
+    throw new ValidationError(`Missing required field: ${field}`, field);
+  }
+  if (normalized.length > maxLength) {
+    throw new ValidationError(`${field} exceeds the maximum allowed length`, field);
+  }
+  return normalized;
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -387,7 +413,7 @@ async function handleLogin(
   // Step 3: Audit log. Attribute the login to the plugin's bound vault (when
   // the user is a member) so it surfaces in that vault's audit view, which is
   // queried by the vaultId-index GSI.
-  const auditVaultId = await resolveAuditVaultId(user, parseBody(event));
+  const auditVaultId = await resolveAuditVaultId(user, parseAuthBody(event));
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
@@ -434,7 +460,7 @@ async function handleRefresh(
   const orgSettings = await getRequiredOrgSettings(user);
   assertMfaPolicy(user, orgSettings);
   assertSessionAgePolicy(user, orgSettings);
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['sessionId', 'refreshToken']);
 
   const sessionId = body.sessionId as string;
@@ -618,10 +644,10 @@ async function handleLogout(
 ): Promise<APIGatewayProxyResult> {
   const user = await verifyActiveUser(event, { allowPendingCheckout: true });
   requireOrgId(user);
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['sessionId']);
 
-  const sessionId = body.sessionId as string;
+  const sessionId = readRequiredBodyString(body, 'sessionId', 256);
 
   // Validate ownership
   const session = await getSession(sessionId);
@@ -889,7 +915,7 @@ async function handleAiKeyPut(
 ): Promise<APIGatewayProxyResult> {
   const user = await verifyActiveUser(event);
   const orgId = requireOrgId(user);
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   const vaultId = requireAiKeyVaultId(body.vaultId);
   await requireVaultMember(user, vaultId, 'viewer');
 
@@ -1073,7 +1099,7 @@ async function handleRevoke(
     throw new AuthError('Admin privileges required', 403);
   }
 
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['targetUserId', 'reason']);
 
   const targetUserId = body.targetUserId as string;
@@ -1147,7 +1173,9 @@ async function handleRevoke(
     },
   });
 
-  // Step 5: Trigger re-encryption via EventBridge
+  // Step 5: Trigger re-encryption via EventBridge. Pre-assign the job id so
+  // callers can poll the truthful scope-level outcome immediately.
+  let reEncryptionJobId: string | null = generateId();
   try {
     await eventBridgeClient.send(
       new PutEventsCommand({
@@ -1160,6 +1188,7 @@ async function handleRevoke(
               orgId: admin.orgId || '',
               triggeredBy: admin.userId,
               reason,
+              jobId: reEncryptionJobId,
             }),
           },
         ],
@@ -1168,6 +1197,7 @@ async function handleRevoke(
   } catch (ebErr) {
     // Re-encryption trigger failure should not block the revocation response.
     // Admin can manually trigger via POST /re-encryption/trigger.
+    reEncryptionJobId = null;
     console.error('[AUTH_REVOKE] EventBridge publish failed:', ebErr);
   }
 
@@ -1178,6 +1208,7 @@ async function handleRevoke(
       invalidatedSessions: invalidatedCount,
       revokedLeases: revokedLeaseCount,
       revokedAt: new Date().toISOString(),
+      reEncryptionJobId,
     },
     requestId
   );
@@ -1941,12 +1972,12 @@ async function handleScopedKeyLease(
   const orgSettings = await getRequiredOrgSettings(user);
   assertMfaPolicy(user, orgSettings);
   assertSessionAgePolicy(user, orgSettings);
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['sessionId', 'scope', 'vaultId']);
 
-  const sessionId = body.sessionId as string;
-  const scope = body.scope as string;
-  const vaultId = body.vaultId as string;
+  const sessionId = readRequiredBodyString(body, 'sessionId', 256);
+  const scope = readRequiredBodyString(body, 'scope', 2048);
+  const vaultId = readRequiredBodyString(body, 'vaultId', 128);
 
   // Validate scope format
   if (!scope.startsWith('/')) {
@@ -2240,7 +2271,7 @@ async function handleSetupZk(
 ): Promise<APIGatewayProxyResult> {
   const user = await verifyActiveUser(event);
   const orgId = requireOrgId(user);
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['wrappedUMK_user', 'wrappedUMK_org', 'argon2Salt']);
 
   const wrappedUMK_user = body.wrappedUMK_user as string;
@@ -2427,7 +2458,7 @@ async function handleRecover(
     throw new AuthError('Re-authenticate to perform recovery', 401);
   }
 
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['targetUserId']);
 
   const targetUserId = body.targetUserId as string;
@@ -2576,6 +2607,10 @@ function isOperationalAwsError(err: unknown): boolean {
     || text.includes('CredentialsProviderError');
 }
 
+function isConditionalCheckFailed(err: unknown): boolean {
+  return readAwsErrorText(err).includes('ConditionalCheckFailedException');
+}
+
 function logPasswordResetFailure(stage: string, err: unknown): void {
   const message = err instanceof Error ? err.message : String(err);
   console.error(`[AUTH_PASSWORD_RESET_FAILURE] stage=${stage}`, message);
@@ -2626,10 +2661,11 @@ async function handleForgotPassword(
     return resp;
   };
 
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['email', 'clientId']);
 
-  const email = (body.email as string).trim().toLowerCase();
+  const email = readRequiredBodyString(body, 'email', 320).toLowerCase();
+  readRequiredBodyString(body, 'clientId', 256);
   const resetKey = { sessionId: `password_reset#${email}` };
 
   // Per-email request throttle. Without this, the failed-attempt counter can
@@ -2805,12 +2841,13 @@ async function handleConfirmReset(
   event: APIGatewayProxyEvent,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['email', 'code', 'newPassword', 'clientId']);
 
-  const email = (body.email as string).trim().toLowerCase();
-  const code = body.code as string;
-  const newPassword = body.newPassword as string;
+  const email = readRequiredBodyString(body, 'email', 320).toLowerCase();
+  const code = readRequiredBodyString(body, 'code', 128);
+  const newPassword = readRequiredBodyString(body, 'newPassword', 1024, false);
+  readRequiredBodyString(body, 'clientId', 256);
 
   // Look up the reset code from DynamoDB
   const resetKey = { sessionId: `password_reset#${email}` };
@@ -2844,23 +2881,23 @@ async function handleConfirmReset(
   const codeMatches = storedHash
     ? verifyResetCodeHash(email, code, storedHash)
     : Boolean(legacyPlaintext) && legacyPlaintext === code;
+  const fingerprintCondition = storedHash
+    ? 'resetCodeHash = :expectedCodeHash'
+    : legacyPlaintext
+      ? 'resetCode = :expectedCode'
+      : 'attribute_not_exists(resetCodeHash) AND attribute_not_exists(resetCode)';
+  const fingerprintValues = storedHash
+    ? { ':expectedCodeHash': storedHash }
+    : legacyPlaintext
+      ? { ':expectedCode': legacyPlaintext }
+      : {};
+  const expectedExpiresAt = result.Item.expiresAt;
 
   if (!codeMatches) {
     // Atomically consume a guess against the exact reset row we just read.
     // The former read-then-unconditional-update let concurrent requests all
     // observe attempts=4 and continue beyond the cap. The row fingerprint also
     // prevents an old request from consuming a newly-issued replacement code.
-    const fingerprintCondition = storedHash
-      ? 'resetCodeHash = :expectedCodeHash'
-      : legacyPlaintext
-        ? 'resetCode = :expectedCode'
-        : 'attribute_not_exists(resetCodeHash) AND attribute_not_exists(resetCode)';
-    const fingerprintValues = storedHash
-      ? { ':expectedCodeHash': storedHash }
-      : legacyPlaintext
-        ? { ':expectedCode': legacyPlaintext }
-        : {};
-    const expectedExpiresAt = result.Item.expiresAt;
     let updatedAttempts: number;
     try {
       const updateResult = await docClient.send(new UpdateCommand({
@@ -2919,6 +2956,71 @@ async function handleConfirmReset(
     return formatError(400, 'Invalid or expired reset code. Please request a new one.', requestId);
   }
 
+  // Atomically claim this exact reset-code generation before ANY Cognito
+  // mutation. A correct-code race used to let both requests pass the read and
+  // both reach AdminSetUserPassword. The short lease gives a crashed Lambda a
+  // bounded recovery path, while every handled failure below releases only
+  // its own claim. A replacement code is protected by the exact
+  // fingerprint+expiry condition and can never be released/deleted by this
+  // stale request.
+  const confirmationOwner = generateId();
+  const confirmationClaimNow = Date.now();
+  const confirmationClaimExpiresAt = confirmationClaimNow + 2 * 60 * 1000;
+  try {
+    await docClient.send(new UpdateCommand({
+      TableName: SESSIONS_TABLE,
+      Key: resetKey,
+      UpdateExpression:
+        'SET confirmationOwner = :confirmationOwner, confirmationClaimExpiresAt = :confirmationClaimExpiresAt',
+      ConditionExpression:
+        `attribute_exists(sessionId) AND ` +
+        `expiresAt = :expectedExpiresAt AND expiresAt > :confirmationNowIso AND ` +
+        `(attribute_not_exists(attempts) OR attempts < :max) AND ` +
+        `(${fingerprintCondition}) AND ` +
+        `(attribute_not_exists(confirmationOwner) OR confirmationClaimExpiresAt < :confirmationClaimNow)`,
+      ExpressionAttributeValues: {
+        ':confirmationOwner': confirmationOwner,
+        ':confirmationClaimExpiresAt': confirmationClaimExpiresAt,
+        ':confirmationClaimNow': confirmationClaimNow,
+        ':confirmationNowIso': new Date(confirmationClaimNow).toISOString(),
+        ':expectedExpiresAt': expectedExpiresAt,
+        ':max': MAX_RESET_ATTEMPTS,
+        ...fingerprintValues,
+      },
+    }));
+  } catch (err: unknown) {
+    if (isConditionalCheckFailed(err)) {
+      return formatError(400, 'Invalid or expired reset code. Please request a new one.', requestId);
+    }
+    logPasswordResetFailure('claim_confirmation', err);
+    return formatError(500, 'Password reset is temporarily unavailable. Please try again later.', requestId);
+  }
+
+  const releaseConfirmationClaim = async (stage: string): Promise<void> => {
+    try {
+      await docClient.send(new UpdateCommand({
+        TableName: SESSIONS_TABLE,
+        Key: resetKey,
+        UpdateExpression: 'REMOVE confirmationOwner, confirmationClaimExpiresAt',
+        ConditionExpression:
+          `expiresAt = :expectedExpiresAt AND (${fingerprintCondition}) AND ` +
+          `confirmationOwner = :confirmationOwner`,
+        ExpressionAttributeValues: {
+          ':expectedExpiresAt': expectedExpiresAt,
+          ':confirmationOwner': confirmationOwner,
+          ...fingerprintValues,
+        },
+      }));
+    } catch (err: unknown) {
+      if (!isConditionalCheckFailed(err)) {
+        // The response remains a failure. If cleanup itself is unavailable,
+        // the owner lease expires and the same code becomes retryable within
+        // two minutes without risking a second concurrent Cognito mutation.
+        logPasswordResetFailure(`release_confirmation_${stage}`, err);
+      }
+    }
+  };
+
   // SD-02-F2: resolve the identity BEFORE the password is set, so an
   // operational Cognito failure aborts while this request is still a no-op.
   // The sweep below is keyed by the Cognito `sub`; neither it nor the optional
@@ -2932,6 +3034,7 @@ async function handleConfirmReset(
     // routing those into the generic 400 would tell the user "request a new
     // code" for a failure that has nothing to do with their code.
     logPasswordResetFailure('resolve_identity', err);
+    await releaseConfirmationClaim('resolve_identity');
     return formatError(500, 'Password reset is temporarily unavailable. Please try again later.', requestId);
   }
 
@@ -2940,6 +3043,7 @@ async function handleConfirmReset(
     // so the endpoint stays enumeration-safe. Deliberately no reset-row delete
     // and no attempts increment — the code was valid, the account lookup was
     // not — and critically NO password is changed.
+    await releaseConfirmationClaim('unidentified_account');
     return formatError(400, 'Invalid or expired reset code. Please request a new one.', requestId);
   }
 
@@ -2959,12 +3063,15 @@ async function handleConfirmReset(
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Password reset failed';
     if (isInvalidPasswordError(err) || message.includes('InvalidPasswordException')) {
+      await releaseConfirmationClaim('invalid_password');
       return formatError(400, 'Password does not meet requirements. Must be 12+ characters with uppercase, lowercase, numbers, and symbols.', requestId);
     }
     if (isOperationalAwsError(err)) {
       logPasswordResetFailure('set_password', err);
+      await releaseConfirmationClaim('set_password');
       return formatError(500, 'Password reset is temporarily unavailable. Please try again later.', requestId);
     }
+    await releaseConfirmationClaim('set_password_rejected');
     return formatError(400, 'Password reset failed. Please request a new code and try again.', requestId);
   }
 
@@ -3050,11 +3157,33 @@ async function handleConfirmReset(
     // row survives for the retry. AdminSetUserPassword is idempotent for this
     // purpose — the retry re-sets the same password the user just chose.
     logPasswordResetFailure(sweepStep, err);
+    await releaseConfirmationClaim(sweepStep);
     return formatError(500, 'Password reset is temporarily unavailable. Please try again later.', requestId);
   }
 
-  // Clean up the used reset code
-  await docClient.send(new DeleteCommand({ TableName: SESSIONS_TABLE, Key: resetKey }));
+  // Consume only the exact reset generation claimed by this request. If a
+  // caller requested a replacement code during the sweep, its row survives.
+  try {
+    await docClient.send(new DeleteCommand({
+      TableName: SESSIONS_TABLE,
+      Key: resetKey,
+      ConditionExpression:
+        `expiresAt = :expectedExpiresAt AND (${fingerprintCondition}) AND ` +
+        `confirmationOwner = :confirmationOwner`,
+      ExpressionAttributeValues: {
+        ':expectedExpiresAt': expectedExpiresAt,
+        ':confirmationOwner': confirmationOwner,
+        ...fingerprintValues,
+      },
+    }));
+  } catch (err: unknown) {
+    if (!isConditionalCheckFailed(err)) {
+      logPasswordResetFailure('consume_confirmation', err);
+      return formatError(500, 'Password reset is temporarily unavailable. Please try again later.', requestId);
+    }
+    // A newer code replaced the claimed row. The password and revocation
+    // sweep succeeded; returning 200 is correct, and the replacement remains.
+  }
 
   return formatSuccess(200, {
     message: 'Password reset successfully. You can now sign in with your new password.',
@@ -3137,7 +3266,7 @@ async function handleStoreRecoveryCodes(
 ): Promise<APIGatewayProxyResult> {
   const user = await verifyActiveUser(event);
 
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['codes']);
 
   const rawCodes = body.codes;
@@ -3293,7 +3422,7 @@ async function handleVerifyRecoveryCode(
   event: APIGatewayProxyEvent,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  const body = parseBody(event);
+  const body = parseAuthBody(event);
   validateRequiredFields(body, ['email', 'code']);
 
   const email = String(body.email).trim().toLowerCase();

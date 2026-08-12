@@ -2442,11 +2442,27 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   color: var(--color-green, #2ea043);
 }
 
-/* ─── Login footer / setup-guide docs link ───────────────────────────── */
+/* ─── Login footer / signup + setup-guide links ──────────────────────── */
 
 .vaultguard-login-footer {
   margin-top: 18px;
   text-align: center;
+}
+
+.vaultguard-login-signup {
+  font-size: 0.82em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.vaultguard-login-signup-link {
+  color: var(--interactive-accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.vaultguard-login-signup-link:hover {
+  text-decoration: underline;
 }
 
 .vaultguard-login-docs-link {

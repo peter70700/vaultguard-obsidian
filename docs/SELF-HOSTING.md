@@ -145,6 +145,9 @@ defaults are sensible for a first deployment; you only need to change
 - **`vaultguard_allow_public_signup`** — When `true`, `POST /signup` stays open
   after your first admin organization is created. Set to `false` for a closed
   deployment.
+- **`turnstile_secret_arn`** — Keep the CE example's explicit empty value while
+  managed verification is disabled. Pro deployments instead export a real,
+  stage-specific Secrets Manager ARN through `TF_VAR_turnstile_secret_arn`.
 - **Google Workspace DNS records** — the Workspace site-verification TXT and
   DKIM TXT records are managed manually in the Route 53 console (terraform
   doesn't model them, so a forgotten `-var-file` cannot destroy a live DKIM
@@ -172,8 +175,18 @@ npm run build:lambdas
 ```bash
 cd ../terraform
 terraform init
-terraform plan -var-file=environments/ce.tfvars
-terraform apply -var-file=environments/ce.tfvars
+export TF_VAR_turnstile_secret_arn=""
+terraform plan -input=false -var="stage=dev" -var-file=environments/ce.tfvars
+```
+
+The empty CE value is explicit public configuration, not a secret. Do not put a
+real Pro ARN on the command line or save a plan; plans can retain resolved
+inputs. In Pro, `-var-file` has higher precedence than `TF_VAR_*`, so the Pro
+examples remain comment-only. After reviewing the plan, apply separately with
+the same explicit stage, var-file, and exported input:
+
+```bash
+terraform apply -var="stage=dev" -var-file=environments/ce.tfvars
 ```
 
 The first `terraform apply` typically takes 4–8 minutes. When it finishes,
@@ -203,7 +216,8 @@ When you pull updated Lambda source, rebuild before each apply:
 cd packages/server/infrastructure
 npm run build:lambdas
 cd ../terraform
-terraform apply -var-file=environments/ce.tfvars
+terraform plan -input=false -var="stage=dev" -var-file=environments/ce.tfvars
+# Review first; then run the explicit apply command above.
 ```
 
 ***

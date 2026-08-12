@@ -9,6 +9,8 @@
       "!**/dist/**",
       "!build",
       "!**/build/**",
+      "!coverage",
+      "!**/coverage/**",
       "!main.js",
       "!packages/plugin/main.js",
       "!infrastructure/dist",
@@ -22,9 +24,6 @@
       "!landing/**",
       "!share-bridge/**",
       "!dev-server/**",
-      "!src/**",
-      "!tests/**",
-      "!infrastructure/lambda/**",
       "!infrastructure/send-test-emails.ts",
       "!esbuild.config.mjs",
       "!version-bump.mjs",
@@ -41,8 +40,19 @@
     "enabled": true,
     "rules": {
       "preset": "recommended",
+      "correctness": {
+        "noConstantCondition": "warn",
+        "noVoidTypeReturn": "warn"
+      },
       "suspicious": {
-        "useBiomeIgnoreFolder": "off"
+        "noAssignInExpressions": "warn",
+        "noControlCharactersInRegex": "warn",
+        "noExportsInTest": "warn",
+        "noImplicitAnyLet": "warn",
+        "noNonNullAssertedOptionalChain": "warn",
+        "noShadowRestrictedNames": "warn",
+        "useBiomeIgnoreFolder": "off",
+        "useIterableCallbackReturn": "warn"
       }
     }
   },
@@ -78,7 +88,20 @@
       ],
       "linter": {
         "rules": {
-          "suspicious": { "noConsole": "off" }
+          "correctness": {
+            "noConstantCondition": "warn",
+            "noVoidTypeReturn": "warn"
+          },
+          "suspicious": {
+            "noAssignInExpressions": "warn",
+            "noConsole": "off",
+            "noControlCharactersInRegex": "warn",
+            "noExportsInTest": "warn",
+            "noImplicitAnyLet": "warn",
+            "noNonNullAssertedOptionalChain": "warn",
+            "noShadowRestrictedNames": "warn",
+            "useIterableCallbackReturn": "warn"
+          }
         }
       }
     }

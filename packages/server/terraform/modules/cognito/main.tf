@@ -161,6 +161,15 @@ resource "aws_cognito_user_pool" "main" {
     enabled = true
   }
 
+  # Feature plan must be stated explicitly, not left computed. Threat protection
+  # (advanced_security_mode AUDIT/ENFORCED) is a PLUS-plan feature under AWS's
+  # current Cognito feature-plan model, so setting the add-on while the pool sits
+  # on ESSENTIALS either fails with InvalidParameterException or silently upgrades
+  # the plan — and the per-MAU rate with it (eu-central-1 tier 1: ESSENTIALS
+  # $0.0150, PLUS $0.0200). Deriving the tier here keeps the billing change
+  # visible in `terraform plan` instead of landing as a surprise on the invoice.
+  user_pool_tier = var.advanced_security_mode == "OFF" ? "ESSENTIALS" : "PLUS"
+
   user_pool_add_ons {
     advanced_security_mode = var.advanced_security_mode
   }
@@ -233,7 +242,7 @@ resource "aws_lambda_function" "pre_authentication" {
   memory_size   = 128
 
   filename         = data.archive_file.pre_authentication.output_path
-  source_code_hash = filebase64sha256("${path.module}/../../../infrastructure/dist/auth/handler.js")
+  source_code_hash = data.archive_file.pre_authentication.output_base64sha256
 
   environment {
     variables = {
@@ -253,7 +262,23 @@ resource "aws_lambda_function" "pre_authentication" {
       )
       error_message = "observe/enforce login verification requires a non-empty managed app-client allowlist."
     }
+    precondition {
+      condition     = var.login_verification_mode == "disabled" || var.turnstile_secret_arn != ""
+      error_message = "observe/enforce login verification requires an explicit stage-specific turnstile_secret_arn."
+    }
   }
+}
+
+# Managed log group for the Pre Authentication trigger. Without this, Lambda
+# auto-creates the group on first invoke with NEVER-EXPIRE retention, outside
+# Terraform's control — unbounded cost and an unbounded retention window for a
+# function that sees every login attempt. Retention matches the Lambda module's
+# production_hardening gate rather than the stage name (SD-12-F12).
+resource "aws_cloudwatch_log_group" "pre_authentication" {
+  name              = "/aws/lambda/${aws_lambda_function.pre_authentication.function_name}"
+  retention_in_days = var.production_hardening ? 365 : 7
+
+  tags = { Name = "vaultguard-cognito-pre-authentication-${var.stage}" }
 }
 
 resource "aws_lambda_permission" "allow_cognito_pre_authentication" {
@@ -337,3 +362,4 @@ resource "aws_cognito_user_pool_domain" "main" {
 output "user_pool_id" { value = aws_cognito_user_pool.main.id }
 output "user_pool_arn" { value = aws_cognito_user_pool.main.arn }
 output "client_id" { value = aws_cognito_user_pool_client.plugin.id }
+output "pre_authentication_function_name" { value = aws_lambda_function.pre_authentication.function_name }
