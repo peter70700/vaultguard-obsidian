@@ -171,10 +171,31 @@ export class FilePermissionHeader {
    * just like markdown files.
    * Returns null for a view with no backing file — everything downstream of the
    * lookup (rule fetch, cache, render, teardown) is path-based and view-agnostic.
+   *
+   * Sidebar fallback: Obsidian activates a leaf on `pointerdown` (RIGHT button
+   * included) and on `focusin` — every WorkspaceLeaf container wires
+   * `setActiveLeaf(leaf)` to both. So any click in a sidebar (right-clicking a
+   * file in the explorer to open its context menu, the search pane, VaultGuard's
+   * own sidebar) makes that sidebar leaf active, and `getActiveViewOfType` —
+   * which resolves purely off `workspace.activeLeaf` — returns null even though
+   * the note is still open and visible. Without the fallback, update() reads
+   * that null as "no file view" and tears the banner down (plus any open Manage
+   * panel), which is exactly the disappearing-header bug. `getMostRecentLeaf()`
+   * searches only the root split and pop-outs — never the sidebars — so it
+   * resolves the note the user is actually looking at.
    */
   private activeFileView(): FileView | null {
-    const view = this.ctx.app.workspace.getActiveViewOfType(FileView);
-    return view && view.file ? view : null;
+    const workspace = this.ctx.app.workspace;
+    const view = workspace.getActiveViewOfType(FileView);
+    // An active FileView is authoritative either way: with a file it's our
+    // target, without one (file-backed view still loading / detached) the
+    // header is correctly suppressed. Only a NON-FileView active leaf — the
+    // sidebar-focus case — falls through to the most-recent main-area leaf.
+    if (view) return view.file ? view : null;
+
+    if (typeof workspace.getMostRecentLeaf !== "function") return null;
+    const recentView = workspace.getMostRecentLeaf()?.view;
+    return recentView instanceof FileView && recentView.file ? recentView : null;
   }
 
   /**
