@@ -397,6 +397,14 @@ export interface RemoteFileContentResponse {
   encrypted?: boolean;
 }
 
+export interface ApiRequestRuntimeOptions {
+  timeoutMs?: number;
+  /** Restrict one call without changing the user's global retry preference. */
+  maxAttempts?: number;
+}
+
+export type RemoteFileFetchOptions = ApiRequestRuntimeOptions;
+
 export interface RemoteFileWriteResponse {
   path?: string;
   size?: number;
@@ -516,6 +524,18 @@ export type MutationIntent =
   | { kind: "force" }
   | { kind: "unknown" };
 
+export type ProtectedContentGate =
+  | { ok: true }
+  | {
+      ok: false;
+      reason:
+        | "at-rest-unavailable"
+        | "needs-recovery"
+        | "binding-unverified"
+        | "wrong-account";
+      message: string;
+    };
+
 export interface AtRestAdapterRuntimeContext {
   app: App;
   readonly manifestId: string | undefined;
@@ -556,6 +576,7 @@ export interface AtRestAdapterRuntimeContext {
   getOfflineQueue(): OfflineQueueOperation[];
   getPermissionStore(): PermissionStore;
   hasWarmedAtLeastOnce(): boolean;
+  getProtectedContentGate?(): ProtectedContentGate;
 
   saveSettings(): Promise<void>;
   openVaultGuardSettings(): void;
@@ -669,11 +690,17 @@ export interface AtRestAdapterRuntimeContext {
     body?: Record<string, unknown>,
     idTokenOverride?: string,
     // L2 (BIN-A): optional per-request timeout override threaded to requestWithTimeout.
-    options?: { timeoutMs?: number },
+    options?: ApiRequestRuntimeOptions,
   ): Promise<ApiResponse<T>>;
   vaultPath(suffix?: string): string;
-  readFileDecrypted(path: string): Promise<ApiResponse<RemoteFileContentResponse>>;
-  fetchRemoteFileContent(path: string): Promise<ApiResponse<RemoteFileContentResponse>>;
+  readFileDecrypted(
+    path: string,
+    options?: RemoteFileFetchOptions,
+  ): Promise<ApiResponse<RemoteFileContentResponse>>;
+  fetchRemoteFileContent(
+    path: string,
+    options?: RemoteFileFetchOptions,
+  ): Promise<ApiResponse<RemoteFileContentResponse>>;
   decodeRemoteFileContent(path: string, data: RemoteFileContentResponse): Promise<string>;
   decodeBase64Utf8(base64: string): string;
 
@@ -741,6 +768,7 @@ export interface SyncRuntimeContext {
    * just dropped. checkKeyLeaseRenewal consults this to early-return.
    */
   isVaultLocked(): boolean;
+  getProtectedContentGate?(): ProtectedContentGate;
   /** PL2: a lease acquisition failed transiently (not a 403) and needs retry. */
   isLeaseRetryNeeded(): boolean;
   getEffectiveSyncMode(): OrgSettingsResponse["syncMode"];
@@ -838,7 +866,10 @@ export interface SyncRuntimeContext {
   uploadFolderMarker(folderPath: string): Promise<boolean>;
   deleteFolderMarker(folderPath: string): Promise<void>;
   deleteFolderContentsOnServer(folderPath: string): Promise<void>;
-  applyRemoteChange(metadata: { path: string; size: number }): Promise<void>;
+  applyRemoteChange(
+    metadata: { path: string; size: number },
+    prefetchedResponse?: ApiResponse<RemoteFileContentResponse>,
+  ): Promise<void>;
   /**
    * Apply a server-reported deletion locally. `inferred` is true when the delta
    * came from the COLD (full-scan) sync path, where deletion is inferred from
@@ -853,14 +884,21 @@ export interface SyncRuntimeContext {
    * back to a permanent delete for inferred deletions.
    */
   trashLocalPath(path: string): Promise<boolean>;
-  readFileDecrypted(path: string): Promise<ApiResponse<RemoteFileContentResponse>>;
-  fetchRemoteFileContent(path: string): Promise<ApiResponse<RemoteFileContentResponse>>;
+  readFileDecrypted(
+    path: string,
+    options?: RemoteFileFetchOptions,
+  ): Promise<ApiResponse<RemoteFileContentResponse>>;
+  fetchRemoteFileContent(
+    path: string,
+    options?: RemoteFileFetchOptions,
+  ): Promise<ApiResponse<RemoteFileContentResponse>>;
   decodeRemoteFileContent(path: string, data: RemoteFileContentResponse): Promise<string>;
   readRemotePlaintext(path: string): Promise<string>;
   resolveReconciliationConflict(
     path: string,
     strategy: import("../types").ConflictResolutionStrategy,
     localManifest: Map<string, LocalManifestEntry>,
+    prefetchedResponse?: ApiResponse<RemoteFileContentResponse>,
   ): Promise<void>;
   hasOriginalAdapterRead(): boolean;
   hasOriginalAdapterReadBinary(): boolean;
@@ -910,7 +948,7 @@ export interface SyncRuntimeContext {
     body?: Record<string, unknown>,
     idTokenOverride?: string,
     // L2 (BIN-A): optional per-request timeout override threaded to requestWithTimeout.
-    options?: { timeoutMs?: number },
+    options?: ApiRequestRuntimeOptions,
   ): Promise<ApiResponse<T>>;
   vaultPath(suffix?: string): string;
   isNetworkError(error: unknown): boolean;

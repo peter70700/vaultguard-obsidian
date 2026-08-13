@@ -235,6 +235,9 @@ export function parseAgentTemplateAllowlistImport(
 
 export const DEFAULT_EXCLUDED_PATHS = [
   ".trash",
+  // Same-device uninstall recovery. The manifest is non-secret and capsules
+  // are sealed, but neither is vault content: never sync or at-rest-wrap them.
+  ".vaultguard",
 ] as const;
 
 export const DEFAULT_SETTINGS: VaultGuardSettings = {

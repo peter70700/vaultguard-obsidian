@@ -9,6 +9,7 @@ import { VaultGuardSidebarView } from "../src/ui/vaultguard-sidebar-view";
 import { DEFAULT_EXCLUDED_PATHS, DEFAULT_SETTINGS, SAAS_DEFAULTS } from "../src/plugin/settings";
 import { ConflictResolutionStrategy, PermissionLevel } from "../src/types";
 import { BINARY_SYNC_MAX_BYTES } from "../src/plugin/binary-content";
+import { AtRestCipher } from "../src/crypto/at-rest-cipher";
 
 const mockNotice = vi.mocked(Notice);
 const mockRequestUrl = vi.mocked(requestUrl);
@@ -138,6 +139,11 @@ function makePlugin() {
   plugin.scheduleConnectionRetry = vi.fn();
   plugin.stopConnectionRetry = vi.fn();
   plugin.derivedBindingId = "test-vault-binding";
+  // Most cases in this legacy unit harness invoke sync helpers without
+  // running plugin.onload(), so no at-rest cipher/bootstrap state exists.
+  // Treat those fixtures as explicitly healthy; protection-gate failure
+  // behavior is covered by sync-protection-gate.test.ts.
+  plugin.getProtectedContentGate = vi.fn(() => ({ ok: true }));
 
   installTestPermissionStore(plugin);
 
@@ -765,12 +771,9 @@ describe("VaultGuardPlugin writeLocalBinaryFileFromRemote (BIN-A / D-06 pull)", 
     mockNotice.mockReset();
   });
 
-  it("writes a new binary via vault.createBinary inside the applyingRemoteWrite bracket, ensuring parent folders", async () => {
+  it("writes a new binary through the direct at-rest writer without awaiting vault.createBinary", async () => {
     const plugin = makeBinaryPullPlugin();
-    let appliedDuringWrite: boolean | null = null;
-    const createBinary = vi.fn(async () => {
-      appliedDuringWrite = plugin.applyingRemoteWrite;
-    });
+    const createBinary = vi.fn(() => new Promise<void>(() => {}));
     plugin.app.vault.getAbstractFileByPath = vi.fn(() => null);
     plugin.app.vault.createBinary = createBinary;
     plugin.app.vault.modifyBinary = vi.fn();
@@ -783,16 +786,17 @@ describe("VaultGuardPlugin writeLocalBinaryFileFromRemote (BIN-A / D-06 pull)", 
     expect(plugin.ensureParentFoldersForPath).toHaveBeenCalledWith(
       "attachments/nested/photo.png"
     );
-    expect(createBinary).toHaveBeenCalledWith("attachments/nested/photo.png", bytes);
+    expect(createBinary).not.toHaveBeenCalled();
     expect(plugin.app.vault.modifyBinary).not.toHaveBeenCalled();
     // The string writers are never used for binary content.
-    expect(plugin.writePlainBinaryToDisk).not.toHaveBeenCalled();
-    // Bracket: applyingRemoteWrite is TRUE during the write, reset to false after.
-    expect(appliedDuringWrite).toBe(true);
+    expect(plugin.writePlainBinaryToDisk).toHaveBeenCalledWith(
+      "attachments/nested/photo.png",
+      bytes,
+    );
     expect(plugin.applyingRemoteWrite).toBe(false);
   });
 
-  it("modifies an existing binary via vault.modifyBinary when a TFile already exists", async () => {
+  it("overwrites an existing binary through the direct at-rest writer", async () => {
     const plugin = makeBinaryPullPlugin();
     const existing = Object.assign(new TFile(), { path: "attachments/photo.png" });
     plugin.app.vault.getAbstractFileByPath = vi.fn(() => existing);
@@ -803,12 +807,16 @@ describe("VaultGuardPlugin writeLocalBinaryFileFromRemote (BIN-A / D-06 pull)", 
     const bytes = new Uint8Array([0x89, 0x50, 0x80, 0xff]).buffer;
     await runtime.writeLocalBinaryFileFromRemote("attachments/photo.png", bytes);
 
-    expect(plugin.app.vault.modifyBinary).toHaveBeenCalledWith(existing, bytes);
+    expect(plugin.app.vault.modifyBinary).not.toHaveBeenCalled();
     expect(plugin.app.vault.createBinary).not.toHaveBeenCalled();
+    expect(plugin.writePlainBinaryToDisk).toHaveBeenCalledWith(
+      "attachments/photo.png",
+      bytes,
+    );
     expect(plugin.applyingRemoteWrite).toBe(false);
   });
 
-  it("falls back to writePlainBinaryToDisk when vault.createBinary throws", async () => {
+  it("does not call vault.createBinary even when the vault index is stale", async () => {
     const plugin = makeBinaryPullPlugin();
     plugin.app.vault.getAbstractFileByPath = vi.fn(() => null);
     plugin.app.vault.createBinary = vi.fn(async () => {
@@ -821,6 +829,7 @@ describe("VaultGuardPlugin writeLocalBinaryFileFromRemote (BIN-A / D-06 pull)", 
     await runtime.writeLocalBinaryFileFromRemote("a.png", bytes);
 
     expect(plugin.writePlainBinaryToDisk).toHaveBeenCalledWith("a.png", bytes);
+    expect(plugin.app.vault.createBinary).not.toHaveBeenCalled();
     expect(plugin.applyingRemoteWrite).toBe(false);
   });
 
@@ -933,6 +942,57 @@ describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => 
     expect(runtime.writeLocalBinaryFileFromRemote).not.toHaveBeenCalled();
   });
 
+  it("consumes a prefetched text response without issuing a duplicate GET", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.fetchRemoteFileContent = vi.fn();
+    plugin.decodeRemoteFileContent = vi.fn().mockResolvedValue("# prefetched");
+    plugin.writeLocalFileFromRemote = vi.fn().mockResolvedValue(undefined);
+    const prefetched = {
+      success: true,
+      data: { content: "prefetched-ciphertext", contentType: "text/markdown" },
+      error: null,
+      requestId: "req-prefetched",
+    };
+
+    const runtime = plugin.ensureSyncRuntime();
+    await runtime.applyRemoteChange({ path: "nested/notes/a.md", size: 17 }, prefetched);
+
+    expect(plugin.fetchRemoteFileContent).not.toHaveBeenCalled();
+    expect(plugin.decodeRemoteFileContent).toHaveBeenCalledWith(
+      "nested/notes/a.md",
+      prefetched.data,
+    );
+    expect(plugin.writeLocalFileFromRemote).toHaveBeenCalledWith(
+      "nested/notes/a.md",
+      "# prefetched",
+    );
+  });
+
+  it("does not let a prefetched response bypass the protected-content gate", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.getProtectedContentGate = vi.fn(() => ({
+      ok: false,
+      reason: "binding-unverified",
+      message: "blocked:binding-unverified",
+    }));
+    plugin.decodeRemoteFileContent = vi.fn();
+    plugin.writeLocalFileFromRemote = vi.fn();
+    const prefetched = {
+      success: true,
+      data: { content: "prefetched-ciphertext", contentType: "text/markdown" },
+      error: null,
+      requestId: "req-prefetched",
+    };
+
+    const runtime = plugin.ensureSyncRuntime();
+    await expect(
+      runtime.applyRemoteChange({ path: "nested/notes/a.md", size: 17 }, prefetched),
+    ).rejects.toThrow("blocked:binding-unverified");
+
+    expect(plugin.decodeRemoteFileContent).not.toHaveBeenCalled();
+    expect(plugin.writeLocalFileFromRemote).not.toHaveBeenCalled();
+  });
+
   it("treats an undefined contentType as text (fail-safe = today's behavior)", async () => {
     const plugin = makeApplyRemotePlugin();
     plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
@@ -982,7 +1042,7 @@ describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => 
     expect(plugin.decodeRemoteFileContent).not.toHaveBeenCalled();
   });
 
-  it("skips with a notice and no write when a binary decrypt fails (OD-2 fail-open, never wipes)", async () => {
+  it("rejects after preserving local bytes when a binary decrypt fails (OD-2 explicit no-apply)", async () => {
     const plugin = makeApplyRemotePlugin();
     plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
       success: true,
@@ -998,10 +1058,142 @@ describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => 
 
     await expect(
       runtime.applyRemoteChange({ path: "attachments/photo.png", size: 8 })
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow('could not decrypt server copy of "attachments/photo.png"');
 
     expect(plugin.notifyCloudDecryptFallback).toHaveBeenCalledWith("attachments/photo.png");
     expect(runtime.writeLocalBinaryFileFromRemote).not.toHaveBeenCalled();
+  });
+
+  it("rejects after preserving local bytes when a text decrypt fails", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: "not-decryptable", contentType: "text/markdown" },
+      error: null,
+      requestId: "req-get",
+    });
+    plugin.decodeRemoteFileContent = vi.fn().mockRejectedValue(new Error("bad tag"));
+    plugin.notifyCloudDecryptFallback = vi.fn();
+    plugin.writeLocalFileFromRemote = vi.fn();
+
+    await expect(
+      plugin.ensureSyncRuntime().applyRemoteChange({ path: "notes/a.md", size: 8 })
+    ).rejects.toThrow('could not decrypt server copy of "notes/a.md"');
+
+    expect(plugin.notifyCloudDecryptFallback).toHaveBeenCalledWith("notes/a.md");
+    expect(plugin.writeLocalFileFromRemote).not.toHaveBeenCalled();
+  });
+
+  it("blocks the plan when comparison cannot decrypt and performs no at-rest mutation", async () => {
+    const plugin = makeApplyRemotePlugin();
+    const originalPath = "notes/conflicted.md";
+    const localContent = "# local survives";
+    const disk = new Map<string, ArrayBuffer>();
+    let wrappedLak: string | null = null;
+    let fallbackKek: string | null = null;
+    const cipher = new AtRestCipher({
+      loadWrappedLak: async () => wrappedLak,
+      saveWrappedLak: async (value) => { wrappedLak = value; },
+      clearWrappedLak: async () => { wrappedLak = null; },
+      loadFallbackKek: async () => fallbackKek,
+      saveFallbackKek: async (value) => { fallbackKek = value; },
+      clearFallbackKek: async () => { fallbackKek = null; },
+    });
+    await expect(cipher.init()).resolves.toBe(true);
+    plugin.atRestCipher = cipher;
+    plugin.originalAdapterMethods = {
+      read: vi.fn(async (path: string) =>
+        new TextDecoder().decode(disk.get(path) ?? new ArrayBuffer(0))),
+      readBinary: vi.fn(async (path: string) =>
+        (disk.get(path) ?? new ArrayBuffer(0)).slice(0)),
+      write: vi.fn(async (path: string, value: string) => {
+        disk.set(path, new TextEncoder().encode(value).buffer as ArrayBuffer);
+      }),
+      writeBinary: vi.fn(async (path: string, value: ArrayBuffer) => {
+        disk.set(path, value.slice(0));
+      }),
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    await plugin.writePlainToDisk(originalPath, localContent);
+    const originalBefore = disk.get(originalPath)!.slice(0);
+    const originalFile = Object.assign(new TFile(), { path: originalPath });
+    const indexed = new Map<string, TFile>([[originalPath, originalFile]]);
+    plugin.app.vault.getFiles = vi.fn(() => [...indexed.values()]);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.app.vault.getAbstractFileByPath = vi.fn((path: string) => indexed.get(path) ?? null);
+    plugin.app.vault.create = vi.fn(async (path: string, content: string) => {
+      await plugin.interceptedWrite(path, content);
+      indexed.set(path, Object.assign(new TFile(), { path }));
+    });
+    plugin.app.vault.modify = vi.fn(async (_file: TFile, content: string) => {
+      await plugin.interceptedWrite(originalPath, content);
+    });
+    plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.connectionState.status = "online";
+    plugin.isOnline = vi.fn(() => true);
+    plugin.vaultLeaseDenied = false;
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.settings.lastSyncTimestamp = "2026-08-11T00:00:00.000Z";
+    plugin.syncState.lastSync = "2026-08-11T00:00:00.000Z";
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.askReconciliationPlan = vi.fn().mockResolvedValue({
+      proceed: true,
+      conflictStrategy: ConflictResolutionStrategy.DUPLICATE,
+    });
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            deltas: [{
+              path: `/${originalPath}`,
+              action: "created",
+              lastModified: "2026-08-12T00:00:00.000Z",
+              checksum: "remote-checksum",
+              size: 64,
+            }],
+            syncTimestamp: "2026-08-12T00:00:01.000Z",
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: { content: "foreign-ciphertext", contentType: "text/markdown" },
+      error: null,
+      requestId: "req-get",
+    });
+    plugin.decodeRemoteFileContent = vi.fn().mockRejectedValue(new Error("wrong cloud key"));
+    plugin.readFileDecrypted = vi.fn().mockResolvedValue({
+      success: false,
+      data: null,
+      error: { message: "server decrypt unavailable" },
+      requestId: "req-decrypted",
+    });
+    plugin.notifyCloudDecryptFallback = vi.fn();
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(false);
+
+    expect(plugin.fetchRemoteFileContent).toHaveBeenCalledTimes(1);
+    expect(plugin.readFileDecrypted).toHaveBeenCalledWith(originalPath, {
+      timeoutMs: 15000,
+      maxAttempts: 1,
+    });
+    expect(plugin.decodeRemoteFileContent).toHaveBeenCalledTimes(1);
+    expect(plugin.askReconciliationPlan).not.toHaveBeenCalled();
+    expect(plugin.settings.bindingReconciledVaultId).toBeUndefined();
+    expect(plugin.settings.lastSyncTimestamp).toBe("2026-08-11T00:00:00.000Z");
+    expect(plugin.syncState.lastSync).toBe("2026-08-11T00:00:00.000Z");
+    expect(plugin.syncState.lastError).toContain("could not safely compare 1 server file");
+    expect(new Uint8Array(disk.get(originalPath)!)).toEqual(new Uint8Array(originalBefore));
+    expect([...disk.keys()].some((path) => path.includes(" (conflict "))).toBe(false);
+    expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
   });
 
   it("does not decrypt previously cached cloud ciphertext outside lease-authorized paths", async () => {
@@ -1050,6 +1242,86 @@ describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => 
     expect(plugin.decryptContent).not.toHaveBeenCalled();
   });
 
+  it("bounds a permission-scoped server-decrypted reconciliation GET", async () => {
+    const plugin = makeApplyRemotePlugin();
+    const path =
+      "VaultGuard Demo/02 - Folders with Different Permissions/Team Shared (Everyone Edits)/Sprint Notes.md";
+    plugin.keyLease = {
+      ...plugin.keyLease,
+      deniedPaths: [{ pathPattern: "/VaultGuard Demo/02 - Folders with Different Permissions/**", ruleId: "scope-team" }],
+    };
+    plugin.connectionState.status = "online";
+    plugin.isOnline = vi.fn(() => true);
+    plugin.vaultLeaseDenied = false;
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.app.vault.getFiles = vi.fn(() => []);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
+    plugin.askReconciliationPlan = vi
+      .fn()
+      .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+    const plaintext = "# Sprint Notes";
+    plugin.apiRequest = vi.fn(async (
+      method: string,
+      endpoint: string,
+      _body?: unknown,
+      _token?: unknown,
+      options?: { timeoutMs?: number; maxAttempts?: number },
+    ) => {
+      if (method === "POST" && endpoint.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            deltas: [{
+              path: `/${path}`,
+              action: "created",
+              lastModified: "2026-08-12T00:00:00.000Z",
+              checksum: "checksum-sprint",
+              size: 256,
+            }],
+            syncTimestamp: "2026-08-12T00:00:01.000Z",
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      if (method === "GET" && endpoint.includes("/files-decrypted/")) {
+        expect(options).toEqual({ timeoutMs: 15_000, maxAttempts: 1 });
+        expect(endpoint).toContain(
+          "/files-decrypted/VaultGuard%20Demo/02%20-%20Folders%20with%20Different%20Permissions/Team%20Shared%20(Everyone%20Edits)/Sprint%20Notes.md",
+        );
+        return {
+          success: true,
+          data: {
+            content: Buffer.from(plaintext, "utf8").toString("base64"),
+            decrypted: true,
+            contentType: "text/markdown",
+          },
+          error: null,
+          requestId: "req-decrypted",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${endpoint}`);
+    });
+    plugin.writeLocalFileFromRemote = vi.fn().mockResolvedValue(undefined);
+    const applyRemoteChange = vi.fn(
+      Object.getPrototypeOf(plugin).applyRemoteChange.bind(plugin),
+    );
+    plugin.applyRemoteChange = applyRemoteChange;
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    const decryptedGets = plugin.apiRequest.mock.calls.filter(
+      ([method, endpoint]: [string, string]) =>
+        method === "GET" && endpoint.includes("/files-decrypted/"),
+    );
+    expect(decryptedGets).toHaveLength(1);
+    expect(applyRemoteChange).toHaveBeenCalledTimes(1);
+    expect(plugin.writeLocalFileFromRemote).toHaveBeenCalledWith(path, plaintext);
+  });
+
   it("still decrypts a non-denied path's raw ciphertext with the vault DEK (normal path intact)", async () => {
     const plugin = makeApplyRemotePlugin();
     plugin.keyLease = {
@@ -1085,6 +1357,18 @@ describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => 
     plugin.askReconciliationPlan = vi
       .fn()
       .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+    const progressUpdates: any[] = [];
+    const complete = vi.fn();
+    plugin.beginLongOperation = vi.fn((options: any) => {
+      progressUpdates.push(options);
+      return {
+        token: { checkpoint: vi.fn().mockResolvedValue(undefined), abortForShutdown: vi.fn() },
+        update: vi.fn((update: any) => progressUpdates.push(update)),
+        complete,
+        cancel: vi.fn(),
+        fail: vi.fn(),
+      };
+    });
 
     const fixture = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x80, 0xff]);
     const encrypted = await plugin.encryptContentBytes(fixture.buffer);
@@ -1117,6 +1401,10 @@ describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => 
       throw new Error(`Unexpected API call: ${method} ${path}`);
     });
 
+    const applyRemoteChange = vi.fn(
+      Object.getPrototypeOf(plugin).applyRemoteChange.bind(plugin),
+    );
+    plugin.applyRemoteChange = applyRemoteChange;
     const runtime = plugin.ensureSyncRuntime();
     runtime.writeLocalBinaryFileFromRemote = vi.fn().mockResolvedValue(undefined);
 
@@ -1126,6 +1414,307 @@ describe("VaultGuardPlugin applyRemoteChange binary fork (BIN-A / D-06)", () => 
     const [p, b] = runtime.writeLocalBinaryFileFromRemote.mock.calls[0];
     expect(p).toBe("attachments/photo.png");
     expect(new Uint8Array(b)).toEqual(fixture);
+    expect(applyRemoteChange).toHaveBeenCalledWith(
+      {
+        path: "attachments/photo.png",
+        size: 6,
+      },
+      expect.objectContaining({ success: true }),
+    );
+    expect(plugin.fetchRemoteFileContent).toHaveBeenCalledTimes(1);
+    expect(progressUpdates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: "Downloading server-only files",
+          totalBytes: 6,
+          message: "Downloading item 1 of 1: attachments/photo.png",
+        }),
+      ]),
+    );
+    const percents = progressUpdates
+      .map((update) => update.percent)
+      .filter((percent): percent is number => typeof percent === "number");
+    expect(percents.every((percent, index) => index === 0 || percent >= percents[index - 1])).toBe(true);
+    expect(Math.min(...percents.filter((percent) => percent >= 65))).toBe(65);
+    expect(complete).toHaveBeenCalled();
+  });
+
+  it("completes Welcome.md serverOnly recovery when vault.create never settles, using real at-rest bytes", async () => {
+    const plugin = makeApplyRemotePlugin();
+    const disk = new Map<string, ArrayBuffer>();
+    let wrappedLak: string | null = null;
+    let fallbackKek: string | null = null;
+    const cipher = new AtRestCipher({
+      loadWrappedLak: async () => wrappedLak,
+      saveWrappedLak: async (value) => { wrappedLak = value; },
+      clearWrappedLak: async () => { wrappedLak = null; },
+      loadFallbackKek: async () => fallbackKek,
+      saveFallbackKek: async (value) => { fallbackKek = value; },
+      clearFallbackKek: async () => { fallbackKek = null; },
+    });
+    await expect(cipher.init()).resolves.toBe(true);
+    plugin.atRestCipher = cipher;
+    plugin.originalAdapterMethods = {
+      read: vi.fn(async (path: string) =>
+        new TextDecoder().decode(disk.get(path) ?? new ArrayBuffer(0))),
+      readBinary: vi.fn(async (path: string) =>
+        (disk.get(path) ?? new ArrayBuffer(0)).slice(0)),
+      write: vi.fn(async (path: string, value: string) => {
+        disk.set(path, new TextEncoder().encode(value).buffer as ArrayBuffer);
+      }),
+      writeBinary: vi.fn(async (path: string, value: ArrayBuffer) => {
+        disk.set(path, value.slice(0));
+      }),
+      list: null,
+      remove: null,
+      rename: null,
+    };
+    plugin.connectionState.status = "online";
+    plugin.isOnline = vi.fn(() => true);
+    plugin.vaultLeaseDenied = false;
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.app.vault.getFiles = vi.fn(() => []);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.app.vault.create = vi.fn(() => new Promise<TFile>(() => {}));
+    plugin.app.vault.modify = vi.fn(() => new Promise<void>(() => {}));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.askReconciliationPlan = vi.fn().mockResolvedValue({
+      proceed: true,
+      conflictStrategy: ConflictResolutionStrategy.KEEP_LOCAL,
+    });
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            deltas: [{
+              path: "/Welcome.md",
+              action: "created",
+              lastModified: "2026-08-13T07:07:41.000Z",
+              checksum: "welcome-checksum",
+              size: 231,
+            }],
+            syncTimestamp: "2026-08-13T07:07:42.000Z",
+          },
+          error: null,
+          requestId: "req-sync-welcome",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+    const welcome = "# Welcome to VaultGuard\n";
+    plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        content: Buffer.from(welcome, "utf8").toString("base64"),
+        decrypted: true,
+        contentType: "text/markdown",
+        size: 231,
+      },
+      error: null,
+      requestId: "req-get-welcome",
+    });
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+
+    expect(plugin.app.vault.create).not.toHaveBeenCalled();
+    expect(plugin.app.vault.modify).not.toHaveBeenCalled();
+    expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledOnce();
+    expect(new Uint8Array(disk.get("Welcome.md")!).slice(0, 4)).toEqual(
+      new Uint8Array([0x56, 0x47, 0x31, 0x00]),
+    );
+    await expect(plugin.readPlainFromDisk("Welcome.md")).resolves.toBe(welcome);
+    expect(plugin.settings.bindingReconciledVaultId).toBe("vault-abc");
+  });
+
+  it("prefetches reconciliation serverOnly files with bounded concurrency and applies them in order", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = makeApplyRemotePlugin();
+      plugin.connectionState.status = "online";
+      plugin.isOnline = vi.fn(() => true);
+      plugin.vaultLeaseDenied = false;
+      plugin.settings.bindingReconciledVaultId = undefined;
+      plugin.app.vault.getFiles = vi.fn(() => []);
+      plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+      plugin.collectLocalFolderPaths = vi.fn(() => []);
+      plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+      plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
+      plugin.askReconciliationPlan = vi
+        .fn()
+        .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+
+      const downloadablePaths = [
+        "/root-a.md",
+        "/folder/one.md",
+        "/folder/deep/two.md",
+        "/root-b.md",
+        "/folder/three.md",
+        "/other/four.md",
+        "/other/deep/five.md",
+        "/root-c.md",
+      ];
+      const tombstonedPath = "/deleted/keep-deleted.md";
+      const paths = [...downloadablePaths, tombstonedPath];
+      plugin.settings.deletionTombstones = {
+        "deleted/keep-deleted.md": "2026-08-12T00:00:00.000Z",
+      };
+      plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+        if (method === "POST" && path.endsWith("/files/sync")) {
+          return {
+            success: true,
+            data: {
+              deltas: paths.map((remotePath, index) => ({
+                path: remotePath,
+                action: "created",
+                lastModified: "2026-08-12T00:00:00.000Z",
+                checksum: `checksum-${index}`,
+                size: 100 + index,
+              })),
+              syncTimestamp: "2026-08-12T00:00:01.000Z",
+            },
+            error: null,
+            requestId: "req-sync",
+          };
+        }
+        throw new Error(`Unexpected API call: ${method} ${path}`);
+      });
+
+      let activeFetches = 0;
+      let peakFetches = 0;
+      plugin.fetchRemoteFileContent = vi.fn(async (path: string) => {
+        activeFetches += 1;
+        peakFetches = Math.max(peakFetches, activeFetches);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        activeFetches -= 1;
+        return {
+          success: true,
+          data: { content: btoa(path), encoding: "base64", contentType: "text/markdown" },
+          error: null,
+          requestId: `get-${path}`,
+        };
+      });
+      let activeApplies = 0;
+      let peakApplies = 0;
+      plugin.applyRemoteChange = vi.fn(async () => {
+        activeApplies += 1;
+        peakApplies = Math.max(peakApplies, activeApplies);
+        await Promise.resolve();
+        activeApplies -= 1;
+      });
+      const runtime = plugin.ensureSyncRuntime();
+      runtime.deleteTombstonedServerPath = vi.fn().mockResolvedValue(true);
+
+      const reconciling = plugin.performInitialReconciliation();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(peakFetches).toBe(4);
+      expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(plugin.applyRemoteChange).toHaveBeenCalledTimes(4);
+
+      await vi.advanceTimersByTimeAsync(100);
+      await reconciling;
+
+      const normalizedPaths = downloadablePaths.map((path) => path.replace(/^\/+/, ""));
+      expect(plugin.fetchRemoteFileContent).toHaveBeenCalledTimes(downloadablePaths.length);
+      expect(plugin.fetchRemoteFileContent.mock.calls.map((call: any[]) => call[0])).toEqual(
+        normalizedPaths,
+      );
+      expect(new Set(plugin.fetchRemoteFileContent.mock.calls.map((call: any[]) => call[0])).size)
+        .toBe(downloadablePaths.length);
+      expect(plugin.applyRemoteChange).toHaveBeenCalledTimes(downloadablePaths.length);
+      expect(plugin.applyRemoteChange.mock.calls.map((call: any[]) => call[0].path)).toEqual(
+        normalizedPaths,
+      );
+      expect(peakApplies).toBe(1);
+      expect(runtime.deleteTombstonedServerPath).toHaveBeenCalledWith(
+        "deleted/keep-deleted.md",
+      );
+      for (const call of plugin.applyRemoteChange.mock.calls) {
+        expect(call[1]).toEqual(expect.objectContaining({ success: true }));
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps prior reconciliation cursors and returns false when a serverOnly download fails", async () => {
+    const plugin = makeApplyRemotePlugin();
+    plugin.connectionState.status = "online";
+    plugin.isOnline = vi.fn(() => true);
+    plugin.vaultLeaseDenied = false;
+    plugin.settings.bindingReconciledVaultId = undefined;
+    plugin.settings.lastSyncTimestamp = "2026-08-11T00:00:00.000Z";
+    plugin.syncState.lastSync = "2026-08-11T00:00:00.000Z";
+    plugin.app.vault.getFiles = vi.fn(() => []);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.uploadReconciledFile = vi.fn().mockResolvedValue("uploaded");
+    plugin.askReconciliationPlan = vi
+      .fn()
+      .mockResolvedValue({ proceed: true, conflictStrategy: "keep-local" });
+    const complete = vi.fn();
+    const fail = vi.fn();
+    plugin.beginLongOperation = vi.fn(() => ({
+      token: { checkpoint: vi.fn().mockResolvedValue(undefined), abortForShutdown: vi.fn() },
+      update: vi.fn(),
+      complete,
+      cancel: vi.fn(),
+      fail,
+    }));
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            deltas: [
+              {
+                path: "/nested/slow.md",
+                action: "created",
+                lastModified: "2026-08-12T00:00:00.000Z",
+                checksum: "checksum-slow",
+                size: 123,
+              },
+            ],
+            syncTimestamp: "2026-08-12T00:00:01.000Z",
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+    plugin.fetchRemoteFileContent = vi.fn(
+      async (_path: string, options?: { timeoutMs?: number; maxAttempts?: number }) => {
+        expect(options).toEqual({ timeoutMs: 15_000, maxAttempts: 1 });
+        return {
+          success: false,
+          data: null,
+          error: {
+            code: "NETWORK_ERROR",
+            message: "Request timeout",
+            details: null,
+            statusCode: 0,
+          },
+          requestId: "",
+        };
+      },
+    );
+
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(false);
+
+    expect(plugin.settings.bindingReconciledVaultId).toBeUndefined();
+    expect(plugin.settings.lastSyncTimestamp).toBe("2026-08-11T00:00:00.000Z");
+    expect(plugin.syncState.lastSync).toBe("2026-08-11T00:00:00.000Z");
+    expect(plugin.syncState.status).toBe("error");
+    expect(plugin.syncState.lastError).toContain("previous sync cursor was kept");
+    expect(complete).not.toHaveBeenCalled();
+    expect(fail).toHaveBeenCalledOnce();
   });
 });
 
@@ -1410,6 +1999,44 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
           String(message).includes("Connection lost")
         )
       ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("limits a sync-prefetch GET to one timed-out requestUrl attempt", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = makePlugin();
+      plugin.session = {
+        ...makeSession(),
+        tokenExpiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      };
+      plugin.connectionState.status = "online";
+      plugin.settings.apiEndpoint = "https://api.vaultguard.test";
+      plugin.resolvedApiEndpoint = "https://api.vaultguard.test";
+      plugin.settings.maxRetryAttempts = 3;
+      mockRequestUrl.mockImplementation(() => new Promise(() => undefined));
+
+      const pending = plugin.apiRequest(
+        "GET",
+        "/vaults/vault-abc/files/folder%2Fslow.md",
+        undefined,
+        undefined,
+        { timeoutMs: 100, maxAttempts: 1 },
+      );
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(pending).resolves.toMatchObject({
+        success: false,
+        error: { code: "NETWORK_ERROR", statusCode: 0 },
+      });
+      expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+
+      // No background client retry is scheduled after the timed-out race. The
+      // one underlying requestUrl is unabortable, but it is never multiplied.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mockRequestUrl).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
@@ -2398,6 +3025,15 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     ).toHaveLength(1);
   });
 
+  it("hard-excludes the recovery area from sync even if settings are incomplete", () => {
+    const plugin = makePlugin();
+    plugin.settings.excludedPaths = [];
+    plugin.settings.serverExcludedPaths = [];
+
+    expect(plugin.isPathExcluded(".vaultguard/manifest.v1.json")).toBe(true);
+    expect(plugin.isPathExcluded(".vaultguard/devices/device-A/current.capsule")).toBe(true);
+  });
+
   it("migrates the removed 'merge' conflict strategy to DUPLICATE on load", async () => {
     const plugin = makePlugin();
     // A user who previously selected the (now-removed) "Attempt auto-merge"
@@ -3373,6 +4009,9 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     });
     const modify = vi.fn();
     const write = vi.fn();
+    plugin.writePlainToDisk = vi.fn(async (path: string) => {
+      existingPaths.add(path);
+    });
 
     plugin.app = {
       vault: {
@@ -3399,7 +4038,11 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     expect(createFolder).toHaveBeenCalledWith("test1");
     expect(createFolder).toHaveBeenCalledWith("test1/nested");
-    expect(create).toHaveBeenCalledWith("test1/nested/remote.md", "remote body");
+    expect(create).not.toHaveBeenCalled();
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith(
+      "test1/nested/remote.md",
+      "remote body",
+    );
     expect(write).not.toHaveBeenCalled();
     expect(modify).not.toHaveBeenCalled();
   });
@@ -3419,6 +4062,9 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     });
     const modify = vi.fn();
     const write = vi.fn();
+    plugin.writePlainToDisk = vi.fn(async (path: string) => {
+      existingPaths.add(path);
+    });
 
     plugin.app = {
       vault: {
@@ -3467,7 +4113,11 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     });
     expect(createFolder).toHaveBeenCalledWith("test1");
     expect(createFolder).toHaveBeenCalledWith("empty");
-    expect(create).toHaveBeenCalledWith("test1/remote.md", "remote body");
+    expect(create).not.toHaveBeenCalled();
+    expect(plugin.writePlainToDisk).toHaveBeenCalledWith(
+      "test1/remote.md",
+      "remote body",
+    );
     expect(write).not.toHaveBeenCalled();
     expect(modify).not.toHaveBeenCalled();
   });
@@ -3834,6 +4484,30 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(mockNotice).toHaveBeenCalledWith(
       "VaultGuard Sync: Session expired. Please log in again."
     );
+  });
+
+  it("cancels active reconciliation before logout crosses the network boundary", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    const cancelActiveOperations = vi.fn();
+    plugin.syncRuntime = {
+      cancelActiveOperations,
+      stopSyncTimer: vi.fn(),
+      stopKeyRenewalMonitor: vi.fn(),
+      stopHeartbeatMonitor: vi.fn(),
+    };
+    plugin.apiRequest = vi.fn().mockImplementation(async () => {
+      expect(cancelActiveOperations).toHaveBeenCalledWith("the account logged out");
+      expect(plugin.vaultBindingAuthorization).toBe("unverified");
+      return { success: true, data: null, error: null, requestId: "req-logout" };
+    });
+    plugin.clearStoredSession = vi.fn().mockResolvedValue(undefined);
+    plugin.revokeAgentBridgeLeasesForSessionEnd = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.forceLogout("bye");
+
+    expect(cancelActiveOperations).toHaveBeenCalledTimes(1);
+    expect(plugin.session).toBeNull();
   });
 
   it("revokes the Cognito refresh token during logout, best-effort (PL6)", async () => {
@@ -4269,6 +4943,214 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     expect(fullSyncCalled).toBe(true);
     expect(plugin.syncState.lastSeenRevision).toBe(6);
+  });
+
+  it("prefetches tiny remote deltas with bounded concurrency before applying them in order", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = makePlugin();
+      plugin.settings.serverVaultId = "vault-abc";
+      plugin.session = makeSession();
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = "online";
+      plugin.offlineQueue = [];
+      plugin.localOnlyCatchupCompleted = true;
+      plugin.remoteInventoryRepairCompleted = true;
+      plugin.syncState.lastSeenRevision = null;
+      plugin.app.vault.getFiles = vi.fn(() => []);
+      plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+      plugin.collectLocalFolderPaths = vi.fn(() => []);
+
+      const paths = [
+        "/root-a.md",
+        "/folder/one.md",
+        "/folder/deep/two.md",
+        "/root-b.md",
+        "/folder/three.md",
+        "/other/four.md",
+        "/other/deep/five.md",
+        "/root-c.md",
+      ];
+      plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+        if (method === "POST" && path.endsWith("/files/sync")) {
+          return {
+            success: true,
+            data: {
+              deltas: paths.map((deltaPath, index) => ({
+                path: deltaPath,
+                action: "created",
+                lastModified: "2026-08-12T00:00:00.000Z",
+                checksum: `checksum-${index}`,
+                size: 100 + index,
+              })),
+              syncTimestamp: "2026-08-12T00:00:01.000Z",
+              revision: 7,
+              mode: "activity-log",
+            },
+            error: null,
+            requestId: "req-sync",
+          };
+        }
+        throw new Error(`Unexpected API call: ${method} ${path}`);
+      });
+
+      let activeFetches = 0;
+      let peakFetches = 0;
+      plugin.fetchRemoteFileContent = vi.fn(async (path: string) => {
+        activeFetches += 1;
+        peakFetches = Math.max(peakFetches, activeFetches);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        activeFetches -= 1;
+        return {
+          success: true,
+          data: { content: btoa(path), encoding: "base64", contentType: "text/markdown" },
+          error: null,
+          requestId: `get-${path}`,
+        };
+      });
+      plugin.applyRemoteChange = vi.fn().mockResolvedValue(undefined);
+
+      const syncing = plugin.performSync();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(peakFetches).toBe(4);
+      expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(plugin.applyRemoteChange).toHaveBeenCalledTimes(4);
+
+      await vi.advanceTimersByTimeAsync(100);
+      await syncing;
+
+      expect(plugin.fetchRemoteFileContent).toHaveBeenCalledTimes(paths.length);
+      expect(plugin.applyRemoteChange).toHaveBeenCalledTimes(paths.length);
+      expect(plugin.applyRemoteChange.mock.calls.map((call: any[]) => call[0].path)).toEqual(
+        paths.map((path) => path.replace(/^\/+/, "")),
+      );
+      for (const call of plugin.applyRemoteChange.mock.calls) {
+        expect(call[1]).toEqual(expect.objectContaining({ success: true }));
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("continues after a second-wave GET timeout but keeps the old sync cursor", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = makePlugin();
+      plugin.settings.serverVaultId = "vault-abc";
+      plugin.settings.lastSyncTimestamp = "2026-08-11T00:00:00.000Z";
+      plugin.session = makeSession();
+      plugin.keyLease = makeKeyLease();
+      plugin.connectionState.status = "online";
+      plugin.offlineQueue = [];
+      plugin.localOnlyCatchupCompleted = true;
+      plugin.remoteInventoryRepairCompleted = true;
+      plugin.syncState.lastSync = "2026-08-11T00:00:00.000Z";
+      plugin.syncState.lastSeenRevision = 41;
+      plugin.app.vault.getFiles = vi.fn(() => []);
+      plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+      plugin.collectLocalFolderPaths = vi.fn(() => []);
+
+      const paths = [
+        "/one.md",
+        "/nested/two.md",
+        "/three.md",
+        "/nested/deep/four.md",
+        "/nested/slow-five.md",
+        "/six.md",
+        "/nested/seven.md",
+      ];
+      plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+        if (method === "POST" && path.endsWith("/files/sync")) {
+          return {
+            success: true,
+            data: {
+              deltas: paths.map((deltaPath, index) => ({
+                path: deltaPath,
+                action: "created",
+                lastModified: "2026-08-12T00:00:00.000Z",
+                checksum: `checksum-${index}`,
+                size: 100 + index,
+              })),
+              syncTimestamp: "2026-08-12T00:00:01.000Z",
+              revision: 42,
+              mode: "activity-log",
+            },
+            error: null,
+            requestId: "req-sync",
+          };
+        }
+        throw new Error(`Unexpected API call: ${method} ${path}`);
+      });
+
+      plugin.fetchRemoteFileContent = vi.fn(
+        async (path: string, options?: { timeoutMs?: number; maxAttempts?: number }) => {
+          expect(options).toEqual({ timeoutMs: 15_000, maxAttempts: 1 });
+          if (path === "nested/slow-five.md") {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            return {
+              success: false,
+              data: null,
+              error: {
+                code: "NETWORK_ERROR",
+                message: "Request timeout",
+                details: null,
+                statusCode: 0,
+              },
+              requestId: "",
+            };
+          }
+          return {
+            success: true,
+            data: { content: btoa(path), encoding: "base64", contentType: "text/markdown" },
+            error: null,
+            requestId: `get-${path}`,
+          };
+        },
+      );
+      const appliedPaths: string[] = [];
+      plugin.applyRemoteChange = vi.fn(async (metadata: any, response?: any) => {
+        if (response?.success === false) {
+          throw new Error(response.error?.message ?? "remote fetch failed");
+        }
+        appliedPaths.push(metadata.path);
+      });
+
+      const syncing = plugin.performSync();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // First window applied, then ordered consumption is waiting on item 5.
+      expect(plugin.applyRemoteChange).toHaveBeenCalledTimes(4);
+      await vi.advanceTimersByTimeAsync(99);
+      expect(plugin.applyRemoteChange).toHaveBeenCalledTimes(4);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await syncing;
+
+      expect(plugin.fetchRemoteFileContent).toHaveBeenCalledTimes(7);
+      expect(appliedPaths).toEqual([
+        "one.md",
+        "nested/two.md",
+        "three.md",
+        "nested/deep/four.md",
+        "six.md",
+        "nested/seven.md",
+      ]);
+      expect(plugin.syncState.lastSync).toBe("2026-08-11T00:00:00.000Z");
+      expect(plugin.settings.lastSyncTimestamp).toBe("2026-08-11T00:00:00.000Z");
+      expect(plugin.syncState.lastSeenRevision).toBe(41);
+      expect(plugin.syncState.status).toBe("error");
+      expect(plugin.syncState.lastError).toContain("1 of 7 remote changes failed");
+      expect(
+        mockNotice.mock.calls.some(([message]) =>
+          String(message).includes("cursor was kept"),
+        ),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("clears the local permission cache when the sync response signals permissionsChanged", async () => {
@@ -4800,7 +5682,6 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     // The lossy artifact was NEVER downloaded over local content (T-11-16).
     expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
     expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
-    // A silent integrity heal — invisible to the plan buckets.
     expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
       serverOnly: [],
       localOnly: [],
@@ -4917,7 +5798,7 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.uploadReconciledFile).not.toHaveBeenCalled();
   });
 
-  it("skips a binary whose server copy cannot be fetched — never a conflict, never a wipe (OD-2)", async () => {
+  it("blocks the plan when a server binary cannot be fetched — never a conflict or wipe (OD-2)", async () => {
     const plugin = makeBinaryReconcilePlugin();
     stubSyncInventory(plugin);
     plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
@@ -4929,14 +5810,10 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     const runtime = plugin.ensureSyncRuntime();
     runtime.uploadReconciledBinaryFile = vi.fn();
 
-    await expect(plugin.performInitialReconciliation()).resolves.toBe(true);
+    await expect(plugin.performInitialReconciliation()).resolves.toBe(false);
 
     // Neither same, conflict, nor heal — just skipped. Local bytes untouched.
-    expect(plugin.askReconciliationPlan).toHaveBeenCalledWith({
-      serverOnly: [],
-      localOnly: [],
-      conflicts: [],
-    });
+    expect(plugin.askReconciliationPlan).not.toHaveBeenCalled();
     expect(runtime.uploadReconciledBinaryFile).not.toHaveBeenCalled();
     expect(plugin.applyRemoteChange).not.toHaveBeenCalled();
   });
@@ -5188,6 +6065,13 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     const plugin = makePlugin();
     plugin.writeLocalFileFromRemote = vi.fn(); // string writer must NOT be used
     plugin.applyRemoteChange = vi.fn().mockResolvedValue(undefined);
+    const prefetched = {
+      success: true,
+      data: { content: "binary-ciphertext", contentType: "image/png" },
+      error: null,
+      requestId: "req-prefetched",
+    };
+    plugin.decryptContentBytes = vi.fn().mockResolvedValue(AR1_BINARY_BYTES.buffer);
     const runtime = plugin.ensureSyncRuntime();
     runtime.writeLocalBinaryFileFromRemote = vi.fn().mockResolvedValue(undefined);
     const manifest = new Map([
@@ -5200,7 +6084,8 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     await runtime.resolveReconciliationConflict(
       "/attachments/photo.png",
       ConflictResolutionStrategy.DUPLICATE,
-      manifest
+      manifest,
+      prefetched,
     );
 
     // Local bytes written to a conflict-named path via the reused byte writer...
@@ -5210,10 +6095,10 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(conflictPath).toMatch(/^attachments\/photo \(conflict .*\)\.png$/);
     expect(new Uint8Array(bytes)).toEqual(AR1_BINARY_BYTES);
     // ...and the remote byte-pulled into the ORIGINAL path.
-    expect(plugin.applyRemoteChange).toHaveBeenCalledWith({
-      path: "attachments/photo.png",
-      size: 0,
-    });
+    expect(plugin.applyRemoteChange).toHaveBeenCalledWith(
+      { path: "attachments/photo.png", size: 0 },
+      prefetched,
+    );
     expect(plugin.writeLocalFileFromRemote).not.toHaveBeenCalled();
   });
 
@@ -7216,5 +8101,66 @@ describe("SD-03-F15/F16 applyOrgSettings toggle-flip invalidation", () => {
     plugin.applyOrgSettings(null);
 
     expect(emitSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("local recovery binding authorization", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  it("independently authorizes the exact recovered vault for the current account", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.localRecoveryExpectedAccountUserId = "user-1";
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockResolvedValue({
+        vaultId: "vault-abc",
+        name: "Protected vault",
+        slug: "protected-vault",
+      }),
+    };
+    plugin.cacheCurrentVaultRecord = vi.fn().mockResolvedValue(undefined);
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(undefined);
+
+    await expect(plugin.verifyBoundVaultAuthorization()).resolves.toBe(true);
+    expect(plugin.apiClient.getVaultRecord).toHaveBeenCalledWith("vault-abc");
+    expect(plugin.vaultBindingAuthorization).toBe("verified");
+  });
+
+  it("rejects a different account before using recovered binding metadata", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B" };
+    plugin.localRecoveryExpectedAccountUserId = "user-A";
+    plugin.apiClient = { getVaultRecord: vi.fn() };
+
+    await expect(plugin.verifyBoundVaultAuthorization()).resolves.toBe(false);
+    expect(plugin.apiClient.getVaultRecord).not.toHaveBeenCalled();
+    expect(plugin.vaultBindingAuthorization).toBe("wrong-account");
+  });
+
+  it("keeps an inaccessible recovered vault in actionable wrong-account state", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.localRecoveryExpectedAccountUserId = null;
+    plugin.stopSyncTimer = vi.fn();
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockRejectedValue(new Error("403 access denied")),
+    };
+
+    await expect(plugin.verifyBoundVaultAuthorization()).resolves.toBe(false);
+    expect(plugin.vaultBindingAuthorization).toBe("wrong-account");
+    expect(plugin.stopSyncTimer).toHaveBeenCalled();
+  });
+
+  it("checks restored binding authorization before requesting a key lease", () => {
+    const source = readFileSync(new URL("../src/plugin/main.ts", import.meta.url), "utf8");
+    const restoreStart = source.indexOf("private async restoreServerSession");
+    const authorization = source.indexOf("await this.verifyBoundVaultAuthorization()", restoreStart);
+    const lease = source.indexOf('"GET",\n          `/auth/key-lease?', restoreStart);
+    expect(restoreStart).toBeGreaterThan(-1);
+    expect(authorization).toBeGreaterThan(restoreStart);
+    expect(lease).toBeGreaterThan(authorization);
   });
 });

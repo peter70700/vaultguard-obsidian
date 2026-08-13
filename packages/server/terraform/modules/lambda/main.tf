@@ -552,8 +552,11 @@ data "aws_iam_policy_document" "files_lambda" {
     actions   = ["dynamodb:GetItem", "dynamodb:Query"]
     resources = [var.sessions_table_arn, "${var.sessions_table_arn}/index/*"]
   }
+  # File mutations acquire/release a conditional rotation-fence permit on the
+  # ACTIVE UserKeys control row. Reads need GetItem/Query; PUT/DELETE/finalize
+  # paths additionally need UpdateItem for that bounded mutation-fence record.
   statement {
-    actions = ["dynamodb:GetItem", "dynamodb:Query"]
+    actions = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
     resources = [
       var.user_keys_table_arn, "${var.user_keys_table_arn}/index/*",
     ]

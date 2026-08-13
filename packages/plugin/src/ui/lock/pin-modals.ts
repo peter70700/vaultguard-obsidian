@@ -17,6 +17,28 @@ import { App, ButtonComponent, Modal } from "obsidian";
 import { PIN_MIN_LENGTH } from "../../crypto/pin-lock-manager";
 import { createShieldIcon } from "../icons";
 
+/**
+ * Run an async modal action with the submit button disabled and relabelled.
+ *
+ * Enrollment can now WAIT for the at-rest cipher instead of refusing a vault
+ * that is merely still starting up (plugin `awaitCipherReadyForPin`), so the
+ * click is no longer instantaneous. Without this the button looks dead for the
+ * length of that wait and invites a second click.
+ */
+async function withPendingButton(
+  button: ButtonComponent,
+  pendingText: string,
+  run: () => Promise<void>
+): Promise<void> {
+  const original = button.buttonEl.textContent ?? "";
+  button.setDisabled(true).setButtonText(pendingText);
+  try {
+    await run();
+  } finally {
+    button.setDisabled(false).setButtonText(original);
+  }
+}
+
 /** A login-style password field group (label + type=password input, autocomplete off). */
 function passwordRow(
   container: HTMLElement,
@@ -62,19 +84,18 @@ export class SetPinModal extends Modal {
     passwordRow(contentEl, "Confirm", (v) => (this.confirm = v));
     const err = contentEl.createDiv({ cls: "vaultguard-pin-modal-error" });
     const actions = contentEl.createDiv({ cls: "vaultguard-pin-modal-actions" });
-    new ButtonComponent(actions)
-      .setButtonText("Set PIN")
-      .setCta()
-      .onClick(async () => {
-        err.setText("");
-        if (this.pin.length < PIN_MIN_LENGTH) {
-          err.setText(`Use at least ${PIN_MIN_LENGTH} characters.`);
-          return;
-        }
-        if (this.pin !== this.confirm) {
-          err.setText("The two entries don't match.");
-          return;
-        }
+    const submit = new ButtonComponent(actions).setButtonText("Set PIN").setCta();
+    submit.onClick(async () => {
+      err.setText("");
+      if (this.pin.length < PIN_MIN_LENGTH) {
+        err.setText(`Use at least ${PIN_MIN_LENGTH} characters.`);
+        return;
+      }
+      if (this.pin !== this.confirm) {
+        err.setText("The two entries don't match.");
+        return;
+      }
+      await withPendingButton(submit, "Setting PIN…", async () => {
         try {
           await this.onEnroll(this.pin);
           this.close();
@@ -82,6 +103,7 @@ export class SetPinModal extends Modal {
           err.setText(e instanceof Error ? e.message : "Could not set the PIN.");
         }
       });
+    });
   }
   onClose(): void {
     this.modalEl.removeClass("vaultguard-pin-modal");
@@ -118,19 +140,18 @@ export class ChangePinModal extends Modal {
     passwordRow(contentEl, "Confirm new", (v) => (this.confirm = v));
     const err = contentEl.createDiv({ cls: "vaultguard-pin-modal-error" });
     const actions = contentEl.createDiv({ cls: "vaultguard-pin-modal-actions" });
-    new ButtonComponent(actions)
-      .setButtonText("Change PIN")
-      .setCta()
-      .onClick(async () => {
-        err.setText("");
-        if (this.next.length < PIN_MIN_LENGTH) {
-          err.setText(`Use at least ${PIN_MIN_LENGTH} characters.`);
-          return;
-        }
-        if (this.next !== this.confirm) {
-          err.setText("The two new entries don't match.");
-          return;
-        }
+    const submit = new ButtonComponent(actions).setButtonText("Change PIN").setCta();
+    submit.onClick(async () => {
+      err.setText("");
+      if (this.next.length < PIN_MIN_LENGTH) {
+        err.setText(`Use at least ${PIN_MIN_LENGTH} characters.`);
+        return;
+      }
+      if (this.next !== this.confirm) {
+        err.setText("The two new entries don't match.");
+        return;
+      }
+      await withPendingButton(submit, "Changing PIN…", async () => {
         try {
           await this.onChange(this.current, this.next);
           this.close();
@@ -138,6 +159,7 @@ export class ChangePinModal extends Modal {
           err.setText(e instanceof Error ? e.message : "Could not change the PIN.");
         }
       });
+    });
   }
   onClose(): void {
     this.modalEl.removeClass("vaultguard-pin-modal");

@@ -162,9 +162,21 @@ export class ReadOnlyGuard {
     const cmAny = cm as unknown as Record<string, unknown>;
     let compartment = cmAny[COMPARTMENT_KEY] as Compartment | undefined;
 
-    if (!compartment) {
-      // First time we touch this editor: register the compartment with the
-      // desired extension in a single dispatch. Combining `appendConfig` and
+    // The compartment is cached on the EditorView, but the STATE it was appended
+    // to is not permanent: Obsidian builds a fresh EditorState whenever it
+    // rebuilds an editor (opening another file in the same tab, restoring a
+    // deferred leaf, recreating the view). A fresh state carries no appended
+    // config, so the cached compartment is orphaned — and `reconfigure` on a
+    // compartment the state never registered is a SILENT no-op in CM6
+    // (Configuration.resolve only keeps compartments it encounters while
+    // walking the extension tree). The guard would then report success while
+    // leaving the editor unlocked. `Compartment.get()` returns undefined for
+    // exactly that case, so treat an orphaned compartment as a first touch.
+    const attached = compartment !== undefined && compartment.get(cm.state) !== undefined;
+
+    if (!compartment || !attached) {
+      // First touch of this state: register the compartment with the desired
+      // extension in a single dispatch. Combining `appendConfig` and
       // `reconfigure` into two transactions has been flaky in practice —
       // Obsidian re-applies its own editor config around our dispatches and
       // the reconfigure effect lands on a state where the compartment isn't

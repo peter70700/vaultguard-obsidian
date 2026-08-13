@@ -112,18 +112,14 @@ export class BindingReconciliationModal extends Modal {
     new ButtonComponent(buttonRow)
       .setButtonText("Cancel")
       .onClick(() => {
-        this.decided = true;
-        this.close();
-        this.resolveDecision({ proceed: false, conflictStrategy: this.defaultStrategy });
+        this.decide({ proceed: false, conflictStrategy: this.defaultStrategy });
       });
 
     new ButtonComponent(buttonRow)
       .setButtonText(this.proceedLabel())
       .setCta()
       .onClick(() => {
-        this.decided = true;
-        this.close();
-        this.resolveDecision({ proceed: true, conflictStrategy: this.defaultStrategy });
+        this.decide({ proceed: true, conflictStrategy: this.defaultStrategy });
       });
   }
 
@@ -132,8 +128,17 @@ export class BindingReconciliationModal extends Modal {
     this.contentEl.removeClass("vaultguard-reconciliation-content");
     this.contentEl.empty();
     if (!this.decided) {
+      this.decided = true;
       this.resolveDecision({ proceed: false, conflictStrategy: this.defaultStrategy });
     }
+  }
+
+  /** Settle the caller before UI teardown, whose host hooks may throw. */
+  private decide(decision: ReconciliationDecision): void {
+    if (this.decided) return;
+    this.decided = true;
+    this.resolveDecision(decision);
+    this.close();
   }
 
   private renderRow(parent: HTMLElement, label: string, count: number, hint: string): void {

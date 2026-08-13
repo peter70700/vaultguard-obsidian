@@ -666,6 +666,37 @@ export class AtRestAdapterRuntime {
     return this.atRestCipher.exportRecoveryCode();
   }
 
+  /** True when at least one managed VG1 file survives outside plugin data. */
+  async hasPriorAtRestCiphertext(): Promise<boolean> {
+    return this.hasAtRestCiphertextOnDisk();
+  }
+
+  /**
+   * Authenticate the currently loaded LAK against an existing VG1 payload.
+   * A locally sealed uninstall capsule is still advisory until this succeeds:
+   * it may be stale or copied from another vault. No plaintext is retained.
+   */
+  async validateCurrentLakAgainstExistingCiphertext(): Promise<boolean> {
+    const cipher = this.atRestCipher;
+    if (!cipher?.isReady()) return false;
+    try {
+      for await (const sample of this.iterateCiphertextForValidation()) {
+        const plaintext = new Uint8Array(await cipher.decryptBinary(sample.bytes));
+        plaintext.fill(0);
+        return true;
+      }
+      return true; // no VG1 remains; the device wrapper is still authenticated locally
+    } catch (error) {
+      const reason =
+        "The restored same-device key capsule does not authenticate this vault's existing protected files. Restore with the vault's recovery code; no files were changed.";
+      cipher.requireRecovery(reason);
+      this.locked = false;
+      this.logError("Recovered local at-rest key failed VG1 continuity validation", error);
+      this.ctx.refreshAtRestRecoverySurfaces?.();
+      return false;
+    }
+  }
+
   /**
    * SD-05-F3: yield every managed VG1 file for recovery-code validation,
    * SMALLEST FIRST so a wrong code is refused after one cheap decrypt.

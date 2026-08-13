@@ -23,7 +23,7 @@ import { PluginAllowlistModal, PluginAllowlistPrompt } from "./plugin-allowlist-
 import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoRevokeToken, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, vaultguardForgotPassword, vaultguardConfirmReset, vaultguardVerifyRecoveryCode, devServerLogin, isLocalDevAuth, CognitoAuthResult } from "./cognito-auth";
 import { MfaSetupModal } from "./mfa-setup-modal";
 import { deriveConnectionConfigFromTokenPayload } from "./session-config";
-import { VaultGuardApiClient } from "../api/client";
+import { AuthorizationError, VaultGuardApiClient } from "../api/client";
 import type {
   OrgSettingsResponse,
   PermissionRule,
@@ -154,6 +154,7 @@ import {
   type MutationIntent,
   type PermissionStoreFactoryContext,
   type PermissionSurfaceContext,
+  type ProtectedContentGate,
   type PermissionsGraphRuntimeContext,
   type SyncRuntimeContext,
   type VaultAdapterOriginalMethods,
@@ -179,6 +180,13 @@ import {
   createSyncRuntime,
   type SyncRuntime,
 } from "./sync-runtime";
+import {
+  LOCAL_RECOVERY_MANIFEST_PATH,
+  LOCAL_RECOVERY_ROOT,
+  LocalRecoveryCapsuleStore,
+  type LocalRecoveryDeviceState,
+  type LocalRecoveryRestoreResult,
+} from "./local-recovery-capsule";
 import {
   RemoteFileStateStore,
   type RemoteFileStateEntry,
@@ -303,6 +311,25 @@ const CONNECTION_LOST_NOTICE_GRACE_MS = 8 * 1000;
 const LOG_PREFIX = "[VaultGuard]";
 
 /**
+ * How long a PIN lifecycle action waits for the at-rest cipher to become ready
+ * before refusing.
+ *
+ * `addSettingTab` runs early in `onload` while `initAtRestCipher()` is only
+ * awaited much later, behind two full-vault scans
+ * (`maybeAutoEnableLocalProjectMemoryMode`, `refreshDetectedGitRepositoryRoots`)
+ * and the cipher's own `hasExistingCiphertext` walk. On a large vault that
+ * window is seconds long — and Settings → VaultGuard is already open and
+ * clickable inside it, so "Set PIN" saw `isReady() === false` and refused with
+ * "Unlock the vault before setting a PIN" even though the vault unlocked a
+ * moment later. Waiting this long absorbs that window; terminal cipher states
+ * short-circuit the wait immediately (see `awaitCipherReadyForPin`).
+ */
+const PIN_CIPHER_READY_TIMEOUT_MS = 15 * 1000;
+
+/** Poll spacing while waiting for the at-rest cipher in `awaitCipherReadyForPin`. */
+const PIN_CIPHER_READY_POLL_MS = 250;
+
+/**
  * Hard cap on per-session permission warmup retries. After this many
  * back-off retries fail, the store stays in `fetch-failed` until the
  * user does something explicit (focus event, login, settings change),
@@ -325,6 +352,32 @@ const SYNC_FEATURE_REVISION = 9;
 type AccessTokenRefreshResult =
   | { ok: true }
   | { ok: false; message: string; error?: unknown; terminal?: boolean };
+
+/**
+ * Why `awaitCipherReadyForPin` stopped waiting. Everything except `"ready"` is a
+ * refusal the caller turns into its own actionable message — `"timeout"` is the
+ * only one that means "still initialising", the rest are states no amount of
+ * waiting can clear.
+ */
+type PinCipherReadyOutcome =
+  | "ready"
+  | "locked"
+  | "needs-recovery"
+  | "local-project-memory"
+  | "disabled"
+  | "timeout";
+
+type LocalProtectionBootstrapState =
+  | { kind: "unknown" }
+  | { kind: "new" }
+  | { kind: "existing"; source: "plugin-envelope" | "vault" | "profile" }
+  | { kind: "needs-recovery"; reason: string };
+
+type VaultBindingAuthorizationState =
+  | "unbound"
+  | "unverified"
+  | "verified"
+  | "wrong-account";
 
 /**
  * PL4: Cognito refresh failures that can never succeed on retry — the refresh
@@ -685,6 +738,15 @@ export default class VaultGuardPlugin extends Plugin {
    * by construction.
    */
   private derivedBindingId: string = "";
+
+  /** Local uninstall/reinstall recovery classification for this vault root. */
+  private localProtectionBootstrap: LocalProtectionBootstrapState = { kind: "unknown" };
+  /** A restored capsule is not authoritative until its LAK opens an existing VG1. */
+  private localRecoveryNeedsLakValidation = false;
+  /** Account identity sealed in the capsule; never exposed through the manifest. */
+  private localRecoveryExpectedAccountUserId: string | null = null;
+  /** Exact `/vaults/{vaultId}` authorization gate for every sync/content path. */
+  private vaultBindingAuthorization: VaultBindingAuthorizationState = "unbound";
 
   /** Serializes saveData writes so settings and session updates do not clobber each other */
   private pluginDataSaveQueue: Promise<void> = Promise.resolve();
@@ -1283,6 +1345,7 @@ export default class VaultGuardPlugin extends Plugin {
       getOfflineQueue: () => this.offlineQueue,
       getPermissionStore: () => this.permissionStore,
       hasWarmedAtLeastOnce: () => this.hasWarmedAtLeastOnce,
+      getProtectedContentGate: () => this.getProtectedContentGate(),
       saveSettings: () => this.saveSettings(),
       openVaultGuardSettings: () => this.openVaultGuardSettings(),
       showLoginRequiredNotice: (action, path) =>
@@ -1308,7 +1371,8 @@ export default class VaultGuardPlugin extends Plugin {
       isNetworkError: (error) => this.isNetworkError(error),
       setConnectionStatus: (status, options) =>
         this.setConnectionStatus(status, options),
-      shouldUploadChangesImmediately: () => this.shouldUploadChangesImmediately(),
+      shouldUploadChangesImmediately: () =>
+        this.getProtectedContentGate().ok && this.shouldUploadChangesImmediately(),
       queueOfflineOperation: (operation, path, data, options) =>
         this.queueOfflineOperation(operation, path, data, options),
       getRemoteFileState: (path) => this.getRemoteFileState(path),
@@ -1355,7 +1419,7 @@ export default class VaultGuardPlugin extends Plugin {
         endpoint: string,
         body?: Record<string, unknown>,
         idTokenOverride?: string,
-        options?: { timeoutMs?: number }
+        options?: { timeoutMs?: number; maxAttempts?: number }
       ) => {
         // L2 (BIN-A): preserve the exact argument arity when no timeout override
         // is passed. Existing callers (and their toHaveBeenCalledWith assertions)
@@ -1371,8 +1435,14 @@ export default class VaultGuardPlugin extends Plugin {
             : this.apiRequest<T>(method, endpoint);
       },
       vaultPath: (suffix = "") => this.vaultPath(suffix),
-      readFileDecrypted: (path) => this.readFileDecrypted(path),
-      fetchRemoteFileContent: (path) => this.fetchRemoteFileContent(path),
+      readFileDecrypted: (path, options) =>
+        options === undefined
+          ? this.readFileDecrypted(path)
+          : this.readFileDecrypted(path, options),
+      fetchRemoteFileContent: (path, options) =>
+        options === undefined
+          ? this.fetchRemoteFileContent(path)
+          : this.fetchRemoteFileContent(path, options),
       decodeRemoteFileContent: (path, data) =>
         this.decodeRemoteFileContent(path, data),
       decodeBase64Utf8: (base64) => this.decodeBase64Utf8(base64),
@@ -1412,6 +1482,7 @@ export default class VaultGuardPlugin extends Plugin {
       // Phase 12 (NN-2 / key-renewal guard): the heartbeat survives the lock,
       // but checkKeyLeaseRenewal consults this to no-op while locked.
       isVaultLocked: () => this.isVaultLocked,
+      getProtectedContentGate: () => this.getProtectedContentGate(),
       isLeaseRetryNeeded: () => this.leaseRetryNeeded,
       getEffectiveSyncMode: () => this.getEffectiveSyncMode(),
       getEffectiveSyncIntervalSeconds: () => this.getEffectiveSyncIntervalSeconds(),
@@ -1503,7 +1574,10 @@ export default class VaultGuardPlugin extends Plugin {
       deleteFolderMarker: (folderPath) => this.deleteFolderMarker(folderPath),
       deleteFolderContentsOnServer: (folderPath) =>
         this.deleteFolderContentsOnServer(folderPath),
-      applyRemoteChange: (metadata) => this.applyRemoteChange(metadata),
+      applyRemoteChange: (metadata, prefetchedResponse) =>
+        prefetchedResponse === undefined
+          ? this.applyRemoteChange(metadata)
+          : this.applyRemoteChange(metadata, prefetchedResponse),
       applyRemoteDeletion: (path, inferred) => this.applyRemoteDeletion(path, inferred),
       trashLocalPath: async (path) => {
         const adapter = this.app.vault.adapter;
@@ -1516,13 +1590,26 @@ export default class VaultGuardPlugin extends Plugin {
           return false;
         }
       },
-      readFileDecrypted: (path) => this.readFileDecrypted(path),
-      fetchRemoteFileContent: (path) => this.fetchRemoteFileContent(path),
+      readFileDecrypted: (path, options) =>
+        options === undefined
+          ? this.readFileDecrypted(path)
+          : this.readFileDecrypted(path, options),
+      fetchRemoteFileContent: (path, options) =>
+        options === undefined
+          ? this.fetchRemoteFileContent(path)
+          : this.fetchRemoteFileContent(path, options),
       decodeRemoteFileContent: (path, data) =>
         this.decodeRemoteFileContent(path, data),
       readRemotePlaintext: (path) => this.readRemotePlaintext(path),
-      resolveReconciliationConflict: (path, strategy, localManifest) =>
-        this.resolveReconciliationConflict(path, strategy, localManifest),
+      resolveReconciliationConflict: (path, strategy, localManifest, prefetchedResponse) =>
+        prefetchedResponse === undefined
+          ? this.resolveReconciliationConflict(path, strategy, localManifest)
+          : this.resolveReconciliationConflict(
+              path,
+              strategy,
+              localManifest,
+              prefetchedResponse,
+            ),
       hasOriginalAdapterRead: () => !!this.originalAdapterMethods.read,
       hasOriginalAdapterReadBinary: () => !!this.originalAdapterMethods.readBinary,
       // BIN-A / L13: wave-4 pull gate needs write-binary capability so a legacy
@@ -1567,7 +1654,7 @@ export default class VaultGuardPlugin extends Plugin {
         endpoint: string,
         body?: Record<string, unknown>,
         idTokenOverride?: string,
-        options?: { timeoutMs?: number }
+        options?: { timeoutMs?: number; maxAttempts?: number }
       ) => {
         // L2 (BIN-A): preserve the exact argument arity when no timeout override
         // is passed. Existing callers (and their toHaveBeenCalledWith assertions)
@@ -2334,11 +2421,17 @@ export default class VaultGuardPlugin extends Plugin {
     // the reason in a Notice and continue in degraded plaintext mode so
     // the plugin remains usable while the user investigates.
     //
+    // Recover same-device uninstall state before constructing the PIN manager:
+    // the sealed capsule may restore its envelope + pepper/settings. Binding is
+    // only a hint and remains hard-gated until exact-vault authorization.
+    await this.restoreLocalRecoveryBeforeCipherInit();
+
     // Phase 12: construct the PIN-lock manager FIRST so initAtRestCipher's
     // PIN-lock pre-check (isPinLockEnrolled) can land the vault LOCKED instead of
     // provisioning/needs-recovery when a PIN owns the LAK (edge #6).
     this.initPinLockManager();
     await this.initAtRestCipher();
+    await this.finalizeRecoveredLocalProtection();
     const startupRepositoryTransition = await this.convertDetectedGitRepositoryCiphertext();
     if (startupRepositoryTransition.failed > 0) {
       new Notice(
@@ -2358,6 +2451,9 @@ export default class VaultGuardPlugin extends Plugin {
     // path second. On desktop this is effectively zero-cost; on mobile it
     // adds a single AES-GCM decrypt (a few ms).
     await this.restoreSession();
+    // Backfill healthy legacy installs and enrich a restored capsule with the
+    // authenticated account identity once a session is available.
+    void this.persistLocalRecoveryCapsule();
 
     // Phase 12-07 (passkey model): if a session was just restored, show the lock
     // curtain ONLY when the vault could not unlock transparently — the cipher is not
@@ -4975,6 +5071,15 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     if (this.settings.serverVaultId) {
+      // A persisted/recovered binding is only a hint. Prove this identity can
+      // access the exact `/vaults/{vaultId}` resource before requesting a lease
+      // or allowing reconciliation to reuse it.
+      if (!(await this.verifyBoundVaultAuthorization())) {
+        this.setConnectionStatus("online");
+        this.maybeEnterLockOnAuth();
+        this.refreshAtRestRecoverySurfaces();
+        return;
+      }
       // Resolve this user's per-vault role before starting sync so the UI
       // (file header, decorations, sidebar) renders the correct read /
       // write / admin affordances for *this* vault. Org role alone is
@@ -5035,8 +5140,14 @@ export default class VaultGuardPlugin extends Plugin {
     // Quick 260708-el6: a fresh login for a NEW user in a lock-policy org with no
     // PIN yet — offer the skippable, once-ever "Set a PIN" prompt so idle-lock is
     // discoverable. Gated + idempotent behind the persisted flag, so it shows at
-    // most once across both auth-entry points and across reloads.
-    this.maybeOfferPinOnboarding();
+    // most once across reloads. This is now the ONLY entry point.
+    //
+    // Unawaited on purpose: the offer waits for the at-rest cipher to hold a live
+    // LAK (so the prompt can never appear on a vault that would then refuse the
+    // PIN), and login must not stall behind that.
+    void this.maybeOfferPinOnboarding().catch((err) =>
+      this.logError("PIN onboarding offer failed", err)
+    );
 
     // Login is an at-rest transition point: re-assert the #1 surfaces so a
     // needs-recovery cipher stays alarmed (and clears if login unlocked it).
@@ -5095,6 +5206,11 @@ export default class VaultGuardPlugin extends Plugin {
       // interceptedRead's `this.keyLease` guard short-circuits to the
       // local copy until the new lease lands.
       this.keyLease = null;
+      this.ensureSyncRuntime().cancelActiveOperations("vault binding changed");
+      this.vaultBindingAuthorization = "unverified";
+      // An explicit picker choice is allowed to establish a new account/vault
+      // relationship; the exact-vault probe below becomes the authority.
+      this.localRecoveryExpectedAccountUserId = null;
     }
 
     this.settings.serverVaultId = result.vaultId;
@@ -5124,6 +5240,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.rebuildApiClient();
     if (this.session) {
       this.initializeApiClientFromSession(this.session);
+      if (!(await this.verifyBoundVaultAuthorization())) return changed;
     }
 
     // Vault changed — the user's effective role may differ on the new
@@ -5142,6 +5259,8 @@ export default class VaultGuardPlugin extends Plugin {
       // A reload reliably picks up everyone's access, so offer it.
       this.offerReloadForAccessList();
     }
+
+    void this.persistLocalRecoveryCapsule();
 
     return changed;
   }
@@ -6035,6 +6154,13 @@ export default class VaultGuardPlugin extends Plugin {
       hasSessionId: !!session.sessionId,
       hasServerVaultId: !!this.settings.serverVaultId,
     });
+    if (this.settings.serverVaultId && !(await this.verifyBoundVaultAuthorization())) {
+      this.setConnectionStatus("online");
+      this.syncDiagnostics.record("restoreServerSession.return.bindingAuthorizationGate", {
+        state: this.vaultBindingAuthorization,
+      });
+      return;
+    }
     let leaseResponse: ApiResponse<{
       keyLease: KeyLease;
       deniedPaths?: LeaseDeniedPath[];
@@ -6173,10 +6299,16 @@ export default class VaultGuardPlugin extends Plugin {
       });
     }
 
-    // Quick 260708-el6: first lock-policy session for a returning/existing user
-    // (the endorsed once-ever migration nudge, reusing the same persisted flag).
-    // The flag guarantees at most one prompt across both entry points + reloads.
-    this.maybeOfferPinOnboarding();
+    // NO PIN-onboarding nudge here — deliberately REVERSED from quick 260708-el6,
+    // which also offered it on this returning-user path. This runs during the
+    // unawaited background resume fired from `onload`, so the prompt ambushed the
+    // user mid-startup: a modal appeared seconds after merely ENABLING the plugin,
+    // with no action of theirs to explain it, and (because `initAtRestCipher()`
+    // has not finished this early) "Set PIN" then failed with "Unlock the vault
+    // before setting a PIN". The nudge now follows a login — a moment the user
+    // initiated, and one where the vault is actually unlocked. Returning users who
+    // never re-login keep the Notice from `lockSessionForInactivity`'s
+    // session-kept branch, which was always the runtime's real nudge.
 
     // Session restore is an at-rest transition point too — re-assert the #1
     // surfaces from the cipher's real state (the init-time banner may have
@@ -6481,7 +6613,10 @@ export default class VaultGuardPlugin extends Plugin {
     if (!isLoggedIn) {
       // Already-protected vault + no session ⇒ "Log in again"; only a brand-new,
       // never-bound vault gets the first-run "Protect this vault" onboarding CTA.
-      const vaultProtected = !!this.settings.serverVaultId;
+      const vaultProtected =
+        !!this.settings.serverVaultId ||
+        this.localProtectionBootstrap.kind === "existing" ||
+        this.localProtectionBootstrap.kind === "needs-recovery";
       menu.addItem((item) =>
         item
           .setTitle(vaultProtected ? "Log in again" : "Protect this vault")
@@ -6698,6 +6833,26 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private getSidebarAuthState(): VaultGuardSidebarAuthState | null {
+    if (this.localProtectionBootstrap.kind === "needs-recovery") {
+      return {
+        title: "Recovery required",
+        message: "VaultGuard found existing local protection but could not restore its device key.",
+        detail: "Restore with the recovery code. Existing encrypted files stay unchanged.",
+        icon: "shield-alert",
+        tone: "danger",
+        actionLabel: "Restore protection",
+      };
+    }
+    if (this.vaultBindingAuthorization === "wrong-account") {
+      return {
+        title: "Wrong account or vault",
+        message: "The signed-in account cannot access this protected folder's server vault.",
+        detail: "Log in with the original account or explicitly pick an authorized vault.",
+        icon: "shield-x",
+        tone: "danger",
+        actionLabel: this.session ? "Pick authorized vault" : "Log in again",
+      };
+    }
     if (this.session && this.settings.serverVaultId) {
       return null;
     }
@@ -6707,10 +6862,14 @@ export default class VaultGuardPlugin extends Plugin {
     // is the state after a reload/restart, which drops the in-memory logout state
     // (`lastLogoutAuthState`), so without this branch the sidebar wrongly showed
     // the "Protect this vault" onboarding CTA to someone who is simply logged out.
-    if (!this.session && this.settings.serverVaultId) {
+    if (
+      !this.session &&
+      (this.settings.serverVaultId || this.localProtectionBootstrap.kind === "existing")
+    ) {
       return {
-        title: "Logged out",
-        message: "Your VaultGuard session ended. Log in again to reconnect this protected vault.",
+        title:
+          this.localProtectionBootstrap.kind === "existing" ? "Existing protection restored" : "Logged out",
+        message: "Log in again to reconnect this protected vault.",
         detail: "Your notes stay encrypted at rest until you reconnect.",
         icon: "log-out",
         tone: "warning",
@@ -6730,6 +6889,10 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private handlePrimaryProtectionAction(): void {
+    if (this.localProtectionBootstrap.kind === "needs-recovery") {
+      this.startAtRestRecoveryFromRecoveryCode();
+      return;
+    }
     if (this.session) {
       void this.switchServerVault();
       return;
@@ -7667,6 +7830,16 @@ export default class VaultGuardPlugin extends Plugin {
       res.lak.fill(0); // defensive: the cipher took its own copy
     }
 
+    if (this.localRecoveryNeedsLakValidation) {
+      await this.finalizeRecoveredLocalProtection();
+      if (this.localProtectionBootstrap.kind === "needs-recovery") {
+        this.lockCurtain?.showError(
+          "This device recovery capsule does not match the protected files. Restore with the vault recovery code.",
+        );
+        return;
+      }
+    }
+
     // Passkey migration (Phase 12-07): a device enrolled under the old model has NO
     // transparent lak.envelope (enroll used to delete it), so it lands LOCKED on
     // every startup. Now that this PIN unlock re-installed the LAK in the cipher,
@@ -7679,6 +7852,16 @@ export default class VaultGuardPlugin extends Plugin {
         await this.getAtRestCipher()?.persistWrappedLak();
       } catch (err) {
         this.logError("Passkey migration (persistWrappedLak after PIN unlock) failed", err);
+      }
+      void this.persistLocalRecoveryCapsule();
+    } else {
+      // Also heals an interrupted max-security transition: make the PIN-only
+      // capsule authoritative first, then remove any transparent wrapper that
+      // survived a process death between those two commits.
+      if (await this.persistLocalRecoveryCapsule()) {
+        await this.getAtRestCipher()?.clearPersistedWrap().catch((err) => {
+          this.logError("Removing a stale transparent wrap after PIN unlock failed", err);
+        });
       }
     }
 
@@ -7728,11 +7911,20 @@ export default class VaultGuardPlugin extends Plugin {
    * Lazy, once-ever discoverability prompt for lock-instead-of-logout (quick
    * 260708-el6). A new user in a lock-policy org who never sets a PIN silently
    * degrades to idle-LOGOUT (lockSessionForInactivity → action "lock" && !enrolled
-   * → forceLogout). Offer a skippable "Set a PIN" nudge exactly once. Safe to call
-   * from BOTH the fresh-login and session-restore entry points because it is
-   * idempotent behind the persisted `pinOnboardingPromptShown` flag.
+   * → forceLogout). Offer a skippable "Set a PIN" nudge exactly once.
+   *
+   * LOGIN-ONLY. 260708-el6 also called this from `restoreServerSession`; that
+   * entry point is gone (see the comment there). A background resume is not a
+   * moment the user asked for anything, so the prompt read as the plugin
+   * ambushing them seconds after they enabled it.
+   *
+   * READINESS-GATED. Prompting is pointless — and produces a refusal the user
+   * can do nothing about — while the at-rest cipher has no live LAK to wrap, so
+   * the offer waits the cipher out (bounded) and simply stays silent if it never
+   * becomes ready. The persisted flag is NOT consumed in that case: an offer the
+   * user never saw must not burn the one chance to make it.
    */
-  private maybeOfferPinOnboarding(): void {
+  private async maybeOfferPinOnboarding(): Promise<void> {
     // Reads the RAW field rather than effectiveIdleAction() on purpose (AC4).
     // `orgSettings` is also null before the policy has loaded, so an absent
     // value means "policy unknown", not "policy is lock" — surfacing an
@@ -7740,14 +7932,35 @@ export default class VaultGuardPlugin extends Plugin {
     // runtime already nudges this user toward a PIN with a Notice from the
     // session-kept branch of lockSessionForInactivity, so nothing is lost by
     // waiting for an explicit policy here.
-    if (
-      this.session &&
+    if (!this.pinOnboardingGateOpen()) {
+      return;
+    }
+
+    // Terminal cipher states (locked, needs-recovery, Local Project Memory Mode,
+    // disabled) come back immediately, so an unpromptable vault costs nothing.
+    const readiness = await this.awaitCipherReadyForPin(PIN_CIPHER_READY_TIMEOUT_MS);
+    if (readiness !== "ready") {
+      this.log(`PIN onboarding prompt skipped — cipher not ready (${readiness}).`);
+      return;
+    }
+
+    // Re-read across the await: the user may have logged out, or set a PIN from
+    // Settings, while the cipher was still coming up.
+    if (!this.pinOnboardingGateOpen()) {
+      return;
+    }
+
+    this.openPinOnboardingPrompt();
+  }
+
+  /** The cheap half of the onboarding gate, evaluated on both sides of the wait. */
+  private pinOnboardingGateOpen(): boolean {
+    return (
+      !!this.session &&
       this.orgSettings?.idleAction === "lock" &&
       !this.pinLockEnrolled() &&
       !this.settings.pinOnboardingPromptShown
-    ) {
-      this.openPinOnboardingPrompt();
-    }
+    );
   }
 
   /**
@@ -7788,9 +8001,84 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Wait (bounded) for the at-rest cipher to hold a live LAK, so a PIN action
+   * that needs one doesn't refuse a vault that is merely still starting up.
+   *
+   * The bug this fixes: the settings tab is registered early in `onload`, but
+   * `initAtRestCipher()` is only awaited later — behind two full-vault scans and
+   * the cipher's own ciphertext walk. Clicking "Set PIN" inside that window hit
+   * `isReady() === false` and got "Unlock the vault before setting a PIN", even
+   * though the vault unlocked a second later. The same window opens whenever the
+   * cipher re-initialises (leaving Local Project Memory Mode, an at-rest reset).
+   *
+   * Only `"timeout"` means "still initialising". The other refusals are terminal
+   * — a curtained lock, a needs-recovery cipher, Local Project Memory Mode, or a
+   * disabled cipher will never become ready on their own, so they short-circuit
+   * instead of making the user watch a 15-second wait end in the wrong message.
+   */
+  private async awaitCipherReadyForPin(
+    timeoutMs: number
+  ): Promise<PinCipherReadyOutcome> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (this.getAtRestCipher()?.isReady() === true) {
+        return "ready";
+      }
+      // Terminal states: more waiting cannot clear any of these.
+      if (this.isVaultLocked || this.ensureAtRestAdapterRuntimeObject().isLocked()) {
+        return "locked";
+      }
+      if (this.isLocalProjectMemoryModeEnabled()) {
+        return "local-project-memory";
+      }
+      const status = this.getAtRestStatus();
+      if (status.kind === "needs-recovery") {
+        return "needs-recovery";
+      }
+      if (status.kind === "disabled") {
+        return "disabled";
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return "timeout";
+      }
+      // Poll rather than awaiting `cipherInitPromise`: that promise is still null
+      // during the pre-init scans that open most of this window, and its resolved
+      // value doesn't distinguish "settled" from "timed out" anyway.
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, Math.min(PIN_CIPHER_READY_POLL_MS, remaining))
+      );
+    }
+  }
+
+  /**
+   * Turn a non-ready `awaitCipherReadyForPin` outcome into a message that tells
+   * the user what to actually do. `action` is the verb phrase for the attempted
+   * operation ("set a PIN"), so one mapping serves every PIN entry point.
+   */
+  private pinCipherRefusalMessage(
+    outcome: Exclude<PinCipherReadyOutcome, "ready">,
+    action: string
+  ): string {
+    switch (outcome) {
+      case "locked":
+        return `Unlock the vault before you ${action}.`;
+      case "needs-recovery":
+        return `Local at-rest encryption needs recovery on this device, so there is no key to protect with a PIN. Restore from your recovery code in Settings → VaultGuard, then ${action}.`;
+      case "local-project-memory":
+        return `Local Project Memory Mode keeps this vault's files in plaintext, so there is no local encryption key to protect with a PIN. Turn it off in Settings → VaultGuard to ${action}.`;
+      case "disabled":
+        return `Local at-rest encryption is not active on this device, so there is no key to protect with a PIN. Enable it in Settings → VaultGuard, then ${action}.`;
+      case "timeout":
+        return `VaultGuard is still unlocking this vault. Wait a moment, then ${action} again.`;
+    }
+  }
+
+  /**
    * Enroll a PIN so the vault locks-instead-of-logs-out on idle (D3) and can be
    * re-opened fast with the PIN. Requires the cipher UNLOCKED (the LAK must be in
-   * memory to hand to the PIN wrap).
+   * memory to hand to the PIN wrap). A cipher that is merely still initialising
+   * is waited out first — see `awaitCipherReadyForPin`.
    *
    * Passkey model (default, requirePinOnStartup off — Phase 12-07): KEEP the
    * transparent `lak.envelope` alongside the new `lak-pin.envelope`, so a full login
@@ -7808,8 +8096,15 @@ export default class VaultGuardPlugin extends Plugin {
    * device with NO way to load the LAK.
    */
   async enrollPinLock(secret: string): Promise<void> {
+    const readiness = await this.awaitCipherReadyForPin(PIN_CIPHER_READY_TIMEOUT_MS);
+    if (readiness !== "ready") {
+      throw new Error(this.pinCipherRefusalMessage(readiness, "set a PIN"));
+    }
     const cipher = this.getAtRestCipher();
     if (!cipher?.isReady()) {
+      // Unreachable via awaitCipherReadyForPin (it only returns "ready" while
+      // isReady() holds), kept so a future refactor of the wait can't silently
+      // hand exportLakBytes a locked cipher.
       throw new Error("Unlock the vault before setting a PIN.");
     }
     if (!this.pinLockManager) {
@@ -7819,6 +8114,20 @@ export default class VaultGuardPlugin extends Plugin {
     try {
       await this.pinLockManager.enroll(secret, lak); // writes lak-pin.envelope
       if (this.settings.requirePinOnStartup === true) {
+        // Commit and verify the PIN-only recovery generation before removing the
+        // last transparent wrapper. The capsule store also destroys every
+        // rollback generation that could contain that wrapper.
+        // A real Obsidian plugin instance always has a vault adapter. Keeping
+        // the structural guard lets the crypto/PIN unit seam run without an App
+        // while preserving the fail-closed ordering in production.
+        if (
+          this.app?.vault?.adapter &&
+          !(await this.persistLocalRecoveryCapsule())
+        ) {
+          throw new Error(
+            "VaultGuard could not persist the PIN-only uninstall recovery capsule. The transparent wrapper was retained; retry PIN setup.",
+          );
+        }
         // Max-security only (true D2): remove the transparent wrap so the PIN is the
         // sole key holder. Passkey mode (default) KEEPS lak.envelope so login /
         // startup unlock transparently and the PIN only re-locks the vault on idle.
@@ -7832,6 +8141,9 @@ export default class VaultGuardPlugin extends Plugin {
         ? "VaultGuard Sync: PIN set. Your vault now requires this PIN on every startup and locks (not logs out) when idle."
         : "VaultGuard Sync: PIN set. Your vault now locks (not logs out) when idle — unlock with the PIN, no full re-login."
     );
+    if (this.settings.requirePinOnStartup !== true) {
+      await this.persistLocalRecoveryCapsule();
+    }
   }
 
   /**
@@ -7846,34 +8158,65 @@ export default class VaultGuardPlugin extends Plugin {
    *                 login / startup unlock transparently and the PIN only re-locks
    *                 the vault on idle.
    *
-   * The flag is ALWAYS persisted. The on-disk reconcile only runs when a PIN is
-   * enrolled AND the cipher is unlocked (it needs the live LAK); if the vault is
-   * locked we persist the flag and ask the user to unlock first — the OFF case is
-   * additionally self-healing via the unlockWithPin passkey migration.
+   * With an enrolled PIN, the flag is committed only after its matching wrapper
+   * posture is durable. This avoids a crash window where settings claim
+   * max-security while a transparent wrapper remains. A cipher that is still
+   * initialising is waited out (awaitCipherReadyForPin) rather than treated as
+   * locked, because toggling this right after opening settings hits the same
+   * startup window that made "Set PIN" refuse a perfectly healthy vault. The OFF
+   * case is additionally self-healing via the unlockWithPin passkey migration.
    */
   async setRequirePinOnStartup(enabled: boolean): Promise<void> {
+    const previousValue = this.settings.requirePinOnStartup === true;
     this.settings.requirePinOnStartup = enabled;
-    await this.saveSettings();
 
     if (!this.pinLockEnrolled()) {
+      await this.saveSettings();
       return; // no PIN → nothing on disk to reconcile; the flag applies at next enroll
     }
+    const readiness = await this.awaitCipherReadyForPin(PIN_CIPHER_READY_TIMEOUT_MS);
     const cipher = this.getAtRestCipher();
-    if (!cipher?.isReady()) {
-      // Vault locked: we can't re-provision the wrap without the live LAK. The flag
-      // is saved; unlocking with the PIN reconciles the OFF case (passkey migration).
+    if (readiness !== "ready" || !cipher?.isReady()) {
+      // Enabling max-security cannot be recorded until its transparent wrapper
+      // has actually been removed. Disabling is safe to record while locked;
+      // the next PIN unlock performs the existing passkey migration.
+      if (enabled) this.settings.requirePinOnStartup = previousValue;
+      await this.saveSettings();
       new Notice(
-        "VaultGuard Sync: unlock the vault first to apply this change to your PIN."
+        `VaultGuard Sync: ${this.pinCipherRefusalMessage(
+          readiness === "ready" ? "timeout" : readiness,
+          "change this PIN setting"
+        )}`
       );
       return;
     }
     try {
       if (enabled) {
+        // First make both recovery homes PIN-only and purge any rollback copy
+        // carrying the transparent wrapper. Only after that durable transition
+        // succeeds may the plugin-owned transparent wrapper be removed.
+        if (!(await this.persistLocalRecoveryCapsule())) {
+          throw new Error("Could not persist the PIN-only local recovery state.");
+        }
         await cipher.clearPersistedWrap(); // max-security: PIN becomes the sole wrap
+        await this.saveSettings();
       } else {
         await cipher.persistWrappedLak(); // passkey: restore transparent unlock
+        if (!(await this.persistLocalRecoveryCapsule())) {
+          await cipher.clearPersistedWrap();
+          throw new Error("Could not persist the passkey local recovery state.");
+        }
+        await this.saveSettings();
       }
     } catch (err) {
+      this.settings.requirePinOnStartup = previousValue;
+      // Restore the previous wrapper posture before reporting failure. These
+      // operations are idempotent and keep a failed toggle from silently
+      // changing the device's security contract.
+      if (previousValue) await cipher.clearPersistedWrap().catch(() => undefined);
+      else await cipher.persistWrappedLak().catch(() => undefined);
+      await this.saveSettings().catch(() => undefined);
+      await this.persistLocalRecoveryCapsule();
       this.logError("Reconciling the at-rest wrap for requirePinOnStartup failed", err);
       new Notice(
         "VaultGuard Sync: couldn't update the PIN startup setting on disk. Try again."
@@ -7911,6 +8254,7 @@ export default class VaultGuardPlugin extends Plugin {
       }
       await cipher.persistWrappedLak(); // NN-1 reverse: restore lak.envelope FIRST
       await this.pinLockManager.disable(); // then remove lak-pin.envelope + pepper
+      await this.persistLocalRecoveryCapsule();
     } finally {
       res.lak.fill(0);
     }
@@ -8010,6 +8354,11 @@ export default class VaultGuardPlugin extends Plugin {
    * and optionally wipes local cache.
    */
   async forceLogout(noticeMessage = "VaultGuard Sync: Logged out successfully."): Promise<void> {
+    // Fence the old identity/binding before any asynchronous logout request.
+    // requestUrl itself is not abortable, but every reconciliation loop checks
+    // the operation token before its next local/remote mutation.
+    this.syncRuntime?.cancelActiveOperations("the account logged out");
+    this.vaultBindingAuthorization = this.settings.serverVaultId ? "unverified" : "unbound";
     // Phase 12: any hard-fallback logout while locked (forgotten PIN, attempt
     // cap, server revocation via the still-alive heartbeat, or the 24h cap on
     // unlock) must tear the curtain down FIRST so the workspace is reachable
@@ -8177,6 +8526,386 @@ export default class VaultGuardPlugin extends Plugin {
     return this.ensureAtRestAdapterRuntimeObject().initAtRestCipher();
   }
 
+  private async createLocalRecoveryStore(): Promise<LocalRecoveryCapsuleStore> {
+    const adapter = this.app.vault.adapter;
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    const fallbackKekPath = this.vaultConfigPath("plugins", pluginId, "at-rest-kek.dat");
+    let fallbackKek: string | null = null;
+    try {
+      const profileValue: unknown = this.app.loadLocalStorage("vaultguard.at-rest.kek.v1");
+      if (typeof profileValue === "string" && profileValue.trim()) {
+        fallbackKek = profileValue.trim();
+      } else if (await adapter.exists(fallbackKekPath)) {
+        const durable = (await adapter.read(fallbackKekPath)).trim();
+        fallbackKek = durable || null;
+      }
+    } catch (error) {
+      this.logError("Reading the local recovery sealing key failed", error);
+    }
+    return new LocalRecoveryCapsuleStore(
+      {
+        readVault: async (path) => {
+          if (!(await adapter.exists(path))) return null;
+          return adapter.read(path);
+        },
+        writeVault: async (path, value) => {
+          await this.ensureParentFoldersForPath(path);
+          await adapter.write(path, value);
+        },
+        renameVault: async (from, to) => {
+          await adapter.rename(from, to);
+        },
+        removeVault: async (path) => {
+          if (await adapter.exists(path)) await adapter.remove(path);
+        },
+        listVaultRecoveryFiles: async () => {
+          if (!(await adapter.exists(LOCAL_RECOVERY_ROOT))) return [];
+          const listed = await adapter.list(LOCAL_RECOVERY_ROOT);
+          return listed.files;
+        },
+        ensureVaultRecoveryRoot: async () => {
+          await this.ensureParentFoldersForPath(LOCAL_RECOVERY_MANIFEST_PATH);
+        },
+        loadProfile: (key) => this.app.loadLocalStorage(key),
+        saveProfile: (key, value) => this.app.saveLocalStorage(key, value),
+      },
+      this.derivedBindingId,
+      probeSafeStorage(),
+      fallbackKek,
+    );
+  }
+
+  /**
+   * Runs after adapter interception but before PIN/cipher construction. It may
+   * restore only device-wrapped material and sealed settings hints. A recovered
+   * binding remains unverified and a recovered LAK remains unusable for sync
+   * until post-init VG1 continuity validation succeeds.
+   */
+  private async restoreLocalRecoveryBeforeCipherInit(): Promise<void> {
+    if (this.isLocalProjectMemoryModeEnabled()) {
+      this.localProtectionBootstrap = { kind: "new" };
+      this.vaultBindingAuthorization = "unbound";
+      return;
+    }
+    const runtime = this.ensureAtRestAdapterRuntimeObject();
+    const hasVg1 = await runtime.hasPriorAtRestCiphertext();
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    const transparentPath = this.vaultConfigPath("plugins", pluginId, "lak.envelope");
+    const pinPath = this.lakPinEnvelopePath();
+    const adapter = this.app.vault.adapter;
+    const transparentEnvelopeExists = await adapter.exists(transparentPath);
+    const pinEnvelopeExists = await adapter.exists(pinPath);
+    const pluginEnvelopeExists =
+      transparentEnvelopeExists ||
+      (pinEnvelopeExists && this.settings.pinLock?.enrolled === true);
+
+    // Compatibility/source priority: a complete plugin-owned envelope remains
+    // authoritative. The recovery capsule is the fallback for uninstall or a
+    // torn plugin directory, never a reason to replace healthy current state.
+    if (pluginEnvelopeExists) {
+      this.localProtectionBootstrap = { kind: "existing", source: "plugin-envelope" };
+      this.vaultBindingAuthorization = this.settings.serverVaultId ? "unverified" : "unbound";
+      return;
+    }
+
+    let result: LocalRecoveryRestoreResult;
+    try {
+      result = await (await this.createLocalRecoveryStore()).restore(hasVg1);
+    } catch (error) {
+      const reason = `VaultGuard could not inspect the local recovery capsule: ${
+        error instanceof Error ? error.message : String(error)
+      }. Existing encrypted files were left unchanged.`;
+      this.localProtectionBootstrap = { kind: "needs-recovery", reason };
+      this.vaultBindingAuthorization = this.settings.serverVaultId ? "unverified" : "unbound";
+      this.logError("Local recovery capsule inspection failed", error);
+      return;
+    }
+
+    if (result.kind === "none") {
+      this.localProtectionBootstrap = pluginEnvelopeExists
+        ? { kind: "existing", source: "plugin-envelope" }
+        : { kind: "new" };
+      this.vaultBindingAuthorization = this.settings.serverVaultId ? "unverified" : "unbound";
+      return;
+    }
+    if (result.kind === "needs-recovery") {
+      this.localProtectionBootstrap = { kind: "needs-recovery", reason: result.reason };
+      this.vaultBindingAuthorization = this.settings.serverVaultId ? "unverified" : "unbound";
+      return;
+    }
+
+    const state = result.state;
+    await this.ensureParentFoldersForPath(transparentPath);
+    if (state.requirePinOnStartup) {
+      // Max-security invariant: restoring a capsule must never recreate the
+      // transparent LAK wrap. The PIN envelope remains the sole LAK wrapper.
+      if (await adapter.exists(transparentPath)) await adapter.remove(transparentPath);
+    } else if (state.wrappedLak) {
+      await adapter.write(transparentPath, state.wrappedLak);
+    }
+    if (state.pinEnvelope) {
+      await this.ensureParentFoldersForPath(pinPath);
+      await adapter.write(pinPath, state.pinEnvelope);
+    }
+    if (state.pinState) {
+      this.settings.pinLock = {
+        ...state.pinState,
+        pepperWrapped: state.pinPepperWrapped,
+      };
+    }
+    this.settings.requirePinOnStartup = state.requirePinOnStartup;
+    if (state.pinOnboardingPromptShown !== undefined) {
+      this.settings.pinOnboardingPromptShown = state.pinOnboardingPromptShown;
+    }
+    if (state.connection) {
+      const connection = state.connection;
+      if (connection.orgSlug !== undefined) this.settings.orgSlug = connection.orgSlug;
+      if (connection.apiEndpoint !== undefined) this.settings.apiEndpoint = connection.apiEndpoint;
+      if (connection.organizationId !== undefined) {
+        this.settings.organizationId = connection.organizationId;
+      }
+      if (connection.cognitoUserPoolId !== undefined) {
+        this.settings.cognitoUserPoolId = connection.cognitoUserPoolId;
+      }
+      if (connection.cognitoClientId !== undefined) {
+        this.settings.cognitoClientId = connection.cognitoClientId;
+      }
+      if (connection.manualConfig !== undefined) this.settings.manualConfig = connection.manualConfig;
+    }
+    if (state.binding) {
+      this.settings.serverVaultId = state.binding.serverVaultId;
+      this.settings.serverVaultName = state.binding.serverVaultName;
+      this.settings.serverVaultSlug = state.binding.serverVaultSlug;
+      if (state.binding.organizationId) {
+        this.settings.organizationId = state.binding.organizationId;
+      }
+      this.localRecoveryExpectedAccountUserId = state.binding.accountUserId ?? null;
+      this.vaultBindingAuthorization = "unverified";
+    } else {
+      this.vaultBindingAuthorization = "unbound";
+    }
+    this.localProtectionBootstrap = { kind: "existing", source: result.source };
+    this.localRecoveryNeedsLakValidation = true;
+    await this.saveSettings();
+    this.rebuildApiClient();
+    this.log(`Restored existing local protection from the ${result.source} recovery capsule.`);
+  }
+
+  private async finalizeRecoveredLocalProtection(): Promise<void> {
+    if (!this.localRecoveryNeedsLakValidation) return;
+    const cipher = this.getAtRestCipher();
+    if (!cipher?.isReady()) {
+      // A PIN-only/max-security capsule intentionally lands locked. Validation
+      // resumes immediately after the PIN unwrap; all sync gates stay closed.
+      if (this.pinLockEnrolled()) return;
+      const reason =
+        "VaultGuard restored local recovery metadata but could not unlock its device-local key wrapper. Restore with the recovery code; no files were changed.";
+      this.localProtectionBootstrap = { kind: "needs-recovery", reason };
+      return;
+    }
+    if (!(await this.ensureAtRestAdapterRuntimeObject().validateCurrentLakAgainstExistingCiphertext())) {
+      const status = this.getAtRestStatus();
+      const reason =
+        status.kind === "needs-recovery"
+          ? status.reason
+          : "The restored device-local key did not match this protected vault.";
+      this.localProtectionBootstrap = { kind: "needs-recovery", reason };
+      this.localRecoveryNeedsLakValidation = false;
+      return;
+    }
+    this.localRecoveryNeedsLakValidation = false;
+    await this.persistLocalRecoveryCapsule();
+  }
+
+  private getProtectedContentGate(): ProtectedContentGate {
+    const status = this.getAtRestStatus();
+    if (this.localProtectionBootstrap.kind === "needs-recovery" || status.kind === "needs-recovery") {
+      return {
+        ok: false,
+        reason: "needs-recovery",
+        message:
+          "VaultGuard Sync is paused because local protection needs recovery. Restore from the local recovery code; protected files were not changed.",
+      };
+    }
+    if (
+      this.localRecoveryNeedsLakValidation ||
+      status.kind === "uninitialized" ||
+      status.kind === "disabled"
+    ) {
+      return {
+        ok: false,
+        reason: "at-rest-unavailable",
+        message: "VaultGuard Sync is paused until local at-rest protection is available.",
+      };
+    }
+    if (this.settings.serverVaultId && this.vaultBindingAuthorization === "wrong-account") {
+      return {
+        ok: false,
+        reason: "wrong-account",
+        message:
+          "This protected folder is bound to a vault that the signed-in account cannot access. Log in with the original account or pick an authorized vault; no sync was started.",
+      };
+    }
+    if (this.settings.serverVaultId && this.vaultBindingAuthorization === "unverified") {
+      return {
+        ok: false,
+        reason: "binding-unverified",
+        message:
+          "VaultGuard Sync is paused until the signed-in account is verified for this exact server vault.",
+      };
+    }
+    return { ok: true };
+  }
+
+  private async verifyBoundVaultAuthorization(): Promise<boolean> {
+    const vaultId = this.settings.serverVaultId?.trim();
+    if (!vaultId) {
+      this.vaultBindingAuthorization = "unbound";
+      return false;
+    }
+    if (!this.session || !this.apiClient) {
+      this.vaultBindingAuthorization = "unverified";
+      return false;
+    }
+    this.vaultBindingAuthorization = "unverified";
+    if (
+      this.localRecoveryExpectedAccountUserId &&
+      this.localRecoveryExpectedAccountUserId !== this.session.userId
+    ) {
+      this.vaultBindingAuthorization = "wrong-account";
+      this.stopSyncTimer();
+      new Notice(
+        "VaultGuard Sync: this folder was protected by a different account. Log in with the original account or explicitly pick a vault available to this account. No sync was started.",
+        0,
+      );
+      return false;
+    }
+    try {
+      const vault = await this.apiClient.getVaultRecord(vaultId);
+      if (vault.vaultId !== vaultId) {
+        throw new AuthorizationError(`Vault identity mismatch for ${vaultId}`);
+      }
+      await this.cacheCurrentVaultRecord(vault);
+      this.vaultBindingAuthorization = "verified";
+      this.localRecoveryExpectedAccountUserId = this.session.userId;
+      void this.persistLocalRecoveryCapsule();
+      return true;
+    } catch (error) {
+      this.stopSyncTimer();
+      if (error instanceof AuthorizationError || /not found|access denied|forbidden|\b403\b/i.test(String(error))) {
+        this.vaultBindingAuthorization = "wrong-account";
+        new Notice(
+          `VaultGuard Sync: the signed-in account cannot access the protected server vault (${vaultId}). Log in with the original account or pick an authorized vault. No files were synchronized.`,
+          0,
+        );
+        this.logError("Bound vault authorization failed", error);
+        return false;
+      }
+      this.vaultBindingAuthorization = "unverified";
+      this.logError("Bound vault authorization could not be verified", error);
+      new Notice(
+        "VaultGuard Sync: the protected vault could not be verified right now. Sync remains paused; retry when the connection is available.",
+        9000,
+      );
+      return false;
+    }
+  }
+
+  /** Backfill every healthy install without exporting or rotating the LAK. */
+  private async persistLocalRecoveryCapsule(): Promise<boolean> {
+    if (this.isLocalProjectMemoryModeEnabled()) return false;
+    // Some isolated crypto/PIN callers (including embedders and unit
+    // harnesses) intentionally exercise these methods before Obsidian has
+    // attached an App. Capsule durability is startup integration work and is
+    // simply deferred until the real vault adapter exists.
+    if (!this.app?.vault?.adapter) return false;
+    const status = this.getAtRestStatus();
+    // Max-security installs intentionally never initialise the cipher until a
+    // successful PIN unlock. They can still be healthy while landed locked,
+    // and the already-sealed PIN envelope is exactly what must be backfilled.
+    const healthyPinOnlyLockedState =
+      this.settings.requirePinOnStartup === true &&
+      this.pinLockManager?.isEnrolled() === true &&
+      this.ensureAtRestAdapterRuntimeObject().isLocked();
+    if (
+      status.kind !== "unlocked" &&
+      status.kind !== "locked" &&
+      !healthyPinOnlyLockedState
+    ) {
+      return false;
+    }
+    const adapter = this.app.vault.adapter;
+    const pluginId = this.manifest?.id ?? "vaultguard-sync";
+    const transparentPath = this.vaultConfigPath("plugins", pluginId, "lak.envelope");
+    const pinPath = this.lakPinEnvelopePath();
+    const readIfPresent = async (path: string): Promise<string | undefined> => {
+      if (!(await adapter.exists(path))) return undefined;
+      const value = (await adapter.read(path)).trim();
+      return value || undefined;
+    };
+    const requirePinOnStartup = this.settings.requirePinOnStartup === true;
+    const pinEnvelope = await readIfPresent(pinPath);
+    const wrappedLak = requirePinOnStartup ? undefined : await readIfPresent(transparentPath);
+    if (!wrappedLak && !pinEnvelope) return false;
+    const state: LocalRecoveryDeviceState = {
+      ...(wrappedLak ? { wrappedLak } : {}),
+      ...(pinEnvelope ? { pinEnvelope } : {}),
+      ...(this.settings.pinLock?.pepperWrapped
+        ? { pinPepperWrapped: this.settings.pinLock.pepperWrapped }
+        : {}),
+      ...(this.settings.pinLock
+        ? {
+            pinState: {
+              enrolled: this.settings.pinLock.enrolled,
+              failedAttempts: this.settings.pinLock.failedAttempts,
+              lockedUntil: this.settings.pinLock.lockedUntil,
+            },
+          }
+        : {}),
+      requirePinOnStartup,
+      pinOnboardingPromptShown: this.settings.pinOnboardingPromptShown,
+      ...(this.settings.serverVaultId
+        ? {
+            binding: {
+              serverVaultId: this.settings.serverVaultId,
+              serverVaultName: this.settings.serverVaultName,
+              serverVaultSlug: this.settings.serverVaultSlug,
+              organizationId: this.settings.organizationId || undefined,
+              accountUserId: this.session?.userId,
+            },
+          }
+        : {}),
+      connection: {
+        orgSlug: this.settings.orgSlug || undefined,
+        apiEndpoint: this.settings.apiEndpoint || undefined,
+        organizationId: this.settings.organizationId || undefined,
+        cognitoUserPoolId: this.settings.cognitoUserPoolId || undefined,
+        cognitoClientId: this.settings.cognitoClientId || undefined,
+        manualConfig: this.settings.manualConfig,
+      },
+    };
+    try {
+      const persisted = await (await this.createLocalRecoveryStore()).persist(state);
+      if (persisted.copies.length < 2) {
+        this.log("Local recovery capsule persisted with only one durable copy; startup will retry.");
+      }
+      return persisted.copies.length > 0;
+    } catch (error) {
+      this.logError("Persisting the local uninstall recovery capsule failed", error);
+      return false;
+    }
+  }
+
+  private async clearLocalRecoveryCapsule(): Promise<void> {
+    if (!this.app?.vault?.adapter) return;
+    try {
+      await (await this.createLocalRecoveryStore()).clear();
+    } catch (error) {
+      this.logError("Clearing the local uninstall recovery capsule failed", error);
+      throw error;
+    }
+  }
+
   private async maybeOfferFirstRunMigration(): Promise<void> {
     return this.ensureAtRestAdapterRuntimeObject().maybeOfferFirstRunMigration();
   }
@@ -8194,7 +8923,17 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private async decryptVaultAtRestAndDisableEncryption(): Promise<AtRestDecryptAndDisableResult> {
-    return this.ensureAtRestAdapterRuntimeObject().decryptVaultAtRestAndDisableEncryption();
+    const result = await this.ensureAtRestAdapterRuntimeObject().decryptVaultAtRestAndDisableEncryption();
+    if (result.failed === 0 && result.remainingCiphertextPaths.length === 0) {
+      // The user explicitly chose plaintext/local-only mode. Retaining a sealed
+      // LAK or a prior-protection marker after that point would both misclassify
+      // a later reinstall and preserve key material the reset contract says is
+      // gone.
+      await this.clearLocalRecoveryCapsule();
+      this.localProtectionBootstrap = { kind: "new" };
+      this.localRecoveryNeedsLakValidation = false;
+    }
+    return result;
   }
 
   private interceptVaultAdapter(): void {
@@ -8995,9 +9734,17 @@ export default class VaultGuardPlugin extends Plugin {
   private async resolveReconciliationConflict(
     path: string,
     strategy: ConflictResolutionStrategy,
-    localManifest: Map<string, LocalManifestEntry>
+    localManifest: Map<string, LocalManifestEntry>,
+    prefetchedResponse?: ApiResponse<RemoteFileContentResponse>,
   ): Promise<void> {
-    return this.ensureSyncRuntime().resolveReconciliationConflict(path, strategy, localManifest);
+    return prefetchedResponse === undefined
+      ? this.ensureSyncRuntime().resolveReconciliationConflict(path, strategy, localManifest)
+      : this.ensureSyncRuntime().resolveReconciliationConflict(
+          path,
+          strategy,
+          localManifest,
+          prefetchedResponse,
+        );
   }
 
   /**
@@ -9352,8 +10099,14 @@ export default class VaultGuardPlugin extends Plugin {
    * Applies a remote file change to the local vault.
    * @param metadata - The remote file metadata and change information
    */
-  private async applyRemoteChange(metadata: Pick<FileMetadata, "path" | "size">): Promise<void> {
-    return this.ensureSyncRuntime().applyRemoteChange(metadata);
+  private async applyRemoteChange(
+    metadata: Pick<FileMetadata, "path" | "size">,
+    prefetchedResponse?: ApiResponse<RemoteFileContentResponse>,
+  ): Promise<void> {
+    const runtime = this.ensureSyncRuntime();
+    return prefetchedResponse === undefined
+      ? runtime.applyRemoteChange(metadata)
+      : runtime.applyRemoteChange(metadata, prefetchedResponse);
   }
 
   /**
@@ -9442,12 +10195,24 @@ export default class VaultGuardPlugin extends Plugin {
    * `/**` key lease. The server gates the route with requireVaultMember +
    * evaluatePermission; 404 on deny (per docs/SHARE-LINKS.md trust pattern).
    */
-  private async readFileDecrypted(relPath: string): Promise<ApiResponse<RemoteFileContentResponse>> {
-    return this.ensureSyncRuntime().readFileDecrypted(relPath);
+  private async readFileDecrypted(
+    relPath: string,
+    options?: { timeoutMs?: number; maxAttempts?: number },
+  ): Promise<ApiResponse<RemoteFileContentResponse>> {
+    const runtime = this.ensureSyncRuntime();
+    return options === undefined
+      ? runtime.readFileDecrypted(relPath)
+      : runtime.readFileDecrypted(relPath, options);
   }
 
-  private async fetchRemoteFileContent(path: string): Promise<ApiResponse<RemoteFileContentResponse>> {
-    return this.ensureSyncRuntime().fetchRemoteFileContent(path);
+  private async fetchRemoteFileContent(
+    path: string,
+    options?: { timeoutMs?: number; maxAttempts?: number },
+  ): Promise<ApiResponse<RemoteFileContentResponse>> {
+    const runtime = this.ensureSyncRuntime();
+    return options === undefined
+      ? runtime.fetchRemoteFileContent(path)
+      : runtime.fetchRemoteFileContent(path, options);
   }
 
   private decodeBase64Utf8(base64: string): string {
@@ -10553,7 +11318,11 @@ export default class VaultGuardPlugin extends Plugin {
     // L2 (BIN-A): optional per-request timeout override. Large binary PUTs pass a
     // longer timeout (BINARY_PUT_TIMEOUT_MS) so a slow uplink is not misread as a
     // network failure; omitted → the 30 s default in requestWithTimeout is unchanged.
-    options?: { timeoutMs?: number; suppressSessionHeader?: boolean }
+    options?: {
+      timeoutMs?: number;
+      suppressSessionHeader?: boolean;
+      maxAttempts?: number;
+    }
   ): Promise<ApiResponse<T>> {
     if (!idTokenOverride && this.session) {
       if (this.isSessionTokenExpiring(this.session)) {
@@ -10694,7 +11463,13 @@ export default class VaultGuardPlugin extends Plugin {
     let lastHttpFailure: ApiResponse<T> | null = null;
     let endpointRefreshAttempted = false;
 
-    for (let attempt = 0; attempt < this.settings.maxRetryAttempts; attempt++) {
+    const configuredAttemptLimit = this.settings.maxRetryAttempts;
+    const attemptLimit =
+      options?.maxAttempts === undefined
+        ? configuredAttemptLimit
+        : Math.max(1, Math.min(configuredAttemptLimit, Math.floor(options.maxAttempts)));
+
+    for (let attempt = 0; attempt < attemptLimit; attempt++) {
       try {
         // L2 (BIN-A): thread the optional per-request timeout override. NOTE:
         // Promise.race does NOT abort the underlying requestUrl — a timed-out PUT
@@ -10715,7 +11490,7 @@ export default class VaultGuardPlugin extends Plugin {
         if (response.status === 0) {
           sawNetworkError = true;
           lastError = new Error(this.describeNetworkFailureResponse(response));
-          if (attempt < this.settings.maxRetryAttempts - 1) {
+          if (attempt < attemptLimit - 1) {
             await this.delay(BASE_RETRY_INTERVAL_MS * Math.pow(2, attempt));
           }
           continue;
@@ -10805,7 +11580,7 @@ export default class VaultGuardPlugin extends Plugin {
       }
 
       // Wait before retry with exponential backoff
-      if (attempt < this.settings.maxRetryAttempts - 1) {
+      if (attempt < attemptLimit - 1) {
         await this.delay(BASE_RETRY_INTERVAL_MS * Math.pow(2, attempt));
       }
     }
@@ -11482,6 +12257,9 @@ export default class VaultGuardPlugin extends Plugin {
     new AtRestRestoreModal(this.app, {
       onSubmit: (code, opts) => this.restoreAtRestFromRecoveryCode(code, opts),
       onRestored: () => {
+        this.localProtectionBootstrap = { kind: "existing", source: "plugin-envelope" };
+        this.localRecoveryNeedsLakValidation = false;
+        void this.persistLocalRecoveryCapsule();
         new Notice(
           "VaultGuard Sync: at-rest key restored. Reopening any notes will now load decrypted content.",
           7000
@@ -11543,6 +12321,24 @@ export default class VaultGuardPlugin extends Plugin {
       throw err;
     }
 
+    // A recovered serverVaultId is only a hint. Prove the current account can
+    // still read that exact vault before the first destructive local action.
+    // This probe changes no local files and prevents a stale/wrong-account
+    // binding from wiping VG1 content that cannot subsequently be re-downloaded.
+    // A real Obsidian plugin instance always has a vault adapter. The adapter
+    // check only preserves the historical isolated reset-unit seam, which has
+    // no API client or filesystem; production must prove the exact binding.
+    if (
+      this.app?.vault?.adapter &&
+      !(await this.verifyBoundVaultAuthorization())
+    ) {
+      const err = new Error(
+        "VaultGuard Sync: the bound server vault is not authorized for this account. Refusing the local reset — no files were changed.",
+      );
+      err.name = "AtRestResetGuardError";
+      throw err;
+    }
+
     // CROSS-INSTANCE REENTRANCY (SD-07-F4). The latch above is instance-local,
     // so it cannot see a wipe orphaned by a hot reload — the exact case where a
     // second reset is most dangerous, because a still-live zombie wipe holds a
@@ -11594,6 +12390,23 @@ export default class VaultGuardPlugin extends Plugin {
       // exception in wipeAndReprovisionLocalAtRest).
       const { wipedPaths } =
         await this.ensureAtRestAdapterRuntimeObject().wipeAndReprovisionLocalAtRest();
+
+      // The LAK was deliberately replaced. Destroy every capsule generation
+      // carrying the dead key, classify the fresh plugin envelope as healthy,
+      // and persist a new generation before the protected-content gate permits
+      // the re-download.
+      await this.clearLocalRecoveryCapsule();
+      this.localProtectionBootstrap = { kind: "existing", source: "plugin-envelope" };
+      this.localRecoveryNeedsLakValidation = false;
+      this.localRecoveryExpectedAccountUserId = this.session.userId;
+      if (
+        this.app?.vault?.adapter &&
+        !(await this.persistLocalRecoveryCapsule())
+      ) {
+        throw new Error(
+          "VaultGuard Sync: the fresh local key was created, but its uninstall recovery capsule could not be persisted. Re-download was paused; reopen VaultGuard and save the new recovery code.",
+        );
+      }
 
       // HI-01: keep suppressing each wiped path's delete even AFTER this method's
       // `finally` drops the global flag — a slow/debounced watcher can deliver

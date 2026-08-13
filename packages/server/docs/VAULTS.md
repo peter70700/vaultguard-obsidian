@@ -281,8 +281,9 @@ tokens return `410`. Full reference:
    opens the **Vault Picker Modal**.
 5. User picks an existing vault they belong to — or, if they're an org admin,
    creates a new one. Their `serverVaultId` is now set.
-6. Sync engine boots and starts mirroring server vault contents into the
-   local Obsidian folder.
+6. The plugin independently authorizes that exact vault for the signed-in
+   account, obtains the vault-scoped lease, and only then starts mirroring
+   server contents into the local Obsidian folder.
 
 ### B. Temporary authenticated guest
 
@@ -411,6 +412,24 @@ message:
 
 The user can run **Pick or Switch Server Vault** from the command palette
 at any time.
+
+`serverVaultId` and the cached display fields are local binding hints, not
+authorization. This distinction is especially important after uninstall/
+reinstall: VaultGuard can recover the former binding from the sealed local
+recovery capsule, but it must verify current membership through the exact
+`/vaults/{vaultId}` scope before requesting a key lease or starting any sync.
+A mismatched signed-in identity or a `403`/inaccessible vault enters an
+actionable wrong-account/binding state and stops; it is not swallowed while the
+old binding continues in the background.
+
+Recovered local protection and recovered binding are separate startup gates.
+The plugin first proves that the recovered local LAK decrypts existing `VG1\0`
+ciphertext, then proves that the current account can access the bound server
+vault. Until both gates pass, initial reconciliation, **Sync now**, downloads,
+uploads, queued mutations, and server-originated local writes remain disabled.
+Logout, account change, and vault switch cancel the active reconciliation and
+fence the old binding before the next mutation. See
+[Local At-Rest Encryption](AT-REST-ENCRYPTION.md#same-device-uninstallreinstall-continuity).
 
 ---
 

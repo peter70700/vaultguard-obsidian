@@ -4,6 +4,7 @@ import type {
   MutationIntent,
   OfflineQueueOperation,
   RemoteFileContentResponse,
+  RemoteFileFetchOptions,
   RemoteFileWriteResponse,
   RemoteWriteConflictResolutionResult,
   SyncRuntimeContext,
@@ -107,6 +108,31 @@ const KEY_RENEWAL_GRACE_MS = 5 * 60 * 1000;
 /** Server heartbeat interval for revocation detection. */
 const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 
+/**
+ * Maximum number of ordinary remote-file GETs allowed in flight while a sync
+ * applies a delta page. Local mutations remain ordered and single-threaded;
+ * only the network reads overlap. Four keeps memory/request pressure bounded
+ * while removing the N × round-trip latency penalty for small reconciliation
+ * pages.
+ */
+const REMOTE_APPLY_PREFETCH_CONCURRENCY = 4;
+
+/**
+ * A sync page must not spend the generic three-attempt (~105 s) envelope on
+ * one tiny file while later completed reads wait behind it. Obsidian's
+ * requestUrl has no abort handle, so each prefetch gets one bounded attempt:
+ * after the race times out there can be one orphaned GET, never three.
+ */
+const REMOTE_APPLY_PREFETCH_TIMEOUT_MS = 15_000;
+const REMOTE_APPLY_PREFETCH_REQUEST_OPTIONS: Readonly<RemoteFileFetchOptions> = {
+  timeoutMs: REMOTE_APPLY_PREFETCH_TIMEOUT_MS,
+  maxAttempts: 1,
+};
+
+type RemoteChangePrefetchOutcome =
+  | { response: ApiResponse<RemoteFileContentResponse>; error?: never }
+  | { response?: never; error: unknown };
+
 /** Periodic key-lease renewal check cadence. */
 const KEY_RENEWAL_INTERVAL_MS = 60 * 1000;
 
@@ -138,8 +164,169 @@ function uint8ToBase64Chunked(bytes: Uint8Array): string {
  */
 export class SyncRuntime {
   private currentSyncOperation: LongOperationHandle | null = null;
+  private currentInitialReconciliationOperation: LongOperationHandle | null = null;
 
   constructor(private readonly ctx: SyncRuntimeContext) {}
+
+  cancelActiveOperations(reason = "session context changed"): void {
+    for (const operation of [
+      this.currentInitialReconciliationOperation,
+      this.currentSyncOperation,
+    ]) {
+      if (!operation) continue;
+      operation.token.abortForShutdown();
+      operation.cancel(`Stopped because ${reason}.`);
+    }
+    this.currentInitialReconciliationOperation = null;
+    this.currentSyncOperation = null;
+    this.stopSyncTimer();
+  }
+
+  private protectedContentGate(): ReturnType<NonNullable<SyncRuntimeContext["getProtectedContentGate"]>> {
+    return this.ctx.getProtectedContentGate?.() ?? { ok: true };
+  }
+
+  private assertProtectedContentAllowed(): void {
+    const gate = this.protectedContentGate();
+    if (!gate.ok) throw new Error(gate.message);
+  }
+
+  private canPrefetchRemoteChange(metadata: { path: string; size: number }): boolean {
+    const normalizedPath = this.ctx.normalizeVaultPath(metadata.path);
+    return (
+      this.protectedContentGate().ok &&
+      !this.ctx.isPathExcluded(normalizedPath) &&
+      !this.ctx.getSettings().pendingLargeFiles?.[normalizedPath] &&
+      metadata.size <= JSON_SYNC_MAX_ENCRYPTED_BYTES
+    );
+  }
+
+  /**
+   * Starts a bounded rolling window of remote GETs and yields each response in
+   * input order. Callers still apply local mutations one at a time, preserving
+   * event ordering and the applyingRemoteWrite no-echo guard.
+   */
+  private createRemoteChangePrefetchWindow<T extends { path: string; size: number }>(
+    items: readonly T[],
+    shouldPrefetch: (item: T) => boolean,
+  ): { take(index: number): Promise<ApiResponse<RemoteFileContentResponse> | undefined> } {
+    const pending = new Map<number, Promise<RemoteChangePrefetchOutcome>>();
+    const schedule = (index: number): void => {
+      const item = items[index];
+      if (!item || !shouldPrefetch(item)) return;
+      const normalizedPath = this.ctx.normalizeVaultPath(item.path);
+      const startedAt = Date.now();
+      this.ctx.recordSyncDiagnostic("remotePrefetch.start", {
+        index,
+        path: normalizedPath,
+        timeoutMs: REMOTE_APPLY_PREFETCH_TIMEOUT_MS,
+      });
+      pending.set(
+        index,
+        this.ctx.fetchRemoteFileContent(
+          normalizedPath,
+          REMOTE_APPLY_PREFETCH_REQUEST_OPTIONS,
+        ).then(
+          (response) => {
+            this.ctx.recordSyncDiagnostic("remotePrefetch.done", {
+              index,
+              path: normalizedPath,
+              elapsedMs: Date.now() - startedAt,
+              success: response.success,
+              statusCode: response.error?.statusCode ?? null,
+              requestId: response.requestId || null,
+            });
+            return { response };
+          },
+          (error) => {
+            this.ctx.recordSyncDiagnostic("remotePrefetch.done", {
+              index,
+              path: normalizedPath,
+              elapsedMs: Date.now() - startedAt,
+              success: false,
+              message: error instanceof Error ? error.message : String(error),
+            });
+            return { error };
+          },
+        ),
+      );
+    };
+
+    for (
+      let index = 0;
+      index < Math.min(REMOTE_APPLY_PREFETCH_CONCURRENCY, items.length);
+      index += 1
+    ) {
+      schedule(index);
+    }
+
+    return {
+      take: async (index) => {
+        const prefetched = pending.get(index);
+        pending.delete(index);
+        const outcome = prefetched ? await prefetched : undefined;
+        // Advance only after this slot settles, keeping the in-flight request
+        // count at or below the configured cap. Non-prefetched entries still
+        // advance their slot so tombstones/markers cannot starve later files.
+        schedule(index + REMOTE_APPLY_PREFETCH_CONCURRENCY);
+        if (outcome?.error) throw outcome.error;
+        return outcome?.response;
+      },
+    };
+  }
+
+  private applyRemoteChangeWithOptionalPrefetch(
+    metadata: { path: string; size: number },
+    prefetchedResponse?: ApiResponse<RemoteFileContentResponse>,
+  ): Promise<void> {
+    return prefetchedResponse === undefined
+      ? this.ctx.applyRemoteChange(metadata)
+      : this.ctx.applyRemoteChange(metadata, prefetchedResponse);
+  }
+
+  /** Prove a prefetched payload is readable before DUPLICATE mutates local state. */
+  private async fetchServerDecryptedFallback(
+    path: string,
+  ): Promise<ApiResponse<RemoteFileContentResponse>> {
+    const response = await this.ctx.readFileDecrypted(
+      path,
+      REMOTE_APPLY_PREFETCH_REQUEST_OPTIONS,
+    );
+    if (!response.success || !response.data || response.data.decrypted !== true) {
+      throw new Error(
+        response.error?.message ??
+          `Server-authorized decrypt fallback for "${path}" did not return plaintext.`,
+      );
+    }
+    return response;
+  }
+
+  private async validateRemoteChangeResponse(
+    path: string,
+    response: ApiResponse<RemoteFileContentResponse>,
+  ): Promise<ApiResponse<RemoteFileContentResponse>> {
+    this.assertProtectedContentAllowed();
+    if (!response.success || !response.data) {
+      throw new Error(response.error?.message ?? `Failed to read ${path} from the server.`);
+    }
+    try {
+      if (isBinaryContentType(response.data.contentType)) {
+        if (response.data.decrypted === true) {
+          this.base64ToBytes(response.data.content);
+        } else {
+          await this.ctx.decryptContentBytes(response.data.content);
+        }
+      } else {
+        await this.ctx.decodeRemoteFileContent(path, response.data);
+      }
+    } catch (error) {
+      if (response.data.decrypted === true) throw error;
+      const fallback = await this.fetchServerDecryptedFallback(path);
+      return this.validateRemoteChangeResponse(path, fallback);
+    }
+    this.assertProtectedContentAllowed();
+    return response;
+  }
 
   private isLocalProjectMemoryMode(): boolean {
     return this.ctx.getSettings().localProjectMemoryMode === true;
@@ -326,6 +513,15 @@ export class SyncRuntime {
       this.ctx.log("Sync engine disabled by Local Project Memory Mode.");
       this.ctx.recordSyncDiagnostic("initializeSyncEngine.skipped", {
         reason: "localProjectMemoryMode",
+      });
+      this.stopSyncTimer();
+      return;
+    }
+    const protectionGate = this.protectedContentGate();
+    if (!protectionGate.ok) {
+      this.ctx.log(protectionGate.message);
+      this.ctx.recordSyncDiagnostic("initializeSyncEngine.skipped", {
+        reason: protectionGate.reason,
       });
       this.stopSyncTimer();
       return;
@@ -530,6 +726,14 @@ export class SyncRuntime {
       return;
     }
 
+    const protectionGate = this.protectedContentGate();
+    if (!protectionGate.ok) {
+      this.ctx.log(protectionGate.message);
+      if (userInitiated) this.ctx.showNotice(protectionGate.message, 9000);
+      this.ctx.recordSyncDiagnostic("performSync.skipped", { reason: protectionGate.reason });
+      return;
+    }
+
     if (!this.ctx.getSession()) {
       const message = userInitiated
         ? this.ctx.showLoginRequiredNotice("sync")
@@ -631,6 +835,7 @@ export class SyncRuntime {
     let totalFoldersDownloaded = 0;
     let totalRepairFailures = 0;
     let deltaCount = 0;
+    let remoteApplyFailures = 0;
 
     try {
       syncState.status = "syncing";
@@ -764,6 +969,7 @@ export class SyncRuntime {
       if (!response.success || !response.data) {
         throw new Error(response.error?.message ?? "Sync request failed.");
       }
+      await operation.token.checkpoint();
 
       if (response.data.permissionsChanged) {
         this.ctx.log("Sync: permission rules changed on the server — emitting bus event.");
@@ -790,10 +996,32 @@ export class SyncRuntime {
 
       let appliedDeltaIndex = 0;
       let appliedDeltaBytes = 0;
-      for (const delta of response.data.deltas) {
+      const prefetchWindow = this.createRemoteChangePrefetchWindow(
+        response.data.deltas,
+        (delta) => {
+          const normalizedPath = this.ctx.normalizeVaultPath(delta.path);
+          return (
+            delta.action !== "deleted" &&
+            !this.isFolderMarkerPath(normalizedPath) &&
+            !this.hasPendingOfflineOperation(normalizedPath) &&
+            this.canPrefetchRemoteChange(delta)
+          );
+        },
+      );
+
+      for (const [deltaIndex, delta] of response.data.deltas.entries()) {
+        await operation.token.checkpoint();
         appliedDeltaIndex += 1;
         const normalizedPath = this.ctx.normalizeVaultPath(delta.path);
         try {
+          operation.update({
+            phase: "Applying remote changes",
+            processedItems: appliedDeltaIndex - 1,
+            totalItems: deltaCount,
+            processedBytes: appliedDeltaBytes,
+            message: `Downloading remote change ${appliedDeltaIndex} of ${deltaCount}: ${normalizedPath}`,
+          });
+          const prefetchedResponse = await prefetchWindow.take(deltaIndex);
 
           if (this.ctx.isPathExcluded(normalizedPath)) {
             continue;
@@ -837,11 +1065,26 @@ export class SyncRuntime {
             continue;
           }
 
-          await this.ctx.applyRemoteChange({
-            path: normalizedPath,
-            size: delta.size,
-          });
+          await this.applyRemoteChangeWithOptionalPrefetch(
+            {
+              path: normalizedPath,
+              size: delta.size,
+            },
+            prefetchedResponse,
+          );
           appliedDeltaBytes += delta.size ?? 0;
+        } catch (error) {
+          remoteApplyFailures += 1;
+          this.ctx.logError(
+            `Sync: remote change ${appliedDeltaIndex} of ${deltaCount} failed for "${normalizedPath}"; continuing without advancing the sync cursor.`,
+            error,
+          );
+          this.ctx.recordSyncDiagnostic("remoteApply.failed", {
+            index: deltaIndex,
+            path: normalizedPath,
+            action: delta.action,
+            message: error instanceof Error ? error.message : String(error),
+          });
         } finally {
           operation.update({
             phase: "Applying remote changes",
@@ -854,6 +1097,28 @@ export class SyncRuntime {
             await yieldToEventLoop();
           }
         }
+      }
+
+      await operation.token.checkpoint();
+
+      if (remoteApplyFailures > 0) {
+        const remoteApplySuccesses = deltaCount - remoteApplyFailures;
+        const message =
+          `VaultGuard Sync: ${remoteApplyFailures} of ${deltaCount} remote changes failed; ` +
+          `${remoteApplySuccesses} succeeded. The failed item was not skipped in sync state — ` +
+          "the cursor was kept so Sync now can retry it.";
+        const error = new Error(message);
+        syncState.status = "error";
+        syncState.lastError = message;
+        operation.fail(error);
+        this.ctx.logError("Sync finished with remote-apply failures", error);
+        this.ctx.recordSyncDiagnostic("performSync.remoteApplyIncomplete", {
+          failed: remoteApplyFailures,
+          succeeded: remoteApplySuccesses,
+          total: deltaCount,
+        });
+        this.ctx.showNotice(message, 12000);
+        return;
       }
 
       // Phase 2b: repair missing server-side items that are older than our
@@ -872,6 +1137,8 @@ export class SyncRuntime {
           this.ctx.setRemoteInventoryRepairCompleted(totalRepairFailures === 0);
         }
       }
+
+      await operation.token.checkpoint();
 
       syncState.lastSync = response.data.syncTimestamp;
       syncState.pendingChanges = this.ctx.getOfflineQueueLength();
@@ -984,32 +1251,48 @@ export class SyncRuntime {
   }
 
   async readFileDecrypted(
-    relPath: string
+    relPath: string,
+    options?: RemoteFileFetchOptions,
   ): Promise<ApiResponse<RemoteFileContentResponse>> {
     const normalizedPath = this.ctx.normalizeVaultPath(relPath);
     const encoded = normalizedPath
       .split("/")
       .map((segment) => encodeURIComponent(segment))
       .join("/");
-    return this.ctx.apiRequest<RemoteFileContentResponse>(
-      "GET",
-      this.ctx.vaultPath(`/files-decrypted/${encoded}`)
-    );
+    const endpoint = this.ctx.vaultPath(`/files-decrypted/${encoded}`);
+    return options === undefined
+      ? this.ctx.apiRequest<RemoteFileContentResponse>("GET", endpoint)
+      : this.ctx.apiRequest<RemoteFileContentResponse>(
+          "GET",
+          endpoint,
+          undefined,
+          undefined,
+          options,
+        );
   }
 
   async fetchRemoteFileContent(
-    path: string
+    path: string,
+    options?: RemoteFileFetchOptions,
   ): Promise<ApiResponse<RemoteFileContentResponse>> {
     const normalizedPath = this.ctx.normalizeVaultPath(path);
     const serverDecrypt =
       !this.hasValidKeyLease() || this.ctx.isPathDeniedByKeyLease(normalizedPath);
     if (serverDecrypt) {
-      return this.ctx.readFileDecrypted(normalizedPath);
+      return options === undefined
+        ? this.ctx.readFileDecrypted(normalizedPath)
+        : this.ctx.readFileDecrypted(normalizedPath, options);
     }
-    return this.ctx.apiRequest<RemoteFileContentResponse>(
-      "GET",
-      this.ctx.vaultPath(`/files/${encodeURIComponent(normalizedPath)}`)
-    );
+    const endpoint = this.ctx.vaultPath(`/files/${encodeURIComponent(normalizedPath)}`);
+    return options === undefined
+      ? this.ctx.apiRequest<RemoteFileContentResponse>("GET", endpoint)
+      : this.ctx.apiRequest<RemoteFileContentResponse>(
+          "GET",
+          endpoint,
+          undefined,
+          undefined,
+          options,
+        );
   }
 
   async decodeRemoteFileContent(
@@ -1081,16 +1364,28 @@ export class SyncRuntime {
         response.error?.message ?? `Failed to read ${normalizedPath} from the server.`
       );
     }
-    const plaintext = await this.ctx.decodeRemoteFileContent(normalizedPath, response.data);
+    let readableData: RemoteFileContentResponse = response.data;
+    try {
+      await this.ctx.decodeRemoteFileContent(normalizedPath, readableData);
+    } catch (error) {
+      if (readableData.decrypted === true) throw error;
+      const fallback = await this.fetchServerDecryptedFallback(normalizedPath);
+      readableData = fallback.data!;
+    }
+    const plaintext = await this.ctx.decodeRemoteFileContent(
+      normalizedPath,
+      readableData,
+    );
     this.recordRemoteReadState(
       normalizedPath,
-      response.data,
+      readableData,
       await this.ctx.computeHash(plaintext)
     );
     return plaintext;
   }
 
   async applyRemoteDeletion(normalizedPath: string, inferred: boolean): Promise<void> {
+    this.assertProtectedContentAllowed();
     this.ctx.recordRemoteFileAbsent(normalizedPath);
     if (!this.ctx.hasOriginalAdapterRemove()) return;
 
@@ -1129,13 +1424,24 @@ export class SyncRuntime {
     }
   }
 
-  async applyRemoteChange(metadata: Pick<FileMetadata, "path" | "size">): Promise<void> {
+  async applyRemoteChange(
+    metadata: Pick<FileMetadata, "path" | "size">,
+    prefetchedResponse?: ApiResponse<RemoteFileContentResponse>,
+  ): Promise<void> {
+    this.assertProtectedContentAllowed();
     const normalizedPath = this.ctx.normalizeVaultPath(metadata.path);
     if (this.ctx.isPathExcluded(normalizedPath)) {
       this.ctx.log(`Sync: skipping excluded path "${normalizedPath}".`);
       return;
     }
-    if (this.ctx.isPathDeniedByKeyLease(normalizedPath)) {
+    if (
+      this.ctx.isPathDeniedByKeyLease(normalizedPath) &&
+      (
+        prefetchedResponse === undefined ||
+        (prefetchedResponse.success === true &&
+          prefetchedResponse.data?.decrypted !== true)
+      )
+    ) {
       this.ctx.log(`Sync: skipping key-lease-denied path "${normalizedPath}".`);
       return;
     }
@@ -1152,6 +1458,7 @@ export class SyncRuntime {
       if (!this.ctx.hasOriginalAdapterWrite()) return;
       try {
         const direct = await this.ctx.downloadLargeEncryptedFile(normalizedPath);
+        this.assertProtectedContentAllowed();
         if (isBinaryContentType(direct.contentType)) {
           await this.writeLocalBinaryFileFromRemote(normalizedPath, direct.bytes);
         } else {
@@ -1174,11 +1481,14 @@ export class SyncRuntime {
           error,
         );
         this.ctx.notifyCloudDecryptFallback(normalizedPath);
+        throw error;
       }
       return;
     }
 
-    const response = await this.ctx.fetchRemoteFileContent(normalizedPath);
+    const response =
+      prefetchedResponse ?? (await this.ctx.fetchRemoteFileContent(normalizedPath));
+    this.assertProtectedContentAllowed();
     if (!response.success || !response.data) {
       // SD-06-F1: same strict 404/410 absence recording as readRemotePlaintext,
       // same verbatim predicate, same traps excluded (0 / 5xx / 401 / 403 are
@@ -1219,14 +1529,24 @@ export class SyncRuntime {
             ? (this.base64ToBytes(response.data.content).buffer as ArrayBuffer)
             : await this.ctx.decryptContentBytes(response.data.content);
       } catch (decryptErr) {
-        // OD-2: a decode/decrypt failure skips with a notice and NEVER wipes or
-        // overwrites the local copy — identical discipline to the string catch.
+        if (response.data.decrypted !== true) {
+          try {
+            const fallback = await this.fetchServerDecryptedFallback(normalizedPath);
+            return this.applyRemoteChange(metadata, fallback);
+          } catch (fallbackError) {
+            decryptErr = fallbackError;
+          }
+        }
+        // OD-2: a decode/decrypt failure NEVER wipes or overwrites the local
+        // copy. It must still reject: reconciliation/conflict callers count a
+        // fulfilled promise as an applied file and may otherwise advance their
+        // cursor after a no-op (the Apply-plan false-success regression).
         this.ctx.logError(
           `Sync: skipping "${normalizedPath}" — cloud binary could not be decrypted.`,
           decryptErr
         );
         this.ctx.notifyCloudDecryptFallback(normalizedPath);
-        return;
+        throw this.remoteDecryptError(normalizedPath, decryptErr);
       }
       this.ctx.recordSyncDiagnostic("applyRemoteChange.binary-pull", {
         path: normalizedPath,
@@ -1240,12 +1560,23 @@ export class SyncRuntime {
     try {
       decrypted = await this.ctx.decodeRemoteFileContent(normalizedPath, response.data);
     } catch (decryptErr) {
+      if (response.data.decrypted !== true) {
+        try {
+          const fallback = await this.fetchServerDecryptedFallback(normalizedPath);
+          return this.applyRemoteChange(metadata, fallback);
+        } catch (fallbackError) {
+          decryptErr = fallbackError;
+        }
+      }
       this.ctx.logError(
         `Sync: skipping "${normalizedPath}" — cloud copy could not be decrypted.`,
         decryptErr
       );
       this.ctx.notifyCloudDecryptFallback(normalizedPath);
-      return;
+      // Preserve the local bytes but make the no-apply outcome explicit to all
+      // callers. In particular, initial reconciliation must count this as a
+      // failed conflict and retain its previous binding/cursor for retry.
+      throw this.remoteDecryptError(normalizedPath, decryptErr);
     }
 
     await this.ctx.writeLocalFileFromRemote(normalizedPath, decrypted);
@@ -1258,47 +1589,34 @@ export class SyncRuntime {
   }
 
   async writeLocalFileFromRemote(path: string, content: string): Promise<void> {
+    this.assertProtectedContentAllowed();
     const normalized = this.ctx.normalizeVaultPath(path);
     await this.ctx.ensureParentFoldersForPath(normalized);
-
-    this.ctx.setApplyingRemoteWrite(true);
-    try {
-      const existing = this.ctx.app.vault.getAbstractFileByPath(normalized);
-      if (existing instanceof TFile) {
-        await this.ctx.app.vault.modify(existing, content);
-        return;
-      }
-
-      try {
-        await this.ctx.app.vault.create(normalized, content);
-      } catch (err) {
-        if (!this.ctx.hasOriginalAdapterWrite()) throw err;
-        await this.ctx.writePlainToDisk(normalized, content);
-      }
-    } finally {
-      this.ctx.setApplyingRemoteWrite(false);
+    if (!this.ctx.hasOriginalAdapterWrite()) {
+      throw new Error(`VaultGuard Sync: cannot write "${normalized}" — vault adapter unavailable.`);
     }
+
+    // The Obsidian vault create/modify promise can remain pending even after
+    // its adapter write has durably landed (observed during first-bind recovery).
+    // Await the authoritative VG1 at-rest writer instead; Obsidian's file
+    // watcher indexes the resulting create/modify asynchronously. This also
+    // avoids holding the global applyingRemoteWrite flag across a host promise.
+    await this.ctx.writePlainToDisk(normalized, content);
   }
 
   /**
    * BIN-A / D-06 (pull side): byte sibling of writeLocalFileFromRemote. Writes a
-   * pulled binary to disk VG1-encrypted, mirroring the string sibling's
-   * applyingRemoteWrite bracket + parent-folder creation + vault-API-preferred
-   * structure with byte substitutions (createBinary/modifyBinary/
-   * writePlainBinaryToDisk instead of create/modify/writePlainToDisk).
+   * pulled binary to disk VG1-encrypted through the authoritative direct
+   * at-rest writer. Obsidian's watcher indexes the resulting path afterward.
    *
    * L13 gate FIRST: writePlainBinaryToDisk SILENTLY no-ops when the adapter has
    * no writeBinary (unlike the string writePlainToDisk's AR2 throw), so a legacy
    * adapter must skip here — downloaded content is never silently discarded, and
    * legacy adapters keep today's no-binary behavior (D-10).
    *
-   * The setApplyingRemoteWrite bracket is mandatory: it passes this write through
-   * interceptedWriteBinary's EXISTING applyingRemoteWrite bypass
-   * (at-rest-adapter-runtime.ts) while the CR-1 ingestion block is still in
-   * place, and prevents an echo-upload. Pull-side VG1 writes are CR-1-safe in ANY
-   * wave — a pulled binary has a server copy by definition. Pull-written binaries
-   * read back immediately: adapter.readBinary → interceptedReadBinary decrypts
-   * VG1 transparently.
+   * Pull-side VG1 writes are CR-1-safe in any wave: a pulled binary has a server
+   * copy by definition. Pull-written binaries read back immediately through the
+   * intercepted adapter, which decrypts VG1 transparently.
    */
   private async writeLocalBinaryFileFromRemote(
     path: string,
@@ -1313,24 +1631,7 @@ export class SyncRuntime {
     const normalized = this.ctx.normalizeVaultPath(path);
     await this.ctx.ensureParentFoldersForPath(normalized);
 
-    this.ctx.setApplyingRemoteWrite(true);
-    try {
-      const existing = this.ctx.app.vault.getAbstractFileByPath(normalized);
-      if (existing instanceof TFile) {
-        await this.ctx.app.vault.modifyBinary(existing, bytes);
-        return;
-      }
-
-      try {
-        await this.ctx.app.vault.createBinary(normalized, bytes);
-      } catch {
-        // Vault binary API unavailable / create raced: fall back to the VG1 byte
-        // writer (refuses VG1-magic plaintext — corrupted-read cascade guard).
-        await this.ctx.writePlainBinaryToDisk(normalized, bytes);
-      }
-    } finally {
-      this.ctx.setApplyingRemoteWrite(false);
-    }
+    await this.ctx.writePlainBinaryToDisk(normalized, bytes);
   }
 
   /**
@@ -1367,6 +1668,7 @@ export class SyncRuntime {
   }
 
   async syncFileRenameToServer(oldPath: string, newPath: string): Promise<void> {
+    this.assertProtectedContentAllowed();
     if (this.isLocalProjectMemoryMode()) return;
     if (!this.ctx.hasOriginalAdapterRead()) return;
 
@@ -1627,6 +1929,7 @@ export class SyncRuntime {
   }
 
   async syncFileDeleteToServer(path: string): Promise<void> {
+    this.assertProtectedContentAllowed();
     if (this.isLocalProjectMemoryMode()) return;
     const normalized = this.ctx.normalizeVaultPath(path);
     if (!normalized || this.isFolderMarkerPath(normalized) || this.ctx.isPathExcluded(normalized)) {
@@ -1666,6 +1969,15 @@ export class SyncRuntime {
       this.ctx.log("Initial reconciliation skipped by Local Project Memory Mode.");
       return false;
     }
+    const protectionGate = this.protectedContentGate();
+    if (!protectionGate.ok) {
+      this.ctx.log(protectionGate.message);
+      this.ctx.showNotice(protectionGate.message, 9000);
+      this.ctx.recordSyncDiagnostic("initialReconciliation.skipped", {
+        reason: protectionGate.reason,
+      });
+      return false;
+    }
     if (!this.ctx.getSession() || !this.ctx.isOnline()) {
       throw new Error("Reconciliation requires an authenticated, online session.");
     }
@@ -1698,6 +2010,7 @@ export class SyncRuntime {
       }
       throw error;
     }
+    this.currentInitialReconciliationOperation = operation;
 
     try {
     const localFiles = this.ctx.app.vault.getFiles();
@@ -1723,6 +2036,7 @@ export class SyncRuntime {
       approximatePercent: true,
     });
     for (const file of localFiles) {
+      await operation.token.checkpoint();
       try {
         const normalized = this.ctx.normalizeVaultPath(file.path);
         if (this.ctx.isPathExcluded(normalized)) continue;
@@ -1794,6 +2108,7 @@ export class SyncRuntime {
     }
 
     const serverPaths = new Set<string>();
+    const serverFileSizes = new Map<string, number>();
     const serverFolderPaths = new Set<string>();
     let inventoryIndex = 0;
     operation.update({
@@ -1804,6 +2119,7 @@ export class SyncRuntime {
       approximatePercent: true,
     });
     for (const delta of inventory.data.deltas) {
+      await operation.token.checkpoint();
       try {
         if (delta.action === "deleted") continue;
         const normalized = this.ctx.normalizeVaultPath(delta.path);
@@ -1815,6 +2131,7 @@ export class SyncRuntime {
         }
         if (this.ctx.isPathExcluded(normalized)) continue;
         serverPaths.add(delta.path);
+        serverFileSizes.set(delta.path, Math.max(0, delta.size ?? 0));
       } finally {
         inventoryIndex += 1;
         if (inventoryIndex % DEFAULT_LONG_OPERATION_BATCH_SIZE === 0) {
@@ -1854,6 +2171,7 @@ export class SyncRuntime {
       approximatePercent: true,
     });
     for (const path of serverPaths) {
+      await operation.token.checkpoint();
       try {
         if (localManifest.has(path)) continue;
         // SY6: a path that's on the server AND unreadable locally is NOT
@@ -1891,6 +2209,7 @@ export class SyncRuntime {
       );
     }
     for (const [path, entry] of localManifest.entries()) {
+      await operation.token.checkpoint();
       try {
         if (!serverPaths.has(path)) {
           localOnly.push(path);
@@ -1928,6 +2247,7 @@ export class SyncRuntime {
       });
       let limitedIndex = 0;
       for (const path of serverOnly) {
+        await operation.token.checkpoint();
         try {
           const normalized = this.ctx.normalizeVaultPath(path);
           if (this.ctx.isPathExcluded(normalized)) continue;
@@ -2005,6 +2325,7 @@ export class SyncRuntime {
     }
 
     const sameContent = new Set<string>();
+    const comparisonFailures = new Set<string>();
     operation.update({
       phase: "Comparing matching files",
       processedItems: 0,
@@ -2014,6 +2335,7 @@ export class SyncRuntime {
     });
     let compareIndex = 0;
     for (const item of localManifestBoth) {
+      await operation.token.checkpoint();
       try {
         const localView = new TextEncoder().encode(item.localContent);
         const remoteHash = localView.byteLength > BINARY_SYNC_MAX_BYTES
@@ -2026,7 +2348,7 @@ export class SyncRuntime {
         }
       } catch (err) {
         this.ctx.logError(`Reconciliation: comparison failed for "${item.path}"`, err);
-        conflicts.push(item.path);
+        comparisonFailures.add(item.path);
       } finally {
         compareIndex += 1;
         operation.update({
@@ -2048,6 +2370,7 @@ export class SyncRuntime {
     // cancelled binding still modifies nothing.
     const healBinary: Array<{ path: string; bytes: ArrayBuffer }> = [];
     for (const item of binaryBoth) {
+      await operation.token.checkpoint();
       try {
         if (item.bytes.byteLength > BINARY_SYNC_MAX_BYTES) {
           const direct = await this.ctx.downloadLargeEncryptedFile(item.path);
@@ -2070,6 +2393,7 @@ export class SyncRuntime {
             `Reconciliation: server read failed for binary "${item.path}"`,
             response.error
           );
+          comparisonFailures.add(item.path);
           continue;
         }
         if (!isBinaryContentType(response.data.contentType)) {
@@ -2087,10 +2411,13 @@ export class SyncRuntime {
         // (/files-decrypted) response is base64 of the PLAIN bytes — decode
         // directly, never via a lossy UTF-8 round-trip; else decrypt the
         // ciphertext with the byte sibling.
-        const remoteBytes =
-          response.data.decrypted === true
-            ? (this.base64ToBytes(response.data.content).buffer as ArrayBuffer)
-            : await this.ctx.decryptContentBytes(response.data.content);
+        const readableResponse = await this.validateRemoteChangeResponse(
+          item.path,
+          response,
+        );
+        const remoteBytes = readableResponse.data!.decrypted === true
+          ? (this.base64ToBytes(readableResponse.data!.content).buffer as ArrayBuffer)
+          : await this.ctx.decryptContentBytes(readableResponse.data!.content);
         const remoteHash = await this.ctx.computeHashBytes(remoteBytes);
         if (remoteHash === item.hash) {
           sameContent.add(item.path);
@@ -2105,8 +2432,29 @@ export class SyncRuntime {
           `Reconciliation: binary comparison failed for "${item.path}"`,
           err
         );
+        comparisonFailures.add(item.path);
         continue;
       }
+    }
+
+    if (comparisonFailures.size > 0) {
+      const message =
+        `VaultGuard Sync: Reconciliation could not safely compare ${comparisonFailures.size} ` +
+        "server file(s). No plan was applied and the previous sync cursor was kept. " +
+        "Retry after refreshing access, or open VaultGuard status for details.";
+      const error = new Error(message);
+      const syncState = this.ctx.getSyncState();
+      syncState.status = "error";
+      syncState.lastError = message;
+      await this.ctx.saveSettings();
+      new Notice(message, 12000);
+      this.ctx.logError("Reconciliation comparison incomplete", error);
+      this.ctx.recordSyncDiagnostic("initialReconciliation.comparison-failed", {
+        failedCount: comparisonFailures.size,
+        paths: [...comparisonFailures],
+      });
+      operation.fail(error);
+      return false;
     }
 
     const decision = await this.ctx.askReconciliationPlan({
@@ -2127,42 +2475,85 @@ export class SyncRuntime {
     let downloaded = 0;
     let downloadFailed = 0;
     let deletedOnServer = 0;
+    const totalDownloadBytes = serverOnly.reduce(
+      (sum, path) => sum + (serverFileSizes.get(path) ?? 0),
+      0,
+    );
+    let processedDownloadBytes = 0;
+    const reconciliationItems = serverOnly.map((path) => ({
+      path,
+      size: serverFileSizes.get(path) ?? 0,
+    }));
+    const reconciliationPrefetchWindow = this.createRemoteChangePrefetchWindow(
+      reconciliationItems,
+      (item) =>
+        !this.isPathTombstoned(this.ctx.normalizeVaultPath(item.path)) &&
+        this.canPrefetchRemoteChange(item),
+    );
     operation.update({
       phase: "Downloading server-only files",
       processedItems: 0,
       totalItems: serverOnly.length,
+      processedBytes: 0,
+      totalBytes: totalDownloadBytes > 0 ? totalDownloadBytes : null,
       percent: 65,
       approximatePercent: true,
+      message:
+        serverOnly.length > 0
+          ? `Preparing item 1 of ${serverOnly.length}.`
+          : "No server-only files to download.",
     });
     let downloadIndex = 0;
-    for (const path of serverOnly) {
+    for (const [serverOnlyIndex, path] of serverOnly.entries()) {
+      await operation.token.checkpoint();
       try {
         const normalized = this.ctx.normalizeVaultPath(path);
+        const size = serverFileSizes.get(path) ?? 0;
+        operation.update({
+          phase: "Downloading server-only files",
+          processedItems: downloadIndex,
+          totalItems: serverOnly.length,
+          processedBytes: processedDownloadBytes,
+          totalBytes: totalDownloadBytes > 0 ? totalDownloadBytes : null,
+          percent: 65 + (serverOnly.length > 0 ? (downloadIndex / serverOnly.length) * 10 : 10),
+          approximatePercent: true,
+          message: `Downloading item ${downloadIndex + 1} of ${serverOnly.length}: ${normalized}`,
+        });
+        const prefetchedResponse = await reconciliationPrefetchWindow.take(serverOnlyIndex);
         if (this.isPathTombstoned(normalized)) {
           if (await this.deleteTombstonedServerPath(normalized)) {
             deletedOnServer += 1;
           }
           continue;
         }
-        await this.ctx.applyRemoteChange({ path: normalized, size: 0 });
+        await this.applyRemoteChangeWithOptionalPrefetch(
+          { path: normalized, size },
+          prefetchedResponse,
+        );
+        await operation.token.checkpoint();
         downloaded += 1;
       } catch (err) {
         this.ctx.logError(`Reconciliation: download failed for "${path}"`, err);
         downloadFailed += 1;
       } finally {
+        processedDownloadBytes += serverFileSizes.get(path) ?? 0;
         downloadIndex += 1;
         operation.update({
           phase: "Downloading server-only files",
           processedItems: downloadIndex,
           totalItems: serverOnly.length,
+          processedBytes: processedDownloadBytes,
+          totalBytes: totalDownloadBytes > 0 ? totalDownloadBytes : null,
+          percent: 65 + (serverOnly.length > 0 ? (downloadIndex / serverOnly.length) * 10 : 10),
           approximatePercent: true,
-          message: `${downloaded} downloaded, ${downloadFailed} failed.`,
+          message: `${downloaded} downloaded, ${downloadFailed} failed; ${downloadIndex} of ${serverOnly.length} processed.`,
         });
         if (downloadIndex % DEFAULT_LONG_OPERATION_BATCH_SIZE === 0) {
           await yieldToEventLoop();
         }
       }
     }
+    await operation.token.checkpoint();
 
     let uploaded = 0;
     let uploadSkipped = 0;
@@ -2176,6 +2567,7 @@ export class SyncRuntime {
     });
     let uploadIndex = 0;
     for (const path of localOnly) {
+      await operation.token.checkpoint();
       try {
         const entry = localManifest.get(path);
         if (!entry) continue;
@@ -2216,6 +2608,7 @@ export class SyncRuntime {
         }
       }
     }
+    await operation.token.checkpoint();
 
     // BIN-A / L7: heal pre-BIN-A lossy server artifacts by uploading the local
     // bytes. Runs only after the user confirmed the plan (above), so a cancelled
@@ -2224,6 +2617,7 @@ export class SyncRuntime {
     // impossible here (T-11-16). A "skipped-*" outcome leaves both copies as-is,
     // never a deletion (SY2 extended).
     for (const heal of healBinary) {
+      await operation.token.checkpoint();
       try {
         // SD-06-F1 / DECISION 7 — FORCE. This is the L7 heal of a pre-BIN-A
         // LOSSY server artifact: the server copy is known-corrupt and the local
@@ -2247,6 +2641,17 @@ export class SyncRuntime {
 
     let conflictsResolved = 0;
     let conflictFailed = 0;
+    // KEEP_REMOTE and DUPLICATE both pull the authoritative server copy after
+    // the user confirms the plan. Bound those GETs exactly like server-only
+    // reconciliation: network reads overlap, while conflict writes/applies stay
+    // ordered and serial. KEEP_LOCAL is upload-only and schedules no GET.
+    const conflictPrefetchWindow =
+      decision.conflictStrategy === ConflictResolutionStrategy.KEEP_LOCAL
+        ? null
+        : this.createRemoteChangePrefetchWindow(
+            conflicts.map((path) => ({ path, size: serverFileSizes.get(path) ?? 0 })),
+            (item) => this.canPrefetchRemoteChange(item),
+          );
     operation.update({
       phase: "Resolving conflicts",
       processedItems: 0,
@@ -2255,13 +2660,26 @@ export class SyncRuntime {
       approximatePercent: true,
     });
     let conflictIndex = 0;
-    for (const path of conflicts) {
+    for (const [conflictListIndex, path] of conflicts.entries()) {
+      await operation.token.checkpoint();
       try {
-        await this.ctx.resolveReconciliationConflict(
-          path,
-          decision.conflictStrategy,
-          localManifest
-        );
+        const prefetchedResponse = conflictPrefetchWindow
+          ? await conflictPrefetchWindow.take(conflictListIndex)
+          : undefined;
+        if (prefetchedResponse === undefined) {
+          await this.ctx.resolveReconciliationConflict(
+            path,
+            decision.conflictStrategy,
+            localManifest,
+          );
+        } else {
+          await this.ctx.resolveReconciliationConflict(
+            path,
+            decision.conflictStrategy,
+            localManifest,
+            prefetchedResponse,
+          );
+        }
         conflictsResolved += 1;
       } catch (err) {
         this.ctx.logError(`Reconciliation: conflict resolution failed for "${path}"`, err);
@@ -2297,6 +2715,7 @@ export class SyncRuntime {
     });
 
     for (const folderPath of serverFolderPaths) {
+      await operation.token.checkpoint();
       try {
         if (!folderPath || localFolderPaths.has(folderPath)) continue;
         const created = await this.ctx.ensureLocalFolderPath(folderPath);
@@ -2319,6 +2738,7 @@ export class SyncRuntime {
     }
 
     for (const folderPath of localFolderPaths) {
+      await operation.token.checkpoint();
       try {
         if (serverFolderPaths.has(folderPath)) continue;
         const ok = await this.ctx.uploadFolderMarker(folderPath);
@@ -2345,6 +2765,7 @@ export class SyncRuntime {
 
     const fullySucceeded =
       uploadFailed === 0 &&
+      uploadSkipped === 0 &&
       downloadFailed === 0 &&
       conflictFailed === 0 &&
       foldersFailed === 0;
@@ -2353,9 +2774,9 @@ export class SyncRuntime {
     const syncState = this.ctx.getSyncState();
     if (fullySucceeded) {
       settings.bindingReconciledVaultId = settings.serverVaultId;
+      syncState.lastSync = inventory.data.syncTimestamp;
+      settings.lastSyncTimestamp = inventory.data.syncTimestamp;
     }
-    syncState.lastSync = inventory.data.syncTimestamp;
-    settings.lastSyncTimestamp = inventory.data.syncTimestamp;
     await this.ctx.saveSettings();
 
     const failureParts: string[] = [];
@@ -2381,18 +2802,34 @@ export class SyncRuntime {
 
     if (fullySucceeded) {
       new Notice(`VaultGuard Sync: Reconciliation complete. ${summary}`);
-    } else {
-      new Notice(
-        `VaultGuard Sync: Reconciliation finished with errors — ${summary} Open the sidebar to retry.`,
-        10000
-      );
+      this.ctx.log(`Reconciliation complete: ${summary}`);
+      operation.complete(`Reconciliation complete — ${summary}`);
+      return true;
     }
-    this.ctx.log(`Reconciliation complete: ${summary}`);
-    operation.complete(`Reconciliation complete — ${summary}`);
-    return true;
+
+    const incompleteMessage =
+      `VaultGuard Sync: Reconciliation incomplete — ${summary} ` +
+      "The previous sync cursor was kept so failed items remain eligible. Open the sidebar to retry.";
+    const incompleteError = new Error(incompleteMessage);
+    syncState.status = "error";
+    syncState.lastError = incompleteMessage;
+    new Notice(incompleteMessage, 12000);
+    this.ctx.logError("Reconciliation incomplete", incompleteError);
+    this.ctx.recordSyncDiagnostic("initialReconciliation.incomplete", {
+      downloadFailed,
+      uploadFailed,
+      conflictFailed,
+      foldersFailed,
+    });
+    operation.fail(incompleteError);
+    return false;
     } catch (error) {
       operation.fail(error);
       throw error;
+    } finally {
+      if (this.currentInitialReconciliationOperation === operation) {
+        this.currentInitialReconciliationOperation = null;
+      }
     }
   }
 
@@ -2419,6 +2856,7 @@ export class SyncRuntime {
     content: string,
     options: { intent: MutationIntent; noWriteNotice?: string }
   ): Promise<UploadReconciledOutcome> {
+    this.assertProtectedContentAllowed();
     const intent: MutationIntent = options?.intent ?? { kind: "unknown" };
     if (this.isLocalProjectMemoryMode()) {
       this.ctx.log(`Reconciliation: skipping "${path}" — Local Project Memory Mode is local-only.`);
@@ -2539,6 +2977,7 @@ export class SyncRuntime {
     // same contract as the string sibling.
     options: { intent: MutationIntent; noWriteNotice?: string }
   ): Promise<UploadReconciledBinaryOutcome> {
+    this.assertProtectedContentAllowed();
     const intent: MutationIntent = options?.intent ?? { kind: "unknown" };
     if (!this.hasValidKeyLease()) {
       this.ctx.log(`Reconciliation: skipping "${path}" — no encryption key lease available.`);
@@ -2736,6 +3175,7 @@ export class SyncRuntime {
     failedFiles: number;
     failedFolders: number;
   } | null> {
+    this.assertProtectedContentAllowed();
     if (this.isLocalProjectMemoryMode()) return null;
     const settings = this.ctx.getSettings();
     if (!this.ctx.getSession() || !settings.serverVaultId || !this.hasValidKeyLease()) {
@@ -3010,6 +3450,7 @@ export class SyncRuntime {
     failedFiles: number;
     failedFolders: number;
   } | null> {
+    this.assertProtectedContentAllowed();
     if (this.isLocalProjectMemoryMode()) return null;
     const settings = this.ctx.getSettings();
     if (!this.ctx.getSession() || !settings.serverVaultId) return null;
@@ -3142,6 +3583,7 @@ export class SyncRuntime {
   }
 
   async uploadFolderMarker(folderPath: string): Promise<boolean> {
+    this.assertProtectedContentAllowed();
     if (this.isLocalProjectMemoryMode()) return false;
     const settings = this.ctx.getSettings();
     if (!this.ctx.getSession() || !settings.serverVaultId) return false;
@@ -3231,6 +3673,7 @@ export class SyncRuntime {
   }
 
   async deleteFolderContentsOnServer(folderPath: string): Promise<void> {
+    this.assertProtectedContentAllowed();
     if (this.isLocalProjectMemoryMode()) return;
     const settings = this.ctx.getSettings();
     if (!this.ctx.getSession() || !settings.serverVaultId) return;
@@ -3332,14 +3775,15 @@ export class SyncRuntime {
   async resolveReconciliationConflict(
     path: string,
     strategy: ConflictResolutionStrategy,
-    localManifest: Map<string, LocalManifestEntry>
+    localManifest: Map<string, LocalManifestEntry>,
+    prefetchedResponse?: ApiResponse<RemoteFileContentResponse>,
   ): Promise<void> {
     const normalizedPath = this.ctx.normalizeVaultPath(path);
     const entry = localManifest.get(path);
 
     switch (strategy) {
       case ConflictResolutionStrategy.KEEP_LOCAL: {
-        if (!entry) return;
+        if (!entry) throw new Error(`Local conflict source "${normalizedPath}" is unavailable.`);
         // SD-06-F1 / DECISION 7 — FORCE, both branches. The USER chose
         // KEEP_LOCAL for this reconciliation conflict, which is the sanctioned
         // "force only after a conflict choice" lane. Declaring it explicitly is
@@ -3353,13 +3797,19 @@ export class SyncRuntime {
           // BIN-A / L4: KEEP_LOCAL byte-uploads the local bytes (never the
           // string uploader — that would lossily UTF-8-encode them). The byte
           // uploader's outcome union is respected; no skip leads to a deletion.
-          await this.uploadReconciledBinaryFile(normalizedPath, entry.bytes, {
+          const outcome = await this.uploadReconciledBinaryFile(normalizedPath, entry.bytes, {
             intent: { kind: "force" },
           });
+          if (outcome !== "uploaded") {
+            throw new Error(`Conflict upload for "${normalizedPath}" was not completed (${outcome}).`);
+          }
         } else {
-          await this.ctx.uploadReconciledFile(normalizedPath, entry.content, {
+          const outcome = await this.ctx.uploadReconciledFile(normalizedPath, entry.content, {
             intent: { kind: "force" },
           });
+          if (outcome !== "uploaded") {
+            throw new Error(`Conflict upload for "${normalizedPath}" was not completed (${outcome}).`);
+          }
         }
         return;
       }
@@ -3368,11 +3818,27 @@ export class SyncRuntime {
         // GET-response contentType (D-06 chokepoint), so this ONE call pulls a
         // binary remote through the byte writer and a text remote through the
         // string writer — no branch needed here.
-        await this.ctx.applyRemoteChange({ path: normalizedPath, size: 0 });
+        await this.applyRemoteChangeWithOptionalPrefetch(
+          { path: normalizedPath, size: 0 },
+          prefetchedResponse,
+        );
         return;
       }
       case ConflictResolutionStrategy.DUPLICATE:
       default: {
+        const response =
+          prefetchedResponse ??
+          await this.ctx.fetchRemoteFileContent(
+            normalizedPath,
+            REMOTE_APPLY_PREFETCH_REQUEST_OPTIONS,
+          );
+        // A retry must not create another conflict-suffix file when the remote
+        // payload is still unreadable. Validate first, then commit the ordered
+        // duplicate + original overwrite using this exact response (one GET).
+        const readableResponse = await this.validateRemoteChangeResponse(
+          normalizedPath,
+          response,
+        );
         if (entry?.kind === "binary") {
           // BIN-A / L4: DUPLICATE for a binary writes the LOCAL bytes to the
           // conflict-named path via the pull byte writer (reused, NOT a third
@@ -3384,7 +3850,10 @@ export class SyncRuntime {
           const conflictPath = this.generateConflictPath(normalizedPath);
           await this.ctx.writeLocalFileFromRemote(conflictPath, entry.content);
         }
-        await this.ctx.applyRemoteChange({ path: normalizedPath, size: 0 });
+        await this.applyRemoteChangeWithOptionalPrefetch(
+          { path: normalizedPath, size: 0 },
+          readableResponse,
+        );
         return;
       }
     }
@@ -3410,6 +3879,7 @@ export class SyncRuntime {
     baseVersionId?: string | null,
     options: { createConflict?: boolean } = {}
   ): Promise<RemoteWriteConflictResolutionResult> {
+    this.assertProtectedContentAllowed();
     const normalizedPath = this.ctx.normalizeVaultPath(path);
     const priorState = this.ctx.getRemoteFileState(normalizedPath);
     const response = await this.ctx.fetchRemoteFileContent(normalizedPath);
@@ -3605,6 +4075,7 @@ export class SyncRuntime {
   }
 
   async handleConflict(conflict: SyncConflict): Promise<void> {
+    this.assertProtectedContentAllowed();
     const strategy = this.ctx.getSettings().defaultConflictResolution;
     await this.ctx.emitAuditEvent("sync.conflict", conflict.path, {
       strategy,
@@ -4019,6 +4490,7 @@ export class SyncRuntime {
    * online); 401/403 clears it (the server decided).
    */
   async retryOutstandingDeletions(): Promise<void> {
+    this.assertProtectedContentAllowed();
     const settings = this.ctx.getSettings();
     if (!this.ctx.getSession() || !settings.serverVaultId || !this.ctx.isOnline()) return;
     const tombstones = settings.deletionTombstones;
@@ -4071,6 +4543,7 @@ export class SyncRuntime {
    * `normalized` must be a vault-relative path with no leading slash.
    */
   async deleteTombstonedServerPath(normalized: string): Promise<boolean> {
+    this.assertProtectedContentAllowed();
     if (!normalized) return false;
     try {
       const response = await this.ctx.apiRequest(
@@ -4192,6 +4665,7 @@ export class SyncRuntime {
    * Operations are sent in chronological order.
    */
   async flushOfflineQueue(): Promise<void> {
+    this.assertProtectedContentAllowed();
     const inFlight = this.ctx.getOfflineQueueFlushPromise();
     if (inFlight) {
       return inFlight;

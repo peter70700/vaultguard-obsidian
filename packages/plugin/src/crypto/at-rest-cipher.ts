@@ -288,6 +288,21 @@ export class AtRestCipher {
     return this.status;
   }
 
+  /**
+   * Fail closed after an external continuity check rejects a restored wrapper.
+   * Used by same-device reinstall recovery: opening the device-sealed capsule is
+   * necessary but not sufficient; its LAK must also authenticate an existing
+   * VG1 file before sync or local writes are allowed.
+   */
+  requireRecovery(reason: string): void {
+    if (this.lak) {
+      this.lak.fill(0);
+      this.lak = null;
+    }
+    this.cryptoKey = null;
+    this.status = { kind: "needs-recovery", reason };
+  }
+
   /** Wipe LAK from memory. Subsequent reads/writes will fail until re-init. */
   lock(): void {
     if (this.lak) {

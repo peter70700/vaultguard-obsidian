@@ -134,10 +134,11 @@ paths.
   process isolation; out of scope.
 - **Memory inspection of a running Obsidian**: decrypted content
   lives in process memory while Obsidian is rendering it.
-- **Plugin uninstalled while still authenticated**: a user can run
-  *Decrypt vault at rest* before disabling. Required because some
-  workflows expect the vault to remain readable through normal tools
-  after the plugin is removed.
+- **Use without the plugin**: uninstalling or disabling VaultGuard does not
+  make `VG1\0` files plaintext. A user who wants normal filesystem tools to
+  read the vault must run *Decrypt vault at rest* before disabling it. A
+  same-device reinstall can restore access through the local recovery capsule,
+  but the capsule is not a general plaintext compatibility layer.
 - **Filename leakage**: paths and file names on disk are unchanged.
   An attacker reading the raw filesystem still sees the directory
   tree and file names. Encrypting names would break Obsidian's
@@ -166,6 +167,8 @@ OS keychain (macOS Keychain / Windows DPAPI / Linux libsecret)
                  ─ AES-256, generated once per device-vault binding
                  ─ Stored at .obsidian/plugins/vaultguard-sync/lak.envelope
                    (wrapped by safeStorage; binary-opaque on disk)
+                 ─ Device-wrapped copy may also be carried inside an
+                   authenticated local recovery capsule
                  ─ Never leaves the device through normal operation
                  ─ Held in process memory only while the plugin runs
                  │
@@ -178,6 +181,11 @@ content for transit and S3 storage and defaults to a 1-hour lease
 (configurable by the server deployment). The LAK
 encrypts local-disk content, is stable for the life of the device-vault
 binding, and never participates in sync.
+
+The recovery capsule does not change that boundary. It contains an existing
+device-local LAK wrapper, never plaintext LAK bytes, and is written only to the
+local vault/profile recovery homes described below. No recovery capsule, LAK,
+PIN material, or recovery code is uploaded to VaultGuard services.
 
 ### Storage method tiers
 
@@ -362,6 +370,50 @@ the override is active.
   shown pointing the user at the recovery flow. This is the typical
   "moved to a different machine" / "OS keychain reset" path.
 
+### Same-device uninstall/reinstall continuity
+
+Healthy protected installations backfill an authenticated, versioned recovery
+capsule into two local-only homes: `.vaultguard/` at the vault root and
+profile-local Obsidian storage. The vault-root `manifest.v1.json` is advisory
+and non-secret. It contains only schema/version, a random local vault-instance
+identifier, a protection marker, capsule/device identifiers, and current/
+previous generations. It contains no email, remote vault ID, filename
+inventory, token, credential, recovery code, or LAK.
+
+The sealed capsule may contain the already-wrapped `lak.envelope`, the PIN
+envelope/pepper/settings required to reopen it, and account/binding hints. Its
+copies are authenticated to the stable local vault locator, discovered through
+a bounded profile index, updated through a write/reread/validate generation
+sequence, and retain the previous valid generation until the replacement is
+proven. Either surviving home can rebuild the other on the next healthy save.
+`.vaultguard/` and every vault-root hidden path remain hard-excluded from both
+sync and at-rest interception.
+
+Startup classifies any surviving `VG1\0`, manifest, or capsule evidence as
+prior protection; it never offers a fresh **Protect this vault** path over that
+state. A complete plugin-owned envelope remains first priority. Otherwise the
+local capsule may restore the wrapper, but the candidate LAK must decrypt an
+existing `VG1\0` file before protected reads or synchronization are enabled.
+For **Require PIN on startup**, the capsule never contains or recreates a
+transparent wrapper: only the PIN envelope can restore the LAK, and validation
+finishes after PIN unlock. Enabling that mode also destroys prior capsule
+generations which may have carried a transparent wrapper; max-security recovery
+therefore keeps no passkey-mode rollback generation.
+
+Binding metadata recovered from a capsule is only a hint. After login the
+plugin independently authorizes that exact `/vaults/{vaultId}` scope for the
+current account before requesting a vault key lease or starting sync. Recovery
+required, binding unverified, and wrong-account states hard-stop initial
+reconciliation, Sync now, queued uploads, downloads, and local remote writes.
+Changing account/binding or logging out cancels active reconciliation and
+fences any non-abortable response before its next mutation.
+
+After a verified **Decrypt vault and disable at-rest encryption** pass, VaultGuard
+removes the vault manifest, capsule generations, and matching profile copies.
+Likewise, a deliberate local-key reset removes every old-key generation before
+persisting the fresh wrapper. Neither an intentionally discarded LAK nor a stale
+"previously protected" marker survives those lifecycle transitions.
+
 The first-run UX surfaces a one-shot Notice when there are still
 plaintext files on disk after the cipher initializes, with an
 "Encrypt them now →" link to the settings panel. The user can
@@ -444,7 +496,8 @@ without the full pass.
 
 The LAK is generated locally and bound to one device. If that
 device's keychain entry is lost — disk failure, OS reinstall, vault
-folder copied to a different laptop, plugin reinstalled — the
+folder copied to a different laptop, or reinstall where both same-device local
+capsule homes were also removed — the
 on-disk ciphertext becomes unreadable on that device until the LAK
 is restored. **Recovery** is the process of getting the LAK back
 onto a device that no longer has it in keychain form.
@@ -650,9 +703,13 @@ documentation pass.
   `writePlainBinaryToDisk()`, `ensureAtRestEncryptedInPlace()`, and the
   media-preview blob cache (`interceptedGetResourcePath`,
   `prewarmResourcePreview`, `revokeAllResourcePreviews`).
+- `src/plugin/local-recovery-capsule.ts` — non-secret manifest validation,
+  authenticated vault/profile capsule sealing, bounded discovery, atomic
+  generation replacement, and previous-generation recovery.
 - `src/plugin/main.ts` — thin delegates to the runtime above, plus
-  `initAtRestCipher()`, migration commands, first-run prompt, recovery
-  banner, `verifyAccountPassword()`, and the `file-open` preview pre-warm.
+  startup recovery classification/validation, exact binding authorization,
+  `initAtRestCipher()`, migration commands, first-run prompt, recovery banner,
+  `verifyAccountPassword()`, and the `file-open` preview pre-warm.
 - `src/plugin/at-rest-modals.ts` — `AtRestRecoveryCodeModal` (display),
   `AtRestRestoreModal` (input), `AtRestPasswordConfirmModal` (re-auth
   gate).
@@ -664,6 +721,8 @@ documentation pass.
   optimistic semantic mutation coordination, and pure Markdown transforms.
 - `tests/at-rest-cipher.test.ts` — round-trip, format, recovery,
   tamper detection, format tolerance.
+- `tests/local-recovery-capsule.test.ts`, `tests/sync-protection-gate.test.ts`
+  — dual-home/generation/corruption/PIN invariants and protected-content gates.
 
 ## What this implementation deliberately does NOT do
 
