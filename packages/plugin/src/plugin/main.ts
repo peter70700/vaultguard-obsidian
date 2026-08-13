@@ -773,6 +773,32 @@ export default class VaultGuardPlugin extends Plugin {
   private session: UserSession | null = null;
 
   /**
+   * Monotonic generation counter for `this.session`, bumped on EVERY identity
+   * transition: a completed login, a logout, and the teardown in
+   * `clearSensitiveData`.
+   *
+   * Why it exists: the background restore/refresh routines capture a
+   * `UserSession` value, then `await` a network round trip (a key-lease GET, a
+   * Cognito refresh) before writing it back to `this.session`. A logout landing
+   * inside that window used to be silently undone — the late write resurrected
+   * the session the user had just ended, `persistSession` wrote it back to disk,
+   * and the ribbon (updated only by `forceLogout`) kept its logged-out badge
+   * while the menu rendered the full signed-in state. `resumeStoredSession` is
+   * fired unawaited from `onload`, so the window is the whole background resume:
+   * on a slow first reconciliation it stays open for many seconds with the
+   * ribbon live and clickable.
+   *
+   * A plain `if (this.session)` re-read is NOT enough. It cannot tell "still the
+   * same session" from "logged out and signed back in as someone else" — that
+   * case is worse, because the stale write clobbers the new user's session with
+   * the previous user's tokens and identity. Comparing epochs distinguishes both.
+   *
+   * In-memory only, never persisted; the absolute value is meaningless, only
+   * changes to it are.
+   */
+  private sessionEpoch = 0;
+
+  /**
    * SD-02-F1 (M10): the session id of a PERSISTED session that is currently being
    * restored, held ONLY for the window of `restoreServerSession`'s first key-lease
    * request — set immediately before that `await`, cleared in its `finally`.
@@ -4383,6 +4409,10 @@ export default class VaultGuardPlugin extends Plugin {
    * Token refresh still happens in the background from onload.
    */
   private async restoreSession(): Promise<void> {
+    // The at-rest load below is an await (the mobile / safeStorage-less decrypt
+    // path), so a logout can land between reading the stored session and
+    // installing it. Rehydrating is not a new identity — capture, never bump.
+    const epoch = this.sessionEpoch;
     let storedSession = this.loadSessionFromStore();
     if (storedSession) {
       this.log("Session restored via safe-storage path");
@@ -4404,6 +4434,11 @@ export default class VaultGuardPlugin extends Plugin {
           5000
         );
       }
+      return;
+    }
+
+    if (!this.isSessionEpochCurrent(epoch)) {
+      this.syncDiagnostics.record("restoreSession.abandoned.sessionEnded");
       return;
     }
 
@@ -5012,6 +5047,11 @@ export default class VaultGuardPlugin extends Plugin {
       roles: sessionRoles,
       createdAt: new Date().toISOString(),
     };
+    // A fresh identity is a session transition too: it must invalidate any
+    // background restore still holding the PREVIOUS user's session, otherwise a
+    // late write-back would replace this login with the account just signed out
+    // of (see `sessionEpoch`).
+    this.beginSessionEpoch();
     this.session = session;
     this.clearLogoutAuthState();
     // POST /auth/session no longer issues a key lease — leases are vault-scoped
@@ -6031,10 +6071,22 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
+    // This whole routine is fired unawaited from `onload`, so a logout can land
+    // anywhere inside it. Capture the generation once and abandon quietly if it
+    // moves (see `sessionEpoch`).
+    const epoch = this.sessionEpoch;
+
     let session = this.session;
     let tokenWasRefreshed = false;
     if (this.isSessionTokenExpiring(session)) {
       const refreshResult = await this.refreshAccessToken(session);
+      // Checked BEFORE the failure branches below: a logout during the refresh
+      // is not a degraded session that needs a Notice and a retry monitor, it is
+      // the expected outcome of what the user just asked for.
+      if (!this.isSessionEpochCurrent(epoch)) {
+        this.syncDiagnostics.record("resumeStoredSession.return.sessionEnded");
+        return;
+      }
       if (!refreshResult.ok) {
         // PL4: a terminal rejection means the stored session is dead (refresh
         // token revoked/expired or user disabled) — clean it up now instead of
@@ -6154,6 +6206,11 @@ export default class VaultGuardPlugin extends Plugin {
       hasSessionId: !!session.sessionId,
       hasServerVaultId: !!this.settings.serverVaultId,
     });
+    // `session` is a value captured before the network awaits below. If the user
+    // logs out (or signs in as someone else) while those are in flight, writing
+    // it back would resurrect a dead session — see `sessionEpoch`. Captured
+    // BEFORE the binding-authorization gate, because that gate awaits too.
+    const epoch = this.sessionEpoch;
     if (this.settings.serverVaultId && !(await this.verifyBoundVaultAuthorization())) {
       this.setConnectionStatus("online");
       this.syncDiagnostics.record("restoreServerSession.return.bindingAuthorizationGate", {
@@ -6204,6 +6261,15 @@ export default class VaultGuardPlugin extends Plugin {
       }
     }
 
+    // The lease request above is the long await — on a slow first reconciliation
+    // it can stay pending for many seconds with the ribbon menu live. A logout
+    // inside that window owns the session now; drop the restore on the floor
+    // rather than undoing it.
+    if (!this.isSessionEpochCurrent(epoch)) {
+      this.syncDiagnostics.record("restoreServerSession.abandoned.sessionEnded");
+      return;
+    }
+
     if (leaseResponse?.success && leaseResponse.data) {
       this.session = session;
       this.clearLogoutAuthState();
@@ -6215,6 +6281,12 @@ export default class VaultGuardPlugin extends Plugin {
       this.applyOrgSettings(leaseResponse.data.orgSettings ?? this.orgSettings);
     } else {
       const serverSession = await this.openServerSession(session.idToken);
+      // Second await, same rule: a session minted for a user who has since
+      // logged out must not be installed.
+      if (!this.isSessionEpochCurrent(epoch)) {
+        this.syncDiagnostics.record("restoreServerSession.abandoned.sessionEndedDuringMint");
+        return;
+      }
       this.session = {
         ...session,
         sessionId: serverSession.sessionId,
@@ -6326,6 +6398,9 @@ export default class VaultGuardPlugin extends Plugin {
    */
   private async refreshAccessToken(session: UserSession): Promise<AccessTokenRefreshResult> {
     const cfg = this.getEffectiveConfig();
+    // Captured before the Cognito round trip below; a logout landing inside it
+    // must not have its teardown undone by the write-back (see `sessionEpoch`).
+    const epoch = this.sessionEpoch;
 
     // Local dev server has no token-refresh that returns fresh JWTs (it rotates
     // the session token server-side only). Dev tokens are valid for an hour,
@@ -6348,6 +6423,14 @@ export default class VaultGuardPlugin extends Plugin {
         cfg.cognitoClientId,
         session.refreshToken
       );
+
+      // Fresh tokens for a session that no longer exists are worthless — and
+      // writing them back would both resurrect the session in memory and
+      // re-persist it to disk, surviving an Obsidian restart.
+      if (!this.isSessionEpochCurrent(epoch)) {
+        this.log("Token refresh landed after logout; discarding the new tokens.");
+        return { ok: false, message: "session ended during token refresh" };
+      }
 
       const expiresAt = new Date(Date.now() + tokens.expiresIn * 1000);
       const idPayload = this.decodeJwtPayload(tokens.idToken);
@@ -6389,6 +6472,12 @@ export default class VaultGuardPlugin extends Plugin {
           : "Cognito token refresh failed, keeping session",
         error
       );
+      // "Keep the session" means keep the one that is still live — not restore
+      // one that was torn down while Cognito was failing. A logout inside this
+      // window already cleared it deliberately.
+      if (!this.isSessionEpochCurrent(epoch)) {
+        return { ok: false, message: "session ended during token refresh" };
+      }
       this.session = session;
       return {
         ok: false,
@@ -6409,6 +6498,29 @@ export default class VaultGuardPlugin extends Plugin {
    */
   getSession(): UserSession | null {
     return this.session;
+  }
+
+  /**
+   * Marks a session identity transition. Call this at every point that installs
+   * a new session or tears the current one down — it is what invalidates the
+   * epochs captured by in-flight background work (see `sessionEpoch`).
+   */
+  private beginSessionEpoch(): number {
+    this.sessionEpoch += 1;
+    return this.sessionEpoch;
+  }
+
+  /**
+   * True when `epoch` is still the live session generation, i.e. no login or
+   * logout has happened since the caller captured it.
+   *
+   * Async work that captured a session before an `await` MUST check this before
+   * writing that value back to `this.session` (or persisting it). Returning
+   * false means the caller's session is gone — abandon the work, do not restore
+   * it.
+   */
+  private isSessionEpochCurrent(epoch: number): boolean {
+    return this.sessionEpoch === epoch;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -8354,6 +8466,13 @@ export default class VaultGuardPlugin extends Plugin {
    * and optionally wipes local cache.
    */
   async forceLogout(noticeMessage = "VaultGuard Sync: Logged out successfully."): Promise<void> {
+    // FIRST statement, before any await: this is the instant the user's intent to
+    // end the session is recorded, so it is the instant every in-flight background
+    // restore/refresh must stop being allowed to write `this.session` back. Bumping
+    // later would leave the whole server-teardown round trip below as a window in
+    // which a resuming session could reinstate itself (see `sessionEpoch`).
+    this.beginSessionEpoch();
+
     // Fence the old identity/binding before any asynchronous logout request.
     // requestUrl itself is not abortable, but every reconciliation loop checks
     // the operation token before its next local/remote mutation.
@@ -8372,14 +8491,17 @@ export default class VaultGuardPlugin extends Plugin {
 
     try {
       if (this.session) {
+
         await this.apiRequest("POST", "/auth/logout", {
           sessionId: this.session.sessionId,
           vaultId: this.settings.serverVaultId || undefined,
         });
+
       }
     } catch {
       // Best-effort server notification; proceed with local cleanup regardless
     }
+
 
     // Persistent agent bridge leases are tied to the session — kill them
     // before we drop the session itself so the bridge's audit trail can
@@ -12855,6 +12977,10 @@ export default class VaultGuardPlugin extends Plugin {
    * Called on plugin unload and forced logout.
    */
   private clearSensitiveData(persistClearedState = true): void {
+    // Covers the teardown paths that do not go through `forceLogout` (unload,
+    // auto-lock). Bumping twice on the logout path is harmless — only a CHANGE
+    // in the counter is meaningful, never its value.
+    this.beginSessionEpoch();
     this.session = null;
     this.keyLease = null;
     // Drop the API client's cached JWTs so no privileged request (an open
