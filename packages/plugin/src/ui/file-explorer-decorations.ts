@@ -141,12 +141,25 @@ export class FileExplorerDecorations {
    * path, also drops the user directory so a newly-invited user shows up
    * with their real name on the next decorate pass instead of their UUID.
    */
-  invalidate(path?: string): void {
+  invalidate(
+    path?: string,
+    options: { preserveVisibleFileRows?: boolean } = {}
+  ): void {
     if (path) {
-      this.cache.delete(path);
+      if (options.preserveVisibleFileRows === true) {
+        this.markCacheEntryStale(path);
+      } else {
+        this.cache.delete(path);
+      }
       this.inFlightPaths.delete(path);
     } else {
-      this.cache.clear();
+      if (options.preserveVisibleFileRows === true) {
+        for (const cachedPath of this.cache.keys()) {
+          this.markCacheEntryStale(cachedPath);
+        }
+      } else {
+        this.cache.clear();
+      }
       this.inFlightPaths.clear();
       // Clear the user directory too — a permission grant may target a user
       // who was just invited and isn't in the cached map. Without this,
@@ -157,6 +170,20 @@ export class FileExplorerDecorations {
       this.hideCurrentUndecidedRows();
       this.scheduleDecorate();
     }
+  }
+
+  /**
+   * Keep the last authoritative presentation while forcing the next decorate
+   * pass to revalidate it. This is used only when the permission event carries
+   * affirmative proof that a local edit targeted another user. Generic,
+   * role-wide, and current-user invalidations still delete cache entries and
+   * fail closed. Newly discovered rows still have no entry and keep the same
+   * initial-loading behavior.
+   */
+  private markCacheEntryStale(path: string): void {
+    const entry = this.cache.get(path);
+    if (!entry) return;
+    this.cache.set(path, { ...entry, fetchedAt: 0 });
   }
 
   /**
@@ -632,11 +659,13 @@ export class FileExplorerDecorations {
   private setExplorerStatus(container: HTMLElement, status: ExplorerStatus | null): void {
     if (typeof container.querySelector !== "function") return;
     const existing = container.querySelector<HTMLElement>(`.${STATUS_CLS}`);
-    if (!status) {
+    const displayStatus =
+      status === "loading" && this.hasVisibleFileRows(container) ? null : status;
+    if (!displayStatus) {
       existing?.remove();
       return;
     }
-    if (existing?.dataset.vaultguardState === status) return;
+    if (existing?.dataset.vaultguardState === displayStatus) return;
     existing?.remove();
 
     const scrollingHost = container.querySelector<HTMLElement>(".nav-files-container");
@@ -644,19 +673,19 @@ export class FileExplorerDecorations {
     if (typeof host.appendChild !== "function") return;
 
     const statusEl = createDiv({
-      cls: `${STATUS_CLS} vaultguard-fe-status-${status}`,
+      cls: `${STATUS_CLS} vaultguard-fe-status-${displayStatus}`,
     });
-    statusEl.dataset.vaultguardState = status;
+    statusEl.dataset.vaultguardState = displayStatus;
     statusEl.setAttribute("role", "status");
     statusEl.setAttribute("aria-live", "polite");
     statusEl.setAttribute("aria-atomic", "true");
 
     const icon = statusEl.createSpan({
-      cls: status === "loading" ? "vaultguard-sb-spinner" : "vaultguard-fe-status-icon",
+      cls: displayStatus === "loading" ? "vaultguard-sb-spinner" : "vaultguard-fe-status-icon",
     });
-    setIcon(icon, status === "loading" ? "loader" : "circle-alert");
+    setIcon(icon, displayStatus === "loading" ? "loader" : "circle-alert");
     statusEl.createSpan({
-      text: status === "loading"
+      text: displayStatus === "loading"
         ? "Loading files…"
         : "Files couldn’t be loaded. Check your connection.",
     });
@@ -665,6 +694,14 @@ export class FileExplorerDecorations {
     } else {
       host.appendChild(statusEl);
     }
+  }
+
+  private hasVisibleFileRows(container: HTMLElement): boolean {
+    return this.getExplorerItems(container).some((item) => {
+      if (!this.isExplorerFileItem(item)) return false;
+      const row = this.getExplorerRowElement(item);
+      return !item.classList.contains(HIDDEN_CLS) && !row?.classList.contains(HIDDEN_CLS);
+    });
   }
 
   private resolveExplorerStatus(rowStatus: ExplorerStatus | null): ExplorerStatus | null {

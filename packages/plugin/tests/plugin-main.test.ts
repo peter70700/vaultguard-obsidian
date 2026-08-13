@@ -1898,6 +1898,21 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     expect(plugin.flushOfflineQueue).toHaveBeenCalledOnce();
   });
 
+  it("defers reconnect queue flushing until the exact server vault is verified", () => {
+    const plugin = makePlugin();
+    plugin.connectionState.status = "reconnecting";
+    plugin.flushOfflineQueue = vi.fn().mockResolvedValue(undefined);
+    plugin.getProtectedContentGate = vi.fn(() => ({
+      ok: false,
+      reason: "binding-unverified",
+      message: "blocked:binding-unverified",
+    }));
+
+    plugin.setConnectionStatus("online");
+
+    expect(plugin.flushOfflineQueue).not.toHaveBeenCalled();
+  });
+
   it("refreshes the file permission header on the offline→online edge", () => {
     const plugin = makePlugin();
     plugin.connectionState.status = "reconnecting";

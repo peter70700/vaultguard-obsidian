@@ -533,9 +533,11 @@ data "aws_iam_policy_document" "files_lambda" {
     actions   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
     resources = [var.vaults_table_arn, "${var.vaults_table_arn}/index/*"]
   }
-  # Vault activity log: append on writes/deletes, query for delta sync.
+  # Vault activity log: append on writes/deletes, query for delta sync, and
+  # consume durable mutation-intent rows inside TransactWriteItems. DynamoDB
+  # authorizes transaction members through their underlying item actions.
   statement {
-    actions   = ["dynamodb:PutItem", "dynamodb:Query"]
+    actions   = ["dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
     resources = [var.vault_activity_table_arn]
   }
   # recordVaultActivity writes its activity row and vault revision in one
@@ -662,9 +664,11 @@ data "aws_iam_policy_document" "permissions_lambda" {
       var.vault_members_table_arn, "${var.vault_members_table_arn}/index/*",
     ]
   }
-  # Activity log: append a permission_changed row on every grant/update/revoke.
+  # Activity log: append a permission_changed row and consume its durable
+  # mutation intent in the same transaction. TransactWriteItems requires the
+  # underlying PutItem/DeleteItem permissions on this exact table.
   statement {
-    actions   = ["dynamodb:PutItem"]
+    actions   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
     resources = [var.vault_activity_table_arn]
   }
   statement {
@@ -1794,9 +1798,10 @@ data "aws_iam_policy_document" "vaults_lambda" {
     resources = [var.leases_table_arn, "${var.leases_table_arn}/index/*"]
   }
   # Vault activity log — member role changes alter effective permissions for
-  # the whole vault, so append a permission_changed cursor event.
+  # the whole vault, so append a permission_changed cursor event and consume
+  # its durable intent. Transaction members use underlying IAM item actions.
   statement {
-    actions   = ["dynamodb:PutItem"]
+    actions   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
     resources = [var.vault_activity_table_arn]
   }
   statement {

@@ -18,7 +18,11 @@ import {
 } from "../api/client";
 import { PermissionLevel } from "../types";
 import type { PermissionDecision } from "../plugin/permission-store";
-import { EffectiveAccessPrincipal, FilePermissionPanel } from "./file-permission-panel";
+import {
+  EffectiveAccessPrincipal,
+  FilePermissionPanel,
+  type FilePermissionRefreshOptions,
+} from "./file-permission-panel";
 import { setButtonLoading, setControlBusy } from "./loading-button";
 import {
   buildAccessUserMap,
@@ -47,7 +51,10 @@ interface HeaderContext {
    * so badges and dots in the sidebar refresh in lockstep with the
    * header itself.
    */
-  onRulesChanged?: (path?: string) => void | Promise<void>;
+  onRulesChanged?: (
+    path?: string,
+    options?: FilePermissionRefreshOptions
+  ) => void | Promise<void>;
   /**
    * Authoritative current-user permission resolver. Used when raw rule
    * listing is unavailable, so the "Your access" badge follows the same
@@ -1267,7 +1274,12 @@ export class FilePermissionHeader {
             this.patchCachedPrincipalLevel(file.path, result.canonicalUserId, result.effectiveLevel);
           }
           await this.update({ force: true });
-          await this.ctx.onRulesChanged?.(file.path);
+          await this.ctx.onRulesChanged?.(
+            file.path,
+            result && result.canonicalUserId !== this.ctx.currentUserId
+              ? { preserveVisibleFileRows: true }
+              : undefined
+          );
         } catch (error) {
           // Surface the failure — previously this catch was empty, which made
           // any server-side rejection look like a non-event to the user. Now
@@ -1484,10 +1496,10 @@ export class FilePermissionHeader {
       allowAdminPerFileRestrictions: this.ctx.allowAdminPerFileRestrictions === true,
       anchorEl: headerEl,
       initialUsers: this.users,
-      onRulesChanged: async () => {
+      onRulesChanged: async (refreshOptions) => {
         this.invalidateCache(file.path);
         await this.update({ force: true });
-        await this.ctx.onRulesChanged?.(file.path);
+        await this.ctx.onRulesChanged?.(file.path, refreshOptions);
       },
       onClose: () => {
         this.activePanel = null;

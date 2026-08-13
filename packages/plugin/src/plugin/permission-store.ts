@@ -513,6 +513,8 @@ export class PermissionStore extends Events {
       serverConfirmed?: boolean;
       /** Confirmed authorization mutation that may revoke semantic-index access. */
       semanticAuthorityChanged?: boolean;
+      /** Safe local edit of another concrete user's access; UI presentation only. */
+      preserveVisibleFileRows?: boolean;
       storeState?: PermissionStoreState;
     }
   ): void {

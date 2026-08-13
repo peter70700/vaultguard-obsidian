@@ -11157,8 +11157,20 @@ export default class VaultGuardPlugin extends Plugin {
 
       // Flush queued operations whenever connectivity is restored.
       if (previousStatus !== "online") {
-        this.log("Connection restored, flushing offline queue...");
-        void this.flushOfflineQueue();
+        const protectedContentGate = this.getProtectedContentGate();
+        if (protectedContentGate.ok) {
+          this.log("Connection restored, flushing offline queue...");
+          void this.flushOfflineQueue();
+        } else {
+          // Auth/session bootstrap requests can prove API connectivity before
+          // this account has been authorized for the exact bound server vault.
+          // Keep the queue intact until login/reconciliation opens the gate;
+          // invoking the guarded flush here only creates an unhandled error and
+          // must never become a bypass around binding verification.
+          this.log(
+            `Connection restored; offline queue remains paused (${protectedContentGate.reason ?? "protected content unavailable"}).`
+          );
+        }
       }
     } else if (status === "offline" && previousStatus !== "offline") {
       this.connectionState.failedAttempts++;

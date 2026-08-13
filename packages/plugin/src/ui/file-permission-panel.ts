@@ -43,8 +43,17 @@ export interface FilePermissionPanelConfig {
   allowAdminPerFileRestrictions?: boolean;
   anchorEl: HTMLElement;
   initialUsers?: UserListEntry[];
-  onRulesChanged: () => Promise<void>;
+  onRulesChanged: (options?: FilePermissionRefreshOptions) => Promise<void>;
   onClose: () => void;
+}
+
+export interface FilePermissionRefreshOptions {
+  /**
+   * Safe only for a confirmed local mutation targeting a different concrete
+   * user. Generic, role, wildcard, and current-user changes must omit it so
+   * explorer metadata continues to fail closed on possible revocation.
+   */
+  preserveVisibleFileRows?: boolean;
 }
 
 const PANEL_CLS = "vaultguard-fp-panel";
@@ -710,7 +719,9 @@ export class FilePermissionPanel {
 
         this.draftPrincipalValue = "";
         this.draftSelectedUserId = null;
-        await this.cfg.onRulesChanged();
+        await this.notifyRulesChangedForUser(
+          principalType === "user" ? canonicalUserId : undefined
+        );
       } catch (error) {
         new Notice(`Failed to add: ${(error as Error).message}`);
       } finally {
@@ -784,7 +795,7 @@ export class FilePermissionPanel {
         this.optimisticRender();
       }
       new Notice("Permission updated.");
-      await this.cfg.onRulesChanged();
+      await this.notifyRulesChangedForUser(rule.role ? undefined : canonicalUserId);
     } catch (error) {
       new Notice(`Failed to update: ${(error as Error).message}`);
     }
@@ -810,7 +821,7 @@ export class FilePermissionPanel {
         this.optimisticRender();
       }
       new Notice("Permission updated.");
-      await this.cfg.onRulesChanged();
+      await this.notifyRulesChangedForUser(canonicalUserId);
     } catch (error) {
       new Notice(`Failed to update: ${(error as Error).message}`);
     }
@@ -893,10 +904,24 @@ export class FilePermissionPanel {
     try {
       await this.cfg.apiClient.deletePermission(rule.id);
       new Notice("Permission rule removed.");
-      await this.cfg.onRulesChanged();
+      await this.notifyRulesChangedForUser(
+        rule.role ? undefined : this.resolveCanonicalUserId(rule.userId)
+      );
     } catch (error) {
       new Notice(`Failed to delete: ${(error as Error).message}`);
     }
+  }
+
+  private async notifyRulesChangedForUser(userId?: string): Promise<void> {
+    const normalizedUserId = userId?.trim().toLowerCase();
+    const targetsCurrentUser = [this.cfg.currentUserId, this.cfg.currentUserEmail]
+      .filter((candidate): candidate is string => Boolean(candidate))
+      .some((candidate) => candidate.trim().toLowerCase() === normalizedUserId);
+    if (normalizedUserId && normalizedUserId !== "*" && !targetsCurrentUser) {
+      await this.cfg.onRulesChanged({ preserveVisibleFileRows: true });
+      return;
+    }
+    await this.cfg.onRulesChanged();
   }
 
   private async loadUsers(): Promise<void> {

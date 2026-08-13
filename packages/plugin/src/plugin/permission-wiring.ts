@@ -46,8 +46,11 @@ export function initFilePermissionHeader(
     isLoggedIn: () => ctx.session !== null,
     isOnline: () => ctx.isOnline(),
     onRetryConnection: () => ctx.reconnectNow(),
-    onRulesChanged: () => {
-      ctx.permissionStore.emit("changed", { serverConfirmed: true });
+    onRulesChanged: (_path, options) => {
+      ctx.permissionStore.emit("changed", {
+        serverConfirmed: true,
+        preserveVisibleFileRows: options?.preserveVisibleFileRows === true,
+      });
     },
   });
 
@@ -121,8 +124,13 @@ export function initFileExplorerDecorations(
 
   ctx.registerEvent(
     ctx.permissionStore.on("changed", (...args: unknown[]) => {
-      const payload = (args[0] as { path?: string } | undefined) ?? {};
-      fileExplorerDecorations.invalidate(payload.path);
+      const payload = (args[0] as {
+        path?: string;
+        preserveVisibleFileRows?: boolean;
+      } | undefined) ?? {};
+      fileExplorerDecorations.invalidate(payload.path, {
+        preserveVisibleFileRows: payload.preserveVisibleFileRows === true,
+      });
     })
   );
 
