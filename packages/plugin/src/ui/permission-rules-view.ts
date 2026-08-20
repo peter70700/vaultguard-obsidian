@@ -414,11 +414,15 @@ export class PermissionRulesView {
         text: rule.expiresAt ? new Date(rule.expiresAt).toLocaleString() : "—",
       });
       const actionsTd = tr.createEl("td", { cls: "vaultguard-rules-row-actions" });
-      actionsTd
+      // The flex row is an inner wrapper, not the cell itself — a <td> with
+      // display:flex no longer stretches to the row height, which breaks the
+      // row separator wherever another cell wraps to two lines.
+      const actions = actionsTd.createDiv({ cls: "vaultguard-rules-row-actions-inner" });
+      actions
         .createEl("button", { text: "Explain" })
         .addEventListener("click", () => void this.showExplanation(rule.pathPattern));
-      actionsTd.createEl("button", { text: "Edit" }).addEventListener("click", () => this.openForm(rule));
-      actionsTd
+      actions.createEl("button", { text: "Edit" }).addEventListener("click", () => this.openForm(rule));
+      actions
         .createEl("button", { cls: "mod-warning", text: "Delete" })
         .addEventListener("click", () => void this.handleDelete(rule));
     }

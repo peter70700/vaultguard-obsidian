@@ -62,11 +62,28 @@ import {
   type AtRestPayloadClassification,
 } from "./at-rest-protection-state";
 
-function getActiveObsidianDocument(): Document | null {
-  if (typeof activeDocument !== "undefined") {
-    return activeDocument;
-  }
-  return null;
+/**
+ * The Notice's own message element — the element Obsidian created in the MAIN
+ * window's realm. Building notice content directly into it is what makes these
+ * notices realm-safe: Obsidian's `Element.prototype.setText` only appends a
+ * message that passes `instanceof DocumentFragment || instanceof Node` against
+ * the MAIN window's globals, so a fragment built from a popped-out window's
+ * own document (a separate JS realm) silently stringifies to the literal
+ * "[object DocumentFragment]". Writing into `messageEl` removes the realm
+ * question entirely rather than papering over it.
+ *
+ * `messageEl` is `@since 1.8.7` and manifest.json's `minAppVersion` is `1.11.5`,
+ * so it is ALWAYS present in any supported Obsidian — deliberately no version
+ * guard and no `noticeEl` fallback. The `null` return exists solely for headless
+ * harnesses where `Notice` is a `vi.fn()` stub with no `messageEl`.
+ *
+ * Duplicated per module per repo convention (no cross-module barrel imports for
+ * tiny helpers).
+ */
+function noticeBody(notice: Notice): HTMLElement | null {
+  const el = (notice as { messageEl?: HTMLElement }).messageEl;
+  if (!el || typeof el.createEl !== "function") return null;
+  return el;
 }
 
 /**
@@ -1971,22 +1988,25 @@ export class AtRestAdapterRuntime {
     if (!this.isLocalProjectMemoryModeEnabled()) return;
     const paths = await this.findAtRestCiphertextFiles({ limit: 20, failClosed: false });
     if (paths.length === 0) return;
-    const doc = getActiveObsidianDocument();
-    if (!doc) {
+    const notice = new Notice("", 0);
+    const body = noticeBody(notice);
+    if (!body) {
+      // No DOM-capable Notice (headless harness) — keep the plain-string
+      // fallback. Deliberately no notice.hide() here: a stub without
+      // `messageEl` has no `hide` either, and calling it would throw.
       new Notice(
         `VaultGuard Sync: Local Project Memory Mode is active, but ${paths.length} encrypted VG1 file(s) were detected. Open VaultGuard settings and run "Decrypt vault and disable at-rest encryption".`,
         12000,
       );
       return;
     }
-    const notice = new Notice("", 0);
-    const frag = doc.createDocumentFragment();
-    const strong = frag.createEl("strong");
+    body.empty();
+    const strong = body.createEl("strong");
     strong.setText("VaultGuard Sync: encrypted repo files detected. ");
-    frag.appendText(
+    body.appendText(
       `Local Project Memory Mode will not encrypt more files, but ${paths.length} VG1 file(s) still need recovery. `,
     );
-    const link = frag.createEl("a", {
+    const link = body.createEl("a", {
       text: "Open settings to decrypt →",
       cls: "vaultguard-notice-link",
     });
@@ -1994,7 +2014,6 @@ export class AtRestAdapterRuntime {
       notice.hide();
       this.openVaultGuardSettings();
     });
-    notice.setMessage(frag);
   }
 
   /**
@@ -2013,16 +2032,18 @@ export class AtRestAdapterRuntime {
     try {
       const tally = await this.tallyAtRestState();
       if (tally.plaintext === 0) return;
-      const doc = getActiveObsidianDocument();
-      if (!doc) return;
       const notice = new Notice("", 0);
-      const frag = doc.createDocumentFragment();
-      const strong = frag.createEl("strong");
+      const body = noticeBody(notice);
+      // No DOM-capable Notice (headless harness) — nothing to show. This
+      // optional prompt has no plain-string fallback by design.
+      if (!body) return;
+      body.empty();
+      const strong = body.createEl("strong");
       strong.setText("VaultGuard Sync: at-rest encryption ready. ");
-      frag.appendText(
+      body.appendText(
         `${tally.plaintext} file${tally.plaintext === 1 ? "" : "s"} in this vault still on disk as plaintext. `
       );
-      const link = frag.createEl("a", {
+      const link = body.createEl("a", {
         text: "Encrypt them now →",
         cls: "vaultguard-notice-link",
       });
@@ -2030,7 +2051,7 @@ export class AtRestAdapterRuntime {
         notice.hide();
         this.openVaultGuardSettings();
       });
-      const dismiss = frag.createEl("a", {
+      const dismiss = body.createEl("a", {
         text: "  Dismiss",
         cls: "vaultguard-notice-dismiss",
       });
@@ -2039,7 +2060,6 @@ export class AtRestAdapterRuntime {
         void this.saveSettings();
         notice.hide();
       });
-      notice.setMessage(frag);
     } catch (err) {
       this.logError("First-run at-rest tally failed", err);
     }
@@ -2053,19 +2073,25 @@ export class AtRestAdapterRuntime {
    * (no timeout) because ignoring it leaves the vault unreadable.
    */
   showAtRestRecoveryBanner(reason: string): void {
-    const doc = getActiveObsidianDocument();
-    if (!doc) return;
+    // The new Notice is now constructed BEFORE the prior one is hidden, so the
+    // capability check can run on the very object we are about to write into.
+    // Both statements run in the same synchronous block (no paint between
+    // them), so the swap stays invisible to the user.
+    const notice = new Notice("", 0);
+    const body = noticeBody(notice);
+    // No DOM-capable Notice (headless harness): leave any prior banner and the
+    // field handle untouched, exactly as the old no-DOM early return did.
+    if (!body) return;
     // W2: keep the handle in a field (hide any prior one first so notices never
     // stack) so recovery via a different door can clear it via
     // clearAtRestRecoveryStickyNotice.
     this.atRestRecoveryNotice?.hide();
-    const notice = new Notice("", 0);
     this.atRestRecoveryNotice = notice;
-    const frag = doc.createDocumentFragment();
-    const strong = frag.createEl("strong");
+    body.empty();
+    const strong = body.createEl("strong");
     strong.setText("VaultGuard Sync: cannot read encrypted files on this device. ");
-    frag.appendText(reason + " ");
-    const link = frag.createEl("a", {
+    body.appendText(reason + " ");
+    const link = body.createEl("a", {
       text: "Open settings to restore →",
       cls: "vaultguard-notice-link",
     });
@@ -2075,7 +2101,6 @@ export class AtRestAdapterRuntime {
       this.clearAtRestRecoveryStickyNotice();
       this.ctx.startAtRestRecoveryFlow?.();
     });
-    notice.setMessage(frag);
   }
 
   /** W2: hide + drop the init-time sticky recovery notice. */
@@ -2975,7 +3000,16 @@ export class AtRestAdapterRuntime {
       // If online, fetch the newest server copy. Full-access sessions decrypt
       // locally with their lease; limited-access sessions ask the backend to
       // decrypt only this permission-checked file.
-      if (this.isOnline()) {
+      //
+      // EXCEPT while the vault binding is wire-blocked (account-changed /
+      // wrong-account): the sync gate holds local edits back in those states,
+      // so serving the newest SERVER copy here displayed stale content over a
+      // newer local edit — typed text visibly "reverted", and re-saving the
+      // stale view then clobbered the local edit for real (runtime-confirmed
+      // 2026-08-19; account-change report §9.8). Local content is the only
+      // coherent source while the folder's identity is unresolved; the
+      // sync engine re-converges after the user decides.
+      if (this.isOnline() && !this.ctx.isVaultBindingWireBlocked?.()) {
         const response = await this.fetchRemoteFileContent(path);
 
         if (response.success && response.data) {
@@ -3796,8 +3830,12 @@ export class AtRestAdapterRuntime {
     }
   }
 
-  /** Revokes every cached blob URL (plugin unload / adapter restore). */
-  private revokeAllResourcePreviews(): void {
+  /**
+   * Revokes every cached blob URL (plugin unload / adapter restore / lock).
+   * Public for the account-takeover reset: previews decrypted under the
+   * previous account's LAK must not outlive that key.
+   */
+  revokeAllResourcePreviews(): void {
     for (const entry of this.resourcePreviewCache.values()) {
       try {
         URL.revokeObjectURL(entry.url);

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
-import { Menu, Notice, Platform, TFile, requestUrl } from "obsidian";
+import { ButtonComponent, Menu, Notice, Platform, TFile, requestUrl } from "obsidian";
 
 import VaultGuardPlugin from "../src/plugin/main";
 import { IN_APP_CHAT_CAPABILITY } from "../src/ui/chat/in-app-chat-capability";
@@ -3847,6 +3847,10 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     const cipherStore = new Map<string, string>();
     plugin.atRestCipher = {
       isReady: () => true,
+      // Keychain-backed LAK: the desktop degraded-tier refusal
+      // (quick-260819-ouh) only permits the at-rest seal when the LAK's own
+      // wrap still requires the OS keychain.
+      getStatus: () => ({ kind: "unlocked", method: "safe-storage" }),
       encryptString: vi.fn(async (plaintext: string) => {
         const id = `cipher-${cipherStore.size + 1}`;
         cipherStore.set(id, plaintext);
@@ -3917,6 +3921,10 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
     const cipherStore = new Map<string, string>();
     plugin.atRestCipher = {
       isReady: () => true,
+      // Keychain-backed LAK: the desktop degraded-tier refusal
+      // (quick-260819-ouh) only permits the at-rest seal when the LAK's own
+      // wrap still requires the OS keychain.
+      getStatus: () => ({ kind: "unlocked", method: "safe-storage" }),
       encryptString: vi.fn(async (plaintext: string) => {
         const id = `cipher-${cipherStore.size + 1}`;
         cipherStore.set(id, plaintext);
@@ -5614,6 +5622,128 @@ describe("VaultGuardPlugin connection and crypto helpers", () => {
 
     expect(result?.uploadedFiles).toBe(1);
     expect(plugin.ensureAtRestEncryptedInPlace).toHaveBeenCalledWith("dropped/note.md");
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // quick-260820-or3: the ungated callee above has exactly one caller, and
+  // these pin the gate on it through the REAL plugin object, so a refactor
+  // that moves the gate cannot silently drop it.
+  //   "i have tested switching vaults and binding them… and now automatically
+  //    my local only files from different vault were uploaded — why? is this
+  //    like this by design?"  — Peter, live E2E of quick-260820-mv4 / -nqm
+  // applyVaultBinding (main.ts:5502/5516) deletes bindingReconciledVaultId and
+  // re-arms localOnlyCatchupCompleted = false on every binding change, so the
+  // next performSync used to read the OLD vault's leftovers as "uploads that
+  // failed" and push them into the NEW vault, with no prompt.
+  // See reports/HANDOFF-2026-08-20-silent-local-only-upload.md §7 (Option 1).
+  // ───────────────────────────────────────────────────────────────────────────
+  function makeCatchupGatePlugin(bindingReconciledVaultId: string | undefined) {
+    const plugin = makePlugin();
+    plugin.settings.serverVaultId = "vault-NEW";
+    plugin.settings.bindingReconciledVaultId = bindingReconciledVaultId;
+    plugin.session = makeSession();
+    plugin.keyLease = makeKeyLease();
+    plugin.connectionState.status = "online";
+    plugin.offlineQueue = [];
+    // The exact state applyVaultBinding leaves behind (main.ts:5516).
+    plugin.localOnlyCatchupCompleted = false;
+    plugin.remoteInventoryRepairCompleted = true;
+    // Local files that belong to the PREVIOUS vault and are still on disk.
+    plugin.app.vault.getFiles = vi.fn(() => [{ path: "old-vault/secret-note.md" }]);
+    plugin.app.vault.getRoot = vi.fn(() => ({ children: [] }));
+    plugin.collectLocalFolderPaths = vi.fn(() => []);
+    plugin.buildLocalSyncManifest = vi.fn(() => ({}));
+    plugin.repairMissingRemoteItems = vi.fn(async () => ({
+      downloadedFiles: 0,
+      downloadedFolders: 0,
+      failedFiles: 0,
+      failedFolders: 0,
+    }));
+
+    // Routed BY PATH, never by call order: an ordered mockReturnValueOnce queue
+    // mis-routes the moment an upstream await is added, and the symptom is a
+    // 15 s vitest timeout rather than an assertion failure. Anything
+    // unrecognised throws loudly and instantly.
+    const apiCalls: Array<{ method: string; path: string }> = [];
+    plugin.apiRequest = vi.fn(async (method: string, path: string) => {
+      apiCalls.push({ method, path });
+      if (method === "POST" && path.endsWith("/files/sync")) {
+        return {
+          success: true,
+          data: {
+            deltas: [],
+            syncTimestamp: "2026-08-20T12:00:00.000Z",
+            revision: 7,
+            mode: "activity-log",
+          },
+          error: null,
+          requestId: "req-sync",
+        };
+      }
+      throw new Error(`Unexpected API call: ${method} ${path}`);
+    });
+
+    return { plugin, apiCalls };
+  }
+
+  function fileWritesIn(apiCalls: Array<{ method: string; path: string }>) {
+    return apiCalls.filter(
+      (call) =>
+        call.method !== "GET" &&
+        call.path.includes("/files/") &&
+        !call.path.endsWith("/files/sync")
+    );
+  }
+
+  it("a REBOUND folder uploads nothing on Sync now — the handoff §8 repro", async () => {
+    const { plugin, apiCalls } = makeCatchupGatePlugin("vault-OLD");
+    const catchup = vi.spyOn(plugin, "uploadLocalOnlyFiles");
+    mockNotice.mockClear();
+
+    // The literal "Sync now" argument shape from commands.ts:426.
+    await plugin.performSync({ userInitiated: true, forceCatchup: true });
+
+    expect(catchup).not.toHaveBeenCalled();
+    // Only the Phase 2 delta call — never the catch-up's full-inventory walk.
+    expect(apiCalls.filter((c) => c.path.endsWith("/files/sync"))).toHaveLength(1);
+    expect(fileWritesIn(apiCalls)).toEqual([]);
+    // The user asked, so the skip is named rather than silent.
+    expect(mockNotice).toHaveBeenCalledWith(
+      expect.stringMatching(/not.*upload|reconcil/i),
+      expect.any(Number)
+    );
+  });
+
+  it("declining the reconciliation preview is BINDING — Sync now afterwards uploads nothing", async () => {
+    // The decline path never stamps bindingReconciledVaultId, so an unbound
+    // stamp is indistinguishable from a first bind — both must stay gated.
+    const { plugin, apiCalls } = makeCatchupGatePlugin(undefined);
+    const catchup = vi.spyOn(plugin, "uploadLocalOnlyFiles");
+
+    await plugin.performSync({ userInitiated: true, forceCatchup: true });
+
+    expect(catchup).not.toHaveBeenCalled();
+    expect(apiCalls.filter((c) => c.path.endsWith("/files/sync"))).toHaveLength(1);
+    expect(fileWritesIn(apiCalls)).toEqual([]);
+    // Still armed: the catch-up runs by itself the moment the binding reconciles.
+    expect(plugin.localOnlyCatchupCompleted).toBe(false);
+  });
+
+  it("a RECONCILED binding still self-heals its own local-only files (SY7, unregressed)", async () => {
+    const { plugin } = makeCatchupGatePlugin("vault-NEW");
+    const catchup = vi.spyOn(plugin, "uploadLocalOnlyFiles").mockResolvedValue({
+      uploadedFiles: 1,
+      uploadedFolders: 0,
+      heldNoPermissionFiles: 0,
+      skippedFiles: 0,
+      failedFiles: 0,
+      failedFolders: 0,
+    });
+
+    await plugin.performSync();
+
+    expect(catchup).toHaveBeenCalledTimes(1);
+    expect(plugin.localOnlyCatchupCompleted).toBe(true);
   });
 
   // BIN-A / wave 5: the former AR1 "binaries are invisible to reconciliation"
@@ -8144,15 +8274,1128 @@ describe("local recovery binding authorization", () => {
     expect(plugin.vaultBindingAuthorization).toBe("verified");
   });
 
-  it("rejects a different account before using recovered binding metadata", async () => {
+  it("treats a different account as a question, not a verdict", async () => {
     const plugin = makePlugin();
     plugin.session = { ...makeSession(), userId: "user-B" };
     plugin.localRecoveryExpectedAccountUserId = "user-A";
+    plugin.stopSyncTimer = vi.fn();
+    plugin.adoptBindingForCurrentAccount = vi.fn().mockResolvedValue(undefined);
     plugin.apiClient = { getVaultRecord: vi.fn() };
 
     await expect(plugin.verifyBoundVaultAuthorization()).resolves.toBe(false);
+    // The mismatch verdict itself never asked the server — it is a pure local
+    // compare (which is what lets the restart-with-mismatch lane block before
+    // layoutReady). The wire question belongs to the delegated resolution's
+    // non-stamping probe, pinned in the adopt-lane tests.
     expect(plugin.apiClient.getVaultRecord).not.toHaveBeenCalled();
+    expect(plugin.stopSyncTimer).toHaveBeenCalled();
+    // ...but this is NOT the server's answer, so it must not masquerade as one.
+    // "wrong-account" here was the dead end: a legitimate second member of the
+    // same vault could never get past it.
+    expect(plugin.vaultBindingAuthorization).toBe("account-changed");
+    // The resolution was delegated (quick-260820-ki7: resolveAccountChange →
+    // adoptBindingForCurrentAccount), not answered locally.
+    expect(plugin.adoptBindingForCurrentAccount).toHaveBeenCalled();
+  });
+
+  it("resolves once per signed-in identity, not once per binding re-check", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B" };
+    plugin.localRecoveryExpectedAccountUserId = "user-A";
+    plugin.stopSyncTimer = vi.fn();
+    plugin.apiClient = { getVaultRecord: vi.fn() };
+    plugin.adoptBindingForCurrentAccount = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.verifyBoundVaultAuthorization();
+    await plugin.verifyBoundVaultAuthorization();
+    await plugin.verifyBoundVaultAuthorization();
+    await Promise.resolve();
+
+    // Three binding checks (startup resume, a reconnect re-drive, a manual
+    // sync) must not stack three resolution runs on the user — the
+    // once-per-identity latch gates automatic re-entry (quick-260820-ki7).
+    expect(plugin.adoptBindingForCurrentAccount).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolveAccountChange runs again once the latch is cleared, and hides the paused notice on entry", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B" };
+    plugin.adoptBindingForCurrentAccount = vi.fn().mockResolvedValue(undefined);
+    plugin.hideAccountChangePausedNotice = vi.fn();
+
+    await plugin.resolveAccountChange();
+    expect(plugin.adoptBindingForCurrentAccount).toHaveBeenCalledTimes(1);
+    // The resolution supersedes any standing paused notice.
+    expect(plugin.hideAccountChangePausedNotice).toHaveBeenCalled();
+
+    // Latched: a second automatic run for the same identity is a no-op.
+    await plugin.resolveAccountChange();
+    expect(plugin.adoptBindingForCurrentAccount).toHaveBeenCalledTimes(1);
+
+    // Every explicit re-offer entry point clears the latch first — that
+    // click IS the user asking again.
+    plugin.accountChangePromptedForUserId = null;
+    await plugin.resolveAccountChange();
+    expect(plugin.adoptBindingForCurrentAccount).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * Shared harness for the redesigned takeover lane (quick-260820-ki7):
+   * user-B signed in over user-A's expectation, probe target reachable,
+   * heavy collaborators stubbed. Individual tests re-stub the cleanliness
+   * gates to steer the clean/dirty routing.
+   */
+  function makeTakeoverPlugin() {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B", email: "second@example.com" };
+    plugin.localRecoveryExpectedAccountUserId = "user-A";
+    plugin.localRecoveryExpectedAccountEmail = "first@example.com";
+    plugin.stopSyncTimer = vi.fn();
+    plugin.cacheCurrentVaultRecord = vi.fn().mockResolvedValue(undefined);
+    plugin.resumeIncompleteServerSession = vi.fn();
+    plugin.serverSessionResumeComplete = true;
+    plugin.setConnectionStatus = vi.fn();
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockResolvedValue({
+        vaultId: "vault-abc",
+        name: "Protected vault",
+        slug: "protected-vault",
+      }),
+    };
+    return plugin;
+  }
+
+  it("adopts a clean DIFFERENT account AUTOMATICALLY — reset runs, no dialog is constructed", async () => {
+    const plugin = makeTakeoverPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn();
+    // The reset owns the adoption: it re-stamps the expectation, re-verifies
+    // the binding and persists the capsule (its own suite pins that); the stub
+    // mimics that contract so adopt's fall-through can be asserted.
+    plugin.resetLocalAtRestAndResync = vi.fn().mockImplementation(async () => {
+      plugin.localRecoveryExpectedAccountUserId = "user-B";
+      plugin.localRecoveryExpectedAccountEmail = "second@example.com";
+      plugin.vaultBindingAuthorization = "verified";
+    });
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    // Membership was proven BEFORE any destructive step (non-stamping probe)...
+    expect(plugin.apiClient.getVaultRecord).toHaveBeenCalledWith("vault-abc");
+    // ...the probe round trip proved reachability, so the takeover lane flips
+    // online (the reset guard requires isOnline)...
+    expect(plugin.setConnectionStatus).toHaveBeenCalledWith("online");
+    // ...BOTH cleanliness gates passed, so the re-key ran in takeover mode
+    // with NO consent ceremony — no dialog object on the clean path.
+    expect(plugin.collectUnsyncedLocalChanges).toHaveBeenCalled();
+    expect(plugin.crossCheckLocalFilesAgainstServerListing).toHaveBeenCalled();
+    expect(plugin.confirmDiscardUnsyncedChanges).not.toHaveBeenCalled();
+    expect(plugin.resetLocalAtRestAndResync).toHaveBeenCalledWith({
+      mode: "account-takeover",
+    });
+    expect(plugin.vaultBindingAuthorization).toBe("verified");
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-B");
+    // Exactly one notice states the takeover outcome (locked copy).
+    expect(mockNotice).toHaveBeenCalledWith(
+      expect.stringContaining("now syncs as second@example.com"),
+      6000
+    );
+    expect(mockNotice).toHaveBeenCalledWith(
+      expect.stringContaining("local cache was refreshed"),
+      6000
+    );
+    // The startup resume bailed at the gate and marked itself finished; nothing
+    // else re-drives it, so adoption has to reopen that path itself.
+    expect(plugin.serverSessionResumeComplete).toBe(false);
+    expect(plugin.resumeIncompleteServerSession).toHaveBeenCalled();
+  });
+
+  it("routes to the dirty dialog when the cross-check cannot confirm files, in the unconfirmed slot", async () => {
+    const plugin = makeTakeoverPlugin();
+    // Local signals clean — the ONLY dirtiness is server-side absence.
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: ["notes/maybe-hidden.md"] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(false);
+    plugin.resetLocalAtRestAndResync = vi.fn();
+    plugin.showAccountChangePausedNotice = vi.fn();
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    // The miss rides the UNCONFIRMED slot, never the unsynced-changes items —
+    // it may be permission-hidden-but-synced (honesty requirement).
+    expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalledWith(
+      expect.objectContaining({ items: [] }),
+      expect.objectContaining({ unconfirmed: ["notes/maybe-hidden.md"] })
+    );
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    expect(plugin.showAccountChangePausedNotice).toHaveBeenCalled();
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+  });
+
+  it("a failed server listing fail-safes to the dirty path (never auto-resets)", async () => {
+    const plugin = makeTakeoverPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: false, unconfirmed: [] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(false);
+    plugin.resetLocalAtRestAndResync = vi.fn();
+    plugin.showAccountChangePausedNotice = vi.fn();
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ ok: false })
+    );
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+  });
+
+  it("[Discard and switch] clears the tracked unsynced state BEFORE the reset", async () => {
+    const plugin = makeTakeoverPlugin();
+    plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue({
+      clean: false,
+      items: ["notes/queued-edit.md"],
+      indeterminate: false,
+    });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(true);
+    plugin.discardUnsyncedLocalChanges = vi.fn().mockResolvedValue(undefined);
+    plugin.resetLocalAtRestAndResync = vi.fn().mockImplementation(async () => {
+      plugin.vaultBindingAuthorization = "verified";
+    });
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    // Ordering is the contract: discarded edits must not survive the wipe and
+    // replay under the new identity once re-verify opens the gate.
+    expect(plugin.discardUnsyncedLocalChanges).toHaveBeenCalled();
+    expect(plugin.resetLocalAtRestAndResync).toHaveBeenCalledWith({
+      mode: "account-takeover",
+    });
+    expect(
+      plugin.discardUnsyncedLocalChanges.mock.invocationCallOrder[0]
+    ).toBeLessThan(plugin.resetLocalAtRestAndResync.mock.invocationCallOrder[0]);
+    expect(plugin.resumeIncompleteServerSession).toHaveBeenCalled();
+  });
+
+  it("pre-reset TOCTOU re-check: an edit landing mid-flight routes to the dirty path", async () => {
+    const plugin = makeTakeoverPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    // The cross-check round trip is exactly where a mid-flight edit can land:
+    // simulate one arriving while the listing was being fetched.
+    plugin.crossCheckLocalFilesAgainstServerListing = vi.fn().mockImplementation(async () => {
+      plugin.offlineQueue.push({
+        operation: "write",
+        path: "notes/mid-flight-edit.md",
+        data: "typed during the cross-check",
+        timestamp: new Date().toISOString(),
+      });
+      return { ok: true, unconfirmed: [] };
+    });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(false);
+    plugin.resetLocalAtRestAndResync = vi.fn();
+    plugin.showAccountChangePausedNotice = vi.fn();
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    // The clean check passed, but the re-check caught the landed op: the auto
+    // reset must NOT run — the flow asks instead.
+    expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalled();
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    expect(plugin.showAccountChangePausedNotice).toHaveBeenCalled();
+  });
+
+  it("headless + clean proceeds to the automatic reset", async () => {
+    // No consent is destroyed-data consent on the clean path — there is
+    // nothing to lose, so headless (no Obsidian document) must not block it.
+    const plugin = makeTakeoverPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.resetLocalAtRestAndResync = vi.fn().mockImplementation(async () => {
+      plugin.vaultBindingAuthorization = "verified";
+    });
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    expect(plugin.resetLocalAtRestAndResync).toHaveBeenCalledWith({
+      mode: "account-takeover",
+    });
+    expect(plugin.resumeIncompleteServerSession).toHaveBeenCalled();
+  });
+
+  it("adopts the SAME account without any takeover machinery", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B", email: "second@example.com" };
+    plugin.localRecoveryExpectedAccountUserId = "user-B";
+    plugin.stopSyncTimer = vi.fn();
+    plugin.cacheCurrentVaultRecord = vi.fn().mockResolvedValue(undefined);
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(undefined);
+    plugin.resumeIncompleteServerSession = vi.fn();
+    plugin.serverSessionResumeComplete = true;
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockResolvedValue({
+        vaultId: "vault-abc",
+        name: "Protected vault",
+        slug: "protected-vault",
+      }),
+    };
+    plugin.collectUnsyncedLocalChanges = vi.fn();
+    plugin.crossCheckLocalFilesAgainstServerListing = vi.fn();
+    plugin.confirmDiscardUnsyncedChanges = vi.fn();
+    plugin.resetLocalAtRestAndResync = vi.fn();
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    // Byte-identical same-account lane: no cleanliness gates, no dialog, no
+    // reset — clear the expectation and let verify decide, exactly as before.
+    expect(plugin.collectUnsyncedLocalChanges).not.toHaveBeenCalled();
+    expect(plugin.crossCheckLocalFilesAgainstServerListing).not.toHaveBeenCalled();
+    expect(plugin.confirmDiscardUnsyncedChanges).not.toHaveBeenCalled();
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    expect(plugin.vaultBindingAuthorization).toBe("verified");
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-B");
+    expect(mockNotice).toHaveBeenCalledWith(
+      expect.stringContaining("now connected as second@example.com"),
+      6000
+    );
+    expect(plugin.resumeIncompleteServerSession).toHaveBeenCalled();
+  });
+
+  it("keeps the paused account-changed state when the discard dialog is declined", async () => {
+    const plugin = makeTakeoverPlugin();
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.serverSessionResumeComplete = false;
+    plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue({
+      clean: false,
+      items: ["notes/typed-while-paused.md"],
+      indeterminate: false,
+    });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(false);
+    plugin.discardUnsyncedLocalChanges = vi.fn();
+    plugin.resetLocalAtRestAndResync = vi.fn();
+    plugin.showAccountChangePausedNotice = vi.fn();
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    // The dialog received the named victims...
+    expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalledWith(
+      expect.objectContaining({ items: ["notes/typed-while-paused.md"] }),
+      expect.anything()
+    );
+    // ...and the decline left EVERYTHING intact: no wipe, no discard, the
+    // expectation survives so the flow can re-arm, sync stays paused.
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    expect(plugin.discardUnsyncedLocalChanges).not.toHaveBeenCalled();
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+    expect(plugin.vaultBindingAuthorization).toBe("account-changed");
+    expect(plugin.resumeIncompleteServerSession).not.toHaveBeenCalled();
+    // The decline explanation must be the STICKY paused notice — a transient
+    // toast disappears while the local-only state it describes persists.
+    expect(plugin.showAccountChangePausedNotice).toHaveBeenCalled();
+  });
+
+  it("headless + dirty NEVER resets — the real consent helper fails closed to keep", async () => {
+    // node test env has no `activeDocument`: the REAL consent helper must
+    // resolve "keep" — a destructive discard never proceeds on an implied
+    // answer (mirrors the old confirmAccountTakeoverReset fail-closed design).
+    const plugin = makeTakeoverPlugin();
+    plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue({
+      clean: false,
+      items: ["notes/unsynced.md"],
+      indeterminate: false,
+    });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.discardUnsyncedLocalChanges = vi.fn();
+    plugin.resetLocalAtRestAndResync = vi.fn();
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    expect(plugin.discardUnsyncedLocalChanges).not.toHaveBeenCalled();
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+    expect(plugin.resumeIncompleteServerSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps the account-changed state when the takeover reset itself fails", async () => {
+    const plugin = makeTakeoverPlugin();
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.logError = vi.fn();
+    plugin.serverSessionResumeComplete = false;
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.resetLocalAtRestAndResync = vi
+      .fn()
+      .mockRejectedValue(new Error("wipe interrupted"));
+
+    await plugin.adoptBindingForCurrentAccount();
+
+    // Crash-safety: nothing was adopted, so the flow re-arms on the next
+    // binding check instead of silently running the old key under a new name.
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+    expect(plugin.resumeIncompleteServerSession).not.toHaveBeenCalled();
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // quick-260820-mv4: the vault-to-vault SWITCH is a cache replacement.
+  //
+  // Re-pointing a folder at a different server vault used to leave the
+  // previous vault's files on disk, where reconciliation classified all of
+  // them as local-only and offered to upload them INTO the vault just
+  // connected. The switch now runs the ki7 gate: auto when provably clean,
+  // one dialog when dirty, and a decline cancels the switch outright.
+  // ───────────────────────────────────────────────────────────────────────
+  function makeSwitchPlugin() {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-A", email: "first@example.com" };
+    plugin.settings.serverVaultId = "vault-OLD";
+    plugin.settings.serverVaultName = "Old vault";
+    plugin.vaultBindingAuthorization = "verified";
+    plugin.syncState = { ...(plugin.syncState ?? {}), conflicts: [], lastSync: null };
+    plugin.blockedStateLocalEdits = new Set();
+    plugin.notifyDiscoveryLifecycleChanged = vi.fn();
+    plugin.shouldPurgeSemanticIndex = vi.fn(() => false);
+    plugin.ensureSyncRuntime = vi.fn(() => ({ cancelActiveOperations: vi.fn() }));
+    plugin.stopSyncTimer = vi.fn();
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.rebuildApiClient = vi.fn();
+    plugin.initializeApiClientFromSession = vi.fn();
+    plugin.verifyBoundVaultAuthorization = vi.fn().mockResolvedValue(true);
+    plugin.refreshVaultMemberRole = vi.fn().mockResolvedValue(undefined);
+    plugin.ensureVaultScopedKeyLease = vi.fn().mockResolvedValue(undefined);
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(true);
+    plugin.resetLocalAtRestAndResync = vi.fn().mockResolvedValue(undefined);
+    return plugin;
+  }
+
+  const NEW_BINDING = { vaultId: "vault-NEW", name: "New vault", slug: "new-vault" };
+
+  it("a CLEAN vault switch wipes and re-pulls automatically — no dialog", async () => {
+    const plugin = makeSwitchPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn();
+
+    const changed = await plugin.applyVaultBinding(NEW_BINDING);
+
+    expect(changed).toBe(true);
+    // The cross-check must target the vault being LEFT — it is the only vault
+    // that can answer "is this local file already safe?".
+    expect(plugin.crossCheckLocalFilesAgainstServerListing).toHaveBeenCalledWith("vault-OLD");
+    // Clean means no ceremony: the dirty dialog is never constructed.
+    expect(plugin.confirmDiscardUnsyncedChanges).not.toHaveBeenCalled();
+    expect(plugin.resetLocalAtRestAndResync).toHaveBeenCalledWith({
+      mode: "vault-switch",
+      previousVaultId: "vault-OLD",
+    });
+    expect(plugin.settings.serverVaultId).toBe("vault-NEW");
+  });
+
+  it("a DIRTY vault switch asks exactly once and discards the tracked holders before the reset", async () => {
+    const plugin = makeSwitchPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: false, items: ["notes/draft.md"], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(true);
+    plugin.discardUnsyncedLocalChanges = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.applyVaultBinding(NEW_BINDING);
+
+    expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalledTimes(1);
+    // The dialog is told which boundary is being crossed, and names both the
+    // vault being left and the one being joined.
+    expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalledWith(
+      expect.objectContaining({ items: ["notes/draft.md"] }),
+      expect.objectContaining({ ok: true }),
+      { kind: "vault", previousVaultName: "Old vault", nextVaultName: "New vault" }
+    );
+    // Discard BEFORE the reset, or the "discarded" queued edits survive the
+    // wipe and replay into the newly bound vault.
+    expect(
+      (plugin.discardUnsyncedLocalChanges as any).mock.invocationCallOrder[0]
+    ).toBeLessThan((plugin.resetLocalAtRestAndResync as any).mock.invocationCallOrder[0]);
+    expect(plugin.resetLocalAtRestAndResync).toHaveBeenCalled();
+  });
+
+  it("declining the dirty dialog CANCELS the switch — binding untouched, nothing destroyed", async () => {
+    const plugin = makeSwitchPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: false, items: ["notes/draft.md"], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(false);
+    plugin.discardUnsyncedLocalChanges = vi.fn();
+
+    const changed = await plugin.applyVaultBinding(NEW_BINDING);
+
+    // Unlike a declined takeover there is nothing to pause: the vault this
+    // folder already holds is still perfectly usable, so the switch simply
+    // does not happen.
+    expect(changed).toBe(false);
+    expect(plugin.settings.serverVaultId).toBe("vault-OLD");
+    expect(plugin.discardUnsyncedLocalChanges).not.toHaveBeenCalled();
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    expect(plugin.rebuildApiClient).not.toHaveBeenCalled();
+    expect(mockNotice).toHaveBeenCalledWith(
+      expect.stringContaining("switch cancelled"),
+      6000
+    );
+  });
+
+  it("a FIRST bind of an unbound folder skips the purge gate entirely", async () => {
+    const plugin = makeSwitchPlugin();
+    plugin.settings.serverVaultId = "";
+    plugin.settings.serverVaultName = "";
+    plugin.collectUnsyncedLocalChanges = vi.fn();
+    plugin.crossCheckLocalFilesAgainstServerListing = vi.fn();
+
+    await plugin.applyVaultBinding(NEW_BINDING);
+
+    // No previous vault means no previous cache to replace — this lane keeps
+    // today's compare-and-merge reconciliation.
+    expect(plugin.collectUnsyncedLocalChanges).not.toHaveBeenCalled();
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    expect(plugin.settings.serverVaultId).toBe("vault-NEW");
+  });
+
+  it("a BLOCKED binding still delegates to the ki7 adopt lane, never the switch gate", async () => {
+    const plugin = makeSwitchPlugin();
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.adoptBindingForCurrentAccount = vi.fn().mockResolvedValue(undefined);
+    plugin.collectUnsyncedLocalChanges = vi.fn();
+
+    await plugin.applyVaultBinding(NEW_BINDING);
+
+    // Double-gating would ask twice for the same consent; adopt owns it.
+    expect(plugin.collectUnsyncedLocalChanges).not.toHaveBeenCalled();
+    expect(plugin.adoptBindingForCurrentAccount).toHaveBeenCalled();
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+  });
+
+  it("headless (no document to consent) never wipes on a dirty switch", async () => {
+    const plugin = makeSwitchPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: false, items: ["notes/draft.md"], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    // The REAL consent helper: with no activeDocument in the node env it
+    // fails closed, exactly as the takeover lane does.
+    const changed = await plugin.applyVaultBinding(NEW_BINDING);
+
+    expect(changed).toBe(false);
+    expect(plugin.settings.serverVaultId).toBe("vault-OLD");
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+  });
+
+  it("an in-flight edit landing during the cross-check re-routes a clean switch to the dialog (TOCTOU)", async () => {
+    const plugin = makeSwitchPlugin();
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi.fn().mockImplementation(async () => {
+      // The user types while the listing round trips.
+      plugin.offlineQueue.push({ path: "notes/just-typed.md" });
+      return { ok: true, unconfirmed: [] };
+    });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(false);
+
+    const changed = await plugin.applyVaultBinding(NEW_BINDING);
+
+    expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalled();
+    expect(changed).toBe(false);
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+  });
+
+  it("a download-only reconciliation plan applies WITHOUT a prompt", async () => {
+    // quick-260820-mv4. The preview exists to get consent for the two
+    // outcomes a user can regret — uploading local-only files into a server
+    // vault, and resolving conflicts. With neither present nothing on this
+    // device can be lost, so there is no question to ask. This is also the
+    // exact shape a takeover/vault-switch reset leaves behind (empty local
+    // side, everything server-only), where a dialog contradicted the
+    // "automatic when clean" promise.
+    const plugin = makePlugin();
+    plugin.settings.defaultConflictResolution = "keep-local";
+
+    // Resolves on its own: a modal-driven path could never settle here, since
+    // nothing in this harness clicks a button.
+    await expect(
+      plugin.askReconciliationPlan({
+        serverOnly: ["notes/a.md", "notes/b.md"],
+        localOnly: [],
+        conflicts: [],
+      })
+    ).resolves.toEqual({ proceed: true, conflictStrategy: "keep-local" });
+  });
+
+  it("[source-contract] the 3-button modal and the takeover-reset modal are gone; the discard dialog fails closed", () => {
+    // quick-260820-ki7: "auto when clean, ask when dirty" deleted both the
+    // AccountChangeModal (the consent ceremony that protected nothing) and
+    // the AccountTakeoverResetModal (replaced by the dirty-only discard
+    // dialog). Deferral stays possible (Escape / X — an Obsidian modal always
+    // closes) and must resolve "keep" so the caller can surface the loud
+    // local-only state instead of destroying anything on an implied answer.
+    expect(existsSync("src/plugin/account-change-modal.ts")).toBe(false);
+    expect(existsSync("src/plugin/account-takeover-reset-modal.ts")).toBe(false);
+
+    const discardSource = readFileSync("src/plugin/account-switch-discard-modal.ts", "utf-8");
+    expect(discardSource).toContain('this.resolveDecision("keep")');
+    // quick-260820-prn made the confirm label lane-specific: a binding that
+    // has ALREADY flipped is replacing a local cache, not switching.
+    expect(discardSource).toContain('"Discard and replace" : "Discard and switch"');
+    // quick-260820-mv4 gave the decline button kind-specific copy — the
+    // account lane's wording is unchanged, the pre-mutation vault lane says
+    // "Cancel" because a declined switch simply does not happen (and the
+    // already-applied lane cannot, so it keeps the account lane's wording).
+    expect(discardSource).toContain('"Cancel" : "Keep working locally"');
+
+    const mainSource = readFileSync("src/plugin/main.ts", "utf-8");
+    expect(mainSource).not.toContain("AccountChangeModal");
+    expect(mainSource).not.toContain("AccountTakeoverResetModal");
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // quick-260820-prn: adopt used to branch on IDENTITY alone, so a blocked
+  // binding whose account did not change but whose VAULT did cleared the
+  // expectation, verified the new vault and left the previous vault's files
+  // on disk (handoff lane C2). They then looked local-only against the new
+  // vault. The sub-lane below runs the same ki7 gate the takeover does.
+  // ───────────────────────────────────────────────────────────────────────
+  describe("blocked same-identity vault change (quick-260820-prn)", () => {
+    /**
+     * The blocked adopt lane as `applyVaultBinding` leaves it: the binding
+     * has ALREADY flipped (settings name the NEW vault), the identity is
+     * unchanged (expectation === session.userId) and the state is blocked.
+     *
+     * Every collaborator is stubbed on the plugin object — no `requestUrl` /
+     * `apiRequest` mocking is involved at all, so the ordered-mock trap that
+     * surfaces as a 15 s timeout cannot apply here.
+     */
+    function makeAdoptedSwitchPlugin() {
+      const plugin = makeSwitchPlugin();
+      plugin.settings.serverVaultId = "vault-NEW";
+      plugin.settings.serverVaultName = "New vault";
+      plugin.vaultBindingAuthorization = "wrong-account";
+      // Same identity: this is what makes the takeover branch inapplicable.
+      plugin.localRecoveryExpectedAccountUserId = "user-A";
+      plugin.localRecoveryExpectedAccountEmail = "first@example.com";
+      plugin.probeBoundVaultMembership = vi.fn().mockResolvedValue(true);
+      plugin.setConnectionStatus = vi.fn();
+      plugin.resumeIncompleteServerSession = vi.fn();
+      plugin.serverSessionResumeComplete = true;
+      plugin.showAccountChangePausedNotice = vi.fn();
+      plugin.discardUnsyncedLocalChanges = vi.fn().mockResolvedValue(undefined);
+      return plugin;
+    }
+
+    /** Spy that still runs the REAL gate, so its wiring is exercised too. */
+    function spyOnRealPurge(plugin: any) {
+      const real = plugin.confirmVaultSwitchLocalPurge.bind(plugin);
+      const spy = vi.fn((...args: unknown[]) => real(...args));
+      plugin.confirmVaultSwitchLocalPurge = spy;
+      return spy;
+    }
+
+    const dirty = { clean: false, items: ["notes/draft.md"], indeterminate: false };
+
+    it("a CHANGED vault runs the gate and replaces the previous vault's local cache", async () => {
+      const plugin = makeAdoptedSwitchPlugin();
+      plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue(dirty);
+      plugin.crossCheckLocalFilesAgainstServerListing = vi
+        .fn()
+        .mockResolvedValue({ ok: false, unconfirmed: [] });
+      plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(true);
+      const purge = spyOnRealPurge(plugin);
+
+      await plugin.adoptBindingForCurrentAccount("vault-OLD", "Old vault");
+
+      // Membership in the NEWLY bound vault is proven by the non-stamping
+      // probe before anything local is touched...
+      expect(plugin.probeBoundVaultMembership).toHaveBeenCalled();
+      // ...and the round trip proved reachability, so the lane flips online
+      // (the vault-switch reset guard requires isOnline()).
+      expect(plugin.setConnectionStatus).toHaveBeenCalledWith("online");
+      // The cross-check must still target the vault being LEFT: listVaultFilesPage
+      // reaches it through explicitVaultBase, so the flipped binding is irrelevant.
+      expect(plugin.crossCheckLocalFilesAgainstServerListing).toHaveBeenCalledWith("vault-OLD");
+      expect(purge).toHaveBeenCalledTimes(1);
+      expect(purge).toHaveBeenCalledWith("vault-OLD", "New vault", {
+        previousVaultName: "Old vault",
+        bindingAlreadyApplied: true,
+      });
+      // The dialog names the vault being left — which post-mutation settings
+      // can no longer supply — and knows the switch already happened.
+      expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalledWith(
+        expect.objectContaining({ items: ["notes/draft.md"] }),
+        expect.objectContaining({ ok: false }),
+        {
+          kind: "vault",
+          previousVaultName: "Old vault",
+          nextVaultName: "New vault",
+          bindingAlreadyApplied: true,
+        }
+      );
+      // Discard BEFORE the reset, or the "discarded" queued edits survive the
+      // wipe and replay into the newly bound vault.
+      expect(
+        (plugin.discardUnsyncedLocalChanges as any).mock.invocationCallOrder[0]
+      ).toBeLessThan((plugin.resetLocalAtRestAndResync as any).mock.invocationCallOrder[0]);
+      expect(plugin.resetLocalAtRestAndResync).toHaveBeenCalledWith({
+        mode: "vault-switch",
+        previousVaultId: "vault-OLD",
+      });
+      expect(mockNotice).toHaveBeenCalledWith(
+        expect.stringContaining("now holds New vault"),
+        6000
+      );
+      // Falls through to the resume re-drive, exactly like the takeover lane.
+      expect(plugin.serverSessionResumeComplete).toBe(false);
+      expect(plugin.resumeIncompleteServerSession).toHaveBeenCalled();
+    });
+
+    it("declining purges nothing, adopts nothing and lands a loud paused state", async () => {
+      const plugin = makeAdoptedSwitchPlugin();
+      plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue(dirty);
+      plugin.crossCheckLocalFilesAgainstServerListing = vi
+        .fn()
+        .mockResolvedValue({ ok: false, unconfirmed: [] });
+      plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(false);
+      spyOnRealPurge(plugin);
+
+      await plugin.adoptBindingForCurrentAccount("vault-OLD", "Old vault");
+
+      expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+      expect(plugin.discardUnsyncedLocalChanges).not.toHaveBeenCalled();
+      expect(plugin.persistLocalRecoveryCapsule).not.toHaveBeenCalled();
+      // Only the reset may stamp the expectation, so a decline — or a crash
+      // anywhere before it — re-arms the whole flow instead of adopting.
+      expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+      expect(plugin.showAccountChangePausedNotice).toHaveBeenCalledWith(
+        expect.stringContaining("still holds the local files from")
+      );
+      expect(plugin.resumeIncompleteServerSession).not.toHaveBeenCalled();
+    });
+
+    it("never verifies before the gate — verify clears blockedStateLocalEdits, a dirty signal", async () => {
+      const plugin = makeAdoptedSwitchPlugin();
+      plugin.blockedStateLocalEdits = new Set(["notes/typed-while-blocked.md"]);
+      let editsAtGate: number | null = null;
+      plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue(dirty);
+      plugin.crossCheckLocalFilesAgainstServerListing = vi
+        .fn()
+        .mockResolvedValue({ ok: false, unconfirmed: [] });
+      plugin.confirmDiscardUnsyncedChanges = vi.fn().mockImplementation(async () => {
+        editsAtGate = plugin.blockedStateLocalEdits.size;
+        return true;
+      });
+      spyOnRealPurge(plugin);
+
+      await plugin.adoptBindingForCurrentAccount("vault-OLD", "Old vault");
+
+      // verifyBoundVaultAuthorization CLEARS blockedStateLocalEdits on success.
+      // Verifying before the gate would destroy the very evidence the gate
+      // exists to read, so this lane must use the non-stamping probe instead;
+      // the reset owns verification afterwards.
+      expect(plugin.verifyBoundVaultAuthorization).not.toHaveBeenCalled();
+      expect(editsAtGate).toBe(1);
+    });
+
+    it("a membership denial on the NEWLY picked vault touches nothing local", async () => {
+      const plugin = makeAdoptedSwitchPlugin();
+      plugin.probeBoundVaultMembership = vi.fn().mockImplementation(async () => {
+        // The probe's own 403 branch: it raises the tracked wrong-account notice.
+        plugin.vaultBindingAuthorization = "wrong-account";
+        return false;
+      });
+      plugin.collectUnsyncedLocalChanges = vi.fn();
+      plugin.crossCheckLocalFilesAgainstServerListing = vi.fn();
+      const purge = spyOnRealPurge(plugin);
+
+      await plugin.adoptBindingForCurrentAccount("vault-OLD", "Old vault");
+
+      expect(purge).not.toHaveBeenCalled();
+      expect(plugin.collectUnsyncedLocalChanges).not.toHaveBeenCalled();
+      expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+      expect(plugin.setConnectionStatus).not.toHaveBeenCalledWith("online");
+      // The probe already raised the sticky wrong-account notice — stacking
+      // the paused notice on top of it would describe the state twice.
+      expect(plugin.showAccountChangePausedNotice).not.toHaveBeenCalled();
+      expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+    });
+
+    it("a TRANSIENT probe failure is never a silent dead end", async () => {
+      const plugin = makeAdoptedSwitchPlugin();
+      // applyVaultBinding leaves a changed binding "unverified"; a network
+      // blip does not move it, so nothing else names the state.
+      plugin.vaultBindingAuthorization = "unverified";
+      plugin.probeBoundVaultMembership = vi.fn().mockResolvedValue(false);
+
+      await plugin.adoptBindingForCurrentAccount("vault-OLD", "Old vault");
+
+      expect(plugin.showAccountChangePausedNotice).toHaveBeenCalledWith(
+        expect.stringContaining("still holds the local files from")
+      );
+      expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    });
+
+    it("headless + dirty declines — the ki7 fail-closed rule holds on this lane too", async () => {
+      const plugin = makeAdoptedSwitchPlugin();
+      plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue(dirty);
+      plugin.crossCheckLocalFilesAgainstServerListing = vi
+        .fn()
+        .mockResolvedValue({ ok: false, unconfirmed: [] });
+      // The REAL consent helper: with no activeDocument in the node env there
+      // is nobody to consent, so it fails closed.
+      spyOnRealPurge(plugin);
+
+      await plugin.adoptBindingForCurrentAccount("vault-OLD", "Old vault");
+
+      expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+      expect(plugin.discardUnsyncedLocalChanges).not.toHaveBeenCalled();
+      expect(plugin.showAccountChangePausedNotice).toHaveBeenCalled();
+    });
+
+    it("an UNCHANGED vault behaves exactly as it does today — no gate, verify decides", async () => {
+      const plugin = makeAdoptedSwitchPlugin();
+      plugin.settings.serverVaultId = "vault-OLD";
+      plugin.settings.serverVaultName = "Old vault";
+      plugin.collectUnsyncedLocalChanges = vi.fn();
+      const purge = spyOnRealPurge(plugin);
+
+      await plugin.adoptBindingForCurrentAccount("vault-OLD", "Old vault");
+
+      expect(purge).not.toHaveBeenCalled();
+      expect(plugin.collectUnsyncedLocalChanges).not.toHaveBeenCalled();
+      expect(plugin.probeBoundVaultMembership).not.toHaveBeenCalled();
+      expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+      expect(plugin.localRecoveryExpectedAccountUserId).toBeNull();
+      expect(plugin.localRecoveryExpectedAccountEmail).toBeNull();
+      expect(plugin.verifyBoundVaultAuthorization).toHaveBeenCalled();
+      expect(mockNotice).toHaveBeenCalledWith(
+        expect.stringContaining("is now connected as first@example.com"),
+        6000
+      );
+    });
+
+    it("resolveAccountChange's argument-free call takes that same unchanged-vault path", async () => {
+      const plugin = makeAdoptedSwitchPlugin();
+      const purge = spyOnRealPurge(plugin);
+
+      // resolveAccountChange passes nothing — it is reached only from verify's
+      // account-changed branch, which requires an identity mismatch, so it is
+      // structurally always the takeover path and never needs the vault lane.
+      await plugin.adoptBindingForCurrentAccount();
+
+      expect(purge).not.toHaveBeenCalled();
+      expect(plugin.probeBoundVaultMembership).not.toHaveBeenCalled();
+      expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+      expect(plugin.localRecoveryExpectedAccountUserId).toBeNull();
+      expect(plugin.verifyBoundVaultAuthorization).toHaveBeenCalled();
+    });
+
+    it("identity AND vault changed runs the ki7 takeover lane, with exactly ONE dialog", async () => {
+      const plugin = makeTakeoverPlugin();
+      plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue(dirty);
+      plugin.crossCheckLocalFilesAgainstServerListing = vi
+        .fn()
+        .mockResolvedValue({ ok: true, unconfirmed: [] });
+      plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(true);
+      plugin.discardUnsyncedLocalChanges = vi.fn().mockResolvedValue(undefined);
+      plugin.resetLocalAtRestAndResync = vi.fn().mockResolvedValue(undefined);
+      const purge = spyOnRealPurge(plugin);
+
+      await plugin.adoptBindingForCurrentAccount("vault-OLD", "Old vault");
+
+      // The two lanes are mutually exclusive by construction — the vault
+      // sub-lane lives inside the `else` of the very `if (takeover)` above it,
+      // so a double-ask is structurally impossible, not merely avoided.
+      expect(plugin.resetLocalAtRestAndResync).toHaveBeenCalledWith({
+        mode: "account-takeover",
+      });
+      expect(purge).not.toHaveBeenCalled();
+      expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalledTimes(1);
+    });
+
+    it("applyVaultBinding threads the previous vault id AND name into the blocked lane", async () => {
+      const plugin = makeSwitchPlugin();
+      plugin.vaultBindingAuthorization = "wrong-account";
+      plugin.adoptBindingForCurrentAccount = vi.fn().mockResolvedValue(undefined);
+      plugin.collectUnsyncedLocalChanges = vi.fn();
+
+      await plugin.applyVaultBinding(NEW_BINDING);
+
+      // Both captured PRE-mutation, so the name still identifies the vault
+      // being left rather than the one being joined.
+      expect(plugin.adoptBindingForCurrentAccount).toHaveBeenCalledWith("vault-OLD", "Old vault");
+      // mv4's own gate still excludes the blocked lane (no double-ask), and
+      // its early return keeps the trailing reset block unreachable here.
+      expect(plugin.collectUnsyncedLocalChanges).not.toHaveBeenCalled();
+      expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    });
+  });
+
+  it("the ribbon badges a BLOCKED binding on a logged-in session (quick-260820-nqm)", () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B", email: "second@example.com" };
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.settings.serverVaultName = "testing-vault";
+
+    const classes = new Set<string>();
+    const attrs: Record<string, string> = {};
+    const shield = {
+      addClass: (c: string) => classes.add(c),
+      removeClass: (c: string) => classes.delete(c),
+      setAttr: (k: string, v: string) => {
+        attrs[k] = v;
+      },
+    };
+    plugin.vaultGuardRibbonEl = shield;
+    plugin.setGlobalAuthChromeState = vi.fn();
+
+    // A binding blocked by the server's verdict about THIS account.
+    plugin.vaultBindingAuthorization = "wrong-account";
+    plugin.updateRibbonAuthIndicator();
+    expect(classes.has("vaultguard-ribbon-binding-blocked")).toBe(true);
+    // The tooltip has to say WHY, and that the folder is not syncing.
+    expect(attrs.title).toContain("paused");
+    expect(attrs.title).toContain("testing-vault");
+    expect(attrs["aria-label"]).toContain("paused");
+
+    // The other blocked state badges identically — both pause the wire.
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.updateRibbonAuthIndicator();
+    expect(classes.has("vaultguard-ribbon-binding-blocked")).toBe(true);
+
+    // Resolved: the badge clears and the ordinary connected tooltip is back.
+    plugin.vaultBindingAuthorization = "verified";
+    plugin.updateRibbonAuthIndicator();
+    expect(classes.has("vaultguard-ribbon-binding-blocked")).toBe(false);
+    expect(attrs.title).toContain("connected");
+
+    // Logged out has its own badge — the blocked one must not linger on top.
+    plugin.vaultBindingAuthorization = "wrong-account";
+    plugin.updateRibbonAuthIndicator();
+    expect(classes.has("vaultguard-ribbon-binding-blocked")).toBe(true);
+    plugin.session = null;
+    plugin.updateRibbonAuthIndicator();
+    expect(classes.has("vaultguard-ribbon-binding-blocked")).toBe(false);
+  });
+
+  it("every write to the binding state refreshes the ribbon (quick-260820-nqm)", () => {
+    const plugin = makePlugin();
+    plugin.vaultGuardRibbonEl = {
+      addClass: vi.fn(),
+      removeClass: vi.fn(),
+      setAttr: vi.fn(),
+    };
+    plugin.updateRibbonAuthIndicator = vi.fn();
+
+    // The accessor pair is what makes the refresh complete: 17 write sites
+    // across restore/verify/probe/logout/binding-change would otherwise each
+    // need their own call, and a future 18th would silently drop the badge.
+    plugin.vaultBindingAuthorization = "wrong-account";
+    expect(plugin.updateRibbonAuthIndicator).toHaveBeenCalledTimes(1);
+
+    // Idempotent: re-writing the same value is not a transition.
+    plugin.vaultBindingAuthorization = "wrong-account";
+    expect(plugin.updateRibbonAuthIndicator).toHaveBeenCalledTimes(1);
+
+    plugin.vaultBindingAuthorization = "verified";
+    expect(plugin.updateRibbonAuthIndicator).toHaveBeenCalledTimes(2);
+    // ...and the value still reads back normally.
+    expect(plugin.vaultBindingAuthorization).toBe("verified");
+  });
+
+  it("the wrong-account notice carries a working way out (quick-260820-nqm)", () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B" };
+    plugin.handlePrimaryProtectionAction = vi.fn();
+
+    plugin.showWrongAccountNotice("not a member of testing-vault");
+
+    // Headless has no DOM-capable Notice, so the actioned body cannot be
+    // built — but the state must still be NAMED, stickily (duration 0). The
+    // button itself is covered in tests/notice-realm-safety.test.ts, which
+    // installs a Notice mock that can host DOM.
+    expect(mockNotice).toHaveBeenCalledWith("not a member of testing-vault", 0);
+    expect(plugin.wrongAccountNotice).not.toBeNull();
+
+    // Still deduped: a second raise replaces rather than stacks.
+    const first = plugin.wrongAccountNotice;
+    plugin.showWrongAccountNotice("not a member of testing-vault");
+    expect(plugin.wrongAccountNotice).not.toBe(first);
+  });
+
+  it("deferring the account decision raises ONE sticky paused notice, deduped", () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B" };
+    plugin.updateStatusBar = vi.fn();
+
+    plugin.showAccountChangePausedNotice();
+
+    // Headless fallback still names the local-only state, stickily (duration 0).
+    expect(mockNotice).toHaveBeenCalledWith(
+      expect.stringContaining("works locally only"),
+      0
+    );
+    const first = plugin.accountChangePausedNotice;
+    expect(first).toBeTruthy();
+
+    // A second deferral replaces the standing notice instead of stacking.
+    plugin.showAccountChangePausedNotice();
+    expect(plugin.accountChangePausedNotice).toBeTruthy();
+    expect(plugin.accountChangePausedNotice).not.toBe(first);
+  });
+
+  it("hides the paused notice once the binding verifies", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.localRecoveryExpectedAccountUserId = "user-1";
+    plugin.cacheCurrentVaultRecord = vi.fn().mockResolvedValue(undefined);
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(undefined);
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockResolvedValue({
+        vaultId: "vault-abc",
+        name: "Protected vault",
+        slug: "protected-vault",
+      }),
+    };
+    const hide = vi.fn();
+    plugin.accountChangePausedNotice = { hide };
+
+    await expect(plugin.verifyBoundVaultAuthorization()).resolves.toBe(true);
+
+    expect(hide).toHaveBeenCalled();
+    expect(plugin.accountChangePausedNotice).toBeNull();
+  });
+
+  it("status bar shows the paused state instead of 'Connected ✓' while blocked", () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.localProtectionBootstrap = { kind: "existing", source: "plugin-envelope" };
+    plugin.permissionWarmupInFlight = 0;
+    plugin.connectionState = {
+      status: "online",
+      lastConnected: null,
+      failedAttempts: 0,
+      nextRetryAt: null,
+      latencyMs: null,
+    };
+    plugin.longOperations = { getPrimarySnapshot: () => null };
+    plugin.getAtRestStatus = vi.fn(() => ({ kind: "unlocked", method: "safe-storage" }));
+    plugin.i18n = { t: (key: string) => key, applyToRoot: vi.fn() };
+    const setText = vi.fn();
+    plugin.statusBarEl = {
+      setText,
+      setAttr: vi.fn(),
+      removeAttribute: vi.fn(),
+      classList: { add: vi.fn(), remove: vi.fn() },
+    };
+    // makePlugin stubs updateStatusBar AND getProtectedContentGate; this test
+    // exercises the real pair — the status-bar branch keys off the gate.
+    plugin.updateStatusBar = Object.getPrototypeOf(plugin).updateStatusBar.bind(plugin);
+    plugin.getProtectedContentGate =
+      Object.getPrototypeOf(plugin).getProtectedContentGate.bind(plugin);
+
+    plugin.updateStatusBar();
+    // "Connected ✓" was literally true (API reachable) but read as "sync is
+    // healthy" while every upload/download was gated — the deceptive half of
+    // the runtime finding.
+    expect(setText).toHaveBeenCalledWith("status.syncPausedAccount");
+
+    setText.mockClear();
+    plugin.vaultBindingAuthorization = "verified";
+    plugin.updateStatusBar();
+    expect(setText).toHaveBeenCalledWith(expect.stringContaining("✓"));
+  });
+
+  it("keeps an honest wrong-account verdict when the server denies the new account", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B" };
+    plugin.localRecoveryExpectedAccountUserId = "user-A";
+    plugin.stopSyncTimer = vi.fn();
+    plugin.resumeIncompleteServerSession = vi.fn();
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockRejectedValue(new Error("403 access denied")),
+    };
+
+    await plugin.adoptBindingForCurrentAccount();
+
     expect(plugin.vaultBindingAuthorization).toBe("wrong-account");
+    expect(plugin.resumeIncompleteServerSession).not.toHaveBeenCalled();
+  });
+
+  it("re-picking the already-bound vault while blocked delegates to the takeover-aware adopt", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B" };
+    plugin.settings.serverVaultId = "vault-abc";
+    plugin.localRecoveryExpectedAccountUserId = "user-A";
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.rebuildApiClient = vi.fn();
+    plugin.initializeApiClientFromSession = vi.fn();
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(undefined);
+    plugin.verifyBoundVaultAuthorization = vi.fn();
+    plugin.adoptBindingForCurrentAccount = vi.fn();
+
+    // Picking the SAME vault used to silently clear the expectation and run
+    // verify straight through — a zero-consent takeover (quick-260820-fvo).
+    // Now the pick is a REQUEST: adopt owns probe → consent → reset, and the
+    // expectation survives until one of those moves it. The full delegation
+    // contract lives in the "blocked picker-lane delegation" describe below.
+    await plugin.applyVaultBinding({
+      vaultId: "vault-abc",
+      name: "Protected vault",
+      slug: "protected-vault",
+    });
+
+    expect(plugin.adoptBindingForCurrentAccount).toHaveBeenCalledTimes(1);
+    expect(plugin.verifyBoundVaultAuthorization).not.toHaveBeenCalled();
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+    // The delegated lane never reaches the trailing capsule persist — adopt's
+    // own lanes (reset / verify) persist through the serialized wrappers.
+    expect(plugin.persistLocalRecoveryCapsule).not.toHaveBeenCalled();
   });
 
   it("keeps an inaccessible recovered vault in actionable wrong-account state", async () => {
@@ -8177,5 +9420,1407 @@ describe("local recovery binding authorization", () => {
     expect(restoreStart).toBeGreaterThan(-1);
     expect(authorization).toBeGreaterThan(restoreStart);
     expect(lease).toBeGreaterThan(authorization);
+  });
+});
+
+describe("unsynced-change detection (quick-260820-ki7)", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  function makeOp(path: string) {
+    return {
+      operation: "write" as const,
+      path,
+      data: "content",
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  it("defaults to dirty/indeterminate when the offline-queue restore never started", async () => {
+    const plugin = makePlugin();
+    // Fresh plugin: onload never ran, so the load handle is null. An empty
+    // in-memory queue proves nothing — the conservative default is dirty.
+    expect(plugin.offlineQueueLoadPromise).toBeNull();
+    await expect(plugin.collectUnsyncedLocalChanges()).resolves.toEqual({
+      clean: false,
+      items: [],
+      indeterminate: true,
+    });
+  });
+
+  it("reports clean only when every signal positively passes", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    // makePlugin: empty queue/holders, adapter.exists resolves false.
+    await expect(plugin.collectUnsyncedLocalChanges()).resolves.toEqual({
+      clean: true,
+      items: [],
+      indeterminate: false,
+    });
+  });
+
+  it("treats a still-present envelope with an empty in-memory queue as dirty", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    // An on-disk envelope the awaited load did not materialize into the
+    // in-memory queue means unrestored/unrestorable ops (research finding 6).
+    plugin.app.vault.adapter.exists = vi.fn().mockResolvedValue(true);
+    const result = await plugin.collectUnsyncedLocalChanges();
+    expect(result.clean).toBe(false);
+    expect(result.indeterminate).toBe(true);
+  });
+
+  it("treats an in-flight offline-queue flush as indeterminate", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    plugin.offlineQueueFlushPromise = Promise.resolve();
+    const result = await plugin.collectUnsyncedLocalChanges();
+    expect(result.clean).toBe(false);
+    expect(result.indeterminate).toBe(true);
+  });
+
+  it("treats an active sync cycle as indeterminate", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    plugin.syncState.status = "syncing";
+    const result = await plugin.collectUnsyncedLocalChanges();
+    expect(result.clean).toBe(false);
+    expect(result.indeterminate).toBe(true);
+  });
+
+  it("a single queued op flips dirty and names its path", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    plugin.offlineQueue = [makeOp("notes/edited.md")];
+    const result = await plugin.collectUnsyncedLocalChanges();
+    expect(result.clean).toBe(false);
+    expect(result.items).toContain("notes/edited.md");
+  });
+
+  it("a single pending large-file record flips dirty and names its path", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    plugin.settings.pendingLargeFiles = {
+      "media/huge.mp4": { state: "blocked" },
+    };
+    const result = await plugin.collectUnsyncedLocalChanges();
+    expect(result.clean).toBe(false);
+    expect(result.items).toContain("media/huge.mp4");
+  });
+
+  it("a single deletion tombstone flips dirty and names its path", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    plugin.settings.deletionTombstones = {
+      "notes/deleted.md": new Date().toISOString(),
+    };
+    const result = await plugin.collectUnsyncedLocalChanges();
+    expect(result.clean).toBe(false);
+    expect(result.items).toContain("notes/deleted.md");
+  });
+
+  it("a single unresolved conflict flips dirty and names its path", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    plugin.syncState.conflicts = [
+      {
+        path: "notes/conflicted.md",
+        localHash: "a",
+        remoteHash: "b",
+        baseHash: null,
+        detectedAt: new Date().toISOString(),
+        resolution: null,
+      },
+    ];
+    const result = await plugin.collectUnsyncedLocalChanges();
+    expect(result.clean).toBe(false);
+    expect(result.items).toContain("notes/conflicted.md");
+  });
+
+  it("a single blocked-window mutation stamp flips dirty and names its path", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueueLoadPromise = Promise.resolve();
+    plugin.blockedStateLocalEdits.add("notes/external.md");
+    const result = await plugin.collectUnsyncedLocalChanges();
+    expect(result.clean).toBe(false);
+    expect(result.items).toContain("notes/external.md");
+  });
+
+  /** Registers the REAL tracker with captured vault-event handlers. */
+  function makeTrackerPlugin() {
+    const plugin = makePlugin();
+    const handlers: Record<string, (...args: any[]) => void> = {};
+    plugin.app.vault.on = vi.fn((name: string, cb: (...args: any[]) => void) => {
+      handlers[name] = cb;
+      return { name, cb };
+    });
+    plugin.registerEvent = vi.fn();
+    plugin.registerBlockedWindowMutationTracker();
+    return { plugin, handlers };
+  }
+
+  it("stamps observed mutations while the binding is blocked", () => {
+    const { plugin, handlers } = makeTrackerPlugin();
+    plugin.vaultBindingAuthorization = "account-changed";
+    handlers.modify({ path: "notes/edited-outside.md" });
+    expect(plugin.blockedStateLocalEdits.has("notes/edited-outside.md")).toBe(true);
+  });
+
+  it("never stamps excluded paths", () => {
+    const { plugin, handlers } = makeTrackerPlugin();
+    plugin.vaultBindingAuthorization = "account-changed";
+    handlers.modify({ path: ".obsidian/workspace.json" });
+    expect(plugin.blockedStateLocalEdits.size).toBe(0);
+  });
+
+  it("stamps nothing while the binding is verified", () => {
+    const { plugin, handlers } = makeTrackerPlugin();
+    plugin.vaultBindingAuthorization = "verified";
+    handlers.modify({ path: "notes/normal-edit.md" });
+    handlers.delete({ path: "notes/normal-delete.md" });
+    expect(plugin.blockedStateLocalEdits.size).toBe(0);
+  });
+
+  it("rename stamps both the old and the new path", () => {
+    const { plugin, handlers } = makeTrackerPlugin();
+    plugin.vaultBindingAuthorization = "wrong-account";
+    handlers.rename({ path: "notes/new-name.md" }, "notes/old-name.md");
+    expect(plugin.blockedStateLocalEdits.has("notes/new-name.md")).toBe(true);
+    expect(plugin.blockedStateLocalEdits.has("notes/old-name.md")).toBe(true);
+  });
+
+  it("the startup-index create flood never stamps (layoutReady gate)", () => {
+    // checker Blocker 2: Obsidian fires "create" for EVERY existing file at
+    // startup, and the restart-with-mismatch lane is blocked BEFORE
+    // layoutReady — an ungated stamp would false-dirty the whole vault and
+    // kill the auto path on its primary lane.
+    const { plugin, handlers } = makeTrackerPlugin();
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.app.workspace.layoutReady = false;
+    handlers.create({ path: "notes/existing-file.md" });
+    expect(plugin.blockedStateLocalEdits.size).toBe(0);
+
+    // A live create after layout is ready IS a real observed mutation.
+    plugin.app.workspace.layoutReady = true;
+    handlers.create({ path: "notes/dropped-in.md" });
+    expect(plugin.blockedStateLocalEdits.has("notes/dropped-in.md")).toBe(true);
+  });
+
+  it("modify stamps regardless of layoutReady", () => {
+    const { plugin, handlers } = makeTrackerPlugin();
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.app.workspace.layoutReady = false;
+    handlers.modify({ path: "notes/pre-layout-edit.md" });
+    expect(plugin.blockedStateLocalEdits.has("notes/pre-layout-edit.md")).toBe(true);
+  });
+
+  it("verify success clears the blocked-window stamps", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.localRecoveryExpectedAccountUserId = "user-1";
+    plugin.cacheCurrentVaultRecord = vi.fn().mockResolvedValue(undefined);
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(undefined);
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockResolvedValue({
+        vaultId: "vault-abc",
+        name: "Protected vault",
+        slug: "protected-vault",
+      }),
+    };
+    plugin.blockedStateLocalEdits.add("notes/blocked-edit.md");
+
+    await expect(plugin.verifyBoundVaultAuthorization()).resolves.toBe(true);
+    expect(plugin.blockedStateLocalEdits.size).toBe(0);
+  });
+
+  it("discardUnsyncedLocalChanges clears tracked holders and leaves tombstones alone", async () => {
+    const plugin = makePlugin();
+    plugin.offlineQueue = [makeOp("notes/queued.md")];
+    plugin.settings.pendingLargeFiles = { "media/huge.mp4": { state: "blocked" } };
+    plugin.settings.deletionTombstones = { "notes/deleted.md": "2026-08-20T00:00:00.000Z" };
+    plugin.syncState.conflicts = [{ path: "notes/conflicted.md" }];
+    plugin.blockedStateLocalEdits.add("notes/external.md");
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.persistOfflineQueue = vi.fn().mockResolvedValue(undefined);
+
+    await plugin.discardUnsyncedLocalChanges();
+
+    expect(plugin.offlineQueue).toEqual([]);
+    expect(plugin.persistOfflineQueue).toHaveBeenCalled();
+    expect(plugin.settings.pendingLargeFiles).toBeUndefined();
+    expect(plugin.saveSettings).toHaveBeenCalled();
+    expect(plugin.syncState.conflicts).toEqual([]);
+    expect(plugin.blockedStateLocalEdits.size).toBe(0);
+    // The takeover reset deletes tombstones itself — discard must not.
+    expect(plugin.settings.deletionTombstones).toEqual({
+      "notes/deleted.md": "2026-08-20T00:00:00.000Z",
+    });
+  });
+});
+
+describe("blocked picker-lane delegation (quick-260820-fvo)", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  /**
+   * A folder bound by user-A, now signed in as user-B, prompt pending. This is
+   * the exact live-repro shape: the account-change modal's "Pick a different
+   * vault" opened the picker, which auto-bound the single visible vault and —
+   * before quick-260820-fvo — silently adopted the previous account's cache.
+   */
+  function makeBlockedPickPlugin() {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B", email: "second@example.com" };
+    plugin.localRecoveryExpectedAccountUserId = "user-A";
+    plugin.localRecoveryExpectedAccountEmail = "first@example.com";
+    plugin.vaultBindingAuthorization = "account-changed";
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.rebuildApiClient = vi.fn();
+    plugin.initializeApiClientFromSession = vi.fn();
+    plugin.stopSyncTimer = vi.fn();
+    plugin.resumeIncompleteServerSession = vi.fn();
+    plugin.setConnectionStatus = vi.fn();
+    return plugin;
+  }
+
+  it("routes a same-vault pick under account-changed through the takeover flow", async () => {
+    const plugin = makeBlockedPickPlugin();
+    plugin.probeBoundVaultMembership = vi.fn().mockResolvedValue(true);
+    // Dirty shape: the discard dialog is asked, and declined.
+    plugin.collectUnsyncedLocalChanges = vi.fn().mockResolvedValue({
+      clean: false,
+      items: ["notes/unsynced.md"],
+      indeterminate: false,
+    });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn().mockResolvedValue(false);
+    plugin.resetLocalAtRestAndResync = vi.fn();
+
+    await plugin.applyVaultBinding({
+      vaultId: "vault-abc",
+      name: "Protected vault",
+      slug: "protected-vault",
+    });
+
+    // The pick engaged the takeover machinery (probe, then the dirty gate)...
+    expect(plugin.probeBoundVaultMembership).toHaveBeenCalled();
+    expect(plugin.confirmDiscardUnsyncedChanges).toHaveBeenCalled();
+    // ...and the DECLINE left everything untouched: no wipe, expectation and
+    // paused state intact — the previous account's cached files are never
+    // adopted without explicit consent.
+    expect(plugin.resetLocalAtRestAndResync).not.toHaveBeenCalled();
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+    expect(plugin.vaultBindingAuthorization).toBe("account-changed");
+    expect(plugin.resumeIncompleteServerSession).not.toHaveBeenCalled();
+  });
+
+  it("a clean same-vault takeover re-drives the resume even after a fresh interactive login", async () => {
+    const plugin = makeBlockedPickPlugin();
+    // Fresh-interactive-login shape: the old resume-restart branch was gated
+    // on this flag being TRUE, which the login path never sets — block
+    // cleared, nothing restarted (handoff §3 Defect B).
+    plugin.serverSessionResumeComplete = false;
+    plugin.probeBoundVaultMembership = vi.fn().mockResolvedValue(true);
+    plugin.collectUnsyncedLocalChanges = vi
+      .fn()
+      .mockResolvedValue({ clean: true, items: [], indeterminate: false });
+    plugin.crossCheckLocalFilesAgainstServerListing = vi
+      .fn()
+      .mockResolvedValue({ ok: true, unconfirmed: [] });
+    // The reset owns the adoption — it re-stamps the expectation, re-verifies
+    // the binding and persists the capsule (its own suite pins that); the stub
+    // mimics that contract so the fall-through can be asserted.
+    plugin.resetLocalAtRestAndResync = vi.fn().mockImplementation(async () => {
+      plugin.localRecoveryExpectedAccountUserId = "user-B";
+      plugin.localRecoveryExpectedAccountEmail = "second@example.com";
+      plugin.vaultBindingAuthorization = "verified";
+    });
+
+    await plugin.applyVaultBinding({
+      vaultId: "vault-abc",
+      name: "Protected vault",
+      slug: "protected-vault",
+    });
+
+    // Ordering pin: probe-without-stamping runs BEFORE any cleanliness check
+    // (nothing may be examined, let alone reset, on an unproven membership).
+    expect(
+      plugin.probeBoundVaultMembership.mock.invocationCallOrder[0]
+    ).toBeLessThan(plugin.collectUnsyncedLocalChanges.mock.invocationCallOrder[0]);
+    expect(plugin.resetLocalAtRestAndResync).toHaveBeenCalledWith({
+      mode: "account-takeover",
+    });
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-B");
+    // Adopt's re-drive is UNCONDITIONAL: flag forced false, resume re-driven.
+    expect(plugin.serverSessionResumeComplete).toBe(false);
+    expect(plugin.resumeIncompleteServerSession).toHaveBeenCalled();
+  });
+
+  it("a CHANGED-vault pick while blocked books the new binding first, then asks the takeover flow", async () => {
+    const plugin = makeBlockedPickPlugin();
+    plugin.settings.serverVaultId = "vault-old";
+    plugin.notifyDiscoveryLifecycleChanged = vi.fn();
+    plugin.shouldPurgeSemanticIndex = vi.fn(() => false);
+    plugin.ensureSyncRuntime = vi.fn(() => ({ cancelActiveOperations: vi.fn() }));
+    let probedVaultId: string | undefined;
+    plugin.probeBoundVaultMembership = vi.fn().mockImplementation(async () => {
+      probedVaultId = plugin.settings.serverVaultId;
+      // Membership denied — adopt ends before any cleanliness check or reset.
+      return false;
+    });
+    plugin.confirmDiscardUnsyncedChanges = vi.fn();
+    plugin.resetLocalAtRestAndResync = vi.fn();
+
+    const changed = await plugin.applyVaultBinding({
+      vaultId: "vault-new",
+      name: "Other vault",
+      slug: "other-vault",
+    });
+
+    expect(changed).toBe(true);
+    // Bookkeeping precedes authorization: the probe ran against the NEWLY
+    // picked vault, after the settings persist.
+    expect(probedVaultId).toBe("vault-new");
+    expect(plugin.saveSettings.mock.invocationCallOrder[0]).toBeLessThan(
+      plugin.probeBoundVaultMembership.mock.invocationCallOrder[0]
+    );
+    // The folder-scoped expectation SURVIVED the changed pick — that is what
+    // routed this through the takeover machinery at all. A crash here re-arms
+    // the prompt on restart; nothing was stamped.
+    expect(plugin.localRecoveryExpectedAccountUserId).toBe("user-A");
+    expect(plugin.resumeIncompleteServerSession).not.toHaveBeenCalled();
+  });
+
+  it("a wrong-account state with no recorded expectation adopts through the same-account lane", async () => {
+    const plugin = makeBlockedPickPlugin();
+    plugin.vaultBindingAuthorization = "wrong-account";
+    plugin.localRecoveryExpectedAccountUserId = null;
+    plugin.localRecoveryExpectedAccountEmail = null;
+    plugin.confirmDiscardUnsyncedChanges = vi.fn();
+    plugin.verifyBoundVaultAuthorization = vi.fn().mockImplementation(async () => {
+      // Mimic verify's success-branch re-stamp.
+      plugin.localRecoveryExpectedAccountUserId = plugin.session.userId;
+      plugin.vaultBindingAuthorization = "verified";
+      return true;
+    });
+
+    await plugin.applyVaultBinding({
+      vaultId: "vault-abc",
+      name: "Protected vault",
+      slug: "protected-vault",
+    });
+
+    expect(plugin.verifyBoundVaultAuthorization).toHaveBeenCalled();
+    expect(plugin.confirmDiscardUnsyncedChanges).not.toHaveBeenCalled();
+    expect(plugin.resumeIncompleteServerSession).toHaveBeenCalled();
+  });
+
+  it("a NOT-blocked binding keeps the direct verify path — no delegation", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.rebuildApiClient = vi.fn();
+    plugin.initializeApiClientFromSession = vi.fn();
+    plugin.resumeIncompleteServerSession = vi.fn();
+    plugin.adoptBindingForCurrentAccount = vi.fn();
+    plugin.verifyBoundVaultAuthorization = vi.fn().mockResolvedValue(true);
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(true);
+
+    await plugin.applyVaultBinding({
+      vaultId: "vault-abc",
+      name: "Protected vault",
+      slug: "protected-vault",
+    });
+
+    // Byte-identical quick-260819-u8a behavior — the dedupe and no-session
+    // pins in the capsule-op describe stay authoritative for this lane.
+    expect(plugin.verifyBoundVaultAuthorization).toHaveBeenCalledTimes(1);
+    expect(plugin.adoptBindingForCurrentAccount).not.toHaveBeenCalled();
+  });
+
+  // quick-260820-ki7: the old g-series pick-vault dead-end tests drove the
+  // deleted AccountChangeModal's pick-vault case. They are SUPERSEDED by the
+  // pins below — the fvo "never silent" rule now lives inside
+  // switchServerVault itself, which is the only remaining picker entry
+  // (Settings / the status-bar menu) after the modal's removal.
+  it("switchServerVault resolving still-blocked lands in the loud paused state, never silence", async () => {
+    const plugin = makeBlockedPickPlugin();
+    // Picker dismissed without a pick / discard declined / membership denied —
+    // the run resolves with the binding still blocked.
+    plugin.promptVaultBinding = vi.fn(async () => false);
+    plugin.showAccountChangePausedNotice = vi.fn();
+
+    await plugin.switchServerVault();
+
+    expect(plugin.promptVaultBinding).toHaveBeenCalled();
+    expect(plugin.showAccountChangePausedNotice).toHaveBeenCalled();
+  });
+
+  it("switchServerVault resolving still WRONG-ACCOUNT re-raises the wrong-account notice", async () => {
+    const plugin = makeBlockedPickPlugin();
+    plugin.vaultBindingAuthorization = "wrong-account";
+    plugin.promptVaultBinding = vi.fn(async () => false);
+    plugin.showAccountChangePausedNotice = vi.fn();
+    plugin.showWrongAccountNotice = vi.fn();
+
+    await plugin.switchServerVault();
+
+    // Still never silent (fvo) — but with the RIGHT explanation (nqm): this
+    // picker run may well have been opened by that notice's own [Connect a
+    // different vault] button, and a paused notice about "the account change"
+    // describes a different state entirely.
+    expect(plugin.showWrongAccountNotice).toHaveBeenCalled();
+    expect(plugin.showAccountChangePausedNotice).not.toHaveBeenCalled();
+  });
+
+  it("switchServerVault that resolves the block raises no paused notice", async () => {
+    const plugin = makeBlockedPickPlugin();
+    plugin.promptVaultBinding = vi.fn(async () => {
+      plugin.vaultBindingAuthorization = "verified";
+      return true;
+    });
+    plugin.initializeSyncEngine = vi.fn().mockResolvedValue(undefined);
+    plugin.refreshPermissionsGraph = vi.fn();
+    plugin.showAccountChangePausedNotice = vi.fn();
+
+    await plugin.switchServerVault();
+
+    expect(plugin.promptVaultBinding).toHaveBeenCalled();
+    expect(plugin.showAccountChangePausedNotice).not.toHaveBeenCalled();
+  });
+
+  it("[source-contract] applyVaultBinding no longer clears the expectation inline and delegates blocked picks", () => {
+    const source = readFileSync(new URL("../src/plugin/main.ts", import.meta.url), "utf8");
+    const start = source.indexOf("private async applyVaultBinding");
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("\n  private ", start + 1);
+    expect(end).toBeGreaterThan(start);
+    const body = source.slice(start, end);
+    // The inline clear WAS the bypass: it dissolved the takeover boundary on
+    // any explicit (or zero-click auto-bound) pick. Only adopt's consented
+    // reset or a verify success may move the expectation now.
+    expect(body).not.toContain("localRecoveryExpectedAccountUserId = null");
+    expect(body).toContain("adoptBindingForCurrentAccount(");
+    // The gated resume branch is gone too — adopt's unconditional re-drive
+    // replaced it (a fresh interactive login never set the flag; Defect B).
+    expect(body).not.toContain("serverSessionResumeComplete");
+  });
+});
+
+describe("server-listing cross-check (quick-260820-ki7)", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  function makeListItem(path: string) {
+    return { path, size: 10, lastModified: "2026-08-20T00:00:00.000Z" };
+  }
+
+  function makeCrossCheckPlugin(localPaths: string[]) {
+    const plugin = makePlugin();
+    plugin.app.vault.getFiles = vi.fn(() => localPaths.map((path) => ({ path })));
+    return plugin;
+  }
+
+  it("consumes EVERY page of the listing — a two-page vault with all files present is clean", async () => {
+    // Checker final blocker: getFiles() returns a single server-default-100
+    // page; a one-page check would false-dirty every vault over ~100 files
+    // and kill the auto path. The loop must accumulate ALL pages.
+    const plugin = makeCrossCheckPlugin(["notes/a.md", "notes/b.md"]);
+    plugin.apiClient = {
+      // Routed by continuation token, never by call order (project rule).
+      listVaultFilesPage: vi.fn(async (_vaultId: string, options: { continuationToken?: string }) => {
+        if (!options?.continuationToken) {
+          return {
+            // The handler emits '/' + relativePath — normalization pinned.
+            files: [makeListItem("/notes/a.md")],
+            count: 1,
+            nextContinuationToken: "page-2",
+            isTruncated: true,
+          };
+        }
+        if (options.continuationToken === "page-2") {
+          return {
+            files: [makeListItem("/notes/b.md")],
+            count: 1,
+            nextContinuationToken: null,
+            isTruncated: false,
+          };
+        }
+        throw new Error(`unexpected continuation token: ${options.continuationToken}`);
+      }),
+    };
+
+    const result = await plugin.crossCheckLocalFilesAgainstServerListing();
+
+    expect(result).toEqual({ ok: true, unconfirmed: [] });
+    expect(plugin.apiClient.listVaultFilesPage).toHaveBeenCalledTimes(2);
+    expect(plugin.apiClient.listVaultFilesPage).toHaveBeenCalledWith(
+      "vault-abc",
+      expect.objectContaining({ limit: 1000 })
+    );
+  });
+
+  it("a local file absent from the accumulated listing lands in unconfirmed", async () => {
+    const plugin = makeCrossCheckPlugin(["notes/a.md", "notes/never-uploaded.md"]);
+    plugin.apiClient = {
+      listVaultFilesPage: vi.fn(async () => ({
+        files: [makeListItem("/notes/a.md")],
+        count: 1,
+        nextContinuationToken: null,
+        isTruncated: false,
+      })),
+    };
+
+    const result = await plugin.crossCheckLocalFilesAgainstServerListing();
+
+    expect(result.ok).toBe(true);
+    expect(result.unconfirmed).toEqual(["notes/never-uploaded.md"]);
+  });
+
+  it("excluded local paths never enter the cross-check", async () => {
+    const plugin = makeCrossCheckPlugin([".obsidian/workspace.json", "notes/a.md"]);
+    plugin.apiClient = {
+      listVaultFilesPage: vi.fn(async () => ({
+        files: [makeListItem("/notes/a.md")],
+        count: 1,
+        nextContinuationToken: null,
+        isTruncated: false,
+      })),
+    };
+
+    const result = await plugin.crossCheckLocalFilesAgainstServerListing();
+
+    expect(result).toEqual({ ok: true, unconfirmed: [] });
+  });
+
+  it("a listing error fail-safes to ok:false (dirty), never clean", async () => {
+    const plugin = makeCrossCheckPlugin(["notes/a.md"]);
+    plugin.apiClient = {
+      listVaultFilesPage: vi.fn(async () => {
+        throw new Error("403 access denied");
+      }),
+    };
+
+    await expect(plugin.crossCheckLocalFilesAgainstServerListing()).resolves.toEqual({
+      ok: false,
+      unconfirmed: [],
+    });
+  });
+
+  it("pagination-cap exhaustion fail-safes to ok:false exactly like an error", async () => {
+    // Checker final blocker: a listing that never terminates cannot be
+    // proven complete — refusing to auto-reset is the only safe answer.
+    const plugin = makeCrossCheckPlugin(["notes/a.md"]);
+    let tokenCounter = 0;
+    plugin.apiClient = {
+      listVaultFilesPage: vi.fn(async () => ({
+        files: [makeListItem("/notes/a.md")],
+        count: 1,
+        nextContinuationToken: `page-${++tokenCounter}`,
+        isTruncated: true,
+      })),
+    };
+
+    const result = await plugin.crossCheckLocalFilesAgainstServerListing();
+
+    expect(result).toEqual({ ok: false, unconfirmed: [] });
+    // The hard cap bounds the work: 50 pages read, the 51st refused.
+    expect(plugin.apiClient.listVaultFilesPage).toHaveBeenCalledTimes(50);
+  });
+
+  it("no bound vault or no client fail-safes to ok:false", async () => {
+    const plugin = makeCrossCheckPlugin(["notes/a.md"]);
+    plugin.settings.serverVaultId = "";
+    await expect(plugin.crossCheckLocalFilesAgainstServerListing()).resolves.toEqual({
+      ok: false,
+      unconfirmed: [],
+    });
+  });
+});
+
+describe("wrong-account notice lifecycle + surfaces (quick-260820-ki7)", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  it("the verify wrong-account branch raises a TRACKED sticky notice", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.localRecoveryExpectedAccountUserId = null;
+    plugin.stopSyncTimer = vi.fn();
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockRejectedValue(new Error("403 access denied")),
+    };
+
+    await expect(plugin.verifyBoundVaultAuthorization()).resolves.toBe(false);
+
+    expect(plugin.vaultBindingAuthorization).toBe("wrong-account");
+    // Tracked, not a bare toast: the field holds the instance so every later
+    // state transition can kill it (the stale-toast regression).
+    expect(plugin.wrongAccountNotice).toBeTruthy();
+    expect(mockNotice).toHaveBeenCalledWith(
+      expect.stringContaining("log in as a different account"),
+      0
+    );
+  });
+
+  it("a second wrong-account show replaces the first (deduped)", () => {
+    const plugin = makePlugin();
+    const hide = vi.fn();
+    plugin.wrongAccountNotice = { hide };
+
+    plugin.showWrongAccountNotice("VaultGuard Sync: wrong account.");
+
+    expect(hide).toHaveBeenCalled();
+    expect(plugin.wrongAccountNotice).toBeTruthy();
+    expect(plugin.wrongAccountNotice.hide).not.toBe(hide);
+  });
+
+  it("forceLogout hides the wrong-account notice", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.syncRuntime = {
+      cancelActiveOperations: vi.fn(),
+      stopSyncTimer: vi.fn(),
+      stopKeyRenewalMonitor: vi.fn(),
+      stopHeartbeatMonitor: vi.fn(),
+    };
+    plugin.apiRequest = vi.fn().mockResolvedValue({
+      success: true,
+      data: null,
+      error: null,
+      requestId: "req-logout",
+    });
+    plugin.clearStoredSession = vi.fn().mockResolvedValue(undefined);
+    plugin.revokeAgentBridgeLeasesForSessionEnd = vi.fn().mockResolvedValue(undefined);
+    const hide = vi.fn();
+    plugin.wrongAccountNotice = { hide };
+
+    await plugin.forceLogout("bye");
+
+    // The toast named the identity that just logged out — left standing it
+    // survived into the next login and named the previous account.
+    expect(hide).toHaveBeenCalled();
+    expect(plugin.wrongAccountNotice).toBeNull();
+  });
+
+  it("completeLogin entry hides a standing wrong-account notice", async () => {
+    const plugin = makePlugin();
+    plugin.settings.localProjectMemoryMode = true;
+    plugin.settings.manualConfig = true;
+    plugin.settings.serverVaultId = "";
+    plugin.openServerSession = vi.fn().mockResolvedValue({
+      sessionId: "server-session-1",
+      userId: "user-1",
+      email: "test@example.com",
+      roles: ["member"],
+      orgSettings: null,
+    });
+    plugin.decodeJwtPayload = vi.fn(() => ({
+      sub: "user-1",
+      email: "test@example.com",
+      name: "Test User",
+      "custom:org": "org-1",
+    }));
+    plugin.syncSettingsFromTokenPayload = vi.fn(() => false);
+    plugin.rebuildApiClient = vi.fn();
+    plugin.initializeApiClientFromSession = vi.fn();
+    plugin.persistSession = vi.fn().mockResolvedValue(undefined);
+    plugin.stopSyncTimer = vi.fn();
+    plugin.stopKeyRenewalMonitor = vi.fn();
+    plugin.stopHeartbeatMonitor = vi.fn();
+    const hide = vi.fn();
+    plugin.wrongAccountNotice = { hide };
+
+    await plugin.completeLogin(
+      {
+        tokens: {
+          idToken: "provider-id-token",
+          accessToken: "access-token",
+          refreshToken: "refresh-token",
+          expiresIn: 3600,
+        },
+      },
+      "test@example.com"
+    );
+
+    // A fresh session gets its own verdict — the old toast described the
+    // previous identity.
+    expect(hide).toHaveBeenCalled();
+    expect(plugin.wrongAccountNotice).toBeNull();
+  });
+
+  it("verify success hides the wrong-account notice", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.localRecoveryExpectedAccountUserId = "user-1";
+    plugin.cacheCurrentVaultRecord = vi.fn().mockResolvedValue(undefined);
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(undefined);
+    plugin.apiClient = {
+      getVaultRecord: vi.fn().mockResolvedValue({
+        vaultId: "vault-abc",
+        name: "Protected vault",
+        slug: "protected-vault",
+      }),
+    };
+    const hide = vi.fn();
+    plugin.wrongAccountNotice = { hide };
+
+    await expect(plugin.verifyBoundVaultAuthorization()).resolves.toBe(true);
+
+    expect(hide).toHaveBeenCalled();
+    expect(plugin.wrongAccountNotice).toBeNull();
+  });
+
+  it("entering account-changed hides a standing wrong-account notice", async () => {
+    const plugin = makePlugin();
+    plugin.session = { ...makeSession(), userId: "user-B" };
+    plugin.localRecoveryExpectedAccountUserId = "user-A";
+    plugin.stopSyncTimer = vi.fn();
+    plugin.adoptBindingForCurrentAccount = vi.fn().mockResolvedValue(undefined);
+    plugin.apiClient = { getVaultRecord: vi.fn() };
+    const hide = vi.fn();
+    plugin.wrongAccountNotice = { hide };
+
+    await plugin.verifyBoundVaultAuthorization();
+
+    // account-changed is an unresolved QUESTION, not a server denial — a
+    // wrong-account toast must not survive into it.
+    expect(hide).toHaveBeenCalled();
+    expect(plugin.wrongAccountNotice).toBeNull();
+  });
+
+  it("the sidebar wrong-account action is 'Log in as a different account' with a session", () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.vaultBindingAuthorization = "wrong-account";
+
+    const state = plugin.getSidebarAuthState();
+
+    // "Pick a different vault" left this flow (§6.4) — vault switching stays
+    // reachable from Settings / the status-bar menu only.
+    expect(state.actionLabel).toBe("Log in as a different account");
+    expect(state.detail).toContain("VaultGuard settings");
+  });
+
+  it("the sidebar wrong-account action stays 'Log in again' without a session", () => {
+    const plugin = makePlugin();
+    plugin.session = null;
+    plugin.vaultBindingAuthorization = "wrong-account";
+
+    const state = plugin.getSidebarAuthState();
+
+    expect(state.actionLabel).toBe("Log in again");
+  });
+
+  it("the wrong-account primary action logs out then reopens login — never the vault picker", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.vaultBindingAuthorization = "wrong-account";
+    plugin.forceLogout = vi.fn().mockResolvedValue(undefined);
+    plugin.handleLogin = vi.fn();
+    plugin.switchServerVault = vi.fn();
+
+    plugin.handlePrimaryProtectionAction();
+    // The handler keeps its sync signature and voids an async chain.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(plugin.forceLogout).toHaveBeenCalledWith(
+      expect.stringContaining("Sign in with an account that can use this folder's vault")
+    );
+    expect(plugin.handleLogin).toHaveBeenCalled();
+    expect(plugin.switchServerVault).not.toHaveBeenCalled();
+  });
+});
+
+describe("AccountSwitchDiscardModal split copy (quick-260820-ki7)", () => {
+  /** Fake element that records every created child's text into a shared array. */
+  function makeRecordingEl(texts: string[]): any {
+    const record = (opts?: { text?: string }) => {
+      if (opts?.text) texts.push(opts.text);
+      return makeRecordingEl(texts);
+    };
+    const el: any = {
+      empty: vi.fn(),
+      addClass: vi.fn(() => el),
+      removeClass: vi.fn(() => el),
+      createEl: vi.fn((_tag: string, opts?: { text?: string }) => record(opts)),
+      createDiv: vi.fn((opts?: { text?: string }) => record(opts)),
+    };
+    return el;
+  }
+
+  async function openDiscardModal(context: Record<string, unknown>) {
+    const { AccountSwitchDiscardModal } = await import(
+      "../src/plugin/account-switch-discard-modal"
+    );
+    const texts: string[] = [];
+    const decisions: string[] = [];
+    const modal = new AccountSwitchDiscardModal(
+      {} as any,
+      {
+        items: [],
+        unconfirmed: [],
+        indeterminate: false,
+        ...context,
+      } as any,
+      (decision) => decisions.push(decision)
+    ) as any;
+    modal.contentEl = makeRecordingEl(texts);
+    modal.modalEl = makeRecordingEl(texts);
+    // Button labels are part of the copy contract (quick-260820-prn): the
+    // shared Obsidian mock's ButtonComponent swallows setButtonText, so record
+    // it into the same list for the duration of the render.
+    const originalSetButtonText = ButtonComponent.prototype.setButtonText;
+    (ButtonComponent.prototype as any).setButtonText = function (this: unknown, text: string) {
+      texts.push(text);
+      return this;
+    };
+    try {
+      modal.onOpen();
+    } finally {
+      ButtonComponent.prototype.setButtonText = originalSetButtonText;
+    }
+    return { modal, texts, decisions };
+  }
+
+  it("labels the two classes separately — cross-check misses are never called unsynced changes", async () => {
+    const { texts } = await openDiscardModal({
+      currentAccountEmail: "second@example.com",
+      items: ["notes/typed-while-paused.md"],
+      unconfirmed: ["notes/maybe-permission-hidden.md"],
+    });
+
+    const joined = texts.join("\n");
+    expect(joined).toContain("1 unsynced change on this device would be permanently discarded:");
+    expect(joined).toContain("notes/typed-while-paused.md");
+    expect(joined).toContain("1 file could not be confirmed as synced with this account:");
+    expect(joined).toContain("notes/maybe-permission-hidden.md");
+    // Honesty: the could-not-confirm class discloses the permission-filtered
+    // listing caveat instead of claiming the files are unsynced.
+    expect(joined).toContain("may already be synced but hidden from this account's permissions");
+  });
+
+  it("caps each list at 8 paths with '+N more'", async () => {
+    const items = Array.from({ length: 11 }, (_, i) => `notes/item-${i}.md`);
+    const { texts } = await openDiscardModal({ items });
+
+    expect(texts).toContain("notes/item-7.md");
+    expect(texts).not.toContain("notes/item-8.md");
+    expect(texts).toContain("+3 more");
+  });
+
+  it("omits both lists when empty and states the indeterminate line", async () => {
+    const { texts } = await openDiscardModal({ indeterminate: true });
+
+    const joined = texts.join("\n");
+    expect(joined).not.toContain("would be permanently discarded");
+    expect(joined).not.toContain("could not be confirmed as synced");
+    expect(joined).toContain("Some unsynced changes on this device could not be fully listed.");
+  });
+
+  it("dismissal without a decision resolves 'keep'", async () => {
+    const { modal, decisions } = await openDiscardModal({
+      items: ["notes/a.md"],
+    });
+
+    modal.onClose();
+
+    expect(decisions).toEqual(["keep"]);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // quick-260820-prn: the blocked adopt lane reaches this dialog AFTER the
+  // binding has already flipped, so the mv4 copy ("cancelling leaves this
+  // folder connected to the vault it is already using") describes a state
+  // that no longer exists. `bindingAlreadyApplied` selects copy that is true
+  // for a switch which has already happened.
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("bindingAlreadyApplied names the vault joined, the vault left, and its surviving server copy", async () => {
+    const { texts } = await openDiscardModal({
+      kind: "vault",
+      vaultName: "New vault",
+      previousVaultName: "Old vault",
+      bindingAlreadyApplied: true,
+      items: ["notes/draft.md"],
+    });
+
+    const joined = texts.join("\n");
+    expect(joined).toContain("Replace this folder's local files?");
+    expect(joined).toContain('is now connected to "New vault"');
+    expect(joined).toContain('still holds the local contents of "Old vault"');
+    // Hazard 7: the wipe is local-only and issues zero server DELETEs. A user
+    // cannot consent to something the dialog misdescribed.
+    expect(joined).toContain('"Old vault" keeps its own copy on the server');
+    expect(joined).toContain('stays connected to "New vault" and paused');
+    // The switch already happened — copy offering to cancel it would lie.
+    expect(joined).not.toContain("Discard local changes and switch vaults?");
+    expect(joined).not.toContain("Cancelling leaves everything");
+  });
+
+  it("discloses that the vault being left can no longer be read, when it cannot", async () => {
+    const { texts } = await openDiscardModal({
+      kind: "vault",
+      vaultName: "New vault",
+      previousVaultName: "Old vault",
+      bindingAlreadyApplied: true,
+      previousVaultUnverifiable: true,
+      indeterminate: true,
+    });
+
+    // The lane exists because the server denied this account on the vault it
+    // is leaving, so the cross-check almost always fails there — say so.
+    expect(texts.join("\n")).toContain('This account can no longer read "Old vault"');
+  });
+
+  it("keeps the generic indeterminate line when the vault being left WAS readable", async () => {
+    const { texts } = await openDiscardModal({
+      kind: "vault",
+      vaultName: "New vault",
+      previousVaultName: "Old vault",
+      bindingAlreadyApplied: true,
+      previousVaultUnverifiable: false,
+      indeterminate: true,
+    });
+
+    const joined = texts.join("\n");
+    expect(joined).toContain("Some unsynced changes on this device could not be fully listed.");
+    expect(joined).not.toContain("can no longer read");
+  });
+
+  it("bindingAlreadyApplied buttons offer keep-local vs replace; dismissal still resolves 'keep'", async () => {
+    const { modal, texts, decisions } = await openDiscardModal({
+      kind: "vault",
+      vaultName: "New vault",
+      previousVaultName: "Old vault",
+      bindingAlreadyApplied: true,
+      items: ["notes/draft.md"],
+    });
+
+    // "Cancel" would promise to undo a switch that already happened.
+    expect(texts).toContain("Keep working locally");
+    expect(texts).toContain("Discard and replace");
+    expect(texts).not.toContain("Cancel");
+
+    modal.onClose();
+    expect(decisions).toEqual(["keep"]);
+  });
+
+  it("[regression] plain vault and account copy are byte-identical without the flag", async () => {
+    const plain = await openDiscardModal({
+      kind: "vault",
+      vaultName: "New vault",
+      previousVaultName: "Old vault",
+      items: ["notes/draft.md"],
+    });
+    const plainJoined = plain.texts.join("\n");
+    expect(plainJoined).toContain("Discard local changes and switch vaults?");
+    expect(plainJoined).toContain("Cancelling leaves everything on this device untouched");
+    expect(plain.texts).toContain("Cancel");
+    expect(plain.texts).toContain("Discard and switch");
+    expect(plainJoined).not.toContain("Replace this folder's local files?");
+
+    const account = await openDiscardModal({
+      currentAccountEmail: "second@example.com",
+      items: ["notes/a.md"],
+    });
+    const accountJoined = account.texts.join("\n");
+    expect(accountJoined).toContain("Discard local changes and switch accounts?");
+    expect(accountJoined).toContain(
+      "Choosing to keep working locally leaves everything on this device untouched"
+    );
+    expect(account.texts).toContain("Keep working locally");
+    expect(account.texts).toContain("Discard and switch");
+    expect(accountJoined).not.toContain("Replace this folder's local files?");
+  });
+});
+
+describe("local recovery capsule op serialization", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  function makeDeferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  /** Macrotask hop: flushes every queued microtask so a chained run can START. */
+  const flushOps = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /**
+   * Stubs the INNER ...Now() methods with deferred-controlled implementations
+   * and an op log, then lets the tests drive the REAL prototype wrappers.
+   */
+  function makeOpChainProbe(plugin: any) {
+    const log: string[] = [];
+    const persistRuns: Array<ReturnType<typeof makeDeferred<boolean>>> = [];
+    const clearRuns: Array<ReturnType<typeof makeDeferred<void>>> = [];
+    plugin.persistLocalRecoveryCapsuleNow = vi.fn(async () => {
+      log.push("persist-start");
+      const deferred = makeDeferred<boolean>();
+      persistRuns.push(deferred);
+      const value = await deferred.promise;
+      log.push("persist-end");
+      return value;
+    });
+    plugin.clearLocalRecoveryCapsuleNow = vi.fn(async () => {
+      log.push("clear-start");
+      const deferred = makeDeferred<void>();
+      clearRuns.push(deferred);
+      await deferred.promise;
+      log.push("clear-end");
+    });
+    return { log, persistRuns, clearRuns };
+  }
+
+  it("coalesces a burst behind an executing rotation into one trailing fresh run", async () => {
+    const plugin = makePlugin();
+    const { persistRuns } = makeOpChainProbe(plugin);
+
+    const p1 = plugin.persistLocalRecoveryCapsule();
+    await flushOps();
+    expect(plugin.persistLocalRecoveryCapsuleNow).toHaveBeenCalledTimes(1);
+
+    // The burst arrives while run 1 is EXECUTING (its deferred is held open).
+    const p2 = plugin.persistLocalRecoveryCapsule();
+    const p3 = plugin.persistLocalRecoveryCapsule();
+    const p4 = plugin.persistLocalRecoveryCapsule();
+    const p5 = plugin.persistLocalRecoveryCapsule();
+    const p6 = plugin.persistLocalRecoveryCapsule();
+
+    persistRuns[0].resolve(true);
+    await expect(p1).resolves.toBe(true);
+
+    await flushOps();
+    expect(plugin.persistLocalRecoveryCapsuleNow).toHaveBeenCalledTimes(2);
+    persistRuns[1].resolve(false);
+
+    // Every burst caller shares the single trailing run — a rotation that
+    // STARTED after their calls — so none of them can be handed p1's stale true.
+    await expect(p2).resolves.toBe(false);
+    await expect(p3).resolves.toBe(false);
+    await expect(p4).resolves.toBe(false);
+    await expect(p5).resolves.toBe(false);
+    await expect(p6).resolves.toBe(false);
+    expect(plugin.persistLocalRecoveryCapsuleNow).toHaveBeenCalledTimes(2);
+  });
+
+  it("shares one rotation across a synchronous burst on an idle chain", async () => {
+    const plugin = makePlugin();
+    const { persistRuns } = makeOpChainProbe(plugin);
+
+    // Back-to-back calls with nothing in flight: the queued run has not
+    // started, so it captures both callers' state when it does.
+    const first = plugin.persistLocalRecoveryCapsule();
+    const second = plugin.persistLocalRecoveryCapsule();
+    await flushOps();
+    expect(plugin.persistLocalRecoveryCapsuleNow).toHaveBeenCalledTimes(1);
+
+    persistRuns[0].resolve(true);
+    await expect(first).resolves.toBe(true);
+    await expect(second).resolves.toBe(true);
+    expect(plugin.persistLocalRecoveryCapsuleNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("orders clear strictly between rotations and re-persists AFTER the clear", async () => {
+    const plugin = makePlugin();
+    const { log, persistRuns, clearRuns } = makeOpChainProbe(plugin);
+
+    const firstPersist = plugin.persistLocalRecoveryCapsule();
+    await flushOps();
+    const cleared = plugin.clearLocalRecoveryCapsule();
+    const rePersist = plugin.persistLocalRecoveryCapsule();
+
+    persistRuns[0].resolve(true);
+    await expect(firstPersist).resolves.toBe(true);
+    await flushOps();
+    clearRuns[0].resolve();
+    await expect(cleared).resolves.toBeUndefined();
+    await flushOps();
+    persistRuns[1].resolve(true);
+    await expect(rePersist).resolves.toBe(true);
+
+    // The takeover flow's clear → re-persist must never interleave with an
+    // in-flight rotation, and the re-persist must be a NEW rotation started
+    // after the clear — coalescing into a pre-clear run would hand the caller
+    // a "persisted" result for a capsule the clear then wiped.
+    expect(log).toEqual([
+      "persist-start",
+      "persist-end",
+      "clear-start",
+      "clear-end",
+      "persist-start",
+      "persist-end",
+    ]);
+  });
+
+  it("keeps a pre-clear queued persist in position and never coalesces a post-clear caller into it", async () => {
+    const plugin = makePlugin();
+    const { log, persistRuns, clearRuns } = makeOpChainProbe(plugin);
+
+    const executing = plugin.persistLocalRecoveryCapsule();
+    await flushOps();
+    const queuedBeforeClear = plugin.persistLocalRecoveryCapsule();
+    const cleared = plugin.clearLocalRecoveryCapsule();
+    const queuedAfterClear = plugin.persistLocalRecoveryCapsule();
+    // A post-clear caller must get a NEW run — sharing the pre-clear one would
+    // resolve it against a rotation the clear immediately destroys.
+    expect(queuedAfterClear).not.toBe(queuedBeforeClear);
+
+    persistRuns[0].resolve(true);
+    await expect(executing).resolves.toBe(true);
+    await flushOps();
+    persistRuns[1].resolve(false);
+    await expect(queuedBeforeClear).resolves.toBe(false);
+    await flushOps();
+    clearRuns[0].resolve();
+    await expect(cleared).resolves.toBeUndefined();
+    await flushOps();
+    persistRuns[2].resolve(true);
+    await expect(queuedAfterClear).resolves.toBe(true);
+
+    expect(log).toEqual([
+      "persist-start",
+      "persist-end",
+      "persist-start",
+      "persist-end",
+      "clear-start",
+      "clear-end",
+      "persist-start",
+      "persist-end",
+    ]);
+    expect(plugin.persistLocalRecoveryCapsuleNow).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects the clear caller on failure without poisoning the chain", async () => {
+    const plugin = makePlugin();
+    plugin.clearLocalRecoveryCapsuleNow = vi.fn().mockRejectedValue(new Error("clear failed"));
+    plugin.persistLocalRecoveryCapsuleNow = vi.fn().mockResolvedValue(true);
+
+    // The takeover flow and decrypt-and-disable both rely on clear's rejection
+    // reaching them; the shared chain still must survive it.
+    await expect(plugin.clearLocalRecoveryCapsule()).rejects.toThrow("clear failed");
+    await expect(plugin.persistLocalRecoveryCapsule()).resolves.toBe(true);
+  });
+
+  it("applyVaultBinding delegates the capsule persist to a successful verify", async () => {
+    const plugin = makePlugin();
+    plugin.session = makeSession();
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.rebuildApiClient = vi.fn();
+    plugin.initializeApiClientFromSession = vi.fn();
+    plugin.resumeIncompleteServerSession = vi.fn();
+    plugin.verifyBoundVaultAuthorization = vi.fn().mockResolvedValue(true);
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(true);
+
+    // Same-vault re-pick: the heavy `changed` branch stays out of the picture.
+    await plugin.applyVaultBinding({
+      vaultId: "vault-abc",
+      name: "Protected vault",
+      slug: "protected-vault",
+    });
+
+    // Verify's success branch already fired the persist (pinned below); a
+    // second trailing fire is exactly the double rotation the latch exists for.
+    expect(plugin.verifyBoundVaultAuthorization).toHaveBeenCalledTimes(1);
+    expect(plugin.persistLocalRecoveryCapsule).not.toHaveBeenCalled();
+  });
+
+  it("applyVaultBinding still persists the capsule itself when no session exists", async () => {
+    const plugin = makePlugin();
+    plugin.session = null;
+    plugin.saveSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.rebuildApiClient = vi.fn();
+    plugin.persistLocalRecoveryCapsule = vi.fn().mockResolvedValue(true);
+
+    await plugin.applyVaultBinding({
+      vaultId: "vault-abc",
+      name: "Protected vault",
+      slug: "protected-vault",
+    });
+
+    // No session means verify never ran — the trailing fire is the only one.
+    expect(plugin.persistLocalRecoveryCapsule).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps verify's success-branch persist as the delegation target", () => {
+    const source = readFileSync(new URL("../src/plugin/main.ts", import.meta.url), "utf8");
+    const verifyStart = source.indexOf("private async verifyBoundVaultAuthorization");
+    expect(verifyStart).toBeGreaterThan(-1);
+    const nextMethod = source.indexOf("\n  private ", verifyStart + 1);
+    const persistFire = source.indexOf("void this.persistLocalRecoveryCapsule()", verifyStart);
+    expect(persistFire).toBeGreaterThan(verifyStart);
+    expect(persistFire).toBeLessThan(nextMethod);
+  });
+});
+
+describe("local recovery capsule persist under adapter races", () => {
+  beforeEach(() => {
+    mockNotice.mockReset();
+    vi.stubGlobal("localStorage", makeMemoryStorage());
+  });
+
+  /**
+   * End-to-end harness: the REAL wrappers drive the REAL
+   * LocalRecoveryCapsuleStore over a map-backed in-memory adapter. Electron
+   * safeStorage is absent under vitest, so the store runs on the documented
+   * fallback sealing tier (seeded KEK in the profile).
+   */
+  function makeCapsulePersistHarness() {
+    const plugin = makePlugin();
+    const files = new Map<string, string>();
+    const removeFromMap = async (path: string) => {
+      if (!files.has(path)) {
+        throw new Error(`ENOENT: no such file or directory, unlink '${path}'`);
+      }
+      files.delete(path);
+    };
+    const adapter = {
+      getBasePath: () => "/Users/test/VaultGuard Test Vault",
+      exists: vi.fn(async (path: string) => {
+        if (files.has(path)) return true;
+        const prefix = `${path}/`;
+        for (const key of files.keys()) {
+          if (key.startsWith(prefix)) return true;
+        }
+        return false;
+      }),
+      read: vi.fn(async (path: string) => {
+        const value = files.get(path);
+        if (value === undefined) {
+          throw new Error(`ENOENT: no such file or directory, open '${path}'`);
+        }
+        return value;
+      }),
+      write: vi.fn(async (path: string, value: string) => {
+        files.set(path, value);
+      }),
+      remove: vi.fn(removeFromMap),
+      rename: vi.fn(async (from: string, to: string) => {
+        const value = files.get(from);
+        if (value === undefined) {
+          throw new Error(`ENOENT: no such file or directory, rename '${from}'`);
+        }
+        files.set(to, value);
+        files.delete(from);
+      }),
+      list: vi.fn(async (path: string) => {
+        const prefix = `${path}/`;
+        return {
+          files: [...files.keys()].filter((key) => key.startsWith(prefix)),
+          folders: [],
+        };
+      }),
+    };
+    plugin.app.vault.adapter = adapter;
+    plugin.ensureParentFoldersForPath = vi.fn().mockResolvedValue(undefined);
+    plugin.getAtRestStatus = vi.fn(() => ({ kind: "unlocked" }));
+    plugin.lakPinEnvelopePath = vi.fn(() => ".obsidian/plugins/vaultguard-sync/lak.pin.envelope");
+    // persistNow requires a wrapped LAK or a PIN envelope; pluginId defaults
+    // to "vaultguard-sync" when no manifest is attached.
+    files.set(".obsidian/plugins/vaultguard-sync/lak.envelope", "ss:opaque-device-wrapper");
+    plugin.app.saveLocalStorage(
+      "vaultguard.at-rest.kek.v1",
+      btoa(String.fromCharCode(...new Uint8Array(32).fill(7))),
+    );
+    plugin.session = makeSession();
+    return { plugin, files, adapter, removeFromMap };
+  }
+
+  const manifestIn = (files: Map<string, string>) =>
+    JSON.parse(files.get(".vaultguard/manifest.v1.json") ?? "null");
+
+  it("keeps a valid generation chain when two persists fire in the same tick", async () => {
+    const { plugin, files } = makeCapsulePersistHarness();
+
+    await expect(plugin.persistLocalRecoveryCapsule()).resolves.toBe(true);
+    expect(manifestIn(files).capsule.currentGeneration).toBe(1);
+
+    // The exact "Pick a different vault" shape: two unawaited fires in one
+    // tick (verify's success branch + applyVaultBinding's trailing fire).
+    const first = plugin.persistLocalRecoveryCapsule();
+    const second = plugin.persistLocalRecoveryCapsule();
+    await expect(first).resolves.toBe(true);
+    await expect(second).resolves.toBe(true);
+
+    // The live defect logged "Persisting the local uninstall recovery capsule
+    // failed: ENOENT ... unlink '...previous.v1.json'" ×2 right here.
+    expect(plugin.logError).not.toHaveBeenCalled();
+
+    // The burst coalesced into ONE trailing rotation — deterministic chain.
+    const manifest = manifestIn(files);
+    expect(manifest.capsule.currentGeneration).toBe(2);
+    expect(manifest.capsule.previousGeneration).toBe(1);
+    const capsuleFiles = [...files.keys()].filter((path) => path.startsWith(".vaultguard/capsule."));
+    expect(capsuleFiles.filter((path) => path.includes(".current.v1.json"))).toHaveLength(1);
+    expect(capsuleFiles.filter((path) => path.includes(".next.v1.json"))).toHaveLength(0);
+
+    const restored = await (await plugin.createLocalRecoveryStore()).restore(true);
+    expect(restored.kind).toBe("restored");
+    expect(restored.generation).toBe(2);
+  });
+
+  it("tolerates a raced-away previous slot during rotation", async () => {
+    const { plugin, files, adapter, removeFromMap } = makeCapsulePersistHarness();
+
+    await expect(plugin.persistLocalRecoveryCapsule()).resolves.toBe(true);
+    await expect(plugin.persistLocalRecoveryCapsule()).resolves.toBe(true);
+    expect([...files.keys()].some((path) => path.includes(".previous.v1.json"))).toBe(true);
+
+    // The exists-guard passes, then the unlink loses a race. The Obsidian
+    // adapter error shape from the live repro: a plain Error carrying the
+    // ENOENT text in its MESSAGE, with NO `code` property.
+    let armed = true;
+    adapter.remove.mockImplementation(async (path: string) => {
+      if (armed && path.includes(".previous.v1.json")) {
+        armed = false;
+        throw new Error(`ENOENT: no such file or directory, unlink '${path}'`);
+      }
+      return removeFromMap(path);
+    });
+
+    await expect(plugin.persistLocalRecoveryCapsule()).resolves.toBe(true);
+    expect(plugin.logError).not.toHaveBeenCalled();
+    expect(manifestIn(files).capsule.currentGeneration).toBe(3);
+  });
+
+  it("still fails loud when the previous slot cannot be removed for a real reason", async () => {
+    const { plugin, adapter, removeFromMap } = makeCapsulePersistHarness();
+
+    await expect(plugin.persistLocalRecoveryCapsule()).resolves.toBe(true);
+    await expect(plugin.persistLocalRecoveryCapsule()).resolves.toBe(true);
+
+    adapter.remove.mockImplementation(async (path: string) => {
+      if (path.includes(".previous.v1.json")) {
+        throw new Error("EPERM: operation not permitted");
+      }
+      return removeFromMap(path);
+    });
+
+    // A swallowed EPERM/EIO would hide a real integrity failure — the store's
+    // error contract and the logError path must keep firing for those.
+    await expect(plugin.persistLocalRecoveryCapsule()).resolves.toBe(false);
+    expect(plugin.logError).toHaveBeenCalledWith(
+      expect.stringContaining("Persisting the local uninstall recovery capsule failed"),
+      expect.anything(),
+    );
   });
 });

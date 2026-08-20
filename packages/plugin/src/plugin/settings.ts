@@ -32,7 +32,7 @@ import {
   ConflictResolutionStrategy,
   UserSession,
 } from "../types";
-import type { AnthropicEffort } from "../types";
+import type { AnthropicEffort, OptionalModuleId } from "../types";
 import { AnthropicKeyStore, OpenAiKeyStore } from "../ui/chat/api-key-store";
 import {
   AI_CHAT_MODELS,
@@ -63,6 +63,7 @@ import type {
   VaultMemberRole,
   VaultRecord,
 } from "../api/client";
+import { deriveGuestPresentation } from "../admin/guest-presentation";
 import type {
   AgentBridgeLeaseSecret,
   AgentBridgeLeaseSummary,
@@ -122,6 +123,32 @@ const TEMPLATE_PATTERN_CHARACTERS = /[*?[\]{}]/;
  * vault-relative Markdown paths survive; malformed input narrows to an empty or
  * smaller allowlist and can never widen agent access.
  */
+/**
+ * Normalize the "Save Claude artifact" destination folder.
+ *
+ * This is the traversal guard for the artifact importer: the value is persisted
+ * in `data.json`, so a hand-edited or corrupted entry is untrusted input that
+ * ends up in a `vault.create()` path. Anything that could aim a write outside
+ * the vault — an absolute path, a Windows drive letter, a `..` segment — falls
+ * back to the default rather than being "cleaned up", because a silently
+ * rewritten path is harder to notice than a reset one.
+ *
+ * An empty/whitespace value is legitimate and means the vault root.
+ */
+export function normalizeArtifactImportFolder(value: unknown): string {
+  if (typeof value !== "string") return DEFAULT_SETTINGS.artifactImportFolder;
+
+  const trimmed = value.trim().replace(/\\/g, "/");
+  if (trimmed.length === 0) return "";
+
+  const isAbsolute = trimmed.startsWith("/") || /^[a-zA-Z]:\//.test(trimmed);
+  const segments = trimmed.split("/").filter((segment) => segment.length > 0);
+  const escapes = segments.some((segment) => segment === "..");
+  if (isAbsolute || escapes) return DEFAULT_SETTINGS.artifactImportFolder;
+
+  return segments.join("/");
+}
+
 export function normalizeAgentTemplateAllowlist(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const output: string[] = [];
@@ -298,6 +325,7 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   // On by default for live token-by-token feedback. Desktop-only; mobile always
   // falls back to the Tier-1 requestUrl path (see chat-view streamingEnabled()).
   aiChatStreaming: true,
+  artifactImportFolder: "Claude Artifacts",
   anthropicKeyStorageMode: "vaultguard",
   openAiKeyStorageMode: "vaultguard",
   // On by default: a key entered on desktop auto-provisions on mobile without
@@ -384,6 +412,46 @@ interface UserLabelIdentity {
   displayName?: string;
   name?: string;
 }
+
+/**
+ * The narrow client surface the vault-member guest controls need, injected so
+ * the orchestration below is callable from a `node` test without Obsidian, a
+ * DOM or a network.
+ *
+ * `revokeUser` is here for two reasons: End now calls it, and the extend
+ * sequence must be able to be OBSERVED not calling it (see
+ * `runGuestExtendSequence`).
+ */
+export interface GuestMemberActionClient {
+  extendGuestAccess(userId: string, expiresInDays: number): Promise<unknown>;
+  reactivateUser(userId: string): Promise<void>;
+  revokeUser(userId: string): Promise<void>;
+}
+
+/** Which guest controls a vault-member row should offer. */
+export interface GuestMemberControls {
+  /** Temporary access, so its boundary can be moved. */
+  showExtend: boolean;
+  /** Temporary access, so it can be ended before its boundary. */
+  showEndNow: boolean;
+  /**
+   * The identity is disabled while its guest row still EXISTS.
+   *
+   * This is a narrow, rare state: it arises only when the teardown failed
+   * partway — the account was disabled and the seat released, but the row
+   * deletes did not complete. It is NOT the normal post-expiry state, in which
+   * the guest has no membership row at all and therefore never reaches this
+   * row-level decision.
+   */
+  needsReactivateFirst: boolean;
+}
+
+/** The result of the reactivate-then-extend sequence. */
+export type GuestExtendOutcome =
+  | { status: "extended"; reactivated: boolean }
+  | { status: "reactivate-failed"; message: string }
+  | { status: "extend-failed"; message: string }
+  | { status: "extend-failed-after-reactivate"; message: string };
 
 interface AgentBridgeConnectionReveal {
   leaseId: string;
@@ -776,7 +844,17 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       setting
         .setName(moduleName)
         .setDesc(this.i18n.t(module.descriptionKey))
-        .addToggle((toggle) =>
+        .addToggle((toggle) => {
+          // Tag the switch so the focus restore below can find the *new*
+          // element after `display()` has rebuilt the tab. `toggleEl` is public
+          // API and Obsidian builds it as
+          // `<label class="checkbox-container" tabindex="0">`, so it takes
+          // focus directly. Typed as possibly-undefined because the test
+          // doubles hand back a toggle component without it.
+          const toggleEl: HTMLElement | undefined = toggle.toggleEl;
+          if (toggleEl?.dataset) {
+            toggleEl.dataset.vaultguardModule = module.id;
+          }
           toggle
             .setValue(this.plugin.isOptionalModuleEnabled(module.id))
             .setDisabled(module.id === "agentAccess" && Platform.isMobileApp)
@@ -784,15 +862,13 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               toggle.setDisabled(true);
               try {
                 await this.plugin.setOptionalModuleEnabled(module.id, enabled);
-                this.showStatus(
-                  containerEl,
-                  this.i18n.t(
-                    enabled ? "settings.module.enabled" : "settings.module.disabled",
-                    { name: moduleName },
-                  ),
-                  false,
-                );
+                // No success banner here. The switch moving, plus the "AI &
+                // automation" disclosure appearing or disappearing beneath it,
+                // already says what happened, and Obsidian's own settings
+                // never confirm a toggle. The failure branch below keeps its
+                // banner: that one carries information the UI cannot show.
                 this.display();
+                this.restoreModuleToggleFocus(module.id);
               } catch (error) {
                 this.showStatus(
                   containerEl,
@@ -805,8 +881,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                 toggle.setValue(this.plugin.isOptionalModuleEnabled(module.id));
                 toggle.setDisabled(false);
               }
-            }),
-        );
+            });
+        });
     };
 
     if (
@@ -833,6 +909,27 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     }
     for (const module of modules) {
       configure(new Setting(containerEl), module);
+    }
+  }
+
+  /**
+   * Put focus back on a module switch after `display()` rebuilt the tab.
+   *
+   * `preventScroll` is mandatory. Without it the browser scrolls the newly
+   * focused element into view, which re-creates the exact jump the scroll
+   * restore at the end of `display()` just undid. `display()` is synchronous,
+   * so this call lands after that restore and `preventScroll` keeps it.
+   *
+   * Both lookups degrade to a no-op: the section can be filtered out of the
+   * DOM, and the node-environment test doubles have neither a matching
+   * `querySelector` nor a `focus` method.
+   */
+  private restoreModuleToggleFocus(moduleId: OptionalModuleId): void {
+    const restored = this.containerEl.querySelector<HTMLElement>(
+      `[data-vaultguard-module="${moduleId}"]`,
+    );
+    if (restored && typeof restored.focus === "function") {
+      restored.focus({ preventScroll: true });
     }
   }
 
@@ -3635,6 +3732,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       for (const user of users) {
         userById.set(user.id, user);
       }
+      // The target's ORG account status, which this tab already has from the
+      // user list it just loaded. It selects between the one-step and the
+      // two-step extend; it never decides whether the guest controls appear.
+      const statusByUser = new Map<string, string>(users.map((user) => [user.id, user.status]));
       const allMembersHaveLabels = members.every((member) => userById.has(member.userId));
 
       membersEl.empty();
@@ -3655,7 +3756,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       }
 
       for (const member of members) {
-        this.renderVaultMemberRow(membersEl, sectionEl, rootEl, session, vault, member, userById, canManage);
+        this.renderVaultMemberRow(membersEl, sectionEl, rootEl, session, vault, member, userById, canManage, statusByUser);
       }
 
       if (vault.archived) {
@@ -3690,15 +3791,12 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     vault: VaultRecord,
     member: VaultMemberRecord,
     userById: Map<string, UserLabelIdentity>,
-    canManage: boolean
+    canManage: boolean,
+    statusByUser: Map<string, string> = new Map()
   ): void {
     const user = userById.get(member.userId);
     const label = this.formatUserLabel(member.userId, user);
-    const desc = [
-      `Role: ${VAULT_ROLE_LABELS[member.role]}`,
-      `Joined: ${this.formatDate(member.joinedAt)}`,
-      member.invitedBy ? `Invited by: ${this.formatUserLabel(member.invitedBy, userById.get(member.invitedBy))}` : null,
-    ].filter((value): value is string => Boolean(value)).join(" · ");
+    const desc = this.formatVaultMemberDescription(member, userById);
 
     const setting = new Setting(membersEl)
       .setName(label)
@@ -3731,6 +3829,91 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         });
     });
 
+    // DR-6. Both controls exist only for a row that IS temporary access. A
+    // guest whose access has fully lapsed has already had every membership row
+    // deleted, so they never appear in this list and neither control is ever
+    // rendered for them — their recovery lives on the user list.
+    const guestControls = this.guestMemberControlsFor(
+      member,
+      statusByUser.get(member.userId),
+      canManage
+    );
+
+    if (guestControls.showExtend) {
+      setting.addButton((button) =>
+        button
+          .setButtonText("Extend")
+          .onClick(async () => {
+            const days = await this.promptForGuestExtension(
+              rootEl,
+              label,
+              guestControls.needsReactivateFirst
+            );
+            if (days === null) return;
+
+            button.setButtonText("Extending...");
+            button.setDisabled(true);
+            const outcome = await this.runGuestExtendSequence(this.guestMemberActionClient(), {
+              userId: member.userId,
+              expiresInDays: days,
+              reactivateFirst: guestControls.needsReactivateFirst,
+            });
+
+            if (outcome.status === "extended") {
+              this.showStatus(
+                rootEl,
+                outcome.reactivated
+                  ? `Re-enabled ${label} and extended their access by ${days} days.`
+                  : `Extended ${label}'s access by ${days} days.`,
+                false
+              );
+              await this.renderCurrentVaultSettingsContent(sectionEl, rootEl, session);
+              return;
+            }
+
+            this.showStatus(
+              rootEl,
+              outcome.status === "reactivate-failed"
+                ? `Could not re-enable ${label}, so their access was not extended: ${outcome.message}`
+                : `${label}: ${outcome.message}`,
+              true
+            );
+            button.setButtonText("Extend");
+            button.setDisabled(false);
+          })
+      );
+    }
+
+    if (guestControls.showEndNow) {
+      setting.addButton((button) =>
+        button
+          .setButtonText("End now")
+          .setWarning()
+          .onClick(async () => {
+            const confirmed = await this.showDestructiveConfirmation(
+              rootEl,
+              "END ACCESS",
+              `Type END ACCESS to confirm. This ends ${label}'s access across the whole ` +
+              "organization and disables their account — it is not limited to " +
+              `${vault.name}. To take away only this vault, use Remove instead.`
+            );
+            if (!confirmed) return;
+
+            button.setButtonText("Ending...");
+            button.setDisabled(true);
+            try {
+              await this.guestMemberActionClient().revokeUser(member.userId);
+              this.showStatus(rootEl, `Ended ${label}'s access.`, false);
+              await this.renderCurrentVaultSettingsContent(sectionEl, rootEl, session);
+            } catch (error) {
+              this.showStatus(rootEl, `Failed to end access: ${this.errorMessage(error)}`, true);
+              button.setButtonText("End now");
+              button.setDisabled(false);
+            }
+          })
+      );
+    }
+
     setting.addButton((button) =>
       button
         .setButtonText("Remove")
@@ -3739,7 +3922,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           const confirmed = await this.showDestructiveConfirmation(
             rootEl,
             "REMOVE MEMBER",
-            `Type REMOVE MEMBER to confirm removing ${label} from ${vault.name}.`
+            `Type REMOVE MEMBER to confirm removing ${label} from ${vault.name}. ` +
+            "This affects this vault only — their organization account is unchanged."
           );
           if (!confirmed) return;
 
@@ -3885,6 +4069,135 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     return email && name !== email ? `${name} (${email})` : name;
   }
 
+  /**
+   * Composes the one-line description under a vault member's name.
+   *
+   * Extracted from `renderVaultMemberRow` so it can be asserted directly:
+   * `Setting.setDesc()` returns `this` and drops the string, so the composed
+   * text is invisible to any test that goes through the Setting mock.
+   *
+   * A permanent member's output is unchanged — `Role:`, `Joined:` and the
+   * optional `Invited by:`, joined with `" · "`. A guest additionally carries a
+   * `Guest` marker and an expiry segment whose verb separates a still-active
+   * guest from a lapsed one; without it an expired guest reads as a permanent
+   * viewer in the exact screen where an admin decides who to remove.
+   *
+   * The expiry verdict comes from `deriveGuestPresentation` — the same derive
+   * the user list and the web admin panel use — so this row can never disagree
+   * with them about whether a guest has lapsed.
+   */
+  private formatVaultMemberDescription(
+    member: VaultMemberRecord,
+    userById: Map<string, UserLabelIdentity>,
+    nowMs = Date.now()
+  ): string {
+    const guest = deriveGuestPresentation(member, nowMs);
+    return [
+      `Role: ${VAULT_ROLE_LABELS[member.role]}`,
+      guest ? "Guest" : null,
+      guest?.date ? `${guest.expired ? "Expired" : "Expires"}: ${this.formatDate(guest.date)}` : null,
+      `Joined: ${this.formatDate(member.joinedAt)}`,
+      member.invitedBy ? `Invited by: ${this.formatUserLabel(member.invitedBy, userById.get(member.invitedBy))}` : null,
+    ].filter((value): value is string => Boolean(value)).join(" · ");
+  }
+
+  /**
+   * Which guest controls a vault-member row offers — DR-6.
+   *
+   * Extracted from `renderVaultMemberRow` because `Setting` discards the names
+   * and descriptions it is given, so nothing about the rendered row is
+   * observable from a test; the decision is.
+   *
+   * Guest-ness comes from the SAME derive the row description, the plugin user
+   * list and the web admin panel read. No date comparison is made here, so
+   * these controls cannot disagree with the badge beside them about who holds
+   * temporary access.
+   *
+   * `accountStatus` is the target's ORG account status from `GET /users`, not
+   * anything about this vault. It only ever selects between a one-step and a
+   * two-step sequence; it never decides whether the controls appear.
+   */
+  private guestMemberControlsFor(
+    member: VaultMemberRecord,
+    accountStatus: string | undefined,
+    canManage: boolean,
+    nowMs = Date.now()
+  ): GuestMemberControls {
+    const manageableGuest = canManage && deriveGuestPresentation(member, nowMs) !== null;
+    return {
+      showExtend: manageableGuest,
+      showEndNow: manageableGuest,
+      // Reaching this row at all means a membership row still exists. A
+      // disabled identity that still has one is the narrow partial-teardown
+      // state, NOT the ordinary post-expiry state — in that one the rows are
+      // gone, the member never appears in this list, and the recovery is the
+      // user list's grant-guest-access path instead.
+      needsReactivateFirst:
+        manageableGuest && (accountStatus === "revoked" || accountStatus === "suspended"),
+    };
+  }
+
+  /**
+   * Runs the extend, reactivating first where the row belongs to a disabled
+   * identity, and reports what actually happened.
+   *
+   * Takes its client as an argument so the whole sequence — including both
+   * failure directions — is exercisable without Obsidian or a network.
+   */
+  private async runGuestExtendSequence(
+    client: GuestMemberActionClient,
+    input: { userId: string; expiresInDays: number; reactivateFirst: boolean }
+  ): Promise<GuestExtendOutcome> {
+    if (input.reactivateFirst) {
+      try {
+        await client.reactivateUser(input.userId);
+      } catch (error) {
+        // Direction 1. Nothing has changed, so nothing needs undoing, and the
+        // extend is deliberately NOT attempted: restoring vault access to an
+        // account that is still disabled would be access nobody can use.
+        return { status: "reactivate-failed", message: this.errorMessage(error) };
+      }
+    }
+
+    try {
+      await client.extendGuestAccess(input.userId, input.expiresInDays);
+    } catch (error) {
+      if (!input.reactivateFirst) {
+        return { status: "extend-failed", message: this.errorMessage(error) };
+      }
+      // Direction 2, the expensive one. The reactivate above has ALREADY
+      // re-taken the seat, so the organization is now paying for an enabled
+      // account that got no access back. All three facts are stated, and the
+      // lever that undoes it is named.
+      //
+      // `revokeUser` is deliberately NOT called here as a silent rollback:
+      // revoking is an org-wide, audited, account-disabling action, and firing
+      // it unattended out of a failed UI sequence is worse than telling the
+      // operator what state they are in.
+      return {
+        status: "extend-failed-after-reactivate",
+        message:
+          "The account was re-enabled and a seat was consumed, but access was NOT extended: " +
+          `${this.errorMessage(error)} Use End now if the account should not stay enabled.`,
+      };
+    }
+
+    return { status: "extended", reactivated: input.reactivateFirst };
+  }
+
+  /**
+   * The real client behind the guest controls, built from the plugin's public
+   * wrappers so this file never reaches for the API client directly.
+   */
+  private guestMemberActionClient(): GuestMemberActionClient {
+    return {
+      extendGuestAccess: (userId, expiresInDays) =>
+        this.plugin.extendCurrentVaultGuestAccess(userId, expiresInDays),
+      reactivateUser: (userId) => this.plugin.reactivateOrganizationUser(userId),
+      revokeUser: (userId) => this.plugin.revokeOrganizationUser(userId),
+    };
+  }
+
   private errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : "Unknown error";
   }
@@ -3943,6 +4256,21 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     this.codexModelAbort?.abort();
     this.codexModelAbort = null;
     const { containerEl } = this;
+
+    // This tab's own container IS the scroll container: Obsidian builds it as
+    // `.vertical-tab-content`, which app.css gives `overflow-y: auto` and
+    // `height: 100%`. So `empty()` collapses the content height and the
+    // browser drops `scrollTop` to 0. With 51 `display()` call sites in this
+    // file, every re-render — flipping an optional module, saving a field —
+    // would otherwise throw the reader back to the top of a 98-row tab.
+    //
+    // The `childElementCount > 0` guard skips the very first render, so an
+    // empty container can never restore a stale offset. It also makes the
+    // whole thing a no-op against the node-environment test doubles, which
+    // have neither property: `undefined > 0` is `false`.
+    const previousScrollTop =
+      this.containerEl.childElementCount > 0 ? this.containerEl.scrollTop : 0;
+
     containerEl.empty();
     containerEl.addClass("vaultguard-settings-tab");
     this.i18n.applyToRoot(containerEl);
@@ -4579,6 +4907,30 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         );
 
     });
+
+    // ── Saved artifacts ─────────────────────────────────────────────────────
+    // One everyday preference, so it sits at the top level next to the other
+    // everyday settings rather than behind a disclosure — the commands that use
+    // it ("Save Claude artifact from clipboard" / "Import Claude artifact
+    // file…") are always available, including on mobile for the clipboard one.
+    new Setting(containerEl)
+      .setName("Claude artifact folder")
+      .setDesc(
+        "Where the \"Save Claude artifact\" commands create notes. Leave empty to use the vault root.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.artifactImportFolder)
+          .setValue(this.plugin.settings.artifactImportFolder)
+          .onChange(async (value) => {
+            // Normalize on the way in as well as on load: this is the path that
+            // reaches vault.create(), so an absolute path or a `..` segment
+            // typed here must be rejected, not stored and rejected later.
+            this.plugin.settings.artifactImportFolder = normalizeArtifactImportFolder(value);
+            await this.plugin.saveSettings();
+          }),
+      );
+
     // ── Capabilities ────────────────────────────────────────────────────────
     // Placed after the everyday preferences and immediately before the sections
     // they gate: these four toggles are what add or remove "AI & automation"
@@ -4711,12 +5063,110 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // The filter must run after every section exists, and again on each
     // re-render, or a toggle inside a filtered view would restore hidden rows.
     this.applySettingsFilter(containerEl);
+
+    // After the filter, never before. `applySettingsFilter` hides rows and
+    // force-opens disclosures, so it is the step that settles `scrollHeight`;
+    // restoring earlier would clamp the offset against the wrong height.
+    //
+    // No clamping of our own: when the rebuilt tab is shorter than the old one
+    // (turning Secure Discovery off drops a whole section) the browser clamps
+    // to `scrollHeight - clientHeight` itself, and landing at the new bottom is
+    // the right answer.
+    if (previousScrollTop > 0) {
+      this.containerEl.scrollTop = previousScrollTop;
+    }
   }
 
   /**
    * Show a type-to-confirm dialog for destructive operations.
    * Returns true only if the user types the exact confirmation phrase.
    */
+  /**
+   * Asks for a whole number of days and confirms the extend.
+   *
+   * When the target's account is disabled the copy names that narrow state
+   * explicitly rather than implying it is the ordinary post-expiry one, and
+   * warns that a re-enabled account has to sign in again — the tokens revoked
+   * at disable time are not resurrected.
+   *
+   * Resolves `null` on cancel.
+   */
+  private promptForGuestExtension(
+    containerEl: HTMLElement,
+    label: string,
+    needsReactivateFirst: boolean
+  ): Promise<number | null> {
+    return new Promise((resolve) => {
+      const existing = containerEl.querySelector(".vaultguard-guest-extend-prompt");
+      if (existing) existing.remove();
+
+      const dialog = containerEl.createDiv({ cls: "vaultguard-destruct-confirm vaultguard-guest-extend-prompt" });
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-label", "Extend temporary access");
+      const descriptionId = `vaultguard-guest-extend-${Date.now()}`;
+      dialog.setAttribute("aria-describedby", descriptionId);
+      dialog.createEl("p", {
+        text: needsReactivateFirst
+          ? `${label}'s account is disabled, but their access record for this vault still exists. ` +
+            "Extending will first re-enable their organization account — consuming a seat — and then " +
+            "move their expiry. They will have to sign in again."
+          : `Extend ${label}'s temporary access by a whole number of days.`,
+        cls: "setting-item-description",
+        attr: { id: descriptionId },
+      });
+
+      const input = dialog.createEl("input", {
+        cls: "vaultguard-confirm-input",
+        attr: {
+          type: "number",
+          min: "1",
+          max: "90",
+          step: "1",
+          value: "30",
+          "aria-label": "Days to extend by",
+        },
+      });
+
+      const btnRow = dialog.createDiv({ cls: "vaultguard-confirm-buttons" });
+      const cancelBtn = btnRow.createEl("button", { text: "Cancel", attr: { type: "button" } });
+      const confirmBtn = btnRow.createEl("button", {
+        text: needsReactivateFirst ? "Re-enable and extend" : "Extend",
+        cls: "mod-cta",
+        attr: { type: "button" },
+      });
+
+      const finish = (value: number | null): void => {
+        dialog.remove();
+        resolve(value);
+      };
+
+      const submit = (): void => {
+        const days = Number(input.value);
+        // A local whole-day check only. The accepted range is the server's to
+        // enforce, so a rejection there is reported rather than pre-empted.
+        if (!Number.isInteger(days) || days < 1) {
+          input.setAttribute("aria-invalid", "true");
+          return;
+        }
+        finish(days);
+      };
+
+      cancelBtn.addEventListener("click", () => finish(null));
+      confirmBtn.addEventListener("click", () => submit());
+      dialog.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          finish(null);
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          submit();
+        }
+      });
+
+      input.focus();
+    });
+  }
+
   private showDestructiveConfirmation(
     containerEl: HTMLElement,
     confirmPhrase: string,

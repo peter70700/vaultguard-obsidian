@@ -61,6 +61,17 @@ variable "session_enforcement_mode" {
   }
 }
 
+variable "guest_sweep_mode" {
+  description = "Expired-guest sweeper posture for the nightly reconciler. Keep observe until an observe-mode run has been reviewed, then select enforce explicitly. The FIRST enforce run processes the entire accumulated backlog of already-expired guests in one pass, so it can move currentUsers — and therefore the Stripe quantity — by more than one."
+  type        = string
+  default     = "observe"
+
+  validation {
+    condition     = contains(["observe", "enforce"], var.guest_sweep_mode)
+    error_message = "guest_sweep_mode must be either observe or enforce."
+  }
+}
+
 variable "cognito_mfa_configuration" {
   description = "Explicit Cognito MFA posture. OPTIONAL is migration-safe; ON requires an operator-approved enrollment rollout."
   type        = string

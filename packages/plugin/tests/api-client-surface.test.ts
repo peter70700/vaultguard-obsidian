@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { requestUrl } from "obsidian";
 
-import { NetworkError, VaultGuardApiClient } from "../src/api/client";
+import { NetworkError, VaultGuardApiClient, VaultGuardError } from "../src/api/client";
 
 const mockRequestUrl = vi.mocked(requestUrl);
 
@@ -681,6 +681,107 @@ describe("VaultGuardApiClient surface", () => {
         sendWelcomeEmail: true,
       }),
     }));
+  });
+
+  // ─── extendGuestAccess (DR-6) ─────────────────────────────────────────
+  //
+  // The extend rides the SAME `PATCH /vaults/{vaultId}/members/{userId}`
+  // resource the membership update has always used. The server reads the two
+  // mutations apart by which field arrives, so the single most important thing
+  // these cases pin is the SHAPE of the body: `expiresInDays` alone. A payload
+  // that also carried the membership's other mutable field would be a 400.
+
+  it("extends a temporary member through the existing vault-scoped member resource", async () => {
+    const client = makeClient();
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(200, {
+      membership: {
+        vaultId: "vault-abc",
+        userId: "user-guest",
+        role: "viewer",
+        joinedAt: "2026-08-01T09:00:00.000Z",
+        invitedBy: "user-admin",
+        accessKind: "guest",
+        expiresAt: "2026-09-18T12:00:00.000Z",
+      },
+      permissionRuleUpdated: true,
+    }));
+
+    const result = await client.extendGuestAccess("vault-abc", "user-guest", 30);
+
+    expect(result.membership.expiresAt).toBe("2026-09-18T12:00:00.000Z");
+    expect(result.permissionRuleUpdated).toBe(true);
+
+    const call = mockRequestUrl.mock.calls[0]![0];
+    expect(call.method).toBe("PATCH");
+    expect(call.url).toContain("/vaults/vault-abc/members/user-guest");
+
+    // Exactly one key. Asserted with toEqual rather than toMatchObject so an
+    // extra field cannot pass, and re-asserted by name because sending the
+    // membership's other mutable field alongside the duration is the specific
+    // request the server rejects with a 400.
+    const body = JSON.parse(call.body as string);
+    expect(body).toEqual({ expiresInDays: 30 });
+    expect(Object.keys(body)).not.toContain("role");
+  });
+
+  it("reports the server's permission-rule half-state instead of hiding it", async () => {
+    const client = makeClient();
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(200, {
+      membership: {
+        vaultId: "vault-abc",
+        userId: "user-guest",
+        role: "viewer",
+        joinedAt: "2026-08-01T09:00:00.000Z",
+        invitedBy: "user-admin",
+        accessKind: "guest",
+        expiresAt: "2026-09-18T12:00:00.000Z",
+      },
+      permissionRuleUpdated: false,
+    }));
+
+    // The server moved the row but found no rule to move with it, and
+    // deliberately did not mint one. That is a member inside the vault with
+    // nothing to read through, so the flag has to reach the caller.
+    await expect(client.extendGuestAccess("vault-abc", "user-guest", 7))
+      .resolves.toMatchObject({ permissionRuleUpdated: false });
+  });
+
+  it("surfaces the extend 409 as the client's normal error type", async () => {
+    const client = makeClient();
+    mockRequestUrl.mockResolvedValueOnce(jsonResponse(409, {
+      message: "Only temporary access carries an expiry date.",
+      code: "conflict",
+    }));
+
+    await expect(client.extendGuestAccess("vault-abc", "user-permanent", 30))
+      .rejects.toBeInstanceOf(VaultGuardError);
+  });
+
+  it("refuses to extend when the client is bound to no server vault", async () => {
+    // The vault-scoping rule, at the one place it can still be broken: an
+    // unbound client whose empty vault id would otherwise interpolate into
+    // `/vaults//members/...` — a vault-unscoped call wearing a vault-scoped
+    // shape. The guard has to fire BEFORE the request, so nothing is sent.
+    const client = makeClient({ vaultId: "" });
+
+    expect(client.getVaultId()).toBe("");
+    await expect(client.extendGuestAccess(client.getVaultId(), "user-guest", 30))
+      .rejects.toThrow(/not bound to a server vault/);
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-whole-day extension locally without calling the server", async () => {
+    const client = makeClient();
+
+    await expect(client.extendGuestAccess("vault-abc", "user-guest", 2.5))
+      .rejects.toThrow(/whole number of days/);
+    await expect(client.extendGuestAccess("vault-abc", "user-guest", 0))
+      .rejects.toThrow(/whole number of days/);
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+
+    // Deliberately NOT asserted here: an upper bound. 1-90 is the server's to
+    // enforce in `guestAccessExpiresAt`; a second copy in the client would be
+    // free to drift away from the one the invite path applies.
   });
 
   it("retries status-0 network responses before marking the client offline", async () => {

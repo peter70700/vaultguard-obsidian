@@ -7,6 +7,25 @@ import type {
   VaultGuardCommandContext,
 } from "./plugin-runtime-types";
 import { registerPermissionsGraphVirtualQaCommand } from "../ui/graph/permissions-graph-qa-command";
+import {
+  importArtifactFiles,
+  importArtifactFromClipboard,
+} from "../ui/import/artifact-importer";
+import type { ArtifactImportContext } from "../ui/import/artifact-importer";
+
+/**
+ * Narrow the broad command context down to exactly what the artifact importer
+ * needs. Built per invocation so the destination folder is read fresh from
+ * settings rather than captured at registration time.
+ */
+function makeArtifactImportContext(ctx: VaultGuardCommandContext): ArtifactImportContext {
+  return {
+    app: ctx.app,
+    artifactImportFolder: ctx.settings.artifactImportFolder,
+    ensureParentFoldersForPath: (path) => ctx.ensureParentFoldersForPath(path),
+    logError: (message, error) => ctx.logError(message, error),
+  };
+}
 
 /**
  * The sync engine's text/binary split is CONTENT-based, not extension-based:
@@ -468,6 +487,7 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
           vaultMemberRole: ctx.vaultMemberRole ?? ctx.session?.vaultMemberRole ?? "—",
           serverVaultId: ctx.settings.serverVaultId || "—",
           bindingReconciledVaultId: ctx.settings.bindingReconciledVaultId ?? "—",
+          localOnlyCatchupCompleted: ctx.localOnlyCatchupCompleted,
           orgSlug: ctx.settings.orgSlug || "—",
           folderLifecycleListenersRegistered: ctx.folderLifecycleListenersRegistered,
           syncTimerAlive: ctx.syncTimerAlive,
@@ -846,6 +866,30 @@ export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void 
       void ctx.activatePermissionsGraph();
     },
   });
+
+  // "Save Claude artifact" — the two user-driven ingestion paths. Neither makes
+  // a network call: a Claude artifact cannot be fetched (see the header of
+  // src/ui/import/artifact-importer.ts), it only ever arrives because the user
+  // copied or downloaded it.
+  ctx.addCommand({
+    id: "vaultguard-import-artifact-clipboard",
+    name: "VaultGuard: Save Claude artifact from clipboard",
+    callback: () => {
+      void importArtifactFromClipboard(makeArtifactImportContext(ctx));
+    },
+  });
+
+  // Desktop-only: needs the Electron picker and Node `fs`. Registered
+  // conditionally so it is not a dead entry in the mobile command palette.
+  if (!Platform.isMobileApp) {
+    ctx.addCommand({
+      id: "vaultguard-import-artifact-file",
+      name: "VaultGuard: Import Claude artifact file…",
+      callback: () => {
+        void importArtifactFiles(makeArtifactImportContext(ctx));
+      },
+    });
+  }
 
   ctx.addCommand({
     id: "vaultguard-chat-history",

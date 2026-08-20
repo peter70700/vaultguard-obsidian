@@ -26,6 +26,7 @@ interface ElectronDialogLike {
   showOpenDialog(opts: {
     properties: string[];
     title?: string;
+    filters?: Array<{ name: string; extensions: string[] }>;
   }): Promise<{ canceled: boolean; filePaths: string[] }>;
 }
 
@@ -153,6 +154,64 @@ export async function pickSourceFolder(): Promise<string | null> {
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extensions offered in the artifact file picker. Mirrors what claude.ai's
+ * artifact "Download" button actually produces, plus the plain-text shapes.
+ * The dispatcher is still the authority on what converts — this list only
+ * shapes the dialog's filter, so an unlisted file the user force-selects is
+ * reported as skipped rather than silently dropped.
+ */
+const ARTIFACT_PICKER_EXTENSIONS = [
+  "md",
+  "markdown",
+  "txt",
+  "html",
+  "htm",
+  "svg",
+  "mermaid",
+  "mmd",
+  "csv",
+  "tsv",
+  "json",
+  "ts",
+  "tsx",
+  "js",
+  "jsx",
+  "py",
+  "sh",
+  "sql",
+  "css",
+];
+
+/**
+ * Open the native file picker (multi-select) and return the chosen absolute
+ * paths, or `null` if cancelled / unavailable. Desktop-gated exactly like
+ * {@link pickSourceFolder} — NEVER attempts the require on mobile.
+ */
+export async function pickSourceFiles(): Promise<string[] | null> {
+  if (Platform.isMobileApp) return null;
+  const req = getElectronRequire();
+  if (!req) return null;
+
+  const dialog = resolveDialog(req);
+  if (!dialog) return null;
+
+  try {
+    const result = await dialog.showOpenDialog({
+      properties: ["openFile", "multiSelections"],
+      title: "Select Claude artifact file(s) to import",
+      filters: [
+        { name: "Claude artifacts", extensions: ARTIFACT_PICKER_EXTENSIONS },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths;
   } catch {
     return null;
   }

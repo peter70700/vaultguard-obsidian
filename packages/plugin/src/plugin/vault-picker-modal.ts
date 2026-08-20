@@ -26,6 +26,19 @@ interface VaultPickerOptions {
   suggestedName: string;
   /** True when the current user is an org-admin (can create vaults). */
   canCreateVaults: boolean;
+  /**
+   * vaultId this Obsidian folder is already bound to. The matching row
+   * renders a "Currently bound" badge and is never auto-bound — a zero-click
+   * re-bind of the current vault is not a decision and must never stand in
+   * for one (quick-260820-fvo).
+   */
+  currentVaultId?: string;
+  /**
+   * Suppress single-vault auto-bind entirely. Set by callers opening the
+   * picker from a blocked account-change state, where an auto-bind would
+   * count as consent the user never gave (quick-260820-fvo).
+   */
+  disableAutoBind?: boolean;
 }
 
 export class VaultPickerModal extends Modal {
@@ -208,17 +221,29 @@ export class VaultPickerModal extends Modal {
     this.listEl.empty();
 
     const usable = vaults.filter((v) => !v.archived);
+    const single = usable.length === 1 ? usable[0] : null;
+    const singleIsCurrent =
+      !!single && single.vaultId === this.options.currentVaultId;
 
     // Single usable vault → bind automatically (admins and non-admins alike).
     // One-shot guard prevents a re-render loop; on failure autoBind falls back
-    // to a normal selectable row.
-    if (usable.length === 1 && !this.autoBindAttempted && !this.busy) {
+    // to a normal selectable row. Never auto-bind the vault this folder is
+    // ALREADY bound to, and never auto-bind at all when the caller disabled it
+    // (blocked account-change state) — a zero-click bind is not a decision
+    // (quick-260820-fvo).
+    if (
+      single &&
+      !singleIsCurrent &&
+      !this.options.disableAutoBind &&
+      !this.autoBindAttempted &&
+      !this.busy
+    ) {
       this.autoBindAttempted = true;
       this.listEl.createEl("p", {
-        text: `Binding to "${usable[0].name}"…`,
+        text: `Binding to "${single.name}"…`,
         cls: "setting-item-description",
       });
-      void this.autoBind(usable[0]);
+      void this.autoBind(single);
       return;
     }
 
@@ -228,6 +253,16 @@ export class VaultPickerModal extends Modal {
     }
 
     this.renderVaultRows(usable);
+    // renderVaultRows empties listEl, so the no-choice note must come after.
+    if (singleIsCurrent) {
+      this.listEl.createEl("p", {
+        text:
+          "This folder is already connected to the only vault this account " +
+          "can use — there is no other vault to pick. Selecting it re-checks " +
+          "access for the signed-in account.",
+        cls: "vaultguard-modal-note",
+      });
+    }
   }
 
   /** Render one selectable "Select" row per usable vault. */
@@ -242,6 +277,14 @@ export class VaultPickerModal extends Modal {
         text: vault.name,
         cls: "vaultguard-vault-picker-name",
       });
+      if (vault.vaultId === this.options.currentVaultId) {
+        // Multi-vault lists get the badge too, and the autoBind-failure
+        // fallback row inherits it for free.
+        info.createSpan({
+          text: "Currently bound",
+          cls: "vaultguard-vault-picker-bound-badge",
+        });
+      }
       info.createEl("div", {
         text: `${vault.kind} - ${vault.slug}`,
         cls: "vaultguard-vault-picker-meta",

@@ -7,9 +7,10 @@ import {
   setIcon,
 } from "obsidian";
 import { VaultGuardApiClient } from "../api/client";
-import type { VaultMemberRecord } from "../api/client";
+import type { UserListEntry, VaultMemberRecord } from "../api/client";
 import { getAccessUserNameInitials } from "../ui/access-user-utils";
 import { createI18n } from "../i18n";
+import { deriveGuestPresentation } from "./guest-presentation";
 
 export type UserStatus = "active" | "suspended" | "revoked" | "pending";
 export type UserRole = "admin" | "editor" | "viewer" | "custom";
@@ -33,6 +34,131 @@ export interface UserActivity {
   action: string;
   resourcePath: string;
   deviceInfo: string;
+}
+
+/**
+ * Reconciles the org-wide guest state on a `GET /users` entry with the member
+ * row for the one vault the plugin currently has open.
+ *
+ * THE SERVER WINS. `entry.accessKind` is computed across every vault in the org
+ * (DR-1); a membership is a single vault's fact. Letting the membership
+ * overwrite the server value would erase the badge of a guest scoped to a vault
+ * this admin does not currently have open — silently presenting a temporary
+ * guest as a permanent viewer.
+ *
+ * The current-vault fallback is kept on purpose rather than deleted: against a
+ * server not yet redeployed with the `GET /users` change, `entry.accessKind` is
+ * absent and the membership is the only guest state that exists.
+ *
+ * A pure field-presence decision with no clock. Every expiry comparison in this
+ * file goes through `deriveGuestPresentation`, which reads guest state and
+ * never re-derives it.
+ */
+export function mergeGuestState(entry: UserListEntry, membership: VaultMemberRecord | undefined): UserListEntry {
+  if (entry.accessKind !== undefined) return entry;
+  if (membership?.accessKind === undefined) return entry;
+  return {
+    ...entry,
+    accessKind: membership.accessKind,
+    expiresAt: membership.expiresAt,
+  };
+}
+
+/**
+ * The narrow client surface the grant-guest-access sequence needs, injected so
+ * the sequence is callable from a `node` test without Obsidian or a network.
+ *
+ * `revokeUser` is here so the sequence can be OBSERVED not calling it.
+ */
+export interface GuestAccessGrantClient {
+  reactivateUser(userId: string): Promise<void>;
+  inviteUser(invite: {
+    email: string;
+    role: string;
+    sendWelcomeEmail: boolean;
+    accessKind?: "member" | "guest";
+    vaultIds?: string[];
+    expiresInDays?: number;
+  }): Promise<unknown>;
+  revokeUser(userId: string): Promise<unknown>;
+}
+
+export type GrantGuestAccessOutcome =
+  | { status: "granted" }
+  | { status: "reactivate-failed"; message: string }
+  | { status: "invite-failed-after-reactivate"; message: string };
+
+function errorMessageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Re-enables a disabled identity and grants it NEW temporary vault access.
+ *
+ * This is the recovery for a guest the expiry sweeper has already torn down.
+ * Such a guest has NO membership row left anywhere — the teardown deletes every
+ * one — so they appear in no vault-member list, there is no boundary to move,
+ * and the vault-scoped extend answers 404 for precisely that state. What
+ * survived a sweep is the IDENTITY, not the grant, so the grant has to be made
+ * afresh. This path deliberately makes no claim about what the user held
+ * before: the client does not know, and for a revoked permanent member there
+ * was never any temporary access at all.
+ *
+ * THE ORDER IS FORCED BY THE SERVER, not a preference. The invite's
+ * attach-to-existing-identity branch answers 409 for an identity that is still
+ * disabled or still carries a revocation marker, precisely so an invite can
+ * never quietly undo an admin's revoke. Reactivate therefore runs first.
+ *
+ * The invite carries the user's EXISTING organization role: the attach branch
+ * issues no group change, so the role field must not be used to move anyone
+ * between roles. `sendWelcomeEmail: false` matches the attach branch already
+ * suppressing that template — asking for it would only add a contradictory
+ * signal, and a password-reset-shaped email to an existing user is confusing.
+ */
+export async function grantGuestAccessToRevokedUser(
+  client: GuestAccessGrantClient,
+  input: {
+    userId: string;
+    email: string;
+    role: string;
+    vaultIds: string[];
+    expiresInDays: number;
+  },
+): Promise<GrantGuestAccessOutcome> {
+  try {
+    await client.reactivateUser(input.userId);
+  } catch (error) {
+    // Nothing changed, so nothing needs undoing — and the invite is NOT
+    // attempted, because against a still-disabled identity it would 409.
+    return { status: "reactivate-failed", message: errorMessageOf(error) };
+  }
+
+  try {
+    await client.inviteUser({
+      email: input.email,
+      role: input.role,
+      sendWelcomeEmail: false,
+      accessKind: "guest",
+      vaultIds: input.vaultIds,
+      expiresInDays: input.expiresInDays,
+    });
+  } catch (error) {
+    // The reactivate above has ALREADY re-taken the seat, so the organization
+    // is now paying for an enabled account that got no vault access. State all
+    // three facts and name the lever.
+    //
+    // `revokeUser` is deliberately NOT called as a silent rollback: revoking is
+    // an org-wide, audited, account-disabling action, and firing it unattended
+    // out of a failed sequence is worse than telling the operator.
+    return {
+      status: "invite-failed-after-reactivate",
+      message:
+        "The account was re-enabled and a seat was consumed, but guest access was NOT granted: " +
+        `${errorMessageOf(error)} Use Revoke access if the account should not stay enabled.`,
+    };
+  }
+
+  return { status: "granted" };
 }
 
 export class UserManager {
@@ -82,12 +208,18 @@ export class UserManager {
         return;
       }
 
+      // Reconcile guest state once, before anything reads it, so the summary
+      // bar and the rows below can never disagree about who is a guest.
+      const mergedUsers = users.map((user) => mergeGuestState(user, membershipByUser.get(user.id)));
+      const nowMs = Date.now();
+
       // Summary bar
       const summary = container.createDiv({ cls: "vaultguard-user-summary" });
-      const activeCount = users.filter((u: VaultGuardUser) => u.status === "active").length;
-      const suspendedCount = users.filter((u: VaultGuardUser) => u.status === "suspended").length;
-      const pendingCount = users.filter((u: VaultGuardUser) => u.status === "pending").length;
-      summary.createSpan({ text: `${users.length} total`, cls: "vaultguard-summary-stat" });
+      const activeCount = mergedUsers.filter((u: UserListEntry) => u.status === "active").length;
+      const suspendedCount = mergedUsers.filter((u: UserListEntry) => u.status === "suspended").length;
+      const pendingCount = mergedUsers.filter((u: UserListEntry) => u.status === "pending").length;
+      const guestCount = mergedUsers.filter((u: UserListEntry) => deriveGuestPresentation(u, nowMs) !== null).length;
+      summary.createSpan({ text: `${mergedUsers.length} total`, cls: "vaultguard-summary-stat" });
       summary.createSpan({ text: `${activeCount} active`, cls: "vaultguard-summary-stat vaultguard-stat-active" });
       if (suspendedCount > 0) {
         summary.createSpan({ text: `${suspendedCount} suspended`, cls: "vaultguard-summary-stat vaultguard-stat-suspended" });
@@ -95,15 +227,13 @@ export class UserManager {
       if (pendingCount > 0) {
         summary.createSpan({ text: `${pendingCount} pending`, cls: "vaultguard-summary-stat vaultguard-stat-pending" });
       }
+      if (guestCount > 0) {
+        summary.createSpan({ text: `${guestCount} guest${guestCount !== 1 ? "s" : ""}`, cls: "vaultguard-summary-stat vaultguard-stat-guest" });
+      }
 
       // User items
-      for (const user of users as VaultGuardUser[]) {
-        const membership = membershipByUser.get(user.id);
-        this.renderUserItem(container, {
-          ...user,
-          accessKind: membership?.accessKind,
-          expiresAt: membership?.expiresAt,
-        });
+      for (const user of mergedUsers) {
+        this.renderUserItem(container, user);
       }
     } catch (error) {
       if (container.isConnected === false) return;
@@ -122,6 +252,9 @@ export class UserManager {
    * Renders a single user row with actions.
    */
   private renderUserItem(container: HTMLElement, user: VaultGuardUser): void {
+    // One clock reading per row: the badge and the expiry line must agree.
+    const guest = deriveGuestPresentation(user, Date.now());
+
     const itemEl = container.createDiv({ cls: "vaultguard-user-item" });
     itemEl.setAttribute("data-username", user.displayName);
     itemEl.setAttribute("data-email", user.email);
@@ -155,12 +288,12 @@ export class UserManager {
     roleBadge.setText(user.role);
     roleBadge.addClass(`vaultguard-role-${user.role}`);
 
-    if (user.accessKind === "guest") {
+    if (guest) {
       const guestBadge = badgesEl.createSpan({
         cls: "vaultguard-role-badge vaultguard-role-guest",
-        text: this.i18n.t("guest.badge"),
+        text: this.i18n.t(guest.badgeKey),
       });
-      if (user.expiresAt && Date.parse(user.expiresAt) <= Date.now()) {
+      if (guest.expired) {
         guestBadge.addClass("vaultguard-status-revoked");
       }
     }
@@ -182,11 +315,10 @@ export class UserManager {
       text: `${user.deviceCount} device${user.deviceCount !== 1 ? "s" : ""}`,
       cls: "vaultguard-user-devices",
     });
-    if (user.accessKind === "guest" && user.expiresAt) {
-      const isActive = Date.parse(user.expiresAt) > Date.now();
+    if (guest?.date) {
       metaEl.createDiv({
-        text: this.i18n.t(isActive ? "guest.expiresAt" : "guest.expiredAt", {
-          date: new Date(user.expiresAt).toLocaleString(),
+        text: this.i18n.t(guest.labelKey, {
+          date: new Date(guest.date).toLocaleString(),
         }),
         cls: "vaultguard-user-last-active",
       });
@@ -234,7 +366,52 @@ export class UserManager {
       });
       setIcon(reactivateBtn, "check-circle");
       reactivateBtn.addEventListener("click", () => { void this.reactivateUser(user, container); });
+
+      // Rendered ALONGSIDE Reactivate user, on the same gate, on purpose: they
+      // are different outcomes. Reactivate user re-enables the account with no
+      // vault access; this re-enables it AND attaches temporary vault access.
+      //
+      // The control is NAMED FOR WHAT ITS GATE ACTUALLY MATCHES. That gate
+      // catches every revoked identity, not only a guest the sweeper swept:
+      // the teardown deletes every guest row, and `GET /users` never exposes
+      // why an account was revoked, so a swept guest and an admin-revoked
+      // editor are indistinguishable here. Rather than narrow the gate — which
+      // would need a per-user marker read on the heaviest route in the API —
+      // the label names the real capability, which is a correct and useful
+      // action for any revoked identity.
+      if (!guest) {
+        const grantGuestBtn = actionsEl.createEl("button", {
+          cls: "vaultguard-icon-btn",
+          attr: { title: "Grant guest access", "aria-label": "Grant guest access", type: "button" },
+        });
+        setIcon(grantGuestBtn, "user-plus");
+        grantGuestBtn.addEventListener("click", () => {
+          void this.showGrantGuestAccessDialog(user, container);
+        });
+      }
     }
+  }
+
+  /**
+   * Opens the guest-invite form pre-targeted at an existing, disabled identity.
+   *
+   * Reuses `InviteUserModal` rather than building a second duration and vault
+   * picker, so this file has exactly one of each.
+   */
+  private async showGrantGuestAccessDialog(
+    user: VaultGuardUser,
+    container: HTMLElement,
+  ): Promise<void> {
+    const modal = new InviteUserModal(
+      this.app,
+      this.apiClient,
+      this.currentVaultId,
+      async () => {
+        await this.renderUserList(container);
+      },
+      { id: user.id, email: user.email, displayName: user.displayName, role: user.role },
+    );
+    modal.open();
   }
 
   /**
@@ -326,6 +503,17 @@ export class UserManager {
 
 // ─── Invite User Modal ──────────────────────────────────────────────────────
 
+/**
+ * An existing, disabled identity this form is granting fresh guest access to,
+ * rather than inviting someone new.
+ */
+interface GuestAccessGrantTarget {
+  id: string;
+  email: string;
+  displayName: string;
+  role: UserRole;
+}
+
 class InviteUserModal extends Modal {
   private apiClient: VaultGuardApiClient;
   private onInvited: () => Promise<void>;
@@ -339,17 +527,30 @@ class InviteUserModal extends Modal {
   private inviteButton: ButtonComponent | null = null;
   private readonly i18n = createI18n();
   private active = false;
+  private readonly grantTarget?: GuestAccessGrantTarget;
 
   constructor(
     app: App,
     apiClient: VaultGuardApiClient,
     currentVaultId: string | undefined,
     onInvited: () => Promise<void>,
+    grantTarget?: GuestAccessGrantTarget,
   ) {
     super(app);
     this.apiClient = apiClient;
     this.currentVaultId = currentVaultId;
     this.onInvited = onInvited;
+    this.grantTarget = grantTarget;
+    if (grantTarget) {
+      // Everything the form would otherwise ask for is already decided: the
+      // identity, its existing organization role (which this path must not
+      // change), that the access is temporary, and that no invitation email is
+      // wanted. What remains to collect is the vaults and the duration.
+      this.email = grantTarget.email;
+      this.role = grantTarget.role;
+      this.accessKind = "guest";
+      this.sendWelcomeEmail = false;
+    }
   }
 
   async onOpen(): Promise<void> {
@@ -360,21 +561,36 @@ class InviteUserModal extends Modal {
     contentEl.addClass("vaultguard-dialog-content");
     this.i18n.applyToRoot(contentEl);
     const title = contentEl.createEl("h3", {
-      text: this.i18n.t("guest.title"),
+      text: this.grantTarget ? "Grant guest access" : this.i18n.t("guest.title"),
       attr: { id: "vaultguard-invite-user-title" },
     });
     this.modalEl.setAttribute("aria-labelledby", title.id);
 
-    new Setting(contentEl)
-      .setName(this.i18n.t("guest.email.name"))
-      .setDesc(this.i18n.t("guest.email.description"))
-      .addText((text) =>
-        text
-          .setPlaceholder(this.i18n.t("guest.email.placeholder"))
-          .onChange((value) => {
-            this.email = value;
-          })
-      );
+    if (this.grantTarget) {
+      // Stated plainly and up front, because every one of these is a real
+      // consequence the operator is about to cause. Deliberately worded as
+      // granting NEW access: nothing about what this user held before is known
+      // here, and for a revoked permanent member there was no guest access.
+      new Setting(contentEl)
+        .setName(`${this.grantTarget.displayName} (${this.grantTarget.email})`)
+        .setDesc(
+          "This will re-enable their organization account as a viewer, consuming a seat, " +
+          "and grant NEW temporary guest access to the vaults you select below for the " +
+          "number of days you choose. They will have to sign in again. " +
+          "To re-enable the account without granting any vault access, use Reactivate user instead."
+        );
+    } else {
+      new Setting(contentEl)
+        .setName(this.i18n.t("guest.email.name"))
+        .setDesc(this.i18n.t("guest.email.description"))
+        .addText((text) =>
+          text
+            .setPlaceholder(this.i18n.t("guest.email.placeholder"))
+            .onChange((value) => {
+              this.email = value;
+            })
+        );
+    }
 
     const accessDetails = contentEl.createDiv({ cls: "vaultguard-invite-access-details" });
     let renderVersion = 0;
@@ -476,38 +692,48 @@ class InviteUserModal extends Modal {
       }
     };
 
-    new Setting(contentEl)
-      .setName(this.i18n.t("guest.accessType.name"))
-      .setDesc(this.i18n.t("guest.accessType.description"))
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("member", this.i18n.t("guest.member"))
-          .addOption("guest", this.i18n.t("guest.guest"))
-          .setValue(this.accessKind)
-          .onChange((value) => {
-            this.accessKind = value === "guest" ? "guest" : "member";
-            void renderAccessDetails();
-          })
-      );
+    // No access-type choice on the grant path: the whole point of the control
+    // is temporary access, and offering "permanent member" here would let one
+    // gesture hand a revoked identity a standing seat by accident.
+    if (!this.grantTarget) {
+      new Setting(contentEl)
+        .setName(this.i18n.t("guest.accessType.name"))
+        .setDesc(this.i18n.t("guest.accessType.description"))
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("member", this.i18n.t("guest.member"))
+            .addOption("guest", this.i18n.t("guest.guest"))
+            .setValue(this.accessKind)
+            .onChange((value) => {
+              this.accessKind = value === "guest" ? "guest" : "member";
+              void renderAccessDetails();
+            })
+        );
+    }
     contentEl.appendChild(accessDetails);
     await renderAccessDetails();
     if (!this.active) return;
 
-    new Setting(contentEl)
-      .setName(this.i18n.t("guest.welcome.name"))
-      .setDesc(this.i18n.t("guest.welcome.description"))
-      .addToggle((toggle) =>
-        toggle.setValue(this.sendWelcomeEmail).onChange((value) => {
-          this.sendWelcomeEmail = value;
-        })
-      );
+    // No welcome-email toggle on the grant path: the server already suppresses
+    // that template when attaching to an existing identity, so offering the
+    // choice would promise something that cannot happen.
+    if (!this.grantTarget) {
+      new Setting(contentEl)
+        .setName(this.i18n.t("guest.welcome.name"))
+        .setDesc(this.i18n.t("guest.welcome.description"))
+        .addToggle((toggle) =>
+          toggle.setValue(this.sendWelcomeEmail).onChange((value) => {
+            this.sendWelcomeEmail = value;
+          })
+        );
+    }
 
     const actionRow = contentEl.createDiv({ cls: "vaultguard-modal-actions" });
     new ButtonComponent(actionRow)
       .setButtonText(this.i18n.t("common.cancel"))
       .onClick(() => this.close());
     this.inviteButton = new ButtonComponent(actionRow)
-      .setButtonText(this.i18n.t("guest.send"))
+      .setButtonText(this.grantTarget ? "Grant guest access" : this.i18n.t("guest.send"))
       .setCta()
       .onClick(() => this.handleInvite());
   }
@@ -538,6 +764,11 @@ class InviteUserModal extends Modal {
         new Notice(this.i18n.t("guest.selectVault"));
         return;
       }
+    }
+
+    if (this.grantTarget) {
+      await this.handleGrantGuestAccess(this.grantTarget);
+      return;
     }
 
     this.inviteButton?.setDisabled(true).setButtonText(this.i18n.t("common.loading"));
@@ -578,6 +809,53 @@ class InviteUserModal extends Modal {
         this.contentEl.setAttribute("aria-busy", "false");
         this.inviteButton?.setDisabled(false).setButtonText(this.i18n.t("guest.send"));
       }
+    }
+  }
+
+  /**
+   * Runs the reactivate-then-guest-invite sequence and reports the outcome.
+   *
+   * The sequence itself lives in `grantGuestAccessToRevokedUser` so it is
+   * testable; this method only collects the form's values and turns the result
+   * into notices.
+   */
+  private async handleGrantGuestAccess(target: GuestAccessGrantTarget): Promise<void> {
+    this.inviteButton?.setDisabled(true).setButtonText(this.i18n.t("common.loading"));
+    this.contentEl.setAttribute("aria-busy", "true");
+
+    const outcome = await grantGuestAccessToRevokedUser(this.apiClient, {
+      userId: target.id,
+      email: target.email,
+      role: target.role,
+      vaultIds: [...this.selectedVaultIds],
+      expiresInDays: this.expiresInDays,
+    });
+
+    if (!this.active) return;
+
+    if (outcome.status === "granted") {
+      new Notice(
+        `${target.displayName} has been re-enabled and granted guest access for ${this.expiresInDays} days.`
+      );
+      await this.onInvited();
+      if (!this.active) return;
+      this.close();
+      return;
+    }
+
+    if (outcome.status === "reactivate-failed") {
+      // Nothing changed, so the message must not imply otherwise.
+      new Notice(`Could not re-enable ${target.displayName}, so no access was granted: ${outcome.message}`);
+    } else {
+      // The three-fact compensation warning. Held on screen: it describes a
+      // billable state the operator has to act on.
+      new Notice(`${target.displayName}: ${outcome.message}`, 15_000);
+      await this.onInvited();
+    }
+
+    if (this.active && this.contentEl.isConnected) {
+      this.contentEl.setAttribute("aria-busy", "false");
+      this.inviteButton?.setDisabled(false).setButtonText("Grant guest access");
     }
   }
 }

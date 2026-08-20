@@ -197,7 +197,12 @@ export async function createHumanVerificationAttempt(
   const nowMs = input.nowMs ?? Date.now();
   const attemptId = input.attemptId ?? randomUUID();
   const expectedAction = actionForPurpose(input.purpose);
-  const expectedCdata = `${input.purpose}:${attemptId}`;
+  // Turnstile only accepts [a-zA-Z0-9_-] in cData, so the widget cannot mint a
+  // challenge carrying a `:`. Must stay identical to the `cData` passed to
+  // turnstile.render() in admin-panel's LoginPage and
+  // HumanVerificationCompletionPage — verifyTurnstileProof compares the
+  // provider-returned cdata byte-for-byte.
+  const expectedCdata = `${input.purpose}_${attemptId}`;
   const expiresAtMs = nowMs + ATTEMPT_TTL_MS;
   const record: HumanVerificationAttemptRecord = {
     sessionId: attemptKey(attemptId),

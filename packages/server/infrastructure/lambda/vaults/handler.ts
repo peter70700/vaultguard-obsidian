@@ -66,6 +66,7 @@ import {
   PERMISSIONS_TABLE,
   LEASES_TABLE,
 } from '../shared/utils';
+import { guestAccessExpiresAt, isExpiringAccessActive } from '../shared/guest-access';
 
 // Required env var — empty-string fallback would let Cognito calls fail
 // confusingly downstream rather than at module load. Match the pattern in
@@ -566,7 +567,22 @@ async function handleAddMember(
     : vault.defaultRole;
 
   const existing = await getStoredVaultMembership(vaultId, targetUserId);
-  if (existing) {
+  const nowMs = Date.now();
+  // DR-4: an elapsed guest row is a tombstone, not a membership, so it must not
+  // block the same person being added as a real member. Everything else still
+  // 409s -- an ACTIVE guest fails the expiry clause, and any permanent
+  // membership fails the accessKind clause (including a legacy row carrying no
+  // accessKind at all, since 'guest' !== undefined). A guest row with no expiry
+  // counts as permanent access and is therefore NOT reclaimable. The shared
+  // predicate below is the only expiry comparison on this path; do not inline a
+  // second one.
+  const reclaimedGuestExpiry =
+    existing?.accessKind === 'guest' && !isExpiringAccessActive(existing.expiresAt, nowMs)
+      ? existing.expiresAt
+      : undefined;
+  const reclaimedExpiredGuest = reclaimedGuestExpiry !== undefined;
+
+  if (existing && !reclaimedExpiredGuest) {
     return formatError(409, `User ${targetUserId} is already a member of this vault.`, requestId);
   }
 
@@ -579,12 +595,47 @@ async function handleAddMember(
     invitedBy: user.userId,
   };
 
-  await docClient.send(
-    new PutCommand({
-      TableName: VAULT_MEMBERS_TABLE,
-      Item: membership,
-    })
-  );
+  // Both write paths are conditional. The reclaim pins the exact row that was
+  // read, so a concurrent guest re-invite that rewrote the expiry wins the race
+  // instead of being silently overwritten; the fresh add closes the pre-existing
+  // get-then-put TOCTOU where two concurrent adds could both succeed.
+  const writeGuard =
+    reclaimedGuestExpiry !== undefined
+      ? {
+          ConditionExpression: '#kind = :guest AND expiresAt = :expiresAt',
+          ExpressionAttributeNames: { '#kind': 'accessKind' },
+          ExpressionAttributeValues: { ':guest': 'guest', ':expiresAt': reclaimedGuestExpiry },
+        }
+      : {
+          ConditionExpression: 'attribute_not_exists(vaultId) AND attribute_not_exists(userId)',
+        };
+
+  try {
+    // A whole-item Put, never an in-place edit: replacing the item is what drops
+    // the stale expiry off a reclaimed row. Editing it in place would hand back a
+    // permanent member still carrying an expiry, which every fail-closed layer
+    // would then honour -- silent, invisible access loss.
+    await docClient.send(
+      new PutCommand({
+        TableName: VAULT_MEMBERS_TABLE,
+        Item: membership,
+        ...writeGuard,
+      })
+    );
+  } catch (error) {
+    if ((error as { name?: string }).name === 'ConditionalCheckFailedException') {
+      return formatError(409, `User ${targetUserId} is already a member of this vault.`, requestId);
+    }
+    throw error;
+  }
+
+  // Ordering is load-bearing: the stale guest rule must go BEFORE the default
+  // rule is written. The two-rule cleanup helper used on removal is deliberately
+  // not reachable from here -- it would also drop the rule the upsert below
+  // creates, leaving a member who can read nothing.
+  if (reclaimedExpiredGuest) {
+    await deleteGuestPermissionRule(vaultId, targetUserId);
+  }
 
   await upsertDefaultMemberPermission(
     vault,
@@ -603,7 +654,7 @@ async function handleAddMember(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { vaultId, targetUserId, role },
+    metadata: { vaultId, targetUserId, role, reclaimedExpiredGuest },
   });
 
   return formatSuccess(201, { membership }, requestId);
@@ -621,6 +672,130 @@ async function handleUpdateMember(
   const vault = await requireVaultMember(user, vaultId, 'admin');
 
   const body = parseBody(event);
+
+  // DR-6. This route now carries TWO mutually exclusive mutations: the role
+  // change it has always done, and pushing a temporary member's boundary out.
+  // A body naming both is rejected rather than silently honouring one, because
+  // the combination is meaningless -- temporary access cannot be promoted in
+  // place (the 409 further down), so there is no request that legitimately
+  // wants both. Neither field present still falls through to the role branch
+  // and fails with the message this route has always returned.
+  const wantsExtension = body.expiresInDays !== undefined;
+  if (wantsExtension && body.role !== undefined) {
+    throw new ValidationError(
+      'Send either role or expiresInDays, not both.',
+      'expiresInDays'
+    );
+  }
+
+  if (wantsExtension) {
+    const stored = await getStoredVaultMembership(vaultId, targetUserId);
+    if (!stored) {
+      return formatError(404, `User ${targetUserId} is not a member of this vault.`, requestId);
+    }
+    // A permanent membership has no boundary to move. The message names the
+    // shape of the row rather than the caller's role or the target's history.
+    if (stored.accessKind !== 'guest') {
+      return formatError(409, 'Only temporary access carries an expiry date.', requestId);
+    }
+
+    // THE ONLY duration check on this route, deliberately. Routing through the
+    // invite path's own helper is what makes the two agree on the accepted
+    // range forever; a bound re-stated here would be free to drift away from
+    // the one the invite enforces.
+    const nowMs = Date.now();
+    let extendedTo: string;
+    try {
+      extendedTo = guestAccessExpiresAt(body.expiresInDays as number, nowMs);
+    } catch (error) {
+      if (error instanceof RangeError) {
+        throw new ValidationError(error.message, 'expiresInDays');
+      }
+      throw error;
+    }
+
+    try {
+      await docClient.send(
+        new UpdateCommand({
+          TableName: VAULT_MEMBERS_TABLE,
+          Key: { vaultId, userId: targetUserId },
+          UpdateExpression: 'SET expiresAt = :expiresAt',
+          // Re-asserted at write time: a row promoted or replaced between the
+          // read above and this update must never be handed an expiry, which
+          // would silently put a permanent member on a countdown.
+          ConditionExpression: '#kind = :guest',
+          ExpressionAttributeNames: { '#kind': 'accessKind' },
+          ExpressionAttributeValues: { ':expiresAt': extendedTo, ':guest': 'guest' },
+        })
+      );
+    } catch (error) {
+      if ((error as { name?: string }).name === 'ConditionalCheckFailedException') {
+        return formatError(409, 'Only temporary access carries an expiry date.', requestId);
+      }
+      throw error;
+    }
+
+    // Row and rule must carry the SAME boundary. A rule outliving its row
+    // grants nothing extra (every enforcement site reads the row too), but a
+    // row outliving its rule is a member who can read nothing. Deliberately
+    // NOT an upsert: minting a missing rule here would hand back access no
+    // admin granted, so a missing rule is reported to the caller instead.
+    //
+    // No TTL attribute is written. The Permissions table has a live TTL, and
+    // putting this boundary on it would let DynamoDB delete the rule on its
+    // own best-effort schedule, out from under the expiry sweeper.
+    let permissionRuleUpdated = false;
+    try {
+      await docClient.send(
+        new UpdateCommand({
+          TableName: PERMISSIONS_TABLE,
+          Key: {
+            pk: guestMemberPermissionRuleId(vaultId, targetUserId),
+            sk: DEFAULT_MEMBER_RULE_SK,
+          },
+          UpdateExpression: 'SET expiresAt = :expiresAt, updatedAt = :now',
+          ConditionExpression: 'attribute_exists(pk) AND attribute_exists(sk)',
+          ExpressionAttributeValues: {
+            ':expiresAt': extendedTo,
+            ':now': new Date(nowMs).toISOString(),
+          },
+        })
+      );
+      permissionRuleUpdated = true;
+    } catch (error) {
+      if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
+      console.error('[VAULTS_MEMBER_EXTEND_RULE_MISSING]', { vaultId, targetUserId });
+    }
+
+    await logAudit({
+      userId: user.userId,
+      userEmail: user.email,
+      orgId: vault.orgId,
+      action: 'vault.guest_access_extended',
+      resourcePath: `/vaults/${vaultId}/members/${targetUserId}`,
+      outcome: 'success',
+      ipAddress: getClientIp(event),
+      userAgent: getUserAgent(event),
+      metadata: {
+        vaultId,
+        targetUserId,
+        expiresInDays: body.expiresInDays,
+        previousExpiresAt: stored.expiresAt ?? null,
+        newExpiresAt: extendedTo,
+        permissionRuleUpdated,
+      },
+    });
+
+    return formatSuccess(
+      200,
+      {
+        membership: { ...stored, expiresAt: extendedTo },
+        permissionRuleUpdated,
+      },
+      requestId
+    );
+  }
+
   if (typeof body.role !== 'string' || !VALID_ROLES.includes(body.role as VaultMemberRole)) {
     throw new ValidationError('role must be viewer, editor, or admin.', 'role');
   }
@@ -999,6 +1174,35 @@ function sanitizePluginAllowlist(
   return out;
 }
 
+/**
+ * The guest permission-rule id. MUST stay byte-identical to
+ * `guestPermissionRuleId` in users/handler.ts (and, from 17-08, the one in
+ * shared/access-revocation.ts): divergent spellings of this key are exactly how
+ * a cleanup sweeper silently misses rows. `tests/access-revocation.test.ts`
+ * source-scans every such template under infrastructure/lambda and fails if any
+ * two disagree (W7).
+ */
+function guestMemberPermissionRuleId(vaultId: string, userId: string): string {
+  return `guest-invite#${vaultId}#${userId}`;
+}
+
+/**
+ * Deletes ONLY the guest rule, leaving the `vault-member-default` rule alone.
+ *
+ * Why this exists rather than reusing `deleteMemberPermissions`: that helper
+ * deletes BOTH rule ids for a guest, so calling it during a DR-4 reclaim would
+ * destroy the default rule the reclaim is about to create via
+ * `upsertDefaultMemberPermission`, leaving a member who can read nothing.
+ */
+async function deleteGuestPermissionRule(vaultId: string, userId: string): Promise<void> {
+  await docClient.send(
+    new DeleteCommand({
+      TableName: PERMISSIONS_TABLE,
+      Key: { pk: guestMemberPermissionRuleId(vaultId, userId), sk: DEFAULT_MEMBER_RULE_SK },
+    })
+  );
+}
+
 async function deleteMemberPermissions(
   vaultId: string,
   userId: string,
@@ -1006,7 +1210,7 @@ async function deleteMemberPermissions(
 ): Promise<void> {
   const ruleIds = [defaultMemberPermissionRuleId(vaultId, userId)];
   if (accessKind === 'guest') {
-    ruleIds.push(`guest-invite#${vaultId}#${userId}`);
+    ruleIds.push(guestMemberPermissionRuleId(vaultId, userId));
   }
   await Promise.all(ruleIds.map((ruleId) => docClient.send(
     new DeleteCommand({

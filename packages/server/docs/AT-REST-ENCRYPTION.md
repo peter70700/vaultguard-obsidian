@@ -132,6 +132,51 @@ paths.
 - **A malicious process running as the same OS user**: it can read
   the keychain entry the same way the plugin does. Mitigate via OS
   process isolation; out of scope.
+- **A different VaultGuard account on the same OS user and folder,
+  short of switching over**: the LAK is scoped to the device+folder,
+  never to an account, and it unlocks before login — so within one OS
+  user, account identity provides no cryptographic separation at rest.
+  What VaultGuard *does* enforce is the switchover itself: a confirmed
+  different account is never allowed to adopt the existing key. When
+  the new account is a member of the bound vault AND this device
+  detects nothing unsynced (offline-queued edits, pending large-file
+  uploads, unconfirmed local deletes, conflicts, edits made while the
+  folder was paused) AND every local file is confirmed present in the
+  server vault's listing, the local reset (wipe, fresh LAK, re-pull —
+  `resetLocalAtRestAndResync`, `account-takeover` mode) runs
+  automatically: it destroys only server-recoverable cache. When
+  unsynced changes are detected, or any local file cannot be confirmed
+  as synced with the new account, one dialog names them — unsynced
+  changes listed separately from could-not-confirm files (the listing
+  is permission-filtered, so absence is not proof a file never synced)
+  — and offers "Discard and switch" or "Keep working locally", the
+  loud paused local-only state. A non-member lands the wrong-account
+  state, whose action is logging in as a different account; switching
+  the folder's vault stays available from VaultGuard settings. One
+  honest residue: modified content that was never uploaded — whether
+  its tracking record was dropped at an earlier logout or it was
+  changed outside Obsidian — cannot be enumerated (the paths still
+  exist server-side) and is removed exactly as before.
+  The same account re-pointing this folder at a **different server
+  vault** is the same problem wearing different clothes — the local
+  cache belongs to the vault being left, so it is replaced rather than
+  merged — and it runs the same cleanliness gate and the same reset
+  (`vault-switch` mode, which issues no server DELETEs: the vault being
+  left keeps its own copy). Two lanes reach it. An ordinary switch is
+  gated *before* the binding changes, so declining simply cancels the
+  switch. A **blocked** binding — one whose signed-in account is no
+  longer a member of the vault it is bound to, without any account
+  change — is resolved by connecting a different vault, which flips the
+  binding first and only then asks; there, declining leaves the folder
+  connected to the new vault, paused and still holding the previous
+  vault's files, and the dialog says exactly that. That lane
+  practically always asks rather than purging automatically: it is
+  reachable only when the server has just denied this account on the
+  vault being left, so the file-by-file cross-check against that vault
+  cannot run and nothing can be proven already safe to discard. You
+  cannot discard what you cannot prove is safe to discard.
+  Multi-user machines should still use separate OS accounts; that is
+  the boundary that genuinely holds.
 - **Memory inspection of a running Obsidian**: decrypted content
   lives in process memory while Obsidian is rendering it.
 - **Use without the plugin**: uninstalling or disabling VaultGuard does not
@@ -165,6 +210,9 @@ OS keychain (macOS Keychain / Windows DPAPI / Linux libsecret)
             │
             └─▶ LAK (Local At-rest Key)
                  ─ AES-256, generated once per device-vault binding
+                   (replaced — never carried over — when a different
+                   account takes over the folder, and by the
+                   needs-recovery reset)
                  ─ Stored at .obsidian/plugins/vaultguard-sync/lak.envelope
                    (wrapped by safeStorage; binary-opaque on disk)
                  ─ Device-wrapped copy may also be carried inside an

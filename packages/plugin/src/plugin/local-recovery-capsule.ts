@@ -29,6 +29,14 @@ export interface LocalRecoveryBindingHint {
   serverVaultSlug?: string;
   organizationId?: string;
   accountUserId?: string;
+  /**
+   * Display only, so a returning session can NAME the account that connected
+   * this folder instead of saying "a different account". Lives in the
+   * authenticated capsule alongside `accountUserId` — never in the vault-root
+   * manifest, which stays non-secret. Optional: capsules written before this
+   * field existed simply fall back to the anonymous wording.
+   */
+  accountEmail?: string;
 }
 
 export interface LocalRecoveryConnectionHint {
@@ -259,6 +267,7 @@ function validateDeviceState(value: unknown): LocalRecoveryDeviceState | null {
       "serverVaultSlug",
       "organizationId",
       "accountUserId",
+      "accountEmail",
     ] as const) {
       const candidate = value.binding[key];
       if (candidate !== undefined && !isNonEmptyString(candidate, 512)) return null;

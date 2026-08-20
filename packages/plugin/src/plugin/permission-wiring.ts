@@ -33,7 +33,12 @@ export function initFilePermissionHeader(
 
   const filePermissionHeader = new FilePermissionHeader({
     app: ctx.app,
-    apiClient: ctx.apiClient,
+    // LIVE getter, not `ctx.apiClient` (quick-260820-mv4). The null-check
+    // above is a construction gate only; this surface outlives every
+    // `rebuildApiClient()` and must read the client that exists at call time,
+    // or it keeps querying the vault this folder was bound to BEFORE a
+    // rebind.
+    getApiClient: () => ctx.apiClient,
     currentUserId: ctx.session?.userId ?? "",
     currentUserEmail: ctx.session?.email ?? "",
     currentUserRole: ctx.getEffectiveUiRole(),
@@ -110,7 +115,8 @@ export function initFileExplorerDecorations(
 
   const fileExplorerDecorations = new FileExplorerDecorations({
     app: ctx.app,
-    apiClient: ctx.apiClient,
+    // LIVE getter — same contract as the header above (quick-260820-mv4).
+    getApiClient: () => ctx.apiClient,
     currentUserId: ctx.session?.userId ?? "",
     currentUserRole: ctx.getEffectiveUiRole(),
     isReady: () => ctx.isFileExplorerDecorationDataReady(),

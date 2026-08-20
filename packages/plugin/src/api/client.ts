@@ -299,6 +299,28 @@ export interface VaultMemberRecord {
   email?: string;
 }
 
+/**
+ * Response of an EXTEND — `PATCH /vaults/{vaultId}/members/{userId}` carrying
+ * `expiresInDays` and no other field.
+ *
+ * Declared narrowly beside `VaultMemberRecord` rather than widening the
+ * existing membership response: only this one mutation reports whether the
+ * guest's permission rule moved with the membership row, and a shared type
+ * would make the flag look available on responses that never carry it.
+ */
+export interface ExtendGuestAccessResult {
+  /** The stored membership with its new `expiresAt`. */
+  membership: VaultMemberRecord;
+  /**
+   * `false` when the guest's permission rule was missing, so the server moved
+   * the membership boundary but had nothing to move alongside it. The server
+   * deliberately does NOT mint a replacement — minting would hand back access
+   * no admin granted — so `false` is a real, reportable half-state: a member
+   * inside the vault with no rule to read through.
+   */
+  permissionRuleUpdated: boolean;
+}
+
 export interface ApiError {
   statusCode: number;
   message: string;
@@ -319,6 +341,13 @@ export interface UserListEntry {
   createdAt: string;
   mfaEnabled: boolean;
   deviceCount: number;
+  /**
+   * Guest access state, computed server-side across the whole org from
+   * VaultMembers (DR-1). Display only — the client must never re-derive it.
+   */
+  accessKind?: "member" | "guest";
+  /** Server-computed guest expiry, ISO-8601. Absent means no expiry. */
+  expiresAt?: string;
   type: "user";
 }
 
@@ -797,13 +826,23 @@ export class VaultGuardApiClient {
    * longer exists post-multi-vault rollout.
    */
   private vaultBase(): string {
-    if (!this.config.vaultId) {
+    return this.vaultScopedBase(this.config.vaultId);
+  }
+
+  /**
+   * The same guarantee as `vaultBase()`, for a vault named explicitly by the
+   * caller rather than read from the bound configuration. An empty id can
+   * never be interpolated into a path, so `/vaults//...` — a vault-unscoped
+   * call wearing a vault-scoped shape — is unreachable by construction.
+   */
+  private vaultScopedBase(vaultId: string): string {
+    if (!vaultId) {
       throw new Error(
         'VaultGuard: this Obsidian folder is not bound to a server vault yet. ' +
         'Open the VaultGuard sidebar to pick or create one.'
       );
     }
-    return `/vaults/${encodeURIComponent(this.config.vaultId)}`;
+    return `/vaults/${encodeURIComponent(vaultId)}`;
   }
 
   /** Returns the currently bound server vault ID, or empty string if unbound. */
@@ -869,6 +908,46 @@ export class VaultGuardApiClient {
     await this.request<void>(
       "DELETE",
       `/vaults/${encodeURIComponent(vaultId)}/members/${encodeURIComponent(userId)}`
+    );
+  }
+
+  /**
+   * Pushes a temporary member's expiry out — DR-6.
+   *
+   * Rides the SAME already-registered API Gateway resource the membership
+   * update has always used, which is why this feature adds no `cors_resources`
+   * entry. The server reads the two mutations apart by which field arrives:
+   * `expiresInDays` alone is an extend, and a body naming both is a 400. That
+   * is why the payload below carries exactly one key.
+   *
+   * The duration is checked here only enough to fail fast and locally on an
+   * obvious mistake. The authoritative 1-90 whole-day bound lives server-side
+   * in `guestAccessExpiresAt`, and restating it here would create a second
+   * source of truth free to drift away from the one the invite enforces.
+   *
+   * Goes through `this.request(...)` like every other method, so the transport
+   * is Obsidian's `requestUrl` — the Networking Rule holds.
+   *
+   * Preconditions the SERVER enforces, not this method: the membership must
+   * exist (404 otherwise) and must be temporary access (409 otherwise). A
+   * guest the sweeper has already torn down has no membership row at all, so
+   * this call is the wrong lever for that state — see the user list's
+   * grant-guest-access path.
+   */
+  async extendGuestAccess(
+    vaultId: string,
+    userId: string,
+    expiresInDays: number
+  ): Promise<ExtendGuestAccessResult> {
+    if (!Number.isInteger(expiresInDays) || expiresInDays < 1) {
+      throw new Error(
+        "VaultGuard: the extension must be a whole number of days, at least 1."
+      );
+    }
+    return this.request<ExtendGuestAccessResult>(
+      "PATCH",
+      `${this.vaultScopedBase(vaultId)}/members/${encodeURIComponent(userId)}`,
+      { expiresInDays }
     );
   }
 

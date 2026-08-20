@@ -18,6 +18,9 @@ import { LoginModal, LoginCredentials } from "./login-modal";
 import { completePluginHumanVerification } from "./auth-human-verification";
 import type { ConversationStore } from "../ui/chat/conversation-store";
 import { BindingReconciliationModal, ReconciliationDecision, ReconciliationPlan } from "./binding-reconciliation-modal";
+// Type-only: the modal itself is imported lazily at the one point of use, so a
+// startup that never hits an account change never pays for it.
+import type { AccountSwitchDiscardDecision } from "./account-switch-discard-modal";
 import { ShareManagementModal } from "./share-management-modal";
 import { PluginAllowlistModal, PluginAllowlistPrompt } from "./plugin-allowlist-modal";
 import { cognitoLogin, cognitoRespondToChallenge, cognitoRefresh, cognitoRevokeToken, cognitoAssociateSoftwareToken, cognitoVerifySoftwareToken, vaultguardForgotPassword, vaultguardConfirmReset, vaultguardVerifyRecoveryCode, devServerLogin, isLocalDevAuth, CognitoAuthResult } from "./cognito-auth";
@@ -25,6 +28,7 @@ import { MfaSetupModal } from "./mfa-setup-modal";
 import { deriveConnectionConfigFromTokenPayload } from "./session-config";
 import { AuthorizationError, VaultGuardApiClient } from "../api/client";
 import type {
+  ExtendGuestAccessResult,
   OrgSettingsResponse,
   PermissionRule,
   UserListEntry,
@@ -263,6 +267,30 @@ function getActiveObsidianDocument(): Document | null {
   return null;
 }
 
+/**
+ * The Notice's own message element — the element Obsidian created in the MAIN
+ * window's realm. Building notice content directly into it is what makes a
+ * notice realm-safe: Obsidian's `Element.prototype.setText` only appends a
+ * message that passes `instanceof DocumentFragment || instanceof Node` against
+ * the MAIN window's globals, so a fragment built from a popped-out window's own
+ * document (a separate JS realm) silently stringifies to the literal
+ * "[object DocumentFragment]". Writing into `messageEl` removes the realm
+ * question entirely rather than papering over it.
+ *
+ * `messageEl` is `@since 1.8.7` and manifest.json's `minAppVersion` is `1.11.5`,
+ * so it is ALWAYS present in any supported Obsidian — deliberately no version
+ * guard and no `noticeEl` fallback. The `null` return exists solely for headless
+ * harnesses where `Notice` is a `vi.fn()` stub with no `messageEl`.
+ *
+ * Duplicated per module per repo convention (no cross-module barrel imports for
+ * tiny helpers) — at-rest-adapter-runtime.ts carries the same helper.
+ */
+function noticeBody(notice: Notice): HTMLElement | null {
+  const el = (notice as { messageEl?: HTMLElement }).messageEl;
+  if (!el || typeof el.createEl !== "function") return null;
+  return el;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -377,6 +405,14 @@ type VaultBindingAuthorizationState =
   | "unbound"
   | "unverified"
   | "verified"
+  // A DIFFERENT account is signed in than the one that last verified this
+  // folder. Deliberately NOT "wrong-account": the local expectation is a
+  // conservative pre-flight, not an authorization answer — the LAK is
+  // device-local, so the same OS user decrypts this folder whichever account is
+  // signed in, and `/vaults/{vaultId}` membership is the real boundary. Sync
+  // stays hard-stopped until the user confirms, then the SERVER decides.
+  | "account-changed"
+  // A definitive 403/404 from `/vaults/{vaultId}` for this identity.
   | "wrong-account";
 
 /**
@@ -497,6 +533,19 @@ interface RemoteFileContentResponse {
 // ─────────────────────────────────────────────────────────────────────────────
 // Main Plugin Class
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Obsidian's desktop adapter surfaces fs errors either as a
+ * NodeJS.ErrnoException (code === "ENOENT") or as a plain Error carrying the
+ * ENOENT text in its MESSAGE with no `code` property at all (the live
+ * capsule-race repro had the latter shape). Both mean the same thing here:
+ * the file is already gone.
+ */
+function isFileAlreadyMissingError(error: unknown): boolean {
+  if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /enoent|no such file/i.test(message);
+}
 
 /**
  * VaultGuard Plugin - Enterprise vault security with permission-aware
@@ -745,8 +794,63 @@ export default class VaultGuardPlugin extends Plugin {
   private localRecoveryNeedsLakValidation = false;
   /** Account identity sealed in the capsule; never exposed through the manifest. */
   private localRecoveryExpectedAccountUserId: string | null = null;
+  /** Same capsule, display only: lets the account-change prompt NAME that account. */
+  private localRecoveryExpectedAccountEmail: string | null = null;
+  /** One account-change prompt per signed-in identity — no modal storm on retry. */
+  private accountChangePromptedForUserId: string | null = null;
+  /** Sticky "working locally only" notice for a deferred account decision; one at a time. */
+  private accountChangePausedNotice: Notice | null = null;
+
+  /**
+   * Sticky notice for a binding whose INITIAL RECONCILIATION never completed
+   * (quick-260820-mv4). Tracked and deduped like the account-changed pair so
+   * it can be replaced on a retry and dropped the moment sync actually
+   * starts, instead of stacking one stale toast per attempt.
+   */
+  private reconciliationPausedNotice: Notice | null = null;
+  /**
+   * Sticky wrong-account notice, tracked so it can never outlive the state it
+   * describes (quick-260820-ki7 stale-toast fix): hidden on forceLogout, on
+   * completeLogin entry, on verify success, and on the transition into
+   * account-changed. Deduped — a re-probe replaces instead of stacking.
+   */
+  private wrongAccountNotice: Notice | null = null;
+  /**
+   * Single-writer latch for the recovery-capsule store. persist()'s
+   * crash-safety rotation (next → current → previous) assumes ONE writer; two
+   * interleaved rotations race the same three slot files and the loser aborts
+   * mid-rotation (handoff 2026-08-19 §2: ENOENT ×2 unlinking previous.v1.json
+   * right after "Pick a different vault"). Both capsule wrappers serialize
+   * through this chain; the ...Now() bodies must never be called directly.
+   */
+  private localRecoveryCapsuleOpChain: Promise<unknown> = Promise.resolve();
+  /** A queued-but-not-started capsule persist that later callers may share. */
+  private queuedLocalRecoveryCapsulePersist: Promise<boolean> | null = null;
   /** Exact `/vaults/{vaultId}` authorization gate for every sync/content path. */
-  private vaultBindingAuthorization: VaultBindingAuthorizationState = "unbound";
+  private vaultBindingAuthorizationState: VaultBindingAuthorizationState = "unbound";
+
+  /**
+   * Accessor pair, not a bare field (quick-260820-nqm). The ribbon's
+   * blocked-binding badge has to track this value, and it is written from 17
+   * places across restore, verify, probe, logout and binding changes — an
+   * explicit refresh at each one is a rule that a future 18th site would
+   * silently break, which is exactly how the badge came to be missing in the
+   * first place. Routing every write through the setter makes the refresh
+   * complete by construction.
+   *
+   * The refresh is skipped until the ribbon elements exist, so writes during
+   * early startup (before `onload` wires the ribbons, and before settings are
+   * loaded) stay inert.
+   */
+  private get vaultBindingAuthorization(): VaultBindingAuthorizationState {
+    return this.vaultBindingAuthorizationState;
+  }
+
+  private set vaultBindingAuthorization(next: VaultBindingAuthorizationState) {
+    if (this.vaultBindingAuthorizationState === next) return;
+    this.vaultBindingAuthorizationState = next;
+    if (this.vaultGuardRibbonEl) this.updateRibbonAuthIndicator();
+  }
 
   /** Serializes saveData writes so settings and session updates do not clobber each other */
   private pluginDataSaveQueue: Promise<void> = Promise.resolve();
@@ -910,6 +1014,13 @@ export default class VaultGuardPlugin extends Plugin {
   /** Debounces the "Limited access" Notice so it isn't shown more than once per minute. */
   private lastLimitedAccessNoticeAt = 0;
   private lastSessionDegradedNoticeAt = 0;
+  /**
+   * Throttle for the transient "vault could not be verified right now" Notice.
+   * That branch is now reachable from the reconnect loop rather than once per
+   * startup, so it needs the same 60 s window the other degraded-state notices
+   * use — the retry is meant to be quiet until it either heals or the user acts.
+   */
+  private lastBindingUnverifiedNoticeAt = 0;
 
   /**
    * P2: mobile has no status bar, so a needs-recovery cipher used to be
@@ -983,6 +1094,28 @@ export default class VaultGuardPlugin extends Plugin {
    * before making destructive denied-read decisions.
    */
   private sessionResumePromise: Promise<void> | null = null;
+
+  /**
+   * True once the server side of this session is fully up: monitors started,
+   * vault binding verified, lease resolved, status flipped online.
+   *
+   * `restoreServerSession` has several early returns and one rethrow that land
+   * before all of that, and none of them leave a mark — so "we have a session"
+   * and "the session is actually usable" used to be indistinguishable, and a
+   * half-finished resume was simply never finished. `attemptReconnection` reads
+   * this to decide whether a successful probe should also re-drive the resume.
+   * Reset by `forceLogout`; a fresh `completeLogin` sets it directly.
+   */
+  private serverSessionResumeComplete = false;
+
+  /**
+   * Consecutive resumes that ended without completing. Feeds the reconnect
+   * backoff so a resume that keeps failing over a REACHABLE backend still backs
+   * off to the 2-minute ceiling instead of retrying every few seconds —
+   * `connectionState.failedAttempts` cannot do that job alone because the
+   * "online" flip that precedes each re-drive resets it to 0.
+   */
+  private incompleteResumeRetries = 0;
 
   /** Status bar element reference */
   private statusBarEl: HTMLElement | null = null;
@@ -1187,6 +1320,26 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Queue of operations made while offline */
   private offlineQueue: OfflineQueueOperation[] = [];
+
+  /**
+   * Awaitable handle for the SY5 offline-queue envelope restore
+   * (quick-260820-ki7). Startup stays fire-and-forget, but the takeover
+   * lane's cleanliness check must positively know the restore finished
+   * before trusting an empty in-memory queue — a null handle (load never
+   * started: early lifecycle, harness) is treated as indeterminate, NOT
+   * clean.
+   */
+  private offlineQueueLoadPromise: Promise<void> | null = null;
+
+  /**
+   * Paths mutated while the binding sat in a blocked state
+   * (`account-changed` / `wrong-account`) — the belt-and-braces live-window
+   * tracker for edits the offline queue never sees (external adds/modifies
+   * Obsidian observes during the blocked window; quick-260820-ki7). Feeds
+   * collectUnsyncedLocalChanges; cleared on verify success, forceLogout, and
+   * discardUnsyncedLocalChanges.
+   */
+  private blockedStateLocalEdits = new Set<string>();
 
   /** SY5: debounce handle for persisting the offline queue envelope. */
   private offlineQueuePersistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1472,6 +1625,9 @@ export default class VaultGuardPlugin extends Plugin {
       decodeRemoteFileContent: (path, data) =>
         this.decodeRemoteFileContent(path, data),
       decodeBase64Utf8: (base64) => this.decodeBase64Utf8(base64),
+      isVaultBindingWireBlocked: () =>
+        this.vaultBindingAuthorization === "account-changed" ||
+        this.vaultBindingAuthorization === "wrong-account",
       emitAuditEvent: (action, resourcePath, metadata) =>
         this.emitAuditEvent(action as AuditAction, resourcePath, metadata),
       log: (message) => this.log(message),
@@ -1574,6 +1730,8 @@ export default class VaultGuardPlugin extends Plugin {
         this.recordRemoteFilePresent(path, update),
       recordRemoteFileAbsent: (path) => this.recordRemoteFileAbsent(path),
       performInitialReconciliation: () => this.performInitialReconciliation(),
+      showReconciliationPausedNotice: (reason) => this.showReconciliationPausedNotice(reason),
+      hideReconciliationPausedNotice: () => this.hideReconciliationPausedNotice(),
       registerFolderLifecycleListeners: () => this.registerFolderLifecycleListeners(),
       performSync: (options) => this.performSync(options),
       buildLocalSyncManifest: () => this.buildLocalSyncManifest(),
@@ -1920,6 +2078,9 @@ export default class VaultGuardPlugin extends Plugin {
       get syncTimerAlive() {
         return !!thisPlugin.syncTimer;
       },
+      get localOnlyCatchupCompleted() {
+        return thisPlugin.localOnlyCatchupCompleted;
+      },
       get keyLease() {
         return thisPlugin.keyLease;
       },
@@ -2077,6 +2238,7 @@ export default class VaultGuardPlugin extends Plugin {
                 totalAttachments: 0,
                 analyzed: [],
               }),
+      ensureParentFoldersForPath: (path) => this.ensureParentFoldersForPath(path),
       logError: (message, error) => this.logError(message, error),
     };
   }
@@ -2469,8 +2631,13 @@ export default class VaultGuardPlugin extends Plugin {
     // SY5: restore queued offline operations (LAK-encrypted envelope) so
     // limited-access/offline edits survive a restart instead of evaporating
     // with the in-memory queue. Fire-and-forget — it waits for cipher init
-    // internally and merges under any ops queued while it loads.
-    void this.loadPersistedOfflineQueue();
+    // internally and merges under any ops queued while it loads. The handle
+    // is kept so collectUnsyncedLocalChanges can await the restore before
+    // trusting an empty queue (quick-260820-ki7); the method catches
+    // internally, and the defensive no-op catch keeps an unhandled rejection
+    // structurally impossible.
+    this.offlineQueueLoadPromise = this.loadPersistedOfflineQueue().catch(() => undefined);
+    void this.offlineQueueLoadPromise;
     void this.loadPersistedRemoteFileState();
 
     // Restore session — synchronous safeStorage path first, async at-rest
@@ -2517,6 +2684,15 @@ export default class VaultGuardPlugin extends Plugin {
       hasServerVaultId: !!this.settings.serverVaultId,
     });
     this.registerFolderLifecycleListeners();
+
+    // Blocked-window mutation tracker (quick-260820-ki7): while the binding
+    // sits blocked (account-changed / wrong-account), stamp every vault
+    // mutation Obsidian observes so the takeover lane's cleanliness check can
+    // refuse the automatic reset. Registered in onload unconditionally,
+    // mirroring the folder-lifecycle listeners above (c2be477) — a listener
+    // that only exists when the sync engine initialized would miss exactly
+    // the blocked sessions it is for.
+    this.registerBlockedWindowMutationTracker();
 
     // Auto-encrypt externally-added files (Finder drops, git checkouts,
     // other tools writing into the vault folder): Obsidian indexes them and
@@ -2616,6 +2792,14 @@ export default class VaultGuardPlugin extends Plugin {
         if (this.sessionResumePromise === resumePromise) {
           this.sessionResumePromise = null;
         }
+        // THE STARTUP BACKSTOP. `resumeStoredSession` has several early returns
+        // and one rethrow (`restoreServerSession` → `openServerSession` throws
+        // on any non-2xx or network failure) that land BEFORE
+        // `startHeartbeatMonitor()` / `startKeyRenewalMonitor()` and before the
+        // "online" flip. Reaching here unfinished therefore means the process
+        // owns a session but has no liveness loop of any kind. Put a probe on
+        // the schedule; `attemptReconnection` finishes the resume from there.
+        this.armResumeRetryIfIncomplete();
       });
     }
 
@@ -5054,6 +5238,10 @@ export default class VaultGuardPlugin extends Plugin {
     this.beginSessionEpoch();
     this.session = session;
     this.clearLogoutAuthState();
+    // A fresh session entry supersedes any standing wrong-account toast —
+    // that verdict was about the previous identity (quick-260820-ki7
+    // stale-toast fix); this identity gets its own answer below.
+    this.hideWrongAccountNotice();
     // POST /auth/session no longer issues a key lease — leases are vault-scoped
     // and are requested explicitly via /auth/key-lease/scoped after the vault
     // binding is resolved. This eliminates the org-wide DEK that used to leak
@@ -5092,6 +5280,8 @@ export default class VaultGuardPlugin extends Plugin {
       this.stopKeyRenewalMonitor();
       this.stopHeartbeatMonitor();
       this.setConnectionStatus("offline", { scheduleRetry: false, notify: false });
+      // Offline here is the intended end state, not a failure to recover from.
+      this.serverSessionResumeComplete = true;
       new Notice(`VaultGuard Sync: Logged in as ${session.displayName}; ${LOCAL_PROJECT_MEMORY_MODE_NOTICE}`, 8000);
       return;
     }
@@ -5142,6 +5332,10 @@ export default class VaultGuardPlugin extends Plugin {
       // flip online because the API is reachable and other endpoints
       // (sidebar, audit, share-link mgmt) continue to work without a DEK.
       this.setConnectionStatus("online");
+      // A completed login brings the server side up exactly as a completed
+      // resume does (monitors started above, binding verified, lease decided),
+      // so a later reconnect must not re-drive `resumeStoredSession` over it.
+      this.serverSessionResumeComplete = true;
       this.syncDiagnostics.record("initializeSyncEngine.invoke", { caller: "login" });
       this.initializeSyncEngine().catch((err) => {
         this.logError("Sync engine init failed (non-blocking)", err);
@@ -5167,6 +5361,10 @@ export default class VaultGuardPlugin extends Plugin {
       });
     } else {
       this.log("Vault binding skipped — sync engine deferred until a vault is picked.");
+      // Nothing server-side is left to resume: the user declined to bind, and
+      // picking a vault later runs its own bring-up. Marking it complete keeps a
+      // reconnect from re-minting a session for a folder with no vault.
+      this.serverSessionResumeComplete = true;
     }
 
     // Phase 12-07 (passkey model): a fresh login unlocks the vault transparently
@@ -5208,13 +5406,25 @@ export default class VaultGuardPlugin extends Plugin {
     const isOrgAdmin =
       this.session?.role === "admin" || this.session?.role === "owner";
     let vaultChanged = false;
+    // While blocked, an auto-bind is a zero-click "pick" that the blocked-lane
+    // delegation in applyVaultBinding would treat as the user engaging the
+    // takeover flow — the modal must show the state, not act on it
+    // (quick-260820-fvo).
+    const blockedAtOpen =
+      this.vaultBindingAuthorization === "account-changed" ||
+      this.vaultBindingAuthorization === "wrong-account";
 
     const { VaultPickerModal } = await import("./vault-picker-modal");
     await new Promise<void>((resolve) => {
       const modal = new VaultPickerModal(
         this.app,
         this.apiClient!,
-        { suggestedName: folderName, canCreateVaults: isOrgAdmin },
+        {
+          suggestedName: folderName,
+          canCreateVaults: isOrgAdmin,
+          currentVaultId: this.settings.serverVaultId || undefined,
+          disableAutoBind: blockedAtOpen,
+        },
         async (result) => {
           vaultChanged = await this.applyVaultBinding(result);
         }
@@ -5230,6 +5440,48 @@ export default class VaultGuardPlugin extends Plugin {
 
   private async applyVaultBinding(result: { vaultId: string; name: string; slug: string }): Promise<boolean> {
     const changed = this.settings.serverVaultId !== result.vaultId;
+    const previousVaultId = this.settings.serverVaultId?.trim() ?? "";
+    // Captured PRE-mutation beside the id (quick-260820-prn), because the
+    // blocked lane's gate runs AFTER the settings below have been rewritten,
+    // where this field already names the vault being JOINED.
+    const previousVaultName = this.settings.serverVaultName?.trim() ?? "";
+    const wasBlocked =
+      this.vaultBindingAuthorization === "account-changed" ||
+      this.vaultBindingAuthorization === "wrong-account";
+
+    // VAULT-TO-VAULT SWITCH GATE (quick-260820-mv4). A folder that already
+    // holds one vault's files cannot simply be re-pointed at another: the old
+    // contents stay on disk and reconciliation offers to upload them into the
+    // vault just connected. The switch replaces the local cache instead, which
+    // needs the same consent boundary as an account takeover.
+    //
+    // Runs FIRST, before a single field is mutated, so:
+    //   - the cross-check can still prove the vault being LEFT, and
+    //   - a decline (or a headless runtime) leaves the binding exactly as it
+    //     was — no half-switched state is reachable.
+    //
+    // Excluded lanes: a FIRST bind (`!previousVaultId`) has no previous cache
+    // to purge and keeps today's reconciliation modal; a blocked binding
+    // delegates to adoptBindingForCurrentAccount below, which owns its own
+    // ki7 gate and must not be double-gated here.
+    const isVaultSwitch = changed && !!previousVaultId && !!this.session && !wasBlocked;
+    if (
+      isVaultSwitch &&
+      // The name is passed explicitly (quick-260820-prn) — same value the gate
+      // used to read for itself, now sourced from the one place it is provably
+      // the vault being LEFT: before any mutation.
+      !(await this.confirmVaultSwitchLocalPurge(previousVaultId, result.name, {
+        previousVaultName: this.settings.serverVaultName || undefined,
+      }))
+    ) {
+      new Notice(
+        `VaultGuard Sync: switch cancelled — this folder stays connected to ${
+          this.settings.serverVaultName || "its current vault"
+        }.`,
+        6000
+      );
+      return false;
+    }
 
     if (changed) {
       // Searches are authority-bound to the old server vault. Cancel before
@@ -5248,9 +5500,13 @@ export default class VaultGuardPlugin extends Plugin {
       this.keyLease = null;
       this.ensureSyncRuntime().cancelActiveOperations("vault binding changed");
       this.vaultBindingAuthorization = "unverified";
-      // An explicit picker choice is allowed to establish a new account/vault
-      // relationship; the exact-vault probe below becomes the authority.
-      this.localRecoveryExpectedAccountUserId = null;
+      // The expectation SURVIVES the pick — deliberately (quick-260820-fvo).
+      // It is FOLDER-scoped (it guards the on-disk LAK residue the previous
+      // account left behind), not vault-scoped, so binding a different vault
+      // does not dissolve it. adoptBindingForCurrentAccount needs it intact
+      // to distinguish a takeover from a same-account re-bind; only adopt's
+      // consented reset or a verify success may move it.
+      this.accountChangePromptedForUserId = null;
     }
 
     this.settings.serverVaultId = result.vaultId;
@@ -5278,9 +5534,49 @@ export default class VaultGuardPlugin extends Plugin {
 
     await this.saveSettings();
     this.rebuildApiClient();
+    let capsulePersistDelegated = false;
     if (this.session) {
       this.initializeApiClientFromSession(this.session);
+      if (wasBlocked) {
+        // Blocked-pick delegation (quick-260820-fvo): an explicit pick — or
+        // the picker's zero-click single-vault auto-bind — is NOT takeover
+        // consent. adoptBindingForCurrentAccount owns the boundary: probe
+        // WITHOUT stamping → cleanliness check (auto when clean, the discard
+        // dialog when dirty; quick-260820-ki7) → the account-takeover reset
+        // (wipe, re-key, re-pull); its same-account
+        // lane covers a wrong-account state for the same identity. For a
+        // CHANGED vault while identity-mismatched, the bookkeeping above then
+        // a crash BEFORE the reset self-heals: the expectation still
+        // mismatches, so the prompt re-arms on restart and the consented
+        // reset re-pulls the newly bound vault — no silent adoption is
+        // possible. Recursion audit: the reset and the resume path call
+        // verify/probe, never applyVaultBinding (no cycle);
+        // sessionResumePromise plus the resume-completion guard inside
+        // resumeIncompleteServerSession hold off resume re-entry.
+        if (changed) {
+          // The old vault's role must not survive into the new binding; the
+          // resume re-drive refreshes it.
+          this.vaultMemberRole = null;
+        }
+        // Both previous-vault values are threaded (quick-260820-prn) so adopt's
+        // same-identity lane can see that the VAULT changed underneath it — the
+        // only thing its identity comparison structurally cannot know.
+        await this.adoptBindingForCurrentAccount(previousVaultId, previousVaultName);
+        // Early return — the quick-260819-u8a capsulePersistDelegated latch
+        // extended to this lane: adopt's lanes persist via reset/verify, so
+        // the trailing fire below must never add a second rotation. The
+        // changed post-verify block is redundant here too — adopt's
+        // unconditional resume re-drive performs refreshVaultMemberRole, the
+        // lease and the sync-engine bring-up via restoreServerSession, and on
+        // adopt failure a lease for an unadopted folder must NOT be acquired.
+        return changed;
+      }
       if (!(await this.verifyBoundVaultAuthorization())) return changed;
+      // Verify's success branch already fired the capsule persist — and every
+      // capsule-relevant input (serverVaultId/Name/Slug, session identity) was
+      // set above before verify ran — so a second trailing fire here would
+      // only schedule a redundant rotation.
+      capsulePersistDelegated = true;
     }
 
     // Vault changed — the user's effective role may differ on the new
@@ -5294,41 +5590,45 @@ export default class VaultGuardPlugin extends Plugin {
       // inside ensureVaultScopedKeyLease — we just need to surface the
       // outcome to the caller's UI flow without throwing.
       await this.ensureVaultScopedKeyLease();
-      // The per-file access list can render with only the current user until
-      // the membership/permission data fully settles after a fresh bind.
-      // A reload reliably picks up everyone's access, so offer it.
-      this.offerReloadForAccessList();
+      // No reload prompt here any more (quick-260820-mv4). The per-file access
+      // list used to need one because the header held the API client captured
+      // at `onload` — after a rebind it queried the PREVIOUS vault and
+      // rendered "Access details unavailable" until Obsidian restarted. Both
+      // permission surfaces now resolve the client live, and the
+      // permission-store broadcast below already clears their directory
+      // caches, so the access list repopulates in place.
     }
 
-    void this.persistLocalRecoveryCapsule();
+    // Consent (or proven cleanliness) was collected above, membership in the
+    // NEW vault is verified and its lease is held: replace the local cache
+    // (quick-260820-mv4). The reset wipes the previous vault's VG1 content,
+    // re-provisions the LAK and re-pulls the newly bound vault — it issues no
+    // server DELETEs, so the vault just left is untouched. Its own guard is
+    // authoritative and refuses with zero side effects on any state miss.
+    if (isVaultSwitch) {
+      try {
+        await this.resetLocalAtRestAndResync({ mode: "vault-switch", previousVaultId });
+        new Notice(
+          `VaultGuard Sync: this folder now holds ${
+            this.settings.serverVaultName || "the selected vault"
+          } — the local cache was replaced.`,
+          6000
+        );
+      } catch (error) {
+        this.logError("Vault-switch local reset failed", error);
+        new Notice(
+          "VaultGuard Sync: connecting this folder to the new vault failed while replacing the local cache. " +
+            "Nothing was uploaded or deleted on either vault — open VaultGuard and retry the switch.",
+          0
+        );
+      }
+    }
+
+    if (!capsulePersistDelegated) {
+      void this.persistLocalRecoveryCapsule();
+    }
 
     return changed;
-  }
-
-  /**
-   * Non-blocking prompt offering to reload Obsidian after binding a vault.
-   * The per-file "who has access" list sometimes shows only the current user
-   * right after the first bind (membership/permission data hasn't settled);
-   * a reload reliably populates it. Dismissible — the user can ignore it.
-   */
-  private offerReloadForAccessList(): void {
-    // No DOM outside the Electron runtime (e.g. unit tests) — nothing to show.
-    const doc = getActiveObsidianDocument();
-    if (!doc) return;
-    const frag = doc.createDocumentFragment();
-    frag.appendText(
-      "VaultGuard: Vault connected. Reload Obsidian so every file shows everyone who has access to it."
-    );
-    const actions = frag.createDiv();
-    actions.addClass("vaultguard-reload-notice-actions");
-    const reloadBtn = actions.createEl("button", { text: "Reload now" });
-    reloadBtn.addEventListener("click", () => {
-      // "Reload app without saving" — re-runs the full startup (session
-      // restore), which is the path that populates the access list correctly.
-      (this.app as unknown as { commands: { executeCommandById: (id: string) => void } })
-        .commands.executeCommandById("app:reload");
-    });
-    new Notice(frag, 20000);
   }
 
   /**
@@ -6212,9 +6512,39 @@ export default class VaultGuardPlugin extends Plugin {
     // BEFORE the binding-authorization gate, because that gate awaits too.
     const epoch = this.sessionEpoch;
     if (this.settings.serverVaultId && !(await this.verifyBoundVaultAuthorization())) {
-      this.setConnectionStatus("online");
+      // Two very different failures land here and they must not be treated
+      // alike. "wrong-account" is a DEFINITIVE server answer (403/404 for this
+      // identity) — the API is demonstrably reachable, so flipping online is
+      // honest and sync stays paused by design until the user picks an
+      // authorized vault. "unverified" means the check could not be COMPLETED
+      // (network failure, 5xx, timeout); claiming "online" there is a lie, and
+      // because the gate is never re-run it used to pause sync permanently on a
+      // single transient blip. Leave the status alone and let the reconnect loop
+      // re-drive the whole resume instead.
+      const definitive = this.vaultBindingAuthorization !== "unverified";
+      if (definitive) {
+        // "account-changed" is equally final for THIS loop — only the user can
+        // move it — but it is reached without contacting the server at all, so
+        // it proves nothing about reachability. Flipping "online" there would
+        // be the same lie the branch above rejects. Leave the status alone and
+        // let the reconnect probe earn it; sync stays gated on the decision
+        // either way.
+        if (this.vaultBindingAuthorization !== "account-changed") {
+          this.setConnectionStatus("online");
+        }
+        // Nothing automatic can change a definitive answer, and the branch has
+        // already put the decision in front of the user (a sticky Notice for
+        // `wrong-account`, the account-change prompt for `account-changed`) — so
+        // this counts as a finished resume and `armResumeRetryIfIncomplete` must
+        // not restage it on a loop. Only the user moves it from here, and the
+        // path that does (`adoptBindingForCurrentAccount` — reached directly,
+        // or via `applyVaultBinding`'s blocked-pick delegation to it) clears
+        // this flag itself and re-drives the resume.
+        this.serverSessionResumeComplete = true;
+      }
       this.syncDiagnostics.record("restoreServerSession.return.bindingAuthorizationGate", {
         state: this.vaultBindingAuthorization,
+        definitive,
       });
       return;
     }
@@ -6358,6 +6688,12 @@ export default class VaultGuardPlugin extends Plugin {
     // until the vault-scoped lease is in place. Otherwise queued writes
     // could be re-encrypted under the org-wide DEK and become unreadable.
     this.setConnectionStatus("online");
+    // THE one place the restart path is declared finished. Everything above can
+    // return early or throw; only reaching here means monitors are running, the
+    // binding is verified and a lease decision has been made. Set AFTER the
+    // online flip so a re-drive from `attemptReconnection` is never marked done
+    // by a resume that did not actually get this far.
+    this.serverSessionResumeComplete = true;
     this.syncDiagnostics.record("restoreServerSession.online");
 
     this.syncDiagnostics.record("restoreServerSession.syncTimerDecision", {
@@ -6955,14 +7291,30 @@ export default class VaultGuardPlugin extends Plugin {
         actionLabel: "Restore protection",
       };
     }
+    if (this.vaultBindingAuthorization === "account-changed") {
+      const email = this.session?.email?.trim();
+      return {
+        title: "A different account is signed in",
+        message: `This folder was connected by ${this.describeExpectedAccount()}.`,
+        detail:
+          "Until you continue, this folder works locally only — notes and edits stay on this device and nothing syncs. Continuing checks whether this account can use the same vault.",
+        // `user-cog` is already rendered through setIcon elsewhere in this
+        // plugin, so it is a known-good id — an unregistered one renders an
+        // invisible, unclickable element rather than failing loudly.
+        icon: "user-cog",
+        tone: "warning",
+        actionLabel: email ? `Continue as ${email}` : "Check my access",
+      };
+    }
     if (this.vaultBindingAuthorization === "wrong-account") {
       return {
-        title: "Wrong account or vault",
-        message: "The signed-in account cannot access this protected folder's server vault.",
-        detail: "Log in with the original account or explicitly pick an authorized vault.",
+        title: "No access to this folder's vault",
+        message: `${this.describeCurrentAccount()} is not a member of the server vault this folder is bound to.`,
+        detail:
+          "Ask a vault admin for access, or log in as a different account. You can also switch this folder's vault from VaultGuard settings.",
         icon: "shield-x",
         tone: "danger",
-        actionLabel: this.session ? "Pick authorized vault" : "Log in again",
+        actionLabel: this.session ? "Log in as a different account" : "Log in again",
       };
     }
     if (this.session && this.settings.serverVaultId) {
@@ -7003,6 +7355,27 @@ export default class VaultGuardPlugin extends Plugin {
   private handlePrimaryProtectionAction(): void {
     if (this.localProtectionBootstrap.kind === "needs-recovery") {
       this.startAtRestRecoveryFromRecoveryCode();
+      return;
+    }
+    // Re-offer the account-change resolution. It is one-shot per identity (a
+    // resolution storm on every binding re-check would be its own bug), so
+    // clear the latch first — this click IS the user asking for it again.
+    if (this.session && this.vaultBindingAuthorization === "account-changed") {
+      this.accountChangePromptedForUserId = null;
+      void this.resolveAccountChange();
+      return;
+    }
+    // Wrong-account is the server's verdict about THIS account: offering the
+    // vault picker here was the dead end (§6.4) — the honest primary action
+    // is switching accounts. Vault switching stays reachable from Settings
+    // and the status-bar menu (switchServerVault), never from this surface.
+    if (this.session && this.vaultBindingAuthorization === "wrong-account") {
+      void (async () => {
+        await this.forceLogout(
+          "VaultGuard Sync: logged out. Sign in with an account that can use this folder's vault."
+        );
+        this.handleLogin();
+      })();
       return;
     }
     if (this.session) {
@@ -7119,6 +7492,22 @@ export default class VaultGuardPlugin extends Plugin {
       // A bound vault is the gate the Permissions graph waits on — refresh any
       // open panel so it loads (or re-targets) the newly selected vault live.
       this.refreshPermissionsGraph();
+    }
+    // The fvo "never silent" rule at its new home (quick-260820-ki7): with
+    // the account-change modal's pick-vault case gone, Settings / the
+    // status-bar menu are the only picker entries — a run that resolves with
+    // the binding still blocked (picker dismissed, takeover declined,
+    // membership denied) must land in the loud sd8 paused local-only state,
+    // never silence ("I don't know that I can't do anything").
+    // Never silent (fvo), and never the WRONG explanation (nqm): a run that
+    // resolves still wrong-account re-raises the wrong-account notice — whose
+    // own [Connect a different vault] button may well be what opened this
+    // picker — rather than a paused notice about "the account change", which
+    // describes a different state entirely.
+    if (this.vaultBindingAuthorization === "wrong-account") {
+      this.showWrongAccountNotice();
+    } else if (this.vaultBindingAuthorization === "account-changed") {
+      this.showAccountChangePausedNotice();
     }
     return changed;
   }
@@ -7251,6 +7640,60 @@ export default class VaultGuardPlugin extends Plugin {
       throw new Error("Not connected");
     }
     await this.apiClient.removeVaultMember(this.settings.serverVaultId, userId);
+    this.refreshPermissionUiAfterMembershipChange();
+  }
+
+  /**
+   * Pushes a temporary member's expiry out on the currently bound vault (DR-6).
+   *
+   * Same guard shape as the other member mutations above: the bound vault is
+   * the only vault the settings tab lists members for, so the vault id is not
+   * a caller's choice here.
+   */
+  async extendCurrentVaultGuestAccess(
+    userId: string,
+    expiresInDays: number
+  ): Promise<ExtendGuestAccessResult> {
+    if (!this.settings.serverVaultId) {
+      throw new Error("No server vault is bound to this Obsidian folder.");
+    }
+    if (!this.apiClient) {
+      throw new Error("Not connected");
+    }
+    const result = await this.apiClient.extendGuestAccess(
+      this.settings.serverVaultId,
+      userId,
+      expiresInDays
+    );
+    this.refreshPermissionUiAfterMembershipChange();
+    return result;
+  }
+
+  /**
+   * Re-enables a disabled organization identity.
+   *
+   * Org-level, NOT vault-scoped: it re-enables the Cognito account, re-takes
+   * the seat and deletes the revocation marker. Deliberately not folded into
+   * the vault-member wrappers above for that reason.
+   */
+  async reactivateOrganizationUser(userId: string): Promise<void> {
+    if (!this.apiClient) {
+      throw new Error("Not connected");
+    }
+    await this.apiClient.reactivateUser(userId);
+  }
+
+  /**
+   * Ends an organization identity's access immediately.
+   *
+   * Org-WIDE and account-disabling — this is not the per-vault lever. Removing
+   * someone from a single vault is `removeCurrentVaultMember`.
+   */
+  async revokeOrganizationUser(userId: string): Promise<void> {
+    if (!this.apiClient) {
+      throw new Error("Not connected");
+    }
+    await this.apiClient.revokeUser(userId);
     this.refreshPermissionUiAfterMembershipChange();
   }
 
@@ -7769,9 +8212,14 @@ export default class VaultGuardPlugin extends Plugin {
     this.lockCurtain = null;
     this.updateStatusBar();
     if (this.session) {
-      void this.resumeStoredSession().catch((err) =>
-        this.logError("Post-PIN-unlock session resume failed", err)
-      );
+      void this.resumeStoredSession()
+        .catch((err) =>
+          this.logError("Post-PIN-unlock session resume failed", err)
+        )
+        // Same backstop as the `onload` resume: this path also owns a session
+        // that has no liveness loop until the resume finishes, so a resume that
+        // returns early or throws must still leave a reconnect probe armed.
+        .finally(() => this.armResumeRetryIfIncomplete());
     } else {
       // Cipher recovered but no stored session was present — the user is simply
       // logged out; the normal login surfaces apply.
@@ -8392,11 +8840,26 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Confirm the forgotten-PIN reset (wired to the lock curtain's onForgot). */
   private confirmForgotPin(): void {
+    const body =
+      "You'll be logged out and your notes will re-sync from the cloud. Continue?";
+    // The confirmation MUST render inside the curtain. Obsidian's
+    // `.modal-container` is `z-index: var(--layer-modal)` — 50 — and the curtain
+    // is 2147483647, so a `Modal` opened over the lock is painted behind an
+    // opaque surface: the user clicks "Log in again" and nothing appears to
+    // happen, which is the escape hatch failing in exactly the state it exists
+    // for. The Modal fallback below is only reachable with no curtain up.
+    if (this.lockCurtain) {
+      this.lockCurtain.confirm({
+        title: "Reset PIN?",
+        body,
+        confirmLabel: "Reset PIN & log out",
+        onConfirm: () => void this.forgotPin(),
+      });
+      return;
+    }
     const modal = new Modal(this.app);
     modal.titleEl.setText("Reset PIN?");
-    modal.contentEl.createEl("p", {
-      text: "You'll be logged out and your notes will re-sync from the cloud. Continue?",
-    });
+    modal.contentEl.createEl("p", { text: body });
     const row = modal.contentEl.createDiv({ cls: "modal-button-container" });
     row
       .createEl("button", { text: "Cancel" })
@@ -8478,6 +8941,20 @@ export default class VaultGuardPlugin extends Plugin {
     // the operation token before its next local/remote mutation.
     this.syncRuntime?.cancelActiveOperations("the account logged out");
     this.vaultBindingAuthorization = this.settings.serverVaultId ? "unverified" : "unbound";
+    // A logout ends the identity the one-shot account-change prompt was latched
+    // to. Without this, signing back in as that same account (the obvious thing
+    // to do after "log in as the other account" turns out to be the wrong one)
+    // would land in a silent paused state with no prompt.
+    this.accountChangePromptedForUserId = null;
+    // The paused-local-only notice describes a state the logout just ended.
+    this.hideAccountChangePausedNotice();
+    // The wrong-account toast describes the identity that just logged out —
+    // left standing, it named the previous account after a re-login
+    // (quick-260820-ki7 stale-toast fix).
+    this.hideWrongAccountNotice();
+    // The blocked-window mutation stamps belong to the identity/binding pair
+    // this logout just ended (quick-260820-ki7).
+    this.blockedStateLocalEdits.clear();
     // Phase 12: any hard-fallback logout while locked (forgotten PIN, attempt
     // cap, server revocation via the still-alive heartbeat, or the 24h cap on
     // unlock) must tear the curtain down FIRST so the workspace is reachable
@@ -8541,6 +9018,10 @@ export default class VaultGuardPlugin extends Plugin {
     }
 
     this.session = null;
+    // The next session starts its resume from scratch; carrying this over would
+    // tell `attemptReconnection` a resume it never ran had already succeeded.
+    this.serverSessionResumeComplete = false;
+    this.incompleteResumeRetries = 0;
     this.notifyDiscoveryLifecycleChanged();
     this.updateRibbonAuthIndicator();
     this.sidebarViewConfig = null;
@@ -8548,6 +9029,7 @@ export default class VaultGuardPlugin extends Plugin {
     this.vaultLeaseDenied = false;
     this.lastLimitedAccessNoticeAt = 0;
     this.lastSessionDegradedNoticeAt = 0;
+    this.lastBindingUnverifiedNoticeAt = 0;
     this.orgSettings = null;
     // Drop cached permission-graph data so a different user signing in next
     // never sees the previous session's (viewer-scoped) graph.
@@ -8678,7 +9160,17 @@ export default class VaultGuardPlugin extends Plugin {
           await adapter.rename(from, to);
         },
         removeVault: async (path) => {
-          if (await adapter.exists(path)) await adapter.remove(path);
+          if (!(await adapter.exists(path))) return;
+          try {
+            await adapter.remove(path);
+          } catch (error) {
+            // The exists-guard is inherently TOCTOU-racy. The persist/clear
+            // latch should keep this from ever firing, but a file that is
+            // already gone is exactly the desired end state — never fail a
+            // rotation over it. Anything else (EPERM/EIO) still propagates so
+            // the store's error contracts and logError paths keep firing.
+            if (!isFileAlreadyMissingError(error)) throw error;
+          }
         },
         listVaultRecoveryFiles: async () => {
           if (!(await adapter.exists(LOCAL_RECOVERY_ROOT))) return [];
@@ -8802,6 +9294,7 @@ export default class VaultGuardPlugin extends Plugin {
         this.settings.organizationId = state.binding.organizationId;
       }
       this.localRecoveryExpectedAccountUserId = state.binding.accountUserId ?? null;
+      this.localRecoveryExpectedAccountEmail = state.binding.accountEmail ?? null;
       this.vaultBindingAuthorization = "unverified";
     } else {
       this.vaultBindingAuthorization = "unbound";
@@ -8860,12 +9353,21 @@ export default class VaultGuardPlugin extends Plugin {
         message: "VaultGuard Sync is paused until local at-rest protection is available.",
       };
     }
+    if (this.settings.serverVaultId && this.vaultBindingAuthorization === "account-changed") {
+      return {
+        ok: false,
+        reason: "account-changed",
+        message: this.accountChangeMessage(),
+      };
+    }
     if (this.settings.serverVaultId && this.vaultBindingAuthorization === "wrong-account") {
       return {
         ok: false,
         reason: "wrong-account",
         message:
-          "This protected folder is bound to a vault that the signed-in account cannot access. Log in with the original account or pick an authorized vault; no sync was started.",
+          `VaultGuard Sync is paused: ${this.describeCurrentAccount()} is not a member of the server vault ` +
+          `this folder is bound to${this.settings.serverVaultName ? ` ("${this.settings.serverVaultName}")` : ""}. ` +
+          "Ask a vault admin to add this account, or connect this folder to a vault it is a member of. No sync was started.",
       };
     }
     if (this.settings.serverVaultId && this.vaultBindingAuthorization === "unverified") {
@@ -8894,12 +9396,20 @@ export default class VaultGuardPlugin extends Plugin {
       this.localRecoveryExpectedAccountUserId &&
       this.localRecoveryExpectedAccountUserId !== this.session.userId
     ) {
-      this.vaultBindingAuthorization = "wrong-account";
+      // NOT an authorization answer — the server has not been asked yet. The
+      // expectation is device-local bookkeeping, and a perfectly ordinary
+      // second member of this same vault trips it. Stop sync (nothing crosses
+      // the wire under an unconfirmed identity), then ASK; confirming re-runs
+      // this method with the expectation cleared, so the server decides.
+      this.vaultBindingAuthorization = "account-changed";
       this.stopSyncTimer();
-      new Notice(
-        "VaultGuard Sync: this folder was protected by a different account. Log in with the original account or explicitly pick a vault available to this account. No sync was started.",
-        0,
-      );
+      // A wrong-account toast must not survive into a different state — this
+      // branch describes an unresolved QUESTION, not a server denial.
+      this.hideWrongAccountNotice();
+      // The status bar must stop claiming "Connected ✓" the moment this state
+      // exists — it renders the paused branch off vaultBindingAuthorization.
+      this.updateStatusBar();
+      void this.resolveAccountChange();
       return false;
     }
     try {
@@ -8910,31 +9420,928 @@ export default class VaultGuardPlugin extends Plugin {
       await this.cacheCurrentVaultRecord(vault);
       this.vaultBindingAuthorization = "verified";
       this.localRecoveryExpectedAccountUserId = this.session.userId;
+      this.localRecoveryExpectedAccountEmail = this.session.email ?? null;
+      this.accountChangePromptedForUserId = null;
+      this.hideAccountChangePausedNotice();
+      // A wrong-account toast must never outlive a successful verification.
+      this.hideWrongAccountNotice();
+      // A verified binding ends the blocked window; its mutation stamps
+      // describe a state that no longer exists (quick-260820-ki7).
+      this.blockedStateLocalEdits.clear();
       void this.persistLocalRecoveryCapsule();
       return true;
     } catch (error) {
       this.stopSyncTimer();
       if (error instanceof AuthorizationError || /not found|access denied|forbidden|\b403\b/i.test(String(error))) {
         this.vaultBindingAuthorization = "wrong-account";
-        new Notice(
-          `VaultGuard Sync: the signed-in account cannot access the protected server vault (${vaultId}). Log in with the original account or pick an authorized vault. No files were synchronized.`,
-          0,
-        );
+        this.showWrongAccountNotice();
         this.logError("Bound vault authorization failed", error);
         return false;
       }
       this.vaultBindingAuthorization = "unverified";
       this.logError("Bound vault authorization could not be verified", error);
-      new Notice(
-        "VaultGuard Sync: the protected vault could not be verified right now. Sync remains paused; retry when the connection is available.",
-        9000,
-      );
+      const now = Date.now();
+      if (now - this.lastBindingUnverifiedNoticeAt >= 60_000) {
+        this.lastBindingUnverifiedNoticeAt = now;
+        new Notice(
+          "VaultGuard Sync: the protected vault could not be verified right now. Sync stays paused and will retry automatically.",
+          9000,
+        );
+      }
       return false;
     }
   }
 
+  /** Names the signed-in account when the session carries an email. */
+  private describeCurrentAccount(): string {
+    const email = this.session?.email?.trim();
+    return email ? `the signed-in account (${email})` : "the signed-in account";
+  }
+
+  /** Names the account that last verified this folder, when the capsule has it. */
+  private describeExpectedAccount(): string {
+    const email = this.localRecoveryExpectedAccountEmail?.trim();
+    return email ? `another account (${email})` : "a different account";
+  }
+
+  /**
+   * Routes a detected account change (quick-260820-ki7: "auto when clean, ask
+   * when dirty"). No modal lives here anymore — adoptBindingForCurrentAccount
+   * owns the whole resolution (probe → cleanliness gates → automatic reset OR
+   * the dirty-only discard dialog), and every lane below is loud on its own.
+   * Deliberately once per signed-in identity: the binding check re-runs from
+   * several places (startup resume, reconnect re-drive, an explicit re-pick),
+   * and re-entering the resolution on each would be its own kind of broken.
+   * `accountChangePromptedForUserId` is cleared whenever the binding verifies
+   * or the account changes again, and every explicit re-offer entry point
+   * (sidebar, status bar, sticky-notice button) clears it first — that click
+   * IS the user asking again.
+   */
+  private async resolveAccountChange(): Promise<void> {
+    const session = this.session;
+    if (!session) return;
+    if (this.accountChangePromptedForUserId === session.userId) return;
+    this.accountChangePromptedForUserId = session.userId;
+    // The resolution supersedes any standing paused notice (a re-offer via the
+    // sidebar / status bar / notice button lands here).
+    this.hideAccountChangePausedNotice();
+    // Deliberately argument-free (quick-260820-prn): this method is reached
+    // only from verify's `account-changed` branch, which requires an identity
+    // mismatch, so it is structurally always the TAKEOVER path and can never
+    // need the vault sub-lane. Passing a previous vault here would be
+    // meaningless — no rebind is in flight.
+    await this.adoptBindingForCurrentAccount();
+  }
+
+  /**
+   * Server-membership probe for the current session against the bound vault
+   * WITHOUT adopting it: no expectation restamp, no capsule persist, no
+   * account-changed gate. The takeover path must know the server's answer
+   * before the destructive local reset, but recording the adoption before the
+   * reset completes would — after a crash mid-wipe — leave the previous
+   * account's key running under the new account's name with the prompt
+   * permanently disarmed. Denials land the same honest terminal state as
+   * `verifyBoundVaultAuthorization` so both paths surface identical UX.
+   */
+  private async probeBoundVaultMembership(): Promise<boolean> {
+    const vaultId = this.settings.serverVaultId?.trim();
+    if (!vaultId || !this.session || !this.apiClient) return false;
+    try {
+      const vault = await this.apiClient.getVaultRecord(vaultId);
+      if (vault.vaultId !== vaultId) {
+        throw new AuthorizationError(`Vault identity mismatch for ${vaultId}`);
+      }
+      await this.cacheCurrentVaultRecord(vault);
+      return true;
+    } catch (error) {
+      this.stopSyncTimer();
+      if (
+        error instanceof AuthorizationError ||
+        /not found|access denied|forbidden|\b403\b/i.test(String(error))
+      ) {
+        this.vaultBindingAuthorization = "wrong-account";
+        this.showWrongAccountNotice();
+        this.logError("Bound vault authorization failed", error);
+      } else {
+        this.logError("Bound vault authorization could not be verified", error);
+        new Notice(
+          "VaultGuard Sync: the protected vault could not be verified right now. Sync stays paused and will retry automatically.",
+          9000,
+        );
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Explicit destructive consent for the DIRTY takeover path
+   * (quick-260820-ki7). Fail-closed: with no Obsidian document (unit
+   * harnesses, embedders, headless startup) there is nobody to consent, so
+   * the answer is "keep" — the paused account-changed state explains itself
+   * and the sidebar keeps offering the action. The clean path never calls
+   * this: no dialog object may be constructed there.
+   */
+  private async confirmDiscardUnsyncedChanges(
+    changes: { items: string[]; indeterminate: boolean },
+    crossCheck: { ok: boolean; unconfirmed: string[] },
+    // quick-260820-mv4: the same gate serves the vault-to-vault switch. Only
+    // the copy differs — `kind` picks it, and the vault lane passes the name
+    // of the vault being left (the current binding has already been read for
+    // it, but nothing is mutated until consent lands).
+    //
+    // quick-260820-prn: `bindingAlreadyApplied` picks the second vault-lane
+    // variant, for the blocked adopt path where the binding has ALREADY
+    // flipped. Its copy cannot offer to cancel a switch that has happened.
+    variant?: {
+      kind: "vault";
+      previousVaultName?: string;
+      nextVaultName?: string;
+      bindingAlreadyApplied?: boolean;
+    }
+  ): Promise<boolean> {
+    if (!getActiveObsidianDocument()) return false;
+    const { AccountSwitchDiscardModal } = await import("./account-switch-discard-modal");
+    // Asserted, not annotated: a plain literal initializer narrows `decision`
+    // for the comparison below, because the modal callback that widens it is
+    // not visible to control-flow analysis. "keep" is the fail-closed default
+    // — a dismissal without a decision never discards.
+    let decision = "keep" as AccountSwitchDiscardDecision;
+    await new Promise<void>((resolve) => {
+      const modal = new AccountSwitchDiscardModal(
+        this.app,
+        {
+          kind: variant?.kind ?? "account",
+          previousVaultName: variant?.previousVaultName,
+          currentAccountEmail: this.session?.email ?? undefined,
+          previousAccountEmail: this.localRecoveryExpectedAccountEmail ?? undefined,
+          // `vaultName` is always the vault being CONNECTED TO. On the account
+          // lane that is the current binding; on the vault lane the gate runs
+          // BEFORE any mutation, so the settings still name the old vault and
+          // the caller must supply the new one.
+          vaultName:
+            (variant?.kind === "vault"
+              ? variant.nextVaultName
+              : this.settings.serverVaultName) || undefined,
+          items: changes.items,
+          unconfirmed: crossCheck.unconfirmed,
+          // A failed/capped cross-check means the server-side picture is
+          // unknown — surfaced as "could not be fully listed", never hidden.
+          indeterminate: changes.indeterminate || !crossCheck.ok,
+          // quick-260820-prn. The modal reads this pair only on the
+          // already-applied vault lane, so no other copy changes: there, a
+          // failed cross-check has a concrete, nameable cause (this account
+          // was denied the vault being left) and saying it is more honest
+          // than the generic "could not be fully listed".
+          bindingAlreadyApplied: variant?.bindingAlreadyApplied === true,
+          previousVaultUnverifiable: !crossCheck.ok,
+        },
+        (result) => {
+          decision = result;
+        }
+      );
+      modal.onClose = () => {
+        modal.contentEl.empty();
+        resolve();
+      };
+      modal.open();
+    });
+    return decision === "discard";
+  }
+
+  /**
+   * Resolves the account change. Let the SERVER answer — `/vaults/{vaultId}`
+   * is the only authority on whether this account may use this binding — and,
+   * when the account genuinely changed hands, replace the folder's local
+   * protection before adopting. The LAK is device-scoped, so adopting without
+   * a re-key would hand this account the previous account's entire decrypted
+   * local cache (including server-denied files, via the deliberate read
+   * fail-open).
+   *
+   * The takeover lane is "auto when clean, ask when dirty" (quick-260820-ki7)
+   * and stays deliberately crash-safe:
+   *   1. Probe membership WITHOUT stamping. A 403 lands the honest
+   *      `wrong-account` state and nothing local changes.
+   *   2. Prove cleanliness TWICE over: every local signal
+   *      (collectUnsyncedLocalChanges — defaults to dirty on any uncertainty)
+   *      AND the positive server-listing cross-check must pass.
+   *   3. Clean → `resetLocalAtRestAndResync({ mode: "account-takeover" })`
+   *      runs automatically (it destroys only server-recoverable cache);
+   *      dirty → exactly one discard dialog names the concrete losses, and
+   *      only an explicit [Discard and switch] — after actively clearing the
+   *      tracked unsynced holders — reaches the reset. Declines, dismissals
+   *      and headless land the loud paused local-only state.
+   *   4. Only the reset re-stamps the expectation and re-verifies the
+   *      binding, so a crash anywhere earlier re-arms the flow instead of
+   *      silently running the old key under the new name.
+   *
+   * Same-account confirms (expectation empty or already this user) skip all of
+   * that: clear the expectation and let `verifyBoundVaultAuthorization` decide,
+   * exactly as before — UNLESS the vault changed too (quick-260820-prn, see the
+   * sub-lane's own comment below). On success the expectation is re-stamped and
+   * the capsule persisted; on a 403 the state becomes a real `wrong-account` and
+   * every later check re-asks the server.
+   *
+   * `previousVaultId` / `previousVaultName` are PARAMETERS, never fields:
+   * `applyVaultBinding` derives them live from settings immediately before the
+   * mutation and hands them over for this single flow. An instance field would
+   * let a re-entrant `resolveAccountChange()` replay a stale previous vault
+   * against a settled binding — and `resetLocalAtRestAndResync` already takes
+   * `previousVaultId` as a parameter for exactly this reason.
+   */
+  private async adoptBindingForCurrentAccount(
+    previousVaultId?: string,
+    previousVaultName?: string
+  ): Promise<void> {
+    if (!this.session) return;
+    const expectedUserId = this.localRecoveryExpectedAccountUserId;
+    const takeover = !!expectedUserId && expectedUserId !== this.session.userId;
+    if (takeover) {
+      if (!(await this.probeBoundVaultMembership())) {
+        if (this.vaultBindingAuthorization === "account-changed") {
+          // Transient failure — the probe's catch already showed the 9s retry
+          // toast, but the blocked state PERSISTS, so its explanation must
+          // too: sticky paused notice, re-offerable from the sidebar.
+          this.showAccountChangePausedNotice();
+        }
+        // wrong-account: the probe already raised the tracked sticky
+        // wrong-account notice — do not stack the paused notice on top.
+        return;
+      }
+      // The probe round trip proved the API reachable — flip online so the
+      // reset guard's isOnline() passes on the startup/restore lane (which
+      // deliberately never flips online at the binding gate: a capsule
+      // mismatch proves nothing about reachability). Safe: the online-flip
+      // flush trigger is gate-checked, so nothing uploads while blocked.
+      this.setConnectionStatus("online");
+      this.hideWrongAccountNotice();
+
+      // Cleanliness gates (quick-260820-ki7): BOTH must positively pass —
+      // the local signals AND the server-listing cross-check (which covers
+      // files added while Obsidian was closed, a class no local tracker can
+      // see). Anything less routes to the dirty dialog.
+      let changes = await this.collectUnsyncedLocalChanges();
+      const crossCheck = await this.crossCheckLocalFilesAgainstServerListing();
+      let clean = changes.clean && crossCheck.ok && crossCheck.unconfirmed.length === 0;
+
+      // Pre-reset TOCTOU re-check: an edit may have landed between the clean
+      // check and this point (the cross-check round trips gave it time).
+      // Cheap in-memory signals only — no second network call. Anything new
+      // routes to the dirty path instead of resetting over it.
+      if (
+        clean &&
+        (this.offlineQueue.length > 0 ||
+          this.blockedStateLocalEdits.size > 0 ||
+          this.syncState.conflicts.length > 0)
+      ) {
+        clean = false;
+        changes = await this.collectUnsyncedLocalChanges();
+      }
+
+      if (!clean) {
+        const consent = await this.confirmDiscardUnsyncedChanges(changes, crossCheck);
+        if (!consent) {
+          // Sticky, not transient: the paused state persists after the
+          // decline, so its explanation must too — a 9s toast left the folder
+          // silently local-only once it faded (user report, 2026-08-20). The
+          // expectation stays untouched so the flow re-arms.
+          this.showAccountChangePausedNotice();
+          return;
+        }
+        // Clear the tracked unsynced holders BEFORE the reset — otherwise the
+        // "discarded" queued edits would survive the wipe and replay under
+        // the new identity once re-verify opens the gate, contradicting the
+        // consent copy. Cross-check misses need no discard bookkeeping — the
+        // reset wipe + re-pull handles them.
+        await this.discardUnsyncedLocalChanges();
+      }
+      // Clean: straight to the reset — no dialog object is constructed
+      // anywhere on this path.
+      try {
+        await this.resetLocalAtRestAndResync({ mode: "account-takeover" });
+      } catch (error) {
+        this.logError("Account takeover local reset failed", error);
+        new Notice(
+          "VaultGuard Sync: resetting local protection for this account failed. Nothing was adopted — open VaultGuard and choose to continue as this account to retry.",
+          0,
+        );
+        return;
+      }
+      // The reset re-stamped the expectation, re-verified the binding and
+      // persisted the fresh capsule; fall through to the resume below.
+      new Notice(
+        `VaultGuard Sync: this folder now syncs as ${this.session.email || "the signed-in account"} — the local cache was refreshed for this account.`,
+        6000
+      );
+    } else {
+      // SAME IDENTITY — but possibly not the same VAULT (quick-260820-prn).
+      //
+      // This branch used to be identity-only: clear the expectation, verify,
+      // done. That is correct when the folder is still pointed at the vault
+      // whose files it holds, and wrong the moment it is not. A blocked
+      // binding resolved with [Connect a different vault] arrives here with
+      // the previous vault's entire local cache still on disk, which the next
+      // reconciliation then reads as local-only against the newly bound vault
+      // (handoff lane C2). The vault change needs the same consent boundary
+      // as a takeover, so it gets the same gate.
+      //
+      // Read live from settings — `applyVaultBinding` has already written the
+      // new vault by the time it delegates here.
+      const priorVaultId = previousVaultId?.trim() ?? "";
+      const vaultChanged =
+        !!priorVaultId && priorVaultId !== (this.settings.serverVaultId?.trim() ?? "");
+      if (!vaultChanged) {
+        // Byte-identical to the pre-prn behaviour, and it needs no second copy
+        // of applyVaultBinding's `changed` predicate: when the vault did not
+        // change, priorVaultId simply equals the bound vault.
+        this.localRecoveryExpectedAccountUserId = null;
+        this.localRecoveryExpectedAccountEmail = null;
+        if (!(await this.verifyBoundVaultAuthorization())) return;
+        new Notice(
+          `VaultGuard Sync: this folder is now connected as ${this.session.email || "the signed-in account"}.`,
+          6000
+        );
+      } else {
+        // THE VAULT-CHANGED SUB-LANE. Four things about its shape are
+        // load-bearing:
+        //
+        // 1. It probes with the NON-STAMPING probe, exactly as the takeover
+        //    branch does — `verifyBoundVaultAuthorization` CLEARS
+        //    `blockedStateLocalEdits` on success, and those live blocked-window
+        //    edits are one of the ki7 dirty signals. Verifying before the gate
+        //    would destroy the evidence the gate exists to read.
+        // 2. The gate runs BEFORE the expectation pair is touched and before
+        //    any verify, for the same reason.
+        // 3. It is mutually exclusive with the takeover branch by
+        //    construction — it lives inside the `else` of the very
+        //    `if (takeover)` that defines it — so a double-ask is structurally
+        //    impossible rather than merely avoided. `applyVaultBinding`'s
+        //    `isVaultSwitch` still excludes `wasBlocked`, so mv4's lane cannot
+        //    ask either.
+        // 4. In practice the cross-check on the previous vault FAILS here:
+        //    this lane is reachable only when the server denied this account
+        //    on the vault being left, so `listVaultFilesPage` 403s and the
+        //    gate is dirty. That means it almost always asks rather than
+        //    auto-purging — by design. You cannot discard what you cannot
+        //    prove is safe to discard; do not relax the gate to "fix" it.
+        if (!(await this.probeBoundVaultMembership())) {
+          if (this.vaultBindingAuthorization !== "wrong-account") {
+            // Transient failure — the probe's catch showed the 9 s retry
+            // toast, but the blocked state PERSISTS, so its explanation must
+            // too. A 403 already raised the tracked sticky wrong-account
+            // notice; stacking on top of that would name the state twice.
+            this.showAccountChangePausedNotice(
+              this.blockedVaultSwitchPausedMessage(previousVaultName)
+            );
+          }
+          return;
+        }
+        // The probe round trip proved the API reachable — flip online so the
+        // vault-switch reset guard's isOnline() passes. Same justification and
+        // same ordering as the takeover branch: connectionState is born
+        // "offline", and the online-flip flush trigger is gate-checked, so
+        // nothing uploads while the binding is still unverified.
+        this.setConnectionStatus("online");
+        this.hideWrongAccountNotice();
+
+        const consented = await this.confirmVaultSwitchLocalPurge(
+          priorVaultId,
+          this.settings.serverVaultName ?? "",
+          { previousVaultName, bindingAlreadyApplied: true }
+        );
+        if (!consented) {
+          // Nothing purged, nothing adopted, no capsule persisted and the
+          // expectation untouched. The previous vault's files stay on disk,
+          // where or3's Phase 1b gate blocks any silent upload of them.
+          this.showAccountChangePausedNotice(
+            this.blockedVaultSwitchPausedMessage(previousVaultName)
+          );
+          return;
+        }
+        try {
+          await this.resetLocalAtRestAndResync({
+            mode: "vault-switch",
+            previousVaultId: priorVaultId,
+          });
+        } catch (error) {
+          this.logError("Blocked-lane vault-switch local reset failed", error);
+          new Notice(
+            "VaultGuard Sync: connecting this folder to the new vault failed while replacing the local cache. " +
+              "Nothing was uploaded or deleted on either vault — open VaultGuard and retry the switch.",
+            0
+          );
+          return;
+        }
+        // The reset re-verified the binding, stamped the expectation and
+        // persisted the fresh capsule — nothing on this lane stamps anything
+        // before it, so a crash at any earlier point re-arms the whole flow.
+        new Notice(
+          `VaultGuard Sync: this folder now holds ${
+            this.settings.serverVaultName || "the selected vault"
+          } — the local cache was replaced.`,
+          6000
+        );
+      }
+    }
+
+    // The startup resume returned early at the binding gate and marked itself
+    // finished (a pending user decision is not something the reconnect loop can
+    // resolve). Now that the decision exists, re-open that path through the
+    // existing guarded helper so monitors, the vault-scoped lease and the sync
+    // engine all come back.
+    this.serverSessionResumeComplete = false;
+    this.resumeIncompleteServerSession();
+  }
+
+  /**
+   * Positive server-presence proof for the takeover lane's clean gate
+   * (quick-260820-ki7). Every non-excluded local file must appear in the
+   * server vault's permission-filtered listing, accumulated across ALL pages
+   * — this is what covers files added while Obsidian was closed or before the
+   * blocked window began, the class the blocked-window event tracker
+   * structurally cannot see.
+   *
+   * Fail-safe by construction: any listing/permission error and
+   * pagination-cap exhaustion return `ok: false` (dirty), never clean.
+   * Deliberately NOT `getFiles()`: that method returns a single
+   * server-default-100 page and discards the continuation token, which would
+   * false-dirty every vault over ~100 files and kill the auto path.
+   *
+   * Contract notes:
+   * - The listing is PERMISSION-FILTERED: a file that exists server-side but
+   *   is denied to this account is absent from it, so a miss is NOT provably
+   *   an unsynced change. Callers must present misses as "could not be
+   *   confirmed as synced", never as unsynced changes (honesty requirement).
+   * - Presence bookkeeping uses a Set of normalized paths, which sidesteps
+   *   the cold-path manifest falsy trap ("" = present / undefined = absent,
+   *   fix 2e4c8f4) entirely; both sides are normalized identically before
+   *   comparison (the handler emits '/' + relativePath shapes, and
+   *   normalizeVaultPath strips the leading slash).
+   */
+  private async crossCheckLocalFilesAgainstServerListing(
+    // quick-260820-mv4: the vault-SWITCH lane must prove the vault it is
+    // LEAVING, which it can only do while that binding is still live — so the
+    // target is explicit there. Omitted (the ki7 takeover lane) it defaults to
+    // the current binding, byte-identically to before.
+    targetVaultId?: string
+  ): Promise<{
+    ok: boolean;
+    unconfirmed: string[];
+  }> {
+    const vaultId = (targetVaultId ?? this.settings.serverVaultId)?.trim();
+    if (!vaultId || !this.apiClient) return { ok: false, unconfirmed: [] };
+    const serverPaths = new Set<string>();
+    try {
+      let continuationToken: string | undefined;
+      let pagesRead = 0;
+      // ~50k files at 1000/page. Exhausting the cap means the listing could
+      // not be proven complete — treated exactly like an error (dirty).
+      const MAX_LISTING_PAGES = 50;
+      for (;;) {
+        if (pagesRead >= MAX_LISTING_PAGES) {
+          return { ok: false, unconfirmed: [] };
+        }
+        const page = await this.apiClient.listVaultFilesPage(vaultId, {
+          limit: 1000,
+          continuationToken,
+        });
+        pagesRead++;
+        for (const item of page.files) {
+          serverPaths.add(this.normalizeVaultPath(item.path));
+        }
+        if (page.nextContinuationToken === null) break;
+        continuationToken = page.nextContinuationToken;
+      }
+    } catch (error) {
+      this.logError("Server-listing cross-check for the account takeover failed", error);
+      return { ok: false, unconfirmed: [] };
+    }
+    const unconfirmed: string[] = [];
+    for (const file of this.app.vault.getFiles()) {
+      const normalized = this.normalizeVaultPath(file.path);
+      if (!normalized || this.isPathExcluded(normalized)) continue;
+      if (!serverPaths.has(normalized)) unconfirmed.push(normalized);
+    }
+    return { ok: true, unconfirmed };
+  }
+
+  /**
+   * Shared copy for the wrong-account state (quick-260820-nqm). The same
+   * sentence was inlined at the verify and probe denial branches; the notice
+   * is now re-raisable from switchServerVault too, and three hand-maintained
+   * copies of one message is how they drift.
+   */
+  private wrongAccountMessage(): string {
+    const vault = this.settings.serverVaultName
+      ? ` ("${this.settings.serverVaultName}")`
+      : "";
+    return (
+      `VaultGuard Sync: ${this.describeCurrentAccount()} is not a member of the server vault ` +
+      `this folder is bound to${vault}. This folder works locally only — nothing uploads or ` +
+      `downloads until it is resolved. Connect it to a vault this account can use, ` +
+      `log in as a different account, or ask a vault admin for access.`
+    );
+  }
+
+  /** Shared copy for the account-change state — gate, sidebar and notices. */
+  private accountChangeMessage(): string {
+    const vault = this.settings.serverVaultName
+      ? ` ("${this.settings.serverVaultName}")`
+      : "";
+    return (
+      `VaultGuard Sync is paused: this folder was connected by ${this.describeExpectedAccount()}, ` +
+      `and ${this.describeCurrentAccount()} has not been checked against its server vault${vault} yet. ` +
+      `The folder works locally only — notes and edits stay on this device, nothing uploads or downloads. ` +
+      `Open VaultGuard (sidebar or status bar) to continue as this account.`
+    );
+  }
+
+  /**
+   * Paused copy for the blocked same-identity VAULT change (quick-260820-prn).
+   * The account is fine here — "resolve the account change" would send the
+   * user looking for a problem that does not exist. What is unresolved is the
+   * folder: it is connected to one vault while holding another's files.
+   *
+   * Its [Resolve now] action is not a dead end: the binding is `unverified`
+   * and a session exists, so `handlePrimaryProtectionAction` opens the vault
+   * picker. Picking again re-enters `applyVaultBinding` unblocked, which runs
+   * mv4's pre-mutation gate, and the leftover files — absent from the bound
+   * vault's listing — land in `unconfirmed`, where consent purges them.
+   */
+  private blockedVaultSwitchPausedMessage(previousVaultName?: string): string {
+    const next = this.settings.serverVaultName?.trim();
+    const prev = previousVaultName?.trim();
+    return (
+      `VaultGuard: sync is paused — this folder is now connected to ` +
+      `${next ? `"${next}"` : "the selected vault"} but still holds the local files from ` +
+      `${prev ? `"${prev}"` : "the vault it was connected to before"}. ` +
+      `Nothing uploads or downloads until those files are replaced or this folder is ` +
+      `connected to a different vault.`
+    );
+  }
+
+  /**
+   * The loud half of "decide later" (quick-260819-sd8). Dismissing the
+   * account-change prompt parks the folder in a LOCAL-ONLY state — the sync
+   * gate holds the wire, and interceptedRead's server-copy fetch is
+   * wire-blocked so local edits stay visible. That state used to look
+   * perfectly healthy (status bar said "Connected ✓", files and permissions
+   * loaded), which made a paused vault read as a broken one. One sticky,
+   * deduped notice names the state and carries the resolve action; the status
+   * bar shows a paused label and is click-to-resolve while it lasts.
+   */
+  private showAccountChangePausedNotice(
+    // quick-260820-prn: the blocked vault-change lane parks the folder in the
+    // same paused local-only state, but "resolve the account change" would be
+    // the wrong instruction there — the account is fine, the folder is holding
+    // the previous vault's files. Applied to BOTH branches so the three
+    // existing call sites keep their exact text.
+    message?: string
+  ): void {
+    this.hideAccountChangePausedNotice();
+    const notice = new Notice("", 0);
+    const body = noticeBody(notice);
+    if (!body) {
+      // No DOM-capable Notice (headless / unit harness): keep the state named
+      // with the plain sticky message instead of the actioned body.
+      notice.hide?.();
+      this.accountChangePausedNotice = new Notice(message ?? this.accountChangeMessage(), 0);
+      this.updateStatusBar();
+      return;
+    }
+    body.empty();
+    body.appendText(
+      message ??
+        "VaultGuard: sync is paused — this folder is working locally only. " +
+          "Notes and edits stay on this device; nothing uploads or downloads until you resolve the account change."
+    );
+    const actions = body.createDiv();
+    actions.addClass("vaultguard-reload-notice-actions");
+    const resolveBtn = actions.createEl("button", { text: "Resolve now" });
+    resolveBtn.addEventListener("click", () => {
+      this.hideAccountChangePausedNotice();
+      this.handlePrimaryProtectionAction();
+    });
+    this.accountChangePausedNotice = notice;
+    this.updateStatusBar();
+  }
+
+  private hideAccountChangePausedNotice(): void {
+    this.accountChangePausedNotice?.hide?.();
+    this.accountChangePausedNotice = null;
+  }
+
+  /**
+   * "Sync never started" is a state, not an event (quick-260820-mv4).
+   *
+   * `initializeSyncEngine` bails before `performSync()` and `startSyncTimer()`
+   * whenever the initial reconciliation does not complete — a dismissed
+   * preview, a long-operation conflict, a protection-gate miss. Nothing
+   * re-arms it, so the folder sat permanently un-synced until Obsidian was
+   * restarted and `onload` re-entered the path. The user's report was exactly
+   * that: "it does not load new files; when I refresh Obsidian it works."
+   *
+   * The dead end is now loud and self-serving: a sticky notice that names the
+   * local-only state and carries the retry that used to require a restart.
+   */
+  showReconciliationPausedNotice(reason?: string): void {
+    this.hideReconciliationPausedNotice();
+    const detail = reason ? ` ${reason}` : "";
+    const message =
+      "VaultGuard Sync: sync has not started for this folder — it is working locally only. " +
+      `Notes and edits stay on this device until this folder is reconciled with its server vault.${detail}`;
+
+    const notice = new Notice("", 0);
+    const body = noticeBody(notice);
+    if (!body) {
+      // No DOM-capable Notice (headless / unit harness): keep the state named
+      // with the plain sticky message instead of the actioned body.
+      notice.hide?.();
+      this.reconciliationPausedNotice = new Notice(message, 0);
+      this.updateStatusBar();
+      return;
+    }
+    body.empty();
+    body.appendText(message);
+    const actions = body.createDiv();
+    actions.addClass("vaultguard-reload-notice-actions");
+    const retryBtn = actions.createEl("button", { text: "Reconcile now" });
+    retryBtn.addEventListener("click", () => {
+      this.hideReconciliationPausedNotice();
+      this.syncDiagnostics.record("initializeSyncEngine.invoke", {
+        caller: "reconciliationPausedNotice",
+      });
+      void this.initializeSyncEngine().catch((err) => {
+        this.logError("Sync engine init failed from the reconciliation retry", err);
+      });
+    });
+    this.reconciliationPausedNotice = notice;
+    this.updateStatusBar();
+  }
+
+  hideReconciliationPausedNotice(): void {
+    this.reconciliationPausedNotice?.hide?.();
+    this.reconciliationPausedNotice = null;
+  }
+
+  /**
+   * Sticky, deduped wrong-account notice (quick-260820-ki7). Both
+   * wrong-account branches (verify + probe) used to raise bare untracked
+   * Notices, which outlived the state they described — the toast still named
+   * the previous account after a logout and re-login. Mirrors the
+   * accountChangePausedNotice pair.
+   */
+  private showWrongAccountNotice(message: string = this.wrongAccountMessage()): void {
+    this.hideWrongAccountNotice();
+    const notice = new Notice("", 0);
+    const body = noticeBody(notice);
+    if (!body) {
+      // No DOM-capable Notice (headless / unit harness): keep the state named
+      // with the plain sticky message instead of the actioned body.
+      notice.hide?.();
+      this.wrongAccountNotice = new Notice(message, 0);
+      return;
+    }
+    body.empty();
+    body.appendText(message);
+    const actions = body.createDiv();
+    actions.addClass("vaultguard-reload-notice-actions");
+
+    // TWO ways out, because this state has two honest causes (nqm follow-up).
+    // ki7 §6.4 removed the vault picker from the wrong-account SIDEBAR action
+    // because the picker was then a dead end and could auto-bind straight past
+    // the takeover boundary (quick-260820-fvo). Both reasons are now gone: a
+    // blocked pick delegates to adoptBindingForCurrentAccount, the picker
+    // refuses to auto-bind while blocked, and switchServerVault is never
+    // silent. So the option comes back — and it leads, because a wrong-account
+    // verdict usually means the FOLDER points at the wrong vault, not that the
+    // person signed in as the wrong human. Making them log out to fix a vault
+    // binding is backwards.
+    const vaultBtn = actions.createEl("button", { text: "Connect a different vault" });
+    vaultBtn.addEventListener("click", () => {
+      this.hideWrongAccountNotice();
+      void this.switchServerVault();
+    });
+
+    // Same wording as the sidebar's wrong-account primary action
+    // (quick-260820-ki7) — two labels for one action would be its own bug.
+    const accountBtn = actions.createEl("button", { text: "Log in as a different account" });
+    accountBtn.addEventListener("click", () => {
+      this.hideWrongAccountNotice();
+      this.handlePrimaryProtectionAction();
+    });
+
+    this.wrongAccountNotice = notice;
+  }
+
+  private hideWrongAccountNotice(): void {
+    this.wrongAccountNotice?.hide?.();
+    this.wrongAccountNotice = null;
+  }
+
+  /**
+   * The single LOCAL cleanliness authority for the account-takeover lane
+   * (quick-260820-ki7). Auto-takeover destroys anything unsynced, so
+   * cleanliness must be POSITIVELY established and default to DIRTY: any
+   * uncertainty (load handle absent, flush in flight, an active sync cycle,
+   * an unrestored on-disk envelope) reports indeterminate instead of clean.
+   * The takeover lane layers a positive server-listing cross-check on top
+   * (crossCheckLocalFilesAgainstServerListing) for mutations no local signal
+   * can see — files added while Obsidian was closed or before the blocked
+   * window began.
+   *
+   * Deliberately EXCLUDED signals — do not "fix" them back in:
+   * - `syncState.pendingChanges`: it increments on SUCCESSFUL immediate
+   *   online uploads too (it counts changes-since-last-cycle, not unsynced
+   *   work), so it would false-dirty virtually every session.
+   * - Any disk-vs-remoteFileState "local-only file" scan: logout clears
+   *   remoteFileState AND removes its envelope, so at every cross-account
+   *   login the map is empty and the scan would classify EVERY file as
+   *   local-only — permanently killing the auto path.
+   */
+  private async collectUnsyncedLocalChanges(): Promise<{
+    clean: boolean;
+    items: string[];
+    indeterminate: boolean;
+  }> {
+    let indeterminate = false;
+
+    if (this.offlineQueueLoadPromise) {
+      await this.offlineQueueLoadPromise;
+    } else {
+      // The envelope restore never started (early lifecycle, harness): an
+      // empty in-memory queue proves nothing.
+      indeterminate = true;
+    }
+    if (this.offlineQueueFlushPromise) indeterminate = true;
+    if (this.syncState.status === "syncing") indeterminate = true;
+
+    const items = new Set<string>();
+    for (const op of this.offlineQueue) {
+      items.add(this.normalizeVaultPath(op.path));
+    }
+    for (const path of Object.keys(this.settings.pendingLargeFiles ?? {})) {
+      items.add(this.normalizeVaultPath(path));
+    }
+    // Tombstones are unsynced local DELETES — they would replay under the
+    // new identity, so they count as unsynced work here.
+    for (const path of Object.keys(this.settings.deletionTombstones ?? {})) {
+      items.add(this.normalizeVaultPath(path));
+    }
+    for (const conflict of this.syncState.conflicts) {
+      items.add(this.normalizeVaultPath(conflict.path));
+    }
+    for (const path of this.blockedStateLocalEdits) {
+      items.add(path);
+    }
+
+    // A still-present envelope with an EMPTY in-memory queue after the
+    // awaited load means ops the restore did not materialize (cipher not
+    // ready at load time, or a future-versioned envelope) —
+    // unrestored/unrestorable work is dirty.
+    try {
+      if (
+        this.offlineQueue.length === 0 &&
+        (await this.app.vault.adapter.exists(this.offlineQueueEnvelopePath()))
+      ) {
+        indeterminate = true;
+      }
+    } catch {
+      // Cannot prove the envelope absent — uncertainty defaults to dirty.
+      indeterminate = true;
+    }
+
+    return {
+      clean: items.size === 0 && !indeterminate,
+      items: [...items],
+      indeterminate,
+    };
+  }
+
+  /**
+   * The [Discard and switch] pre-reset step (quick-260820-ki7): actively drop
+   * every tracked unsynced-work holder BEFORE the takeover reset, otherwise
+   * the "discarded" queued edits would survive the wipe and replay under the
+   * new identity once re-verify opens the gate — contradicting the consent
+   * copy. `settings.deletionTombstones` are deliberately NOT touched here:
+   * the takeover reset itself deletes them (its account-takeover branch).
+   * resetLocalAtRestAndResync internals stay untouched by design.
+   */
+  private async discardUnsyncedLocalChanges(): Promise<void> {
+    this.offlineQueue = [];
+    // Empty queue => persistOfflineQueue removes the on-disk envelope; it
+    // catches internally, and the serialized tail keeps ordering safe against
+    // any concurrent scheduled persist.
+    await this.enqueueOfflineQueuePersist(() => this.persistOfflineQueue());
+    delete this.settings.pendingLargeFiles;
+    await this.saveSettings();
+    this.syncState.conflicts = [];
+    this.blockedStateLocalEdits.clear();
+  }
+
+  /**
+   * The vault-to-vault SWITCH gate (quick-260820-mv4) — the ki7 takeover gate
+   * applied to the other way this folder's local cache stops matching its
+   * binding.
+   *
+   * Re-pointing a folder at a different server vault used to leave the
+   * previous vault's files on disk, where reconciliation then classified every
+   * one of them as local-only and offered to UPLOAD them into the vault just
+   * connected. The cache must be replaced instead, which makes this exactly
+   * the takeover problem: prove cleanliness positively, wipe automatically
+   * when there is nothing to lose, and ask exactly once when there is.
+   *
+   * Runs BEFORE any binding mutation, so `previousVaultId` is still the live
+   * binding and the server-listing cross-check can prove the vault being LEFT
+   * — the only vault that can answer "is this file already safe?".
+   *
+   * Fail-closed on every axis, same as ki7: `collectUnsyncedLocalChanges`
+   * defaults to dirty on any uncertainty, a failed/capped cross-check is
+   * dirty, and a headless runtime (no document to consent) declines. A
+   * decline CANCELS THE SWITCH rather than landing the paused local-only
+   * state — unlike a declined takeover, the existing binding is still
+   * completely usable, so there is nothing to pause.
+   */
+  private async confirmVaultSwitchLocalPurge(
+    previousVaultId: string,
+    nextVaultName: string,
+    // quick-260820-prn. `previousVaultName` used to be read implicitly off
+    // `this.settings.serverVaultName` below, which is only correct while this
+    // runs PRE-mutation. The blocked adopt lane calls it POST-mutation, where
+    // that field already names the NEW vault — the dialog would have told the
+    // user the folder is leaving the vault it is joining. The name is now
+    // always supplied by the caller, from wherever it is provably right.
+    // `bindingAlreadyApplied` selects that lane's copy variant.
+    options?: { previousVaultName?: string; bindingAlreadyApplied?: boolean }
+  ): Promise<boolean> {
+    let changes = await this.collectUnsyncedLocalChanges();
+    const crossCheck = await this.crossCheckLocalFilesAgainstServerListing(previousVaultId);
+    let clean = changes.clean && crossCheck.ok && crossCheck.unconfirmed.length === 0;
+
+    // Pre-reset TOCTOU re-check (ki7's, verbatim): the cross-check round trips
+    // gave an edit time to land. Cheap in-memory signals only — anything new
+    // routes to the dialog instead of wiping over it.
+    if (
+      clean &&
+      (this.offlineQueue.length > 0 ||
+        this.blockedStateLocalEdits.size > 0 ||
+        this.syncState.conflicts.length > 0)
+    ) {
+      clean = false;
+      changes = await this.collectUnsyncedLocalChanges();
+    }
+
+    if (clean) return true;
+
+    const consent = await this.confirmDiscardUnsyncedChanges(changes, crossCheck, {
+      kind: "vault",
+      previousVaultName: options?.previousVaultName || undefined,
+      nextVaultName,
+      // Spread only when true, so the pre-mutation mv4 call site's argument
+      // shape is exactly what it was before this parameter existed.
+      ...(options?.bindingAlreadyApplied === true ? { bindingAlreadyApplied: true } : {}),
+    });
+    if (!consent) return false;
+
+    // Same ordering rule as the takeover: clear the tracked unsynced holders
+    // BEFORE the reset, or the "discarded" queued edits survive the wipe and
+    // replay into the newly bound vault once the gate opens — contradicting
+    // the consent copy. Tombstones are left to the reset's own branch.
+    await this.discardUnsyncedLocalChanges();
+    return true;
+  }
+
+  /**
+   * Serialized, coalescing entry point for capsule persistence. Every call —
+   * including each fire-and-forget `void this.persistLocalRecoveryCapsule()`
+   * site — funnels through localRecoveryCapsuleOpChain, so store rotations can
+   * never interleave (see the field's comment for the live ENOENT race this
+   * prevents; those call sites are safe by construction now — do NOT
+   * restructure them). A run that has not yet STARTED absorbs any number of
+   * later callers (it captures their state when it runs); callers arriving
+   * while a rotation is EXECUTING share exactly one trailing run. A burst
+   * therefore costs at most two rotations (last-write-wins), and every awaited
+   * boolean comes from a rotation started at-or-after the caller's call.
+   */
+  private persistLocalRecoveryCapsule(): Promise<boolean> {
+    const queued = this.queuedLocalRecoveryCapsulePersist;
+    if (queued) return queued;
+    const run = this.localRecoveryCapsuleOpChain.then(() => {
+      // clearLocalRecoveryCapsule may have dropped/replaced the slot; only
+      // release it when it still points at this run.
+      if (this.queuedLocalRecoveryCapsulePersist === run) {
+        this.queuedLocalRecoveryCapsulePersist = null;
+      }
+      return this.persistLocalRecoveryCapsuleNow();
+    });
+    this.queuedLocalRecoveryCapsulePersist = run;
+    // ...Now() never rejects (it logs and returns false), but the shared chain
+    // must stay unpoisonable by construction.
+    this.localRecoveryCapsuleOpChain = run.catch(() => undefined);
+    return run;
+  }
+
   /** Backfill every healthy install without exporting or rotating the LAK. */
-  private async persistLocalRecoveryCapsule(): Promise<boolean> {
+  private async persistLocalRecoveryCapsuleNow(): Promise<boolean> {
     if (this.isLocalProjectMemoryModeEnabled()) return false;
     // Some isolated crypto/PIN callers (including embedders and unit
     // harnesses) intentionally exercise these methods before Obsidian has
@@ -8994,6 +10401,7 @@ export default class VaultGuardPlugin extends Plugin {
               serverVaultSlug: this.settings.serverVaultSlug,
               organizationId: this.settings.organizationId || undefined,
               accountUserId: this.session?.userId,
+              accountEmail: this.session?.email || undefined,
             },
           }
         : {}),
@@ -9018,7 +10426,26 @@ export default class VaultGuardPlugin extends Plugin {
     }
   }
 
-  private async clearLocalRecoveryCapsule(): Promise<void> {
+  /**
+   * Serialized on the same chain as persist — a purge and a rotation must
+   * never interleave. Callers arriving AFTER this clear must never coalesce
+   * into a persist queued BEFORE it (the takeover flow's clear → re-persist
+   * would otherwise await a pre-clear rotation and end up wiped), so the
+   * queued-persist slot is dropped up front; that pre-clear run keeps its own
+   * chain position and its awaiters.
+   */
+  private clearLocalRecoveryCapsule(): Promise<void> {
+    this.queuedLocalRecoveryCapsulePersist = null;
+    const run = this.localRecoveryCapsuleOpChain.then(() =>
+      this.clearLocalRecoveryCapsuleNow(),
+    );
+    // ...Now() rethrows to its callers by contract; the shared chain still
+    // must not be poisoned by that rejection.
+    this.localRecoveryCapsuleOpChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async clearLocalRecoveryCapsuleNow(): Promise<void> {
     if (!this.app?.vault?.adapter) return;
     try {
       await (await this.createLocalRecoveryStore()).clear();
@@ -9390,6 +10817,59 @@ export default class VaultGuardPlugin extends Plugin {
     registerFolderLifecycleListenersLifecycle(this.createLifecycleEventsContext());
   }
 
+  /**
+   * Blocked-window mutation tracker (quick-260820-ki7). While the binding
+   * sits in a blocked state (`account-changed` / `wrong-account`) the offline
+   * queue catches every interceptor-mediated edit, but external adds/modifies
+   * that Obsidian merely OBSERVES (Finder drops, git checkouts) never enter
+   * it — encryptExternallyAddedFile deliberately leaves them for sync
+   * catch-up, which is dead while blocked. Stamp those paths so the takeover
+   * lane's cleanliness check refuses the automatic reset.
+   *
+   * The "create" handler is gated on `workspace.layoutReady`: the startup
+   * index fires "create" for EVERY existing file, and the
+   * restart-with-mismatch lane is already blocked BEFORE layoutReady
+   * (verify's mismatch branch is a pure local compare — no network), so an
+   * ungated stamp would false-dirty the whole vault and kill the auto path on
+   * its primary lane (mirrors the encryptExternallyAddedFile gate in onload).
+   * That gate structurally excludes files added while Obsidian was CLOSED
+   * from this tracker — the takeover lane's server-listing cross-check
+   * (crossCheckLocalFilesAgainstServerListing) is what covers that subset.
+   * Modify/delete/rename stamps stay unconditional (those events do not flood
+   * at startup).
+   */
+  private registerBlockedWindowMutationTracker(): void {
+    const stampBlockedWindowMutation = (path: string): void => {
+      if (
+        this.vaultBindingAuthorization !== "account-changed" &&
+        this.vaultBindingAuthorization !== "wrong-account"
+      ) {
+        return;
+      }
+      const normalized = this.normalizeVaultPath(path);
+      if (!normalized || this.isPathExcluded(normalized)) return;
+      this.blockedStateLocalEdits.add(normalized);
+    };
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        if (!this.app.workspace.layoutReady) return;
+        stampBlockedWindowMutation(file.path);
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => stampBlockedWindowMutation(file.path))
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => stampBlockedWindowMutation(file.path))
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        stampBlockedWindowMutation(oldPath);
+        stampBlockedWindowMutation(file.path);
+      })
+    );
+  }
+
   private handleFolderCreated(path: string): void {
     return this.ensureSyncRuntime().handleFolderCreated(path);
   }
@@ -9560,6 +11040,25 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private askReconciliationPlan(plan: ReconciliationPlan): Promise<ReconciliationDecision> {
+    // DOWNLOAD-ONLY plans apply without asking (quick-260820-mv4). The modal
+    // exists to get consent for the two outcomes a user can regret — uploading
+    // local-only files into a server vault, and resolving conflicts — and when
+    // neither is present there is no question to ask: nothing on this device
+    // can be lost, the plan only adds server files this account may already
+    // read. This is what keeps the "auto when clean" promise intact after a
+    // takeover or vault-switch reset, whose wipe leaves exactly this shape
+    // (empty local side, everything server-only) and used to surface a
+    // pointless "Apply plan ↓N" dialog at the end of an automatic flow.
+    if (plan.localOnly.length === 0 && plan.conflicts.length === 0) {
+      this.log(
+        `Reconciliation: download-only plan (${plan.serverOnly.length} server file(s)) — applying without a prompt.`
+      );
+      return Promise.resolve({
+        proceed: true,
+        conflictStrategy: this.settings.defaultConflictResolution,
+      });
+    }
+
     return new Promise<ReconciliationDecision>((resolve) => {
       const modal = new BindingReconciliationModal(
         this.app,
@@ -11172,10 +12671,25 @@ export default class VaultGuardPlugin extends Plugin {
           );
         }
       }
-    } else if (status === "offline" && previousStatus !== "offline") {
-      this.connectionState.failedAttempts++;
+    } else if (status === "offline") {
+      // Backoff still grows per DISTINCT outage, so only a real transition
+      // counts as a new failure — a repeat "offline" while already offline must
+      // not inflate the interval.
+      if (previousStatus !== "offline") {
+        this.connectionState.failedAttempts++;
+      }
       if (scheduleRetry) {
-        this.scheduleConnectionRetry();
+        // Deliberately NOT gated on `previousStatus !== "offline"`. The class is
+        // BORN "offline" (see the connectionState field initializer), so an
+        // edge-only guard swallowed the very first offline signal of every
+        // process: no `failedAttempts++`, no retry armed, and — because
+        // `attemptReconnection` only ever runs from that timer while
+        // `performSync` and its focus triggers are gated behind `isOnline()` —
+        // no path back online short of a logout/login. That is the
+        // "still offline after restarting Obsidian, fixed by signing out and
+        // in" report. `ensureConnectionRecovery` is idempotent, so a live timer
+        // keeps its place in the backoff sequence instead of being reset.
+        this.ensureConnectionRecovery();
       } else {
         this.stopConnectionRetry();
         this.connectionState.nextRetryAt = null;
@@ -11244,6 +12758,83 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
+   * Arms the reconnect loop if — and ONLY if — it is currently missing.
+   *
+   * THE INVARIANT IT ENFORCES: while a session exists and the status is not
+   * "online", there is always exactly one live reconnect timer. Nothing else in
+   * the plugin re-probes the backend on its own — `performSync` and its
+   * focus/visibility triggers all return early on `!isOnline()`, and the
+   * heartbeat / key-renewal monitors are only started from paths that a failing
+   * startup resume never reaches. So a lost timer is not a degraded state, it is
+   * a terminal one, and the user's only escape is a logout/login.
+   *
+   * Idempotent by design: a live timer is left exactly where it is, so repeated
+   * offline signals during one outage can never reset the backoff sequence back
+   * to 5 s. The `failedAttempts` floor keeps `scheduleConnectionRetry`'s
+   * `2^(n-1)` arithmetic on whole steps when we arm from the birth state (where
+   * no failure was ever counted).
+   *
+   * The `!this.session` early exit is load-bearing and matches
+   * `scheduleConnectionRetry`'s own guard: `forceLogout` nulls the session
+   * BEFORE its `setConnectionStatus("offline")`, so a logout still arms nothing
+   * and the "Connection retry scheduled in 5s/10s/…" post-logout storm stays
+   * fixed.
+   */
+  private ensureConnectionRecovery(): void {
+    if (this.connectionRetryTimer) return;
+    if (this.connectionState.status === "online") return;
+    if (!this.session) return;
+    // Local Project Memory Mode has no backend to reconnect to — it parks the
+    // plugin offline on purpose (see completeLogin / restoreServerSession).
+    if (this.isLocalProjectMemoryModeEnabled()) return;
+
+    if (this.connectionState.failedAttempts < 1) {
+      this.connectionState.failedAttempts = 1;
+    }
+    this.scheduleConnectionRetry();
+  }
+
+  /**
+   * THE single backstop every `resumeStoredSession` caller runs when its resume
+   * settles — success, early return, or throw.
+   *
+   * It exists because "reachable" and "resumed" are independent failures.
+   * `ensureConnectionRecovery` alone is not enough: a resume can end incomplete
+   * while the status reads ONLINE (the probe that triggered the re-drive
+   * succeeded, or an unrelated request flipped it), and there the reconnect loop
+   * correctly refuses to arm — leaving a plugin that answers "online" but has no
+   * monitors, an unverified binding and no sync engine, with nothing scheduled
+   * to ever try again.
+   *
+   * So: complete → just keep the ordinary offline-recovery invariant. Incomplete
+   * → force a probe onto the schedule regardless of the current status, backing
+   * off on `incompleteResumeRetries` (5 s, 10 s, 20 s … 2 min ceiling) because
+   * the "online" flip ahead of each re-drive keeps resetting
+   * `connectionState.failedAttempts` to 0.
+   *
+   * Note what is deliberately NOT retried: a DEFINITIVE server answer marks the
+   * resume complete at its own call site (see the binding gate's `wrong-account`
+   * branch), because re-asking cannot change it and the loop would only restage
+   * the same sticky Notice.
+   */
+  private armResumeRetryIfIncomplete(): void {
+    if (this.serverSessionResumeComplete) {
+      this.incompleteResumeRetries = 0;
+      this.ensureConnectionRecovery();
+      return;
+    }
+    if (!this.session) return;
+    if (this.isLocalProjectMemoryModeEnabled()) return;
+
+    this.incompleteResumeRetries++;
+    this.connectionState.failedAttempts = Math.max(
+      this.connectionState.failedAttempts,
+      this.incompleteResumeRetries
+    );
+    this.scheduleConnectionRetry();
+  }
+
+  /**
    * Schedules a connection retry with exponential backoff.
    */
   private scheduleConnectionRetry(): void {
@@ -11308,6 +12899,11 @@ export default class VaultGuardPlugin extends Plugin {
       if (response.success) {
         this.setConnectionStatus("online");
         this.log("Reconnection successful.");
+        // Connectivity alone is not recovery. If the startup resume never
+        // finished, the plugin has no heartbeat, no key-renewal poll, an
+        // unverified vault binding and no sync engine — it would sit "online"
+        // and idle forever. Finish it now that the backend answers.
+        this.resumeIncompleteServerSession();
       } else if (
         response.error?.statusCode === 401 ||
         response.error?.statusCode === 403
@@ -11321,6 +12917,42 @@ export default class VaultGuardPlugin extends Plugin {
     } catch {
       this.setConnectionStatus("offline");
     }
+  }
+
+  /**
+   * Re-drives a startup resume that never reached its end state, once the
+   * backend is answering again.
+   *
+   * Fire-and-forget by contract — `attemptReconnection` must not start waiting
+   * on a full session restore, and a second failure here is just another
+   * incomplete resume that the next successful probe will retry. Re-entrancy is
+   * held off by `sessionResumePromise`, the same handle `onload` and the
+   * interceptors already use, so this can never run two resumes at once.
+   *
+   * `resumeStoredSession` is idempotent enough to re-run: the monitors
+   * stop-then-start, `initializeSyncEngine` is guarded on `!this.syncTimer`, and
+   * the vault-binding check re-runs from scratch. Re-minting a server session is
+   * the one real cost, and it only happens when the previous one could not be
+   * used anyway.
+   */
+  private resumeIncompleteServerSession(): void {
+    if (this.serverSessionResumeComplete) return;
+    if (!this.session) return;
+    if (this.sessionResumePromise) return;
+    if (this.isLocalProjectMemoryModeEnabled()) return;
+
+    this.log("Reconnected with an unfinished session resume — retrying it.");
+    this.syncDiagnostics.record("attemptReconnection.resumeRetry");
+    const resumePromise = this.resumeStoredSession().catch((err) => {
+      this.logError("Post-reconnect session resume failed (will retry)", err);
+    });
+    this.sessionResumePromise = resumePromise;
+    void resumePromise.finally(() => {
+      if (this.sessionResumePromise === resumePromise) {
+        this.sessionResumePromise = null;
+      }
+      this.armResumeRetryIfIncomplete();
+    });
   }
 
   /**
@@ -12069,6 +13701,16 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
+    // A blocked binding is a PAUSED vault that otherwise looks perfectly
+    // healthy (quick-260820-nqm). The logged-out state has carried a ribbon
+    // badge for a long time; a logged-IN session whose binding is
+    // account-changed or wrong-account showed the ordinary connected shield,
+    // so once its notice was dismissed nothing outside the status bar said
+    // sync had stopped — the same class of bug quick-260819-sd8 fixed for the
+    // status bar, still open on the ribbon. Cleared on EVERY other path below
+    // (including logged-out, which has its own badge) so it cannot stick.
+    shieldEl?.removeClass("vaultguard-ribbon-binding-blocked");
+
     if (!this.session) {
       for (const el of ribbonEls) {
         el.removeClass("vaultguard-ribbon-auth-logged-in");
@@ -12096,13 +13738,36 @@ export default class VaultGuardPlugin extends Plugin {
       el.addClass("vaultguard-ribbon-auth-logged-in");
       el.removeClass("vaultguard-ribbon-auth-logged-out");
     }
-    shieldEl?.setAttr("aria-label", "VaultGuard Sync");
-    shieldEl?.setAttr(
-      "title",
-      `VaultGuard Sync: connected${
-        this.session.email ? ` as ${this.session.email}` : ""
-      }.`
-    );
+
+    const blockedReason =
+      this.settings.serverVaultId &&
+      (this.vaultBindingAuthorization === "account-changed" ||
+        this.vaultBindingAuthorization === "wrong-account")
+        ? this.vaultBindingAuthorization
+        : null;
+    if (blockedReason && shieldEl) {
+      const vault = this.settings.serverVaultName
+        ? ` ("${this.settings.serverVaultName}")`
+        : "";
+      shieldEl.addClass("vaultguard-ribbon-binding-blocked");
+      shieldEl.setAttr("aria-label", "VaultGuard Sync: paused — account check needed");
+      shieldEl.setAttr(
+        "title",
+        blockedReason === "wrong-account"
+          ? `VaultGuard Sync is paused: ${this.describeCurrentAccount()} is not a member of this folder's server vault${vault}. ` +
+            "This folder works locally only. Click to resolve."
+          : `VaultGuard Sync is paused: this folder's server vault${vault} has not been checked against the signed-in account yet. ` +
+            "This folder works locally only. Click to resolve."
+      );
+    } else {
+      shieldEl?.setAttr("aria-label", "VaultGuard Sync");
+      shieldEl?.setAttr(
+        "title",
+        `VaultGuard Sync: connected${
+          this.session.email ? ` as ${this.session.email}` : ""
+        }.`
+      );
+    }
     this.vaultGuardChatRibbonEl?.setAttr("aria-label", "VaultGuard Chat");
     this.vaultGuardChatRibbonEl?.setAttr(
       "title",
@@ -12178,6 +13843,21 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
+    // A parked account decision (or a server "no") outranks the connection
+    // line: "Connected ✓" was literally true (the API is reachable) but read
+    // as "sync is healthy" while every upload and download was gated — the
+    // deceptive half of the quick-260819-sd8 finding. Click-to-resolve is
+    // wired in applyStatusBarMode.
+    const bindingGate = this.getProtectedContentGate();
+    if (
+      !bindingGate.ok &&
+      (bindingGate.reason === "account-changed" || bindingGate.reason === "wrong-account")
+    ) {
+      this.statusBarEl.setText(this.i18n.t("status.syncPausedAccount"));
+      this.statusBarEl.setAttr("title", `${bindingGate.message} Click to resolve.`);
+      return;
+    }
+
     const connectionIcon =
       this.connectionState.status === "online"
         ? "\u2713"
@@ -12213,11 +13893,19 @@ export default class VaultGuardPlugin extends Plugin {
     this.settings.showStatusBar = show;
     if (show && !this.statusBarEl) {
       this.statusBarEl = this.addStatusBarItem();
-      // Clickable recovery affordance — but ONLY act while needs-recovery, so a
-      // normal Connected status bar is never hijacked (no-op otherwise).
+      // Clickable affordance — but ONLY act in the alarm states, so a normal
+      // Connected status bar is never hijacked (no-op otherwise).
       this.statusBarEl?.addEventListener("click", () => {
         if (this.getAtRestStatus().kind === "needs-recovery") {
           this.startAtRestRecoveryFlow();
+          return;
+        }
+        if (
+          this.vaultBindingAuthorization === "account-changed" ||
+          this.vaultBindingAuthorization === "wrong-account"
+        ) {
+          this.hideAccountChangePausedNotice();
+          this.handlePrimaryProtectionAction();
         }
       });
       this.updateStatusBar();
@@ -12422,8 +14110,44 @@ export default class VaultGuardPlugin extends Plugin {
    *
    * Does NOT surface the new recovery code — that is 13-03 (UI). Resolves on
    * success; the caller shows the code.
+   *
+   * SECOND ENTRY CONDITION — `mode: "account-takeover"` (quick-260819-ouh):
+   * the same wipe+reprovision+re-pull, entered from a HEALTHY at-rest state
+   * when a confirmed different account takes over this folder's binding. The
+   * LAK is device-scoped, so adopting without a re-key hands the new account
+   * the previous account's entire decrypted local cache (investigation report
+   * §9.2). Takeover mode swaps the needs-recovery guard for a pending
+   * expectation-mismatch guard, proves membership via the NON-stamping probe
+   * (the expectation must survive until the reset completes), and additionally
+   * drops the previous account's sync bookkeeping, caches and sealed sessions
+   * before the re-pull. The caller (adoptBindingForCurrentAccount) has already
+   * collected explicit destructive consent — this method still refuses on any
+   * guard miss with zero side effects.
+   *
+   * THIRD ENTRY CONDITION — `mode: "vault-switch"` (quick-260820-mv4): the
+   * SAME account re-points this folder at a DIFFERENT server vault. The local
+   * cache belongs to the vault being left, so it must be replaced rather than
+   * merged — without this, reconciliation classified the whole previous vault
+   * as local-only and offered to upload it into the vault just connected.
+   * Identity is unchanged, so the session re-seal and the account-expectation
+   * bits of takeover mode do not apply; everything else (wipe, re-key,
+   * bookkeeping reset, re-pull) is shared. The pending-switch proof is the
+   * caller-supplied `previousVaultId` differing from the now-bound vault, so
+   * a stray call on a settled binding refuses like any other guard miss.
    */
-  async resetLocalAtRestAndResync(): Promise<void> {
+  async resetLocalAtRestAndResync(
+    options?: {
+      mode?: "needs-recovery" | "account-takeover" | "vault-switch";
+      /** `vault-switch` only: the vault this folder held before the rebind. */
+      previousVaultId?: string;
+    }
+  ): Promise<void> {
+    const mode = options?.mode ?? "needs-recovery";
+    const takeover = mode === "account-takeover";
+    const vaultSwitch = mode === "vault-switch";
+    // Both non-recovery modes replace a local cache that no longer matches the
+    // binding, and share every step below except the identity-only ones.
+    const rebind = takeover || vaultSwitch;
     // REENTRANCY GUARD (CR-01) — the VERY FIRST thing, before ANY side effect.
     // A second concurrent reset must refuse cleanly: if it fell through to the
     // shared-flag `finally` below it would run `setResettingLocalCache(false)` +
@@ -12441,15 +14165,38 @@ export default class VaultGuardPlugin extends Plugin {
 
     // GUARD (authoritative, D1). All four conditions are required; any miss
     // refuses with ZERO side effects (no flag flip, no pause, no wipe, no
-    // network) so a wrong-state call can never delete live server data.
+    // network) so a wrong-state call can never delete live server data. In
+    // takeover mode the at-rest-state condition is replaced by a REAL pending
+    // account mismatch: the capsule must name a different user than the
+    // session, or there is no takeover to perform and a stray call must not
+    // wipe a healthy single-account vault.
+    const takeoverPending =
+      !!this.session &&
+      !!this.localRecoveryExpectedAccountUserId &&
+      this.localRecoveryExpectedAccountUserId !== this.session.userId;
+    // The vault-switch analogue of `takeoverPending`: a REAL rebind must be in
+    // flight. Without this a stray call would wipe a folder whose cache
+    // matches its binding perfectly.
+    const previousVaultId = options?.previousVaultId?.trim() ?? "";
+    const vaultSwitchPending =
+      !!previousVaultId && previousVaultId !== this.settings.serverVaultId?.trim();
+    const modePrecondition = takeover
+      ? takeoverPending
+      : vaultSwitch
+        ? vaultSwitchPending
+        : this.getAtRestStatus().kind === "needs-recovery";
     if (
       !this.session ||
       !this.isOnline() ||
-      this.getAtRestStatus().kind !== "needs-recovery" ||
+      !modePrecondition ||
       !this.settings.serverVaultId
     ) {
       const err = new Error(
-        "VaultGuard Sync: resetting local encryption needs a locked (needs-recovery) at-rest state, an authenticated session, an online connection, and a bound vault. Refusing — no files were changed."
+        takeover
+          ? "VaultGuard Sync: an account-takeover reset needs an authenticated session, an online connection, a bound vault, and a pending account change recorded for this folder. Refusing — no files were changed."
+          : vaultSwitch
+            ? "VaultGuard Sync: a vault-switch reset needs an authenticated session, an online connection, and a newly bound vault that differs from the one this folder held. Refusing — no files were changed."
+            : "VaultGuard Sync: resetting local encryption needs a locked (needs-recovery) at-rest state, an authenticated session, an online connection, and a bound vault. Refusing — no files were changed."
       );
       err.name = "AtRestResetGuardError";
       throw err;
@@ -12462,15 +14209,21 @@ export default class VaultGuardPlugin extends Plugin {
     // A real Obsidian plugin instance always has a vault adapter. The adapter
     // check only preserves the historical isolated reset-unit seam, which has
     // no API client or filesystem; production must prove the exact binding.
-    if (
-      this.app?.vault?.adapter &&
-      !(await this.verifyBoundVaultAuthorization())
-    ) {
-      const err = new Error(
-        "VaultGuard Sync: the bound server vault is not authorized for this account. Refusing the local reset — no files were changed.",
-      );
-      err.name = "AtRestResetGuardError";
-      throw err;
+    // Takeover mode uses the NON-stamping probe: verifyBoundVaultAuthorization
+    // would trip on the still-pending expectation mismatch (that mismatch IS
+    // the takeover), and the expectation must not be re-stamped until the
+    // reset has actually replaced the previous account's key.
+    if (this.app?.vault?.adapter) {
+      const authorized = takeover
+        ? await this.probeBoundVaultMembership()
+        : await this.verifyBoundVaultAuthorization();
+      if (!authorized) {
+        const err = new Error(
+          "VaultGuard Sync: the bound server vault is not authorized for this account. Refusing the local reset — no files were changed.",
+        );
+        err.name = "AtRestResetGuardError";
+        throw err;
+      }
     }
 
     // CROSS-INSTANCE REENTRANCY (SD-07-F4). The latch above is instance-local,
@@ -12533,6 +14286,7 @@ export default class VaultGuardPlugin extends Plugin {
       this.localProtectionBootstrap = { kind: "existing", source: "plugin-envelope" };
       this.localRecoveryNeedsLakValidation = false;
       this.localRecoveryExpectedAccountUserId = this.session.userId;
+      this.localRecoveryExpectedAccountEmail = this.session.email ?? null;
       if (
         this.app?.vault?.adapter &&
         !(await this.persistLocalRecoveryCapsule())
@@ -12560,6 +14314,55 @@ export default class VaultGuardPlugin extends Plugin {
       // app.vault.getFiles() before reconcile — else they are SY6 unreadable-
       // skipped and never re-pulled (threat T-13-06).
       await this.settleVaultIndexAfterWipe(wipedPaths);
+
+      if (rebind) {
+        // The local cache no longer belongs to this binding — on takeover
+        // because the folder changed hands, on a vault switch because it now
+        // points at a different vault. Either way none of the previous
+        // relationship's bookkeeping may carry over: tombstones would replay
+        // the previous queued deletes into the new world (report §3.4); the
+        // delta cursor and reconciled-id describe a binding that no longer
+        // exists; the permission cache, semantic index and decrypted-media
+        // previews all derive from content read under the old key and the old
+        // authority (SD-03-F5 rationale — an authority switch invalidates the
+        // whole context).
+        delete this.settings.deletionTombstones;
+        delete this.settings.lastSyncTimestamp;
+        delete this.settings.bindingReconciledVaultId;
+        this.syncState.lastSync = null;
+        await this.saveSettings();
+        this.keyLease = null;
+        // `!`-declared, assigned in onload — the optional calls keep the
+        // orchestrator usable from the isolated reset-unit harness, same as
+        // the pinLockManager/runtime members above.
+        this.permissionStore?.invalidate();
+        this.permissionStore?.emit("changed", { serverConfirmed: true });
+        this.ensureAtRestAdapterRuntimeObject().revokeAllResourcePreviews?.();
+        if (this.shouldPurgeSemanticIndex()) {
+          await this.purgeSemanticRuntime(mode);
+        }
+        if (takeover) {
+          // IDENTITY-ONLY, and therefore takeover-only: sweep EVERY sealed
+          // session envelope (PL6 already covers stale binding ids from folder
+          // renames — the previous account's refresh token must not survive
+          // its own folder), then re-seal the current session under the fresh
+          // key material. A vault switch never changes who is signed in, so
+          // re-sealing there would churn a perfectly valid session envelope
+          // for nothing.
+          await this.clearStoredSession();
+          await this.persistSession(this.session);
+        }
+        // The protected-content gate still reads "account-changed" (takeover)
+        // or "unverified" (the vault switch set it when the binding flipped).
+        // The expectation stamp above recorded the takeover, so this verify
+        // sees no mismatch, asks the server once more, lands "verified", and
+        // thereby opens the gate the re-pull below runs behind.
+        if (!(await this.verifyBoundVaultAuthorization())) {
+          throw new Error(
+            "VaultGuard Sync: the local key was replaced but the binding could not be re-verified, so the re-download is still pending. Continue as this account from the sidebar to retry.",
+          );
+        }
+      }
 
       // Re-pull every server file under the fresh LAK (set-based serverOnly
       // pull; binaries included, contingent on the deployed cold-path fix).

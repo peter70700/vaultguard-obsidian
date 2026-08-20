@@ -343,6 +343,41 @@ describe('File Protection: Vault Adapter Interception', () => {
       expect(plugin.originalAdapterMethods.read).toHaveBeenCalledWith('docs/readme.md');
     });
 
+    it('serves LOCAL content while the account question is unanswered, even online (quick-260819-sd8)', async () => {
+      // While the binding is account-changed the sync gate holds local edits
+      // back; serving the newest SERVER copy here displayed stale content
+      // over a newer local edit — typed text visibly "reverted", and saving
+      // the stale view clobbered the edit for real (runtime repro 2026-08-19).
+      plugin.session = makeSession('member');
+      plugin.permissionCache.set('docs/readme.md', PermissionLevel.READ);
+      plugin.connectionState.status = 'online';
+      plugin.vaultBindingAuthorization = 'account-changed';
+      plugin.fetchRemoteFileContent = vi.fn();
+      plugin.decodeRemoteFileContent = vi.fn();
+
+      const content = await plugin.interceptedRead('docs/readme.md');
+
+      expect(content).toBe('local file content');
+      expect(plugin.fetchRemoteFileContent).not.toHaveBeenCalled();
+    });
+
+    it('resumes serving the newest server copy once the binding is verified', async () => {
+      plugin.session = makeSession('member');
+      plugin.permissionCache.set('docs/readme.md', PermissionLevel.READ);
+      plugin.connectionState.status = 'online';
+      plugin.vaultBindingAuthorization = 'verified';
+      plugin.fetchRemoteFileContent = vi.fn().mockResolvedValue({
+        success: true,
+        data: { content: 'ZW5jcnlwdGVk', encrypted: true },
+      });
+      plugin.decodeRemoteFileContent = vi.fn().mockResolvedValue('server file content');
+
+      const content = await plugin.interceptedRead('docs/readme.md');
+
+      expect(content).toBe('server file content');
+      expect(plugin.fetchRemoteFileContent).toHaveBeenCalledWith('docs/readme.md');
+    });
+
     it('waits for restored-session permission warm-up before wiping a startup read', async () => {
       plugin.session = makeSession('member');
       plugin.connectionState.status = 'offline';

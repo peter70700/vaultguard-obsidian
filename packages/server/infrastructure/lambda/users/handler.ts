@@ -36,7 +36,6 @@ import {
   CreateGroupCommand,
   MessageActionType,
 } from '@aws-sdk/client-cognito-identity-provider';
-import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
 import type {
   AdminGetUserCommandOutput,
   ListUsersCommandOutput,
@@ -87,15 +86,33 @@ import {
   isEmailAllowedForOrg,
   invalidateOrgSettingsCache,
   VaultRecord,
+  listVaultMembers,
+  VaultMemberRecord,
 } from '../shared/utils';
 import {
   DEFAULT_GUEST_ACCESS_DAYS,
+  GUEST_ORIGIN_ATTACHED,
+  GUEST_ORIGIN_INVITE,
+  GuestOrigin,
   guestAccessExpiresAt,
   isIdenticalGuestMembership,
+  isExpiringAccessActive,
   isIdenticalGuestPermissionRule,
   normalizeGuestVaultIds,
+  summarizeGuestAccess,
 } from '../shared/guest-access';
 import { UsersRouteContext, resolveUsersRouteContext } from '../shared/route-utils';
+// Seat accounting and crypto-access teardown live in shared/ so the reconciler's
+// guest-expiry sweeper can call the SAME implementation, and so the IAM grant
+// guard can see the tables they touch. Layering is one-directional: this handler
+// imports the module, never the reverse.
+import {
+  deleteGuestAccessRows,
+  ensureRevokedSeatIdentity,
+  releaseRevokedUserSeat,
+  reserveReactivatedUserSeat,
+  revokeUserCryptoAccess,
+} from '../shared/access-revocation';
 import { sendEmail } from '../email/handler';
 import { syncStripeSeats } from '../billing/handler';
 
@@ -108,7 +125,6 @@ const REGION = process.env.AWS_REGION || 'eu-west-1';
 const REVOKED_KEYS_TABLE = process.env.REVOKED_KEYS_TABLE!;
 
 const cognitoClient = new CognitoIdentityProviderClient({ region: REGION });
-const eventBridgeClient = new EventBridgeClient({ region: REGION });
 
 // Valid roles that map to Cognito groups
 const VALID_ROLES = ['admin', 'editor', 'viewer'] as const;
@@ -249,75 +265,6 @@ async function releaseInviteSeatReservation(org: OrgRecord, token: string): Prom
   } catch (error) {
     // A missing token means this exact reservation was already released.
     if (!isConditionalCheckFailure(error)) throw error;
-  }
-}
-
-/**
- * Releases a user's seat exactly once. The subject set is mutated in the same
- * conditional update as the counter, so concurrent/repeated revocations cannot
- * drive the counter below the number of active users.
- */
-async function releaseRevokedUserSeat(org: OrgRecord, subjectId: string): Promise<boolean> {
-  try {
-    await docClient.send(new UpdateCommand({
-      TableName: ORGANIZATIONS_TABLE,
-      Key: { slug: org.slug },
-      UpdateExpression: 'SET updatedAt = :now ADD currentUsers :minusOne, revokedSeatUserIds :subjects',
-      ConditionExpression: [
-        'currentUsers > :zero',
-        '(attribute_not_exists(revokedSeatUserIds) OR NOT contains(revokedSeatUserIds, :subject))',
-      ].join(' AND '),
-      ExpressionAttributeValues: {
-        ':now': new Date().toISOString(),
-        ':minusOne': -1,
-        ':zero': 0,
-        ':subjects': new Set([subjectId]),
-        ':subject': subjectId,
-      },
-    }));
-    return true;
-  } catch (error) {
-    if (isConditionalCheckFailure(error)) return false;
-    throw error;
-  }
-}
-
-async function ensureRevokedSeatIdentity(org: OrgRecord, subjectId: string): Promise<void> {
-  await docClient.send(new UpdateCommand({
-    TableName: ORGANIZATIONS_TABLE,
-    Key: { slug: org.slug },
-    UpdateExpression: 'SET updatedAt = :now ADD revokedSeatUserIds :subjects',
-    ExpressionAttributeValues: {
-      ':now': new Date().toISOString(),
-      ':subjects': new Set([subjectId]),
-    },
-  }));
-}
-
-async function reserveReactivatedUserSeat(org: OrgRecord, subjectId: string): Promise<boolean> {
-  try {
-    await docClient.send(new UpdateCommand({
-      TableName: ORGANIZATIONS_TABLE,
-      Key: { slug: org.slug },
-      UpdateExpression: 'SET updatedAt = :now ADD currentUsers :one DELETE revokedSeatUserIds :subjects',
-      ConditionExpression: [
-        'contains(revokedSeatUserIds, :subject)',
-        'attribute_exists(currentUsers)',
-        'attribute_exists(maxUsers)',
-        '(maxUsers < :zero OR currentUsers < maxUsers)',
-      ].join(' AND '),
-      ExpressionAttributeValues: {
-        ':now': new Date().toISOString(),
-        ':one': 1,
-        ':zero': 0,
-        ':subjects': new Set([subjectId]),
-        ':subject': subjectId,
-      },
-    }));
-    return true;
-  } catch (error) {
-    if (isConditionalCheckFailure(error)) return false;
-    throw error;
   }
 }
 
@@ -571,6 +518,34 @@ async function handleListUsers(
     return orgAttr?.Value === admin.orgId;
   });
 
+  // DR-1: guest state is computed HERE, server-side, org-wide — not by either client
+  // and not from whichever vault a client happens to have open. A guest scoped to any
+  // vault in the org must be identified, so the membership fetch is org-scoped by
+  // construction: one Query for the org's vaults, then one Query per vault.
+  //
+  // The per-user membership GSI is deliberately NOT used here: its rows carry no orgId
+  // (it is org-blind, RESEARCH assumption A3) and it would cost one round trip per user.
+  // This shape costs 1 + N_vaults Queries regardless of how many users the org has.
+  //
+  // One clock for the entire response. Re-reading the clock per user would let two users
+  // in the same payload straddle an expiry boundary and disagree about the same instant.
+  const nowMs = Date.now();
+  const orgVaults = (await listVaultsForOrg(admin.orgId)).filter((vault) => !vault.archived);
+  const vaultMemberships = await Promise.all(
+    orgVaults.map((vault) => listVaultMembers(vault.vaultId))
+  );
+  const membershipsByUser = new Map<string, VaultMemberRecord[]>();
+  for (const rows of vaultMemberships) {
+    for (const row of rows) {
+      const existing = membershipsByUser.get(row.userId);
+      if (existing) {
+        existing.push(row);
+      } else {
+        membershipsByUser.set(row.userId, [row]);
+      }
+    }
+  }
+
   const users = await Promise.all(
     orgUsers.map(async (cognitoUser) => {
       const userId = cognitoUser.Username!;
@@ -601,6 +576,13 @@ async function handleListUsers(
       const mfaEnabled = mfaMethods.length > 0;
       const displayName = buildUserDisplayName(attrs, attrs['email'] || userId);
 
+      // VaultMembers rows are keyed on the Cognito SUB, which is the same value `id`
+      // below returns — NOT on `cognitoUser.Username`. In this pool the two frequently
+      // differ, and keying on Username yields a join that is silently empty: every
+      // active guest would render as an ordinary viewer with no error anywhere.
+      const subjectId = attrs['sub'] || userId;
+      const guestSummary = summarizeGuestAccess(membershipsByUser.get(subjectId) ?? [], nowMs);
+
       return {
         id: attrs['sub'] || userId,
         email: attrs['email'] || '',
@@ -615,9 +597,16 @@ async function handleListUsers(
         mfaEnabled,
         deviceCount: 0,
         type: 'user' as const,
+        // Both fields are OMITTED rather than set to a falsy value for a non-guest, so
+        // the client's `accessKind !== 'guest'` test stays the whole decision and the 13
+        // pre-existing fields are untouched for every user.
+        ...(guestSummary.isGuest ? { accessKind: 'guest' as const } : {}),
+        ...(guestSummary.expiresAt !== undefined ? { expiresAt: guestSummary.expiresAt } : {}),
       };
     })
   );
+
+  const guestCount = users.filter((user) => user.accessKind === 'guest').length;
 
   await logAudit({
     userId: admin.userId,
@@ -628,13 +617,28 @@ async function handleListUsers(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { userCount: users.length },
+    metadata: { userCount: users.length, guestCount },
   });
 
   return formatSuccess(200, users, requestId);
 }
 
 // ─── POST /users/invite ─────────────────────────────────────────────────────
+
+/**
+ * ONE message and ONE status for BOTH the cross-org and the not-found outcome of
+ * resolving an already-existing email on the guest path. Splitting them (403 vs
+ * 404, or two wordings) would turn this route into an existence oracle over the
+ * shared Cognito pool: an admin could type any address and read from the status
+ * whether it belongs to somebody else's organization. Disclosure *within* the
+ * caller's own org is fine — they can already list it — which is why the copy
+ * may point at the user list.
+ */
+const GUEST_ATTACH_UNRESOLVABLE_MESSAGE =
+  'Guest access could not be granted to that email address. If they are already in your organization, grant access from the user list instead.';
+
+const GUEST_ATTACH_REVOKED_MESSAGE =
+  "This user's access is revoked. Reactivate them first, then extend their guest access.";
 
 async function handleInviteUser(
   event: APIGatewayProxyEvent,
@@ -758,6 +762,7 @@ async function handleInviteUser(
   // with the temp password in plaintext). We send our own branded email instead.
   let cognitoUsername: string | undefined;
   let userId: string;
+  let attachedToExistingIdentity = false;
   try {
     const createResult = await cognitoClient.send(
       new AdminCreateUserCommand({
@@ -798,53 +803,104 @@ async function handleInviteUser(
       })
     );
   } catch (error) {
-    if (cognitoUsername) {
-      await cognitoClient.send(new AdminDeleteUserCommand({
-        UserPoolId: USER_POOL_ID,
-        Username: cognitoUsername,
-      })).catch((deleteError) => {
-        console.error('[USERS_INVITE_COMPENSATION_DELETE_FAILED]', {
+    // CONTEXT.md DR-7 — a colleague who already has an account can be given
+    // temporary access to one more vault. Fires ONLY for a guest invite whose
+    // identity already exists; every other error and every member-path
+    // collision falls straight through to the compensation below and rethrows,
+    // which is what keeps the member path's behaviour unchanged.
+    //
+    // Nothing here creates, deletes, re-enables, re-groups or re-profiles an
+    // identity: no AdminAddUserToGroup (it would put an existing editor in two
+    // groups and let resolveRole change their org role), no
+    // AdminUpdateUserAttributes (an invite form must not rewrite a colleague's
+    // profile), no AdminDeleteUser. Only membership rows are added, by the
+    // seeding call further down, whose conditional writes already refuse to
+    // overwrite a permanent membership.
+    if ((error as { name?: string }).name === 'UsernameExistsException' && accessKind === 'guest') {
+      let resolved: ResolvedTargetUser;
+      try {
+        resolved = await resolveTargetUserForOrg(
+          email,
+          admin.orgId,
+          GUEST_ATTACH_UNRESOLVABLE_MESSAGE
+        );
+      } catch (resolveError) {
+        await releaseInviteSeatReservation(org, seatReservationToken).catch((releaseError) => {
+          console.error('[USERS_INVITE_COMPENSATION_SEAT_FAILED]', {
+            orgId: admin.orgId,
+            seatReservationToken,
+            error: (releaseError as Error).message,
+          });
+        });
+        // Both the foreign-org rejection and the unresolvable address collapse
+        // into the same response. Anything else is an infrastructure failure
+        // and must keep its own error.
+        if (resolveError instanceof AuthError) {
+          return formatError(404, GUEST_ATTACH_UNRESOLVABLE_MESSAGE, requestId);
+        }
+        throw resolveError;
+      }
+
+      const revocationMarker = await getRevocationMarker(resolved.subjectId);
+      if (resolved.user.Enabled === false || revocationMarker) {
+        // Attaching to a blanket-403'd identity would report success and
+        // deliver nothing, and silently re-enabling one here would let an
+        // invite undo a deliberate revoke. Point at the explicit flow instead.
+        await releaseInviteSeatReservation(org, seatReservationToken).catch((releaseError) => {
+          console.error('[USERS_INVITE_COMPENSATION_SEAT_FAILED]', {
+            orgId: admin.orgId,
+            seatReservationToken,
+            error: (releaseError as Error).message,
+          });
+        });
+        return formatError(409, GUEST_ATTACH_REVOKED_MESSAGE, requestId);
+      }
+
+      // No new identity means no new seat.
+      await releaseInviteSeatReservation(org, seatReservationToken);
+      userId = resolved.subjectId;
+      attachedToExistingIdentity = true;
+    } else {
+      // cognitoUsername is still undefined when AdminCreateUser itself threw,
+      // so a name collision never reaches AdminDeleteUser. That ordering is
+      // load-bearing — keep it.
+      if (cognitoUsername) {
+        await cognitoClient.send(new AdminDeleteUserCommand({
+          UserPoolId: USER_POOL_ID,
+          Username: cognitoUsername,
+        })).catch((deleteError) => {
+          console.error('[USERS_INVITE_COMPENSATION_DELETE_FAILED]', {
+            orgId: admin.orgId,
+            cognitoUsername,
+            error: (deleteError as Error).message,
+          });
+        });
+      }
+      await releaseInviteSeatReservation(org, seatReservationToken).catch((releaseError) => {
+        console.error('[USERS_INVITE_COMPENSATION_SEAT_FAILED]', {
           orgId: admin.orgId,
-          cognitoUsername,
-          error: (deleteError as Error).message,
+          seatReservationToken,
+          error: (releaseError as Error).message,
         });
       });
+      throw error;
     }
-    await releaseInviteSeatReservation(org, seatReservationToken).catch((releaseError) => {
-      console.error('[USERS_INVITE_COMPENSATION_SEAT_FAILED]', {
+  }
+
+  // The reservation is already released on the attach path — committing it
+  // would fail its own contains() condition and log a spurious error.
+  if (!attachedToExistingIdentity) {
+    await commitInviteSeatReservation(org, seatReservationToken).catch((error) => {
+      // The user and the count are already correct. A stale reservation token
+      // cannot release itself and is safe to reconcile out-of-band.
+      console.error('[USERS_INVITE_RESERVATION_CLEANUP_FAILED]', {
         orgId: admin.orgId,
         seatReservationToken,
-        error: (releaseError as Error).message,
+        error: (error as Error).message,
       });
     });
-    throw error;
   }
-
-  await commitInviteSeatReservation(org, seatReservationToken).catch((error) => {
-    // The user and the count are already correct. A stale reservation token
-    // cannot release itself and is safe to reconcile out-of-band.
-    console.error('[USERS_INVITE_RESERVATION_CLEANUP_FAILED]', {
-      orgId: admin.orgId,
-      seatReservationToken,
-      error: (error as Error).message,
-    });
-  });
   await bestEffortSeatSync(admin.orgId);
-
-  // Send our own branded invitation email (no plaintext password — user sets
-  // their password via the "Forgot Password" flow in the plugin on first login)
-  if (sendWelcomeEmail) {
-    const orgName = org.name || admin.orgId;
-    const orgSlug = org.slug;
-    const inviterName = admin.email;
-    await sendEmail('invitation', {
-      email,
-      orgName,
-      orgSlug,
-      inviterName,
-      username: email,
-    }, { throwOnError: true });
-  }
 
   // Seed baseline vault membership + /** allow rule for non-admin invites.
   // Admin-role invites are skipped: the inviting admin chooses which vaults to
@@ -853,12 +909,18 @@ async function handleInviteUser(
   let bootstrap: { vaultsJoined: number; failures: number } | null = null;
   if (accessKind === 'guest') {
     try {
+      // This is the only place in the codebase that knows whether the rows
+      // about to be written belong to an identity the invite created or to one
+      // that already existed, which is why the origin has to be decided here.
+      // 17-09's sweeper reads it back through summarizeGuestAccess and
+      // restrains instead of disabling when an attached grant lapses.
       bootstrap = await seedGuestVaultMembershipsForInvitee(
         admin.orgId,
         userId,
         guestVaults,
         guestExpiresAt!,
-        admin.userId
+        admin.userId,
+        attachedToExistingIdentity ? GUEST_ORIGIN_ATTACHED : GUEST_ORIGIN_INVITE
       );
     } catch (bootstrapErr) {
       bootstrap = { vaultsJoined: 0, failures: guestVaults.length };
@@ -933,6 +995,32 @@ async function handleInviteUser(
         : 'failed'
     : undefined;
 
+  // Our own branded invitation email (no plaintext password — the user sets one
+  // via the "Forgot Password" flow in the plugin on first login). It is sent
+  // AFTER provisioning so an invitation never announces access that does not
+  // exist: a guest invite whose vault seeding failed completely sends nothing.
+  // A 'partial' guest still gets it — they do have access to something — and
+  // every member invite is unaffected, because the status is undefined for them.
+  //
+  // It is also suppressed when the grant was attached to somebody who already
+  // has an account: the template tells the recipient to use "Forgot Password",
+  // which to an existing user reads as a password-reset phishing prompt.
+  const invitationEmailSent = sendWelcomeEmail
+    && !attachedToExistingIdentity
+    && guestProvisioningStatus !== 'failed';
+  if (invitationEmailSent) {
+    const orgName = org.name || admin.orgId;
+    const orgSlug = org.slug;
+    const inviterName = admin.email;
+    await sendEmail('invitation', {
+      email,
+      orgName,
+      orgSlug,
+      inviterName,
+      username: email,
+    }, { throwOnError: true });
+  }
+
   await logAudit({
     userId: admin.userId,
     userEmail: admin.email,
@@ -947,6 +1035,8 @@ async function handleInviteUser(
       role,
       accessKind,
       sendWelcomeEmail,
+      invitationEmailSent,
+      attachedToExistingIdentity,
       ...(guestExpiresAt ? { expiresAt: guestExpiresAt } : {}),
       ...(accessKind === 'guest' ? { vaultIds: guestVaults.map((vault) => vault.vaultId) } : {}),
       ...(guestProvisioningStatus ? { provisioningStatus: guestProvisioningStatus } : {}),
@@ -955,12 +1045,24 @@ async function handleInviteUser(
     },
   });
 
-  return formatSuccess(201, {
-    message: guestProvisioningStatus === 'partial'
+  // An attach is not an invitation, and saying so would be a lie the admin acts
+  // on. The provisioning fields below keep reporting the real seeding outcome
+  // either way, so "guest in 2 of 3 selected vaults because they are already an
+  // editor of the third" still surfaces.
+  const inviteMessage = attachedToExistingIdentity
+    ? guestProvisioningStatus === 'partial'
+      ? `${email} already has an account and was granted temporary access to some of the selected vaults`
+      : guestProvisioningStatus === 'failed'
+        ? `${email} already has an account, but temporary access to the selected vaults could not be provisioned`
+        : `${email} already has an account and was granted temporary access to the selected vaults`
+    : guestProvisioningStatus === 'partial'
       ? `User ${email} was invited, but access to some selected vaults could not be provisioned`
       : guestProvisioningStatus === 'failed'
         ? `User ${email} was invited, but selected-vault access could not be provisioned`
-        : `User ${email} invited successfully`,
+        : `User ${email} invited successfully`;
+
+  return formatSuccess(201, {
+    message: inviteMessage,
     userId,
     role,
     accessKind,
@@ -971,6 +1073,9 @@ async function handleInviteUser(
       vaultsJoined: bootstrap?.vaultsJoined ?? 0,
       vaultProvisioningFailures: bootstrap?.failures ?? guestVaults.length,
     } : {}),
+    // Emitted only on the attach path, so the ordinary invite response keeps
+    // exactly the fields it had before.
+    ...(attachedToExistingIdentity ? { attachedToExistingIdentity: true } : {}),
     displayName,
   }, requestId);
 }
@@ -1013,6 +1118,27 @@ async function handleUpdateRole(
       'Guest users are viewer-only. Remove their guest memberships and invite them as a member instead.'
     );
   }
+
+  // ORDER IS LOAD-BEARING, NOT STYLISTIC. This runs BEFORE every Cognito
+  // mutation below and its failure fails the whole request, which makes the
+  // dangerous end state — promoted AND still holding lapsed temporary rows,
+  // which the scheduled sweeper reads as fully expired and tears the account
+  // down for — UNREACHABLE rather than merely reported. Running it afterwards
+  // could only ever report that state after it already existed.
+  //
+  // The cost is the benign direction, accepted deliberately: the cleanup lands,
+  // Cognito then fails, and the target remains a viewer minus rows that granted
+  // nothing anyway (vault listing already filters lapsed rows out).
+  //
+  // A promotion to `viewer` is not a promotion — the gate above never fired, so
+  // there is nothing to clean up and nothing is touched.
+  const promotionCleanup = newRole === 'viewer'
+    ? { membershipsDeleted: 0, permissionRulesDeleted: 0 }
+    : await clearExpiredGuestRowsForPromotion([
+        target.subjectId,
+        target.username,
+        target.requestedUserId,
+      ]);
 
   // Get current groups and remove user from all role groups
   const currentGroups = await cognitoClient.send(
@@ -1061,6 +1187,10 @@ async function handleUpdateRole(
       targetUsername: target.username,
       oldRole,
       newRole,
+      // Recorded on the EXISTING action rather than a new one: this is part of
+      // the role change, not an event of its own.
+      guestMembershipsDeleted: promotionCleanup.membershipsDeleted,
+      guestPermissionRulesDeleted: promotionCleanup.permissionRulesDeleted,
     },
   });
 
@@ -1237,7 +1367,60 @@ async function handleRevokeUser(
       orgId: admin.orgId,
       reason: 'admin_user_revoked',
       revokedAt,
+      // LD-4, stated EXPLICITLY rather than inherited from the default. An
+      // admin offboarding a person is exactly the case org-wide re-encryption
+      // exists for. The scheduled expiry sweeper passes `false` for the same
+      // parameter, and the divergence between a human decision and a nightly
+      // job should be legible at both call sites, not only at the one that
+      // departs from the default.
+      triggerReEncryption: true,
     });
+
+    // DR-6 early revoke. Without this, an admin who ends someone's temporary
+    // access early leaves rows that are NOT expired behind — so the expiry
+    // sweeper never collects them, they keep the person badged as temporary,
+    // and they keep jamming both the DR-3 promotion gate and the DR-4 reclaim.
+    // The teardown itself is the SAME shared helper the sweeper uses.
+    //
+    // The membership delete is guarded on the row KIND rather than pinned to a
+    // boundary, because the admin is deliberately overriding a boundary that
+    // has not been reached. Selection is temporary rows only, so a revoke can
+    // never strip a permanent member's vault records.
+    //
+    // Deliberately NON-FATAL, and deliberately last. The account is already
+    // disabled, the marker written and the seat released; leaving rows behind
+    // is strictly less harmful than failing the request and leaving an account
+    // enabled, so a failure is recorded in the audit trail and moved past.
+    let guestMembershipsDeleted = 0;
+    let guestPermissionRulesDeleted = 0;
+    let guestCleanupError: string | null = null;
+    try {
+      const guestRows = await listStoredGuestRows([
+        target.subjectId,
+        target.username,
+        target.requestedUserId,
+      ]);
+      if (guestRows.length > 0) {
+        const cleaned = await deleteGuestAccessRows(
+          guestRows.map((row) => ({
+            vaultId: row.vaultId,
+            userId: row.userId,
+            // Carried through unread by the kind guard; passing the row's own
+            // value keeps the shape honest rather than synthesising one.
+            expiresAt: row.expiresAt ?? '',
+          })),
+          { membershipGuard: 'kind' }
+        );
+        guestMembershipsDeleted = cleaned.membershipsDeleted;
+        guestPermissionRulesDeleted = cleaned.permissionRulesDeleted;
+      }
+    } catch (cleanupError) {
+      guestCleanupError = (cleanupError as Error).message;
+      console.error('[USERS_REVOKE_GUEST_CLEANUP_FAILED]', {
+        userId: target.subjectId,
+        error: guestCleanupError,
+      });
+    }
 
     await bestEffortSeatSync(admin.orgId);
 
@@ -1256,6 +1439,11 @@ async function handleRevokeUser(
         action: 'revoked',
         invalidatedSessions: cryptoRevocation.invalidatedSessions,
         revokedLeases: cryptoRevocation.revokedLeases,
+        guestMembershipsDeleted,
+        guestPermissionRulesDeleted,
+        // Null on the happy path. Non-null is the only record that rows were
+        // left behind, since the request still succeeded.
+        guestCleanupError,
       },
     });
 
@@ -1310,126 +1498,6 @@ async function handleRevokeUser(
   }
 }
 
-async function revokeUserCryptoAccess(params: {
-  targetUserId: string;
-  adminUserId: string;
-  orgId: string;
-  reason: string;
-  revokedAt: string;
-}): Promise<{
-  invalidatedSessions: number;
-  revokedLeases: number;
-  revokedAt: string;
-  reEncryptionJobId: string | null;
-}> {
-  const revokedAt = params.revokedAt;
-
-  const sessionsResult = await docClient.send(
-    new QueryCommand({
-      TableName: SESSIONS_TABLE,
-      IndexName: 'userId-index',
-      KeyConditionExpression: 'userId = :uid',
-      FilterExpression: 'isActive = :active AND orgId = :orgId',
-      ExpressionAttributeValues: {
-        ':uid': params.targetUserId,
-        ':active': true,
-        ':orgId': params.orgId,
-      },
-    })
-  );
-
-  const activeSessions = sessionsResult.Items || [];
-  for (const session of activeSessions) {
-    await docClient.send(
-      new UpdateCommand({
-        TableName: SESSIONS_TABLE,
-        Key: { sessionId: session.sessionId as string },
-        UpdateExpression: 'SET isActive = :inactive, invalidatedAt = :now',
-        ExpressionAttributeValues: {
-          ':inactive': false,
-          ':now': revokedAt,
-        },
-      })
-    );
-  }
-
-  const leasesResult = await docClient.send(
-    new QueryCommand({
-      TableName: LEASES_TABLE,
-      IndexName: 'userId-index',
-      KeyConditionExpression: 'userId = :uid',
-      FilterExpression: '#s = :active AND orgId = :orgId',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: {
-        ':uid': params.targetUserId,
-        ':active': 'active',
-        ':orgId': params.orgId,
-      },
-    })
-  );
-
-  const activeLeases = leasesResult.Items || [];
-  for (const lease of activeLeases) {
-    await docClient.send(
-      new UpdateCommand({
-        TableName: LEASES_TABLE,
-        Key: { leaseId: lease.leaseId as string },
-        UpdateExpression: 'SET #s = :revoked, revokedAt = :now, revokedBy = :by',
-        ExpressionAttributeNames: { '#s': 'status' },
-        ExpressionAttributeValues: {
-          ':revoked': 'revoked',
-          ':now': revokedAt,
-          ':by': params.adminUserId,
-        },
-      })
-    );
-  }
-
-  await docClient.send(
-    new PutCommand({
-      TableName: REVOKED_KEYS_TABLE,
-      Item: {
-        userId: params.targetUserId,
-        revokedAt,
-        revokedBy: params.adminUserId,
-        reason: params.reason,
-        transitionState: 'revoked',
-      },
-    })
-  );
-
-  let reEncryptionJobId: string | null = generateId();
-  try {
-    await eventBridgeClient.send(
-      new PutEventsCommand({
-        Entries: [
-          {
-            Source: 'vaultguard.auth',
-            DetailType: 'UserAccessRevoked',
-            Detail: JSON.stringify({
-              targetUserId: params.targetUserId,
-              orgId: params.orgId,
-              triggeredBy: params.adminUserId,
-              reason: params.reason,
-              jobId: reEncryptionJobId,
-            }),
-          },
-        ],
-      })
-    );
-  } catch (err) {
-    reEncryptionJobId = null;
-    console.error('[USERS_REVOKE] EventBridge publish failed:', err);
-  }
-
-  return {
-    invalidatedSessions: activeSessions.length,
-    revokedLeases: activeLeases.length,
-    revokedAt,
-    reEncryptionJobId,
-  };
-}
-
 // ─── POST /users/{userId}/reactivate ────────────────────────────────────────
 
 async function handleReactivateUser(
@@ -1471,6 +1539,22 @@ async function handleReactivateUser(
       'Guest users are viewer-only. Remove their guest memberships and invite them as a member instead.'
     );
   }
+
+  // The SECOND promotion door, gated by the identical predicate above and
+  // therefore carrying the identical hazard — a reactivate that names a
+  // non-viewer role promotes just as surely as a role change does. Same shared
+  // helper, same reason, same ordering: it runs before the seat reservation and
+  // every Cognito mutation, so a failure here leaves nothing changed.
+  //
+  // Note the server-side default. A reactivate with no role in the body is a
+  // viewer, which is not a promotion, so it cleans up nothing.
+  const promotionCleanup = role === 'viewer'
+    ? { membershipsDeleted: 0, permissionRulesDeleted: 0 }
+    : await clearExpiredGuestRowsForPromotion([
+        target.subjectId,
+        target.username,
+        target.requestedUserId,
+      ]);
 
   const marker = await getRevocationMarker(target.subjectId);
   if (!marker || (marker.transitionState && marker.transitionState !== 'revoked')) {
@@ -1610,6 +1694,8 @@ async function handleReactivateUser(
       targetUserId: target.subjectId,
       targetUsername: target.username,
       role,
+      guestMembershipsDeleted: promotionCleanup.membershipsDeleted,
+      guestPermissionRulesDeleted: promotionCleanup.permissionRulesDeleted,
     },
   });
 
@@ -2422,7 +2508,27 @@ async function seedDefaultVaultMembershipForInvitee(
 
 const GUEST_MEMBER_RULE_SOURCE = 'guest-invite';
 
-async function hasStoredGuestMembership(userIds: string[]): Promise<boolean> {
+/**
+ * True when any of these identities holds an ACTIVE guest membership row.
+ *
+ * DR-3: the active test is the fix. Before it, this asked only whether a guest row
+ * EXISTED, so one lapsed row locked a former guest to viewer permanently — an admin
+ * could never promote them, and could never reactivate them as anything but a viewer.
+ * A lapsed row grants nothing (every enforcement site already fails closed on it), so
+ * it must not block a promotion either. An unexpired guest row still blocks, which is
+ * the rule this predicate exists to enforce.
+ *
+ * RESEARCH assumption A3: the per-identity index this Query uses is org-blind — its
+ * rows carry no orgId — so the predicate can in principle observe a row belonging to
+ * another org's vault. That is left as-is deliberately. This asks a per-identity
+ * question rather than an org-scoped one, and the error direction is conservative in
+ * the deny direction: a stray row can only BLOCK a promotion, never grant one.
+ * Denormalising orgId onto the membership rows is explicitly out of scope for this phase.
+ */
+async function hasStoredGuestMembership(
+  userIds: string[],
+  nowMs = Date.now()
+): Promise<boolean> {
   for (const userId of new Set(userIds.filter(Boolean))) {
     const result = await docClient.send(new QueryCommand({
       TableName: VAULT_MEMBERS_TABLE,
@@ -2430,11 +2536,105 @@ async function hasStoredGuestMembership(userIds: string[]): Promise<boolean> {
       KeyConditionExpression: 'userId = :userId',
       ExpressionAttributeValues: { ':userId': userId },
     }));
-    if ((result?.Items ?? []).some((item) => item.accessKind === 'guest')) {
+    if ((result?.Items ?? []).some(
+      (item) => item.accessKind === 'guest' && isExpiringAccessActive(item.expiresAt, nowMs)
+    )) {
       return true;
     }
   }
   return false;
+}
+
+/** One stored temporary membership row, as read back off the per-identity index. */
+interface StoredGuestRow {
+  vaultId: string;
+  userId: string;
+  expiresAt?: string;
+}
+
+/**
+ * Every stored TEMPORARY membership row for these identities, deduped on
+ * (vaultId, userId).
+ *
+ * Reuses the access pattern `hasStoredGuestMembership` already established —
+ * VaultMembers `userId-index`, one Query per identity — rather than adding a
+ * second one; RESEARCH assumption A3 (the index is org-blind) applies here
+ * identically. The difference is only in what is returned: that predicate
+ * answers "is any of these still ACTIVE", this hands back the rows so a caller
+ * can decide per row.
+ *
+ * Permanent memberships are filtered out HERE, exactly once, so no caller can
+ * hand one to a delete by accident. The test is `!== 'guest'` and never
+ * `=== 'member'`: rows written before the temporary-access feature carry no
+ * kind at all and must count as permanent.
+ */
+async function listStoredGuestRows(userIds: string[]): Promise<StoredGuestRow[]> {
+  const rows = new Map<string, StoredGuestRow>();
+  for (const userId of new Set(userIds.filter(Boolean))) {
+    const result = await docClient.send(new QueryCommand({
+      TableName: VAULT_MEMBERS_TABLE,
+      IndexName: 'userId-index',
+      KeyConditionExpression: 'userId = :userId',
+      ExpressionAttributeValues: { ':userId': userId },
+    }));
+    for (const item of result?.Items ?? []) {
+      if (item.accessKind !== 'guest') continue;
+      const vaultId = item.vaultId as string | undefined;
+      const rowUserId = item.userId as string | undefined;
+      if (!vaultId || !rowUserId) continue;
+      rows.set(`${vaultId}#${rowUserId}`, {
+        vaultId,
+        userId: rowUserId,
+        expiresAt: item.expiresAt as string | undefined,
+      });
+    }
+  }
+  return [...rows.values()];
+}
+
+/**
+ * DR-3, the half that makes a promotion STICK. Called from BOTH doors that can
+ * promote a former temporary user — role change and reactivate-with-a-role —
+ * so the two cannot diverge.
+ *
+ * WHY DELETING IS REQUIRED, and why a filter elsewhere could not substitute:
+ * `summarizeGuestAccess` is purely row-shaped and takes no org role as input,
+ * by design — it is the single rule behind both the admin-panel badge and the
+ * scheduled expiry sweeper, and teaching it about roles is what makes those two
+ * drift apart. So a promoted user who KEPT these rows still reads as fully
+ * expired to that sweeper, which disables the account, writes a revocation
+ * marker and releases the seat on its next run: the promotion silently undone,
+ * and for a promotion to admin the org losing its own administrator overnight.
+ * Removing the rows makes the answer structurally false instead of filtered.
+ *
+ * Selection is narrow on purpose. `hasStoredGuestMembership` has already run
+ * and thrown if ANY temporary row is still active, so everything reaching here
+ * is a row that already grants nothing — every enforcement site fails closed on
+ * it, and vault listing filters it out. Permanent rows are excluded upstream by
+ * `listStoredGuestRows`, and the boundary test is the shared predicate rather
+ * than a date comparison written here.
+ *
+ * The delete is pinned to the exact boundary that was READ (the shared helper's
+ * default guard), so an admin extending this user in another tab between the
+ * read and the write wins the race: the condition fails and the now-active row
+ * is left alone rather than deleted.
+ */
+async function clearExpiredGuestRowsForPromotion(
+  userIds: string[],
+  nowMs = Date.now()
+): Promise<{ membershipsDeleted: number; permissionRulesDeleted: number }> {
+  const lapsed = (await listStoredGuestRows(userIds)).filter(
+    (row): row is StoredGuestRow & { expiresAt: string } =>
+      !!row.expiresAt && !isExpiringAccessActive(row.expiresAt, nowMs)
+  );
+  if (lapsed.length === 0) return { membershipsDeleted: 0, permissionRulesDeleted: 0 };
+  return await deleteGuestAccessRows(
+    lapsed.map((row) => ({
+      vaultId: row.vaultId,
+      userId: row.userId,
+      expiresAt: row.expiresAt,
+    }))
+  );
 }
 
 function guestPermissionRuleId(vaultId: string, userId: string): string {
@@ -2445,13 +2645,20 @@ function guestPermissionRuleId(vaultId: string, userId: string): string {
  * Creates viewer-only, expiring access for exactly the selected active vaults.
  * Conditional writes never replace a permanent member or a differently scoped
  * guest. A retry accepts only byte-for-byte-equivalent access boundaries.
+ *
+ * The origin parameter is REQUIRED rather than defaulted: a default would
+ * silently classify a future caller's rows as invite-origin, which is the
+ * direction that gets a pre-existing colleague's account disabled once their
+ * temporary grant lapses. It rides the membership Put that already exists, so
+ * the row is never briefly stored without it.
  */
 async function seedGuestVaultMembershipsForInvitee(
   orgId: string,
   newUserId: string,
   vaults: VaultRecord[],
   expiresAt: string,
-  inviterUserId: string
+  inviterUserId: string,
+  guestOrigin: GuestOrigin
 ): Promise<{ vaultsJoined: number; failures: number }> {
   let vaultsJoined = 0;
   let failures = 0;
@@ -2469,6 +2676,7 @@ async function seedGuestVaultMembershipsForInvitee(
             userId: newUserId,
             role: 'viewer',
             accessKind: 'guest',
+            guestOrigin,
             joinedAt: nowIso,
             invitedBy: inviterUserId,
             expiresAt,

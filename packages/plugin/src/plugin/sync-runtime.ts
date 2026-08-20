@@ -540,26 +540,38 @@ export class SyncRuntime {
     // First-time bind for this serverVaultId: reconcile local<->server before
     // any sync writes happen. The context callback preserves the plugin-level
     // pass-through surface while the behavior stays in this runtime.
+    // quick-260820-or3: routed through the same helper the Phase 1b catch-up
+    // gate uses, so "may I upload" and "must I reconcile" cannot drift apart —
+    // that drift is exactly the hole the silent local-only upload came through.
+    // Provably unchanged: with `vaultId` truthy the helper's `!!serverVaultId`
+    // term is satisfied and it reduces to `bindingReconciledVaultId === vaultId`;
+    // negated, `!== vaultId` — the expression this replaces.
     const vaultId = settings.serverVaultId;
     this.ctx.recordSyncDiagnostic("initializeSyncEngine.reconcileDecision", {
-      willReconcile: !!vaultId && settings.bindingReconciledVaultId !== vaultId,
+      willReconcile: !!vaultId && !this.isBindingReconciled(),
     });
-    if (vaultId && settings.bindingReconciledVaultId !== vaultId) {
+    if (vaultId && !this.isBindingReconciled()) {
       try {
         const reconciled = await this.ctx.performInitialReconciliation();
         if (!reconciled) {
           this.ctx.log("Initial reconciliation declined or aborted — sync engine will not start.");
           this.ctx.recordSyncDiagnostic("initializeSyncEngine.return.reconcileDeclined");
+          // NEVER a silent dead end (quick-260820-mv4). This return skips
+          // performSync() and startSyncTimer(), and nothing else re-arms
+          // them — before this the folder simply stopped syncing until
+          // Obsidian was restarted, with no visible reason. The sticky notice
+          // names the state and carries the retry.
+          this.ctx.showReconciliationPausedNotice(
+            "Reconciling compares this folder with the server vault before the first sync."
+          );
           return;
         }
       } catch (err) {
         this.ctx.logError("Initial reconciliation failed", err);
-        this.ctx.showNotice(
-          `VaultGuard Sync: Couldn't reconcile this folder with the server vault: ${
-            err instanceof Error ? err.message : "Unknown error"
-          }. Sync paused — open the sidebar to retry.`
-        );
         this.ctx.recordSyncDiagnostic("initializeSyncEngine.return.reconcileFailed");
+        this.ctx.showReconciliationPausedNotice(
+          `Reconciling failed: ${err instanceof Error ? err.message : "Unknown error"}.`
+        );
         return;
       }
     }
@@ -575,6 +587,8 @@ export class SyncRuntime {
     this.ctx.recordSyncDiagnostic("initializeSyncEngine.reachedStartTimer");
     this.startSyncTimer();
 
+    // Sync is armed — the paused state is over, so its sticky notice goes.
+    this.ctx.hideReconciliationPausedNotice();
     this.ctx.log("Sync engine initialized.");
   }
 
@@ -877,10 +891,16 @@ export class SyncRuntime {
 
       // Phase 1b: Catch up local-only files + folders.
       let catchupChanges = 0;
-      if (
-        canUploadEncryptedContent &&
-        (forceCatchup || !this.ctx.getLocalOnlyCatchupCompleted())
-      ) {
+      const catchupArmed = forceCatchup || !this.ctx.getLocalOnlyCatchupCompleted();
+      // quick-260820-or3: a SEPARATE conjunct, deliberately NOT folded into the
+      // disjunction above. Every "Sync now" entry point passes
+      // `forceCatchup: true` (commands.ts:426, main.ts:4546 / :7180 / :7453), so
+      // an `||` here would hand a user who DECLINED the reconciliation preview
+      // exactly what they refused the moment they pressed "Sync now", and would
+      // let a rebound folder push the OLD vault's leftovers into the NEW one.
+      // `forceCatchup` means "re-run the repair passes", never "skip consent".
+      const bindingReconciled = this.isBindingReconciled();
+      if (canUploadEncryptedContent && catchupArmed && bindingReconciled) {
         operation.update({
           phase: "Catching up local-only files",
           percent: 25,
@@ -903,6 +923,35 @@ export class SyncRuntime {
           // stayed local-only and unsynced indefinitely.
           this.ctx.setLocalOnlyCatchupCompleted(
             result.failedFiles === 0 && result.failedFolders === 0
+          );
+        }
+      } else if (canUploadEncryptedContent && catchupArmed) {
+        // The binding was never reconciled (first bind), was rebound, or the
+        // user declined the preview. Reconciliation — the one path that ASKS
+        // (askReconciliationPlan) — is the only route these files may take.
+        //
+        // Deliberately does NOT call setLocalOnlyCatchupCompleted: leaving the
+        // flag armed is what lets the catch-up run by itself the moment the
+        // binding does reconcile.
+        this.ctx.recordSyncDiagnostic("performSync.catchupSkipped", {
+          reason: "bindingNotReconciled",
+          serverVaultId: settings.serverVaultId,
+          bindingReconciledVaultId: settings.bindingReconciledVaultId ?? null,
+        });
+        this.ctx.log(
+          `Sync: local-only catch-up skipped — this folder is bound to ${
+            settings.serverVaultId
+          } but was last reconciled with ${
+            settings.bindingReconciledVaultId ?? "no vault"
+          }. Reconciling reviews those files before anything is uploaded.`
+        );
+        if (userInitiated) {
+          // No file count: producing one would need the full server inventory
+          // walk that is exactly what is being skipped. Background syncs stay
+          // silent — mv4's sticky paused notice already owns this state.
+          this.ctx.showNotice(
+            "VaultGuard Sync: Local-only files were not uploaded — this folder has not been reconciled with its server vault yet. Reconciling shows what would be uploaded and asks first.",
+            9000
           );
         }
       }
@@ -4135,6 +4184,29 @@ export class SyncRuntime {
 
   hasValidKeyLease(): boolean {
     return !!this.ctx.getKeyLease() && !this.isKeyLeaseExpired();
+  }
+
+  /**
+   * The "these files belong here" proof the local-only catch-up never had.
+   *
+   * `bindingReconciledVaultId` is stamped only by a COMPLETED initial
+   * reconciliation — the single upload path that ASKS first
+   * (`askReconciliationPlan`). `applyVaultBinding` (main.ts:5502 / :5516)
+   * deletes that stamp and re-arms `localOnlyCatchupCompleted = false` on the
+   * same binding change, so an unstamped binding means precisely: this folder
+   * was just pointed at a different vault (or has never been reconciled with
+   * one), and the files sitting on disk have no claim on it yet.
+   *
+   * Reads settings FRESH on every call — never a field, never a constructor
+   * capture. quick-260820-mv4's post-mortem: long-lived surfaces that captured
+   * state by value across a rebind kept answering for the OLD vault.
+   *
+   * See reports/HANDOFF-2026-08-20-silent-local-only-upload.md §7 (Option 1).
+   */
+  private isBindingReconciled(): boolean {
+    const settings = this.ctx.getSettings();
+    const vaultId = settings.serverVaultId;
+    return !!vaultId && settings.bindingReconciledVaultId === vaultId;
   }
 
   /**

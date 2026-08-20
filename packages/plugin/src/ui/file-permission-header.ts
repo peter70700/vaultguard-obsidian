@@ -39,7 +39,23 @@ const HEADER_CLS = "vaultguard-file-header";
 
 interface HeaderContext {
   app: App;
-  apiClient: VaultGuardApiClient;
+  /**
+   * LIVE client resolver — never a captured reference (quick-260820-mv4).
+   *
+   * `rebuildApiClient()` DESTROYS the client and constructs a new one on
+   * every vault rebind, login and token refresh, while this header is built
+   * once during `onload` and never reconstructed. A field captured at
+   * construction therefore keeps calling the previous vault's id after a
+   * rebind — `GET /vaults/{old}/permissions` 403s for a non-member, the
+   * fetch resolves empty and the header renders "Access details
+   * unavailable" until Obsidian is reloaded. `permission-store.ts` already
+   * documents this hazard and prescribes exactly this getter.
+   *
+   * Null only when no API endpoint is configured; every read site degrades
+   * to its existing honest-failure branch rather than synthesizing a
+   * current-user-only access list.
+   */
+  getApiClient: () => VaultGuardApiClient | null;
   currentUserId: string;
   currentUserEmail?: string;
   currentUserRole: string;
@@ -152,6 +168,16 @@ export class FilePermissionHeader {
   private userMap: Map<string, UserListEntry> = new Map();
   private usersLoaded = false;
   private usersLoadPromise: Promise<void> | null = null;
+
+  /**
+   * The API client as it exists RIGHT NOW (quick-260820-mv4). Resolved per
+   * call, never cached in a field — see the `getApiClient` contract note on
+   * HeaderContext for why a captured reference silently targets the previous
+   * vault after a rebind.
+   */
+  private get apiClient(): VaultGuardApiClient | null {
+    return this.ctx.getApiClient();
+  }
 
   /** Direct vault members, used to show people who inherit access from membership. */
   private vaultMembers: VaultMemberRecord[] = [];
@@ -453,7 +479,11 @@ export class FilePermissionHeader {
 
   private async loadUsers(): Promise<void> {
     try {
-      const users = await this.ctx.apiClient.listUsers();
+      const api = this.apiClient;
+      // No client configured (or none yet): leave `usersLoaded` false so the
+      // next render retries instead of latching an empty directory.
+      if (!api) return;
+      const users = await api.listUsers();
       this.users = sortAccessUsers(users);
       this.userMap = buildAccessUserMap(this.users);
       this.usersLoaded = true;
@@ -476,7 +506,16 @@ export class FilePermissionHeader {
   }
 
   private async loadVaultMembers(): Promise<void> {
-    const vaultId = this.ctx.apiClient.getVaultId();
+    const api = this.apiClient;
+    if (!api) {
+      // Same reasoning as loadUsers: an absent client is not evidence that
+      // the vault has no members, so never latch `loaded`.
+      this.vaultMembers = [];
+      this.vaultMembersLoaded = false;
+      this.vaultMembersLoadPromise = null;
+      return;
+    }
+    const vaultId = api.getVaultId();
     if (!vaultId) {
       this.vaultMembers = [];
       this.vaultMembersLoaded = true;
@@ -485,7 +524,7 @@ export class FilePermissionHeader {
     }
 
     try {
-      this.vaultMembers = await this.ctx.apiClient.listVaultMembers(vaultId);
+      this.vaultMembers = await api.listVaultMembers(vaultId);
       this.vaultMembersLoaded = true;
 
       // Vault members carry server-resolved displayName/email since the
@@ -722,10 +761,13 @@ export class FilePermissionHeader {
       return { rules: [], rulesAvailable: false };
     }
 
+    const api = this.apiClient;
+    if (!api) return { rules: [], rulesAvailable: false };
+
     try {
       const rules = this.ctx.isAdmin
-        ? await this.ctx.apiClient.getPermissions()
-        : await this.ctx.apiClient.getPermissions(path);
+        ? await api.getPermissions()
+        : await api.getPermissions(path);
       return { rules, rulesAvailable: true };
     } catch {
       return { rules: [], rulesAvailable: false };
@@ -847,9 +889,12 @@ export class FilePermissionHeader {
   }
 
   private async fetchPathAccessForHeader(path: string): Promise<PathAccessSummary | null> {
+    const api = this.apiClient;
+    if (!api) return null;
+
     try {
-      if (typeof this.ctx.apiClient.getBatchPathAccess === "function") {
-        const summaries = await this.ctx.apiClient.getBatchPathAccess([path]);
+      if (typeof api.getBatchPathAccess === "function") {
+        const summaries = await api.getBatchPathAccess([path]);
         const target = this.normalizeAccessPath(path);
         const summary = summaries.find((entry) =>
           this.normalizeAccessPath(entry.path) === target
@@ -861,7 +906,7 @@ export class FilePermissionHeader {
     }
 
     try {
-      return await this.ctx.apiClient.getPathAccess(path);
+      return await api.getPathAccess(path);
     } catch {
       return null;
     }
@@ -1390,7 +1435,9 @@ export class FilePermissionHeader {
         if (!newName) return;
         setButtonLoading(editSaveBtn, true, { label: "Saving" });
         try {
-          await this.ctx.apiClient.updateUserProfile(userId, { displayName: newName });
+          const api = this.apiClient;
+          if (!api) throw new Error("VaultGuard: no API client available.");
+          await api.updateUserProfile(userId, { displayName: newName });
           // Refresh the user map so the header reflects the change
           this.usersLoaded = false;
           this.usersLoadPromise = this.loadUsers();
@@ -1502,10 +1549,15 @@ export class FilePermissionHeader {
       return;
     }
 
+    // The panel is constructed fresh on every open, so passing the value is
+    // safe here — but it must be TODAY's client, resolved now.
+    const api = this.apiClient;
+    if (!api) return;
+
     const panelAccess = this.panelEffectiveAccess(rules, options);
     this.activePanel = new FilePermissionPanel({
       app: this.ctx.app,
-      apiClient: this.ctx.apiClient,
+      apiClient: api,
       file,
       rules,
       effectivePrincipals: panelAccess.principals,
@@ -1573,7 +1625,9 @@ export class FilePermissionHeader {
     // permission transition matrix test for the failure modes that motivated
     // moving this logic out of the client.
     if (level === "unknown") return null;
-    const response = await this.ctx.apiClient.setPermissionLevel({
+    const api = this.apiClient;
+    if (!api) return null;
+    const response = await api.setPermissionLevel({
       userId: canonicalUserId,
       role: null,
       pathPattern: this.fileRulePath(file),

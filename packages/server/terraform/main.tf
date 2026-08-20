@@ -135,6 +135,7 @@ module "lambda" {
   key_lease_duration_seconds       = var.key_lease_duration_seconds
   session_duration_seconds         = var.session_duration_seconds
   session_enforcement_mode         = var.session_enforcement_mode
+  guest_sweep_mode                 = var.guest_sweep_mode
   login_verification_mode          = var.login_verification_mode
   login_verification_browser_url   = var.login_verification_browser_url
   turnstile_expected_hostnames     = join(",", var.turnstile_expected_hostnames)

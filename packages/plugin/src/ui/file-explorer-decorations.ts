@@ -47,7 +47,14 @@ interface DecorationCacheEntry {
 
 export interface FileExplorerDecorationsConfig {
   app: App;
-  apiClient: VaultGuardApiClient;
+  /**
+   * LIVE client resolver — never a captured reference (quick-260820-mv4).
+   * `rebuildApiClient()` destroys and replaces the client on every vault
+   * rebind while these decorations are built once in `onload`, so a captured
+   * field keeps decorating rows with the PREVIOUS vault's access picture
+   * until Obsidian is reloaded. Same contract as the permission header.
+   */
+  getApiClient: () => VaultGuardApiClient | null;
   currentUserId: string;
   currentUserRole: string;
   isReady?: () => boolean;
@@ -59,6 +66,15 @@ export interface FileExplorerDecorationsConfig {
 
 export class FileExplorerDecorations {
   private config: FileExplorerDecorationsConfig;
+
+  /**
+   * The API client as it exists RIGHT NOW (quick-260820-mv4) — see the
+   * `getApiClient` contract note on the config interface.
+   */
+  private get apiClient(): VaultGuardApiClient | null {
+    return this.config.getApiClient();
+  }
+
   private cache: Map<string, DecorationCacheEntry> = new Map();
   private inFlightPaths: Map<string, Promise<void>> = new Map();
   private observer: MutationObserver | null = null;
@@ -829,8 +845,11 @@ export class FileExplorerDecorations {
       return;
     }
 
+    const api = this.apiClient;
+    if (!api) return;
+
     try {
-      const summaries = await this.config.apiClient.getBatchPathAccess(paths);
+      const summaries = await api.getBatchPathAccess(paths);
       const byPath = new Map(summaries.map((s) => [this.normalizePath(s.path), s]));
       const now = Date.now();
       for (const path of paths) {
@@ -904,11 +923,14 @@ export class FileExplorerDecorations {
    * doesn't poison the rest.
    */
   private async fetchPerPathFallback(paths: string[]): Promise<void> {
+    const api = this.apiClient;
+    if (!api) return;
+
     const now = Date.now();
     await Promise.allSettled(
       paths.map(async (path) => {
         try {
-          const summary = await this.config.apiClient.getPathAccess(path);
+          const summary = await api.getPathAccess(path);
           this.cache.set(path, this.summaryToCacheEntry(summary, now));
         } catch {
           // Individual path failure — leave the cache untouched so a later
@@ -986,7 +1008,10 @@ export class FileExplorerDecorations {
     }
     this.usersLoadPromise = (async () => {
       try {
-        const users = await this.config.apiClient.listUsers();
+        const api = this.apiClient;
+        // No client: leave `usersLoaded` false so a later pass retries.
+        if (!api) return;
+        const users = await api.listUsers();
         this.mergeUsersIntoDirectory(users);
         this.usersLoaded = true;
       } catch {
@@ -1009,9 +1034,16 @@ export class FileExplorerDecorations {
       return;
     }
     this.vaultMembersLoadPromise = (async () => {
-      const getVaultId = this.config.apiClient.getVaultId;
+      const api = this.apiClient;
+      if (!api) {
+        // An absent client is not evidence of an empty membership — leave
+        // `loaded` false so a later refresh retries.
+        this.vaultMembersLoaded = false;
+        return;
+      }
+      const getVaultId = api.getVaultId;
       const vaultId = typeof getVaultId === "function"
-        ? getVaultId.call(this.config.apiClient)
+        ? getVaultId.call(api)
         : "";
       if (!vaultId) {
         this.vaultMembersLoaded = true;
@@ -1019,11 +1051,11 @@ export class FileExplorerDecorations {
       }
 
       try {
-        if (typeof this.config.apiClient.listVaultMembers !== "function") {
+        if (typeof api.listVaultMembers !== "function") {
           this.vaultMembersLoaded = true;
           return;
         }
-        const members = await this.config.apiClient.listVaultMembers(vaultId);
+        const members = await api.listVaultMembers(vaultId);
         this.mergeVaultMembersIntoDirectory(members);
         this.vaultMembersLoaded = true;
       } catch {

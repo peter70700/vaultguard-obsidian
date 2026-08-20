@@ -7,6 +7,8 @@
  *   - .docx                     → DOCX → HTML → Markdown (mammoth + Turndown)
  *   - .csv/.tsv                 → GFM Markdown table (papaparse)
  *   - curated code extensions   → fenced code block with a language hint
+ *   - .mermaid/.mmd             → ```mermaid fence (Obsidian renders it natively)
+ *   - .svg                      → ```xml fence of the source, plus a warning
  *   - .pdf                      → SKIPPED ("PDF import not yet supported")
  *   - .xlsx/.xls                → SKIPPED ("XLSX import not yet supported")
  *   - everything else (images,
@@ -43,6 +45,26 @@ const XLSX_EXTS = new Set(["xlsx", "xls", "xlsm", "xlsb"]);
 
 /** PDF is recognised but deferred in v1 (pdf.js ≈ 491 KB gzip) → reported as skipped. */
 const PDF_EXTS = new Set(["pdf"]);
+
+/**
+ * SVG (a common Claude artifact type) is imported as FENCED SOURCE, not as a
+ * rendered image. This is a STRUCTURAL limit, not a deferral:
+ *
+ * Writing the bytes as an attachment and emitting `![[name.svg]]` would render
+ * a BROKEN image whenever at-rest encryption is on. Obsidian loads media
+ * through `adapter.getResourcePath()` → `app://`, which reads the on-disk bytes
+ * directly and so sees `VG1` ciphertext. `interceptedGetResourcePath`
+ * (at-rest-adapter-runtime.ts) exists to serve a decrypted blob instead — but it
+ * only does so for `isKnownBinaryExtensionPath()`, and `svg` is DELIBERATELY
+ * absent from that map (binary-content.ts): an SVG is valid UTF-8, so it must
+ * ride the text sync pipeline losslessly and must never be labelled binary.
+ *
+ * So the embed would be strictly worse than the fence until either that
+ * classification changes (it must not) or the resource-path override grows an
+ * SVG case. Fencing is lossless and always readable; the warning tells the user
+ * exactly what they got.
+ */
+const SVG_EXTS = new Set(["svg"]);
 
 /**
  * Curated code/config extensions → wrap the file text in a fenced code block.
@@ -84,6 +106,11 @@ const CODE_EXT_TO_LANG: Record<string, string> = {
   css: "css",
   scss: "scss",
   less: "less",
+  // Mermaid rides the code route on purpose: Obsidian renders a ```mermaid
+  // fence natively, so the fenced form IS the rendered form — no converter,
+  // no dependency, no loss.
+  mermaid: "mermaid",
+  mmd: "mermaid",
 };
 
 /** Direct (non-text) converters keyed by extension. */
@@ -104,6 +131,7 @@ export type DispatchRoute =
   | "passthrough"
   | "code"
   | "convert"
+  | "svg-fence"
   | "pdf-skip"
   | "xlsx-skip"
   | "unsupported";
@@ -113,6 +141,7 @@ export function classifyExtension(extRaw: string): DispatchRoute {
   if (PASSTHROUGH_EXTS.has(ext)) return "passthrough";
   if (PDF_EXTS.has(ext)) return "pdf-skip";
   if (XLSX_EXTS.has(ext)) return "xlsx-skip";
+  if (SVG_EXTS.has(ext)) return "svg-fence";
   if (ext in CONVERTERS) return "convert";
   if (ext in CODE_EXT_TO_LANG) return "code";
   return "unsupported";
@@ -123,8 +152,12 @@ export function normalizeExt(ext: string): string {
   return ext.replace(/^\.+/, "").toLowerCase();
 }
 
-/** Wrap decoded file text in a fenced code block with a language hint. */
-function toFencedCode(text: string, lang: string): string {
+/**
+ * Wrap decoded file text in a fenced code block with a language hint.
+ * Exported so the clipboard artifact path fences identically instead of
+ * re-implementing the 4-backtick escape and drifting from it.
+ */
+export function toFencedCode(text: string, lang: string): string {
   // Use a 4-backtick fence so source that itself contains ``` doesn't break out.
   return ["````" + lang, text.replace(/\s+$/, ""), "````"].join("\n");
 }
@@ -151,6 +184,13 @@ export async function dispatchConvert(input: ConvertInput): Promise<ConvertResul
         const converter = CONVERTERS[ext];
         return await converter({ ...input, ext });
       }
+
+      case "svg-fence":
+        return {
+          kind: "converted",
+          markdown: toFencedCode(decodeUtf8(input.bytes), "xml"),
+          warnings: ["SVG imported as source — inline preview is not supported yet"],
+        };
 
       case "pdf-skip":
         return { kind: "skipped", reason: "PDF import not yet supported" };

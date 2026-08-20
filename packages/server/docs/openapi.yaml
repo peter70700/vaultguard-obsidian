@@ -476,16 +476,44 @@ paths:
       - $ref: '#/components/parameters/UserId'
     patch:
       tags: [Vaults]
-      summary: Update a vault member role
+      summary: Update a vault member role, or extend temporary (guest) access
+      description: |
+        Requires vault admin. Carries two mutually exclusive mutations:
+
+        - `role` — change a permanent member's role. A guest row is rejected
+          with 409: temporary access cannot be promoted in place; remove it and
+          invite the user as a member.
+        - `expiresInDays` — push a guest membership's expiry out. This is the
+          extend path; no separate `/extend` resource exists, so the route rides
+          an API Gateway resource that was already registered.
       requestBody:
         $ref: '#/components/requestBodies/VaultMemberUpdateRequest'
       responses:
         '200':
-          description: Updated vault membership.
+          description: |
+            Updated vault membership. An extend also returns
+            `permissionRuleUpdated`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/VaultMembershipResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Conflict. The extend path returns 409 when the target row is not a
+            guest — either because it was already permanent when read, or
+            because it stopped being a guest between the read and the write, a
+            condition the update re-asserts at write time. Both cases return the
+            same message, so a caller cannot distinguish a permanent member from
+            a row that changed underneath the request. The `role` path returns
+            409 when the target is a guest.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     delete:
       tags: [Vaults]
       summary: Remove a vault member and revoke related leases
@@ -2297,6 +2325,22 @@ components:
         invitedBy: { type: string }
         displayName: { type: string }
         email: { type: string, format: email }
+        accessKind:
+          type: string
+          enum: [member, guest]
+          description: |
+            Shape of this single membership row. `guest` marks temporary,
+            viewer-only access that expires; absent or `member` is an ordinary
+            permanent membership. Row-scoped: a user may hold a guest row in
+            one vault and a permanent membership in another.
+        expiresAt:
+          type: string
+          format: date-time
+          description: |
+            When this guest row stops granting access. Present only on guest
+            rows. Enforcement is fail-closed at read time; the row and its
+            `guest-invite#` permission rule are removed later by the scheduled
+            sweeper.
       additionalProperties: true
 
     VaultMembersResponse:
@@ -2315,6 +2359,15 @@ components:
       properties:
         membership:
           $ref: '#/components/schemas/VaultMember'
+        permissionRuleUpdated:
+          type: boolean
+          description: |
+            Returned only by an EXTEND (a `expiresInDays` body). `false` means
+            the membership row's boundary moved but the guest's permission rule
+            was missing, so nothing moved alongside it — leaving a member inside
+            the vault with no rule to read through. The server deliberately does
+            NOT mint a replacement rule, because minting would hand back access
+            no admin granted.
       additionalProperties: true
 
     VaultMemberAddRequest:
@@ -2328,10 +2381,25 @@ components:
 
     VaultMemberUpdateRequest:
       type: object
-      required: [role]
+      description: |
+        Carries TWO mutually exclusive mutations. Send `role` to change a
+        permanent member's role, or send `expiresInDays` to push a temporary
+        (guest) member's expiry out. Sending both is a 400; sending neither is
+        also rejected.
       properties:
         role:
           $ref: '#/components/schemas/VaultMemberRole'
+        expiresInDays:
+          type: integer
+          minimum: 1
+          maximum: 90
+          description: |
+            Extend a guest membership to this many whole days from now,
+            replacing the current expiry rather than adding to it. Mutually
+            exclusive with `role` — temporary access cannot be promoted in
+            place, so no request legitimately sends both. The bound is the same
+            one the guest invite enforces, because both routes compute the
+            boundary through a single shared helper.
       additionalProperties: true
 
     VaultMemberRemoveResponse:
@@ -3170,6 +3238,27 @@ components:
         createdAt: { type: string, format: date-time }
         mfaEnabled: { type: boolean }
         deviceCount: { type: integer }
+        accessKind:
+          type: string
+          enum: [member, guest]
+          description: |
+            Org-wide guest state, computed server-side by joining every
+            VaultMembers row this user holds across the organization. `guest`
+            means the user holds at least one unexpired guest row and no
+            permanent membership anywhere in the org. Display only — clients
+            must not re-derive it, and the value does not depend on which vault
+            the client currently has open.
+
+            On this response the field is OMITTED for a non-guest rather than
+            emitted as `member`, so testing this one value against `guest` is
+            the whole decision. A user holding zero membership rows (an org
+            admin, who bypasses per-vault membership) is never a guest.
+        expiresAt:
+          type: string
+          format: date-time
+          description: |
+            The LATEST expiry across the user's guest rows, because that is when
+            their access actually ends. Omitted when the user is not a guest.
         type:
           type: string
           enum: [user]
@@ -3193,6 +3282,33 @@ components:
       properties:
         email: { type: string, format: email }
         role: { type: string }
+        accessKind:
+          type: string
+          enum: [member, guest]
+          default: member
+          description: |
+            Omit or send `member` for an ordinary org invite. `guest` creates
+            temporary, viewer-only access — `role` must then be `viewer`, and
+            `vaultIds` becomes required. If the email already belongs to an org
+            identity, the guest grant is ATTACHED to that identity instead of
+            creating a second one.
+        vaultIds:
+          type: array
+          items: { type: string }
+          minItems: 1
+          maxItems: 50
+          description: |
+            Required when `accessKind` is `guest`: the vaults the guest is
+            granted temporary read access to. Duplicates are collapsed; every id
+            must name a live, non-archived vault in the caller's org.
+        expiresInDays:
+          type: integer
+          minimum: 1
+          maximum: 90
+          default: 30
+          description: |
+            Guest access duration in whole days. Honoured only when
+            `accessKind` is `guest`.
         sendWelcomeEmail: { type: boolean }
         givenName: { type: string }
         firstName: { type: string }
@@ -3204,12 +3320,41 @@ components:
 
     UserInviteResponse:
       type: object
-      required: [message, userId, role, displayName]
+      required: [message, userId, role, accessKind, displayName]
       properties:
         message: { type: string }
         userId: { type: string }
         role: { type: string }
+        accessKind:
+          type: string
+          enum: [member, guest]
         displayName: { type: string }
+        expiresAt:
+          type: string
+          format: date-time
+          description: Present only for a guest invite.
+        vaultIds:
+          type: array
+          items: { type: string }
+          description: |
+            Present only for a guest invite — the vaults actually provisioned.
+            May be shorter than the requested list when the target is already a
+            permanent member of one of them.
+        provisioningStatus:
+          type: string
+          enum: [complete, partial, failed]
+          description: |
+            Present only for a guest invite. `partial` or `failed` means the
+            identity exists but some or all of the selected vault access could
+            not be provisioned.
+        vaultsJoined: { type: integer }
+        vaultProvisioningFailures: { type: integer }
+        attachedToExistingIdentity:
+          type: boolean
+          description: |
+            Emitted only when the guest grant was attached to an org identity
+            that already existed, so no invitation was sent and no new account
+            was created. Absent on the ordinary invite path.
       additionalProperties: true
 
     UserRoleUpdateRequest:

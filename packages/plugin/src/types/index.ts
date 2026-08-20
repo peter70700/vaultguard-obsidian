@@ -770,6 +770,13 @@ export interface VaultGuardSettings {
    */
   aiChatStreaming: boolean;
   /**
+   * Vault-relative folder that "Save Claude artifact" writes into. Default
+   * "Claude Artifacts"; empty means the vault root. Normalized on load by
+   * `normalizeArtifactImportFolder` — a persisted absolute path or `..` segment
+   * is rejected so a bad value can never aim a write outside the vault.
+   */
+  artifactImportFolder: string;
+  /**
    * Whether to store an ENCRYPTED (DEK-wrapped) copy of the Anthropic API key
    * in VaultGuard Cloud so it auto-provisions on the user's other devices
    * (e.g. mobile) without re-entry. Default true. The plaintext key is never

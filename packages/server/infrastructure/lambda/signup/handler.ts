@@ -269,7 +269,11 @@ async function handleSignup(
       return formatTurnstileError('CAPTCHA challenge required.', requestId);
     }
     const remoteip = event.requestContext?.identity?.sourceIp;
-    const expectedCdata = `signup:${String(body.orgSlug ?? '').trim().toLowerCase()}`;
+    // Turnstile only accepts [a-zA-Z0-9_-] in cData, so the widget cannot mint
+    // a challenge carrying a `:`. Must stay identical to the `cData` passed to
+    // turnstile.render() in admin-panel/src/components/SignupPage.tsx —
+    // verifyTurnstileProof compares the provider-returned cdata byte-for-byte.
+    const expectedCdata = `signup_${String(body.orgSlug ?? '').trim().toLowerCase()}`;
     const ok = await verifyTurnstile(
       turnstileToken,
       remoteip,

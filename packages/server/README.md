@@ -1,7 +1,10 @@
 # VaultGuard Server — Community Edition
 
 Open-source server stack for [VaultGuard](https://vaultguard.cloud) — an
-end-to-end encrypted, permission-aware sync backend for Obsidian vaults.
+encrypted, permission-aware sync backend for Obsidian vaults. File bodies are
+AES-256-GCM encrypted client-side before upload under KMS-backed,
+server-managed keys, so the server is inside the trust boundary: this is not
+end-to-end or zero-knowledge encryption.
 
 This repository ships the AWS infrastructure you self-host. Pair it with the
 [VaultGuard Obsidian plugin](https://github.com/peter70700/vaultguard-obsidian)
@@ -75,7 +78,7 @@ later via `vaultguard_allow_public_signup = true`.
 
 | Capability | Included |
 |---|---|
-| End-to-end file encryption (AES-256-GCM + AWS KMS) | ✅ |
+| Client-side file encryption (AES-256-GCM + server-managed AWS KMS keys) | ✅ |
 | Per-file permissions with role inheritance | ✅ |
 | Re-encryption on user offboarding | ✅ |
 | Multi-vault support per organization | ✅ |

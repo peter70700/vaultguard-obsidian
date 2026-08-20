@@ -146,6 +146,13 @@ export interface VaultGuardCommandContext {
   readonly manifestVersion: string;
   readonly folderLifecycleListenersRegistered: boolean;
   readonly syncTimerAlive: boolean;
+  /**
+   * quick-260820-or3: the other half of the Phase 1b catch-up gate. The debug
+   * report already prints serverVaultId + bindingReconciledVaultId; without
+   * this flag a reader cannot tell an armed-but-gated catch-up from a
+   * completed one.
+   */
+  readonly localOnlyCatchupCompleted: boolean;
   readonly keyLease: KeyLease | null;
   readonly vaultLeaseDenied: boolean;
   readonly placeholderPathsSize: number;
@@ -204,6 +211,13 @@ export interface VaultGuardCommandContext {
    * command surface never gains a raw-disk-read capability.
    */
   collectAttachmentPreviewData(limit: number): Promise<AttachmentPreviewReport>;
+  /**
+   * Create any missing parent folders for a vault-relative path. Exposed so the
+   * artifact importer reuses the plugin's existing folder-ensure logic (which
+   * tolerates a concurrent creation of the same folder) instead of shipping a
+   * second, subtly different copy of it.
+   */
+  ensureParentFoldersForPath(path: string): Promise<void>;
   logError(message: string, error: unknown): void;
 }
 
@@ -532,6 +546,7 @@ export type ProtectedContentGate =
         | "at-rest-unavailable"
         | "needs-recovery"
         | "binding-unverified"
+        | "account-changed"
         | "wrong-account";
       message: string;
     };
@@ -703,6 +718,16 @@ export interface AtRestAdapterRuntimeContext {
   ): Promise<ApiResponse<RemoteFileContentResponse>>;
   decodeRemoteFileContent(path: string, data: RemoteFileContentResponse): Promise<string>;
   decodeBase64Utf8(base64: string): string;
+  /**
+   * True while the folder's vault binding is in a state where nothing may
+   * cross the wire (`account-changed` — the identity question is unanswered —
+   * or `wrong-account` — the server said no). interceptedRead consults this
+   * before its fetch-newest-server-copy branch: serving the stale server copy
+   * while the sync gate holds local edits back made typed text visibly
+   * "revert" (runtime-confirmed 2026-08-19; account-change report §9.8).
+   * Optional so pre-existing harness contexts keep today's behavior.
+   */
+  isVaultBindingWireBlocked?(): boolean;
 
   emitAuditEvent(
     action: BridgeAuditAction | "file.read" | "file.write" | "file.delete" | "file.rename",
@@ -816,6 +841,14 @@ export interface SyncRuntimeContext {
   recordRemoteFilePresent(path: string, update?: RemoteFileStateUpdate): void;
   recordRemoteFileAbsent(path: string): void;
   performInitialReconciliation(): Promise<boolean>;
+  /**
+   * Raise the sticky "sync has not started" state (quick-260820-mv4). Called
+   * whenever initializeSyncEngine returns without arming the sync loop, so the
+   * dead end can never be silent.
+   */
+  showReconciliationPausedNotice(reason?: string): void;
+  /** Drop that state once sync actually starts. */
+  hideReconciliationPausedNotice(): void;
   registerFolderLifecycleListeners(): void;
   performSync(options?: { userInitiated?: boolean; forceCatchup?: boolean }): Promise<void>;
   buildLocalSyncManifest(): Record<string, string>;

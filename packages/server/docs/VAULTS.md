@@ -308,6 +308,72 @@ tokens return `410`. Full reference:
    guest deletes its default and guest permission rules and revokes outstanding
    vault leases. A guest cannot be promoted in place; remove the guest access
    and invite the identity as a permanent member instead.
+6. **Visibility is org-wide, not vault-scoped.** `GET /users` returns
+   `accessKind` and `expiresAt` computed server-side from an org-scoped
+   VaultMembers join, so a guest is identified regardless of which vault the
+   requesting client happens to have open. The aggregation rule: a user is a
+   guest when they hold **at least one guest row and no permanent membership
+   anywhere in the org**, and the reported expiry is the **latest** guest
+   expiry, because that is when their access actually ends. A user holding no
+   membership rows at all — an org admin, who bypasses per-vault membership —
+   is never a guest. Clients render this value; they must not re-derive it.
+7. **The seat is released at expiry.** Temporary access does not consume a seat
+   forever. Teardown adds the subject to the organization's existing
+   `revokedSeatUserIds` set, whose conditional update is itself the idempotency
+   guard, so a replayed or repeated teardown decrements the seat count once. The
+   account is disabled **before** the seat is released, and the nightly
+   reconciler subtracts the run's disabled subjects before recomputing seat
+   totals — so its absolute recompute confirms the release instead of reversing
+   it.
+8. **Expiry ends the access, not the identity.** Teardown disables the Cognito
+   account and deletes the lapsed membership rows and their `guest-invite#`
+   permission rules, but it never deletes the user record. That is deliberate:
+   audit rows resolve `userId` to an email through that record, and an admin who
+   later extends access needs something to re-enable. A permission rule is
+   deleted only when its membership row's delete actually landed, so a
+   membership extended mid-sweep does not lose the rule it reads through.
+9. **Disabling alone does not end an in-flight session.** Token verification is
+   offline, so an already-issued token keeps verifying until it expires. The
+   entry written to the revoked-keys table during teardown is what closes that
+   window; sessions are invalidated and outstanding leases revoked in the same
+   step.
+10. **Scheduled expiry does not trigger org-wide re-encryption; admin revoke
+    still does.** Teardown takes a `triggerReEncryption` flag that defaults to
+    true, and the scheduled sweeper is the only caller that opts out — so no
+    `UserAccessRevoked` event is published on the scheduled path. The reason is
+    that a guest's key leases are already clamped to the guest boundary, so at
+    expiry the guest holds no live lease to invalidate. An admin-initiated
+    revoke keeps the default and still publishes the event.
+11. **Extend and early revoke reuse routes that already exist.** An admin
+    pushes the boundary out with `PATCH /vaults/{vaultId}/members/{userId}`
+    carrying `expiresInDays` (1–90, mutually exclusive with `role`) — there is
+    no `/extend` resource, which is why no new API Gateway resource and no
+    `cors.tf` entry were needed. Ending access early goes through
+    `POST /users/{userId}/revoke`, which runs the same teardown with
+    re-encryption left on. Re-enabling an identity the sweeper disabled goes
+    through the existing `POST /users/{userId}/reactivate`.
+12. **A lapsed guest row is a tombstone, not a membership.** An expired row no
+    longer blocks adding the same person as a real member of that vault, and no
+    longer blocks an org-level promotion — both promotion doors delete the
+    lapsed rows before any Cognito mutation, so a promoted user cannot be left
+    in a state the sweeper would later read as a fully expired guest. An
+    **active** guest row still blocks both.
+
+The sweeper that performs steps 7–10 lives in
+`infrastructure/lambda/reconciler/guest-sweeper.ts` and rides the reconciler's
+existing schedule — it adds no schedule of its own. The teardown it calls is
+`endGuestAccess` in `infrastructure/lambda/shared/access-revocation.ts`, the
+single implementation shared with admin-initiated revoke.
+
+**Rollout state — expiry enforcement is not switched on yet.** The sweeper is
+gated by `GUEST_SWEEP_MODE`, which **defaults to `observe`**. In `observe` it
+runs the identical discovery and the identical decision logic with zero writes
+and zero Cognito calls, logging what it *would* have done. Nothing is disabled,
+no seat is released and no row is deleted until an operator explicitly sets the
+mode to `enforce`. Note before flipping it: the first `enforce` run processes
+the entire accumulated backlog of already-expired guests in one pass, so it can
+move the organization's user count — and therefore the billed quantity — by
+more than one.
 
 This is authenticated temporary collaboration, not anonymous public sharing.
 The guest still needs a Cognito session, an active selected-vault membership,

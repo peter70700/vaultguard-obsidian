@@ -197,8 +197,35 @@
   display: none;
 }
 
+/* Pinned to the top of the scrollport.
+ *
+ * This host is a direct child of `.vertical-tab-content`, which app.css gives
+ * `overflow-y: auto; height: 100%` — it is the scroll container, so `top: 0`
+ * sticks the banner across the whole scroll range. Now that `display()`
+ * preserves the scroll offset instead of snapping to the top, a banner left at
+ * its document position would be off-screen for most of the 85 actions in this
+ * tab that raise one.
+ *
+ * The background has to be opaque — matching `.vertical-tab-content`'s own
+ * `--background-primary` — or rows would scroll through the stuck banner. For
+ * the same reason the old `margin-block: var(--size-4-3)` (a transparent
+ * gutter) becomes padding, so the opaque box runs unbroken to the scrollport
+ * edge. The asymmetric block padding keeps the rendered spacing exactly as it
+ * was: 12px above, and 4px below on top of the 8px `margin-bottom` that
+ * `.vaultguard-status-msg` already carries inside.
+ *
+ * No horizontal padding here: `.vaultguard-status-msg` already pads to
+ * `var(--size-4-4, 16px)`, which lands the text on this tab's single left edge
+ * (`--vg-settings-inset`). A second inset would double it.
+ *
+ * `container-type: inline-size` on the scroll container does not interfere;
+ * sticky still resolves against the scrollport. */
 .vaultguard-settings-status-host {
-  margin-block: var(--size-4-3);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-block: var(--size-4-3) var(--size-4-1);
+  background-color: var(--background-primary);
 }
 
 .vaultguard-plaintext-warning-setting {
@@ -460,6 +487,65 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   line-height: 13px;
   text-align: center;
   box-shadow: 0 0 0 2px var(--background-primary);
+  pointer-events: none;
+}
+
+/* Blocked binding (account-changed / wrong-account) on a LOGGED-IN session.
+   A paused vault otherwise looks identical to a healthy one once its notice is
+   dismissed (quick-260820-nqm). Deliberately a clip-path triangle rather than a
+   "⚠" glyph: emoji presentation varies per platform and font, and even a
+   text-presentation selector still renders as a colour glyph on some systems.
+   The triangle is a filled shape with no inner character — at 14px a glyph
+   inside it would be illegible; the SHAPE plus the warning colour is the
+   signal, and the accessible name lives on the element's aria-label. */
+.vaultguard-ribbon-binding-blocked {
+  position: relative;
+  color: var(--color-orange, #d98e04);
+  opacity: 1;
+}
+
+/* The triangle body. Its contrast ring is four 1px drop-shadows rather than the
+   logged-out bubble's `box-shadow: 0 0 0 2px`: box-shadow follows the BORDER
+   BOX, so on a clip-path shape it would draw a rectangle around the triangle.
+   drop-shadow follows the alpha channel, so chaining it in four directions
+   traces the triangle's actual edges. */
+.vaultguard-ribbon-binding-blocked::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 15px;
+  height: 13px;
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+  background-color: var(--color-orange, #d98e04);
+  filter:
+    drop-shadow(1px 0 0 var(--background-primary))
+    drop-shadow(-1px 0 0 var(--background-primary))
+    drop-shadow(0 1px 0 var(--background-primary))
+    drop-shadow(0 -1px 0 var(--background-primary));
+  pointer-events: none;
+}
+
+/* The "!", painted OVER the triangle (::after follows ::before in paint order).
+   Bottom-aligned inside the same box: a triangle is widest at its base, so a
+   vertically centred glyph would crowd the sloping sides. Same dark-on-orange
+   treatment as the logged-out bubble's "!". */
+.vaultguard-ribbon-binding-blocked::after {
+  content: "!";
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 15px;
+  height: 13px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 1px;
+  box-sizing: border-box;
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+  color: var(--background-primary);
   pointer-events: none;
 }
 
@@ -1506,6 +1592,22 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   white-space: nowrap;
 }
 
+/* quick-260820-fvo: muted pill marking the row this folder is already bound
+   to — the row the picker must never auto-bind. */
+.vaultguard-vault-picker-bound-badge {
+  display: inline-block;
+  margin: 0 0 2px;
+  padding: 1px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  color: var(--text-muted);
+  font-size: 0.72em;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
 .vaultguard-vault-picker-meta {
   overflow: hidden;
   color: var(--text-muted);
@@ -1546,6 +1648,38 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
 .vaultguard-vault-picker-empty-actions {
   display: flex;
   gap: 8px;
+}
+
+/* ─── Account Switch Discard Modal ─────────────────────────────────────── */
+
+.modal.vaultguard-account-switch-discard-modal {
+  width: 560px;
+  max-width: calc(100vw - 32px);
+}
+
+.modal.vaultguard-account-switch-discard-modal .modal-content {
+  padding: 24px 28px 22px;
+}
+
+/* Both buttons can sit next to long email addresses in the copy. The shared
+   .vaultguard-modal-actions rule already wraps; left-align the wrapped rows so a
+   long label does not push the destructive action off on its own line. */
+.modal.vaultguard-account-switch-discard-modal .vaultguard-modal-actions {
+  justify-content: flex-start;
+}
+
+.modal.vaultguard-account-switch-discard-modal .vaultguard-modal-actions button {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Vault-relative paths can be long — wrap instead of overflowing the modal. */
+.modal.vaultguard-account-switch-discard-modal .vaultguard-account-switch-discard-paths {
+  margin: 6px 0 10px;
+  padding-left: 22px;
+  font-size: var(--font-ui-small);
+  word-break: break-all;
 }
 
 /* ─── Binding Reconciliation Modal ─────────────────────────────────────── */
@@ -5708,14 +5842,28 @@ button .vaultguard-btn-spinner:only-child {
   font-size: 13px;
 }
 
+/* Obsidian resolves `--background-modifier-error` and `--text-error` to the
+ * SAME value — both are `var(--color-red)`, and success is the same story with
+ * `--color-green`. A solid fill plus the matching text colour therefore
+ * rendered these banners at a 1:1 contrast ratio: a blank coloured rectangle.
+ *
+ * Use the tint channel Obsidian ships for exactly this
+ * (`--background-modifier-*-rgb`, which it uses itself as
+ * `rgba(var(--background-modifier-error-rgb), 0.1)`) and carry the text in
+ * `--text-normal`. The hue says success-or-error; the text stays readable.
+ * Measured against the default themes that is 14.1:1 (success) and 13.4:1
+ * (error) in light, 9.5:1 and 10.5:1 in dark — where keeping `--text-success` /
+ * `--text-error` on the same tint would have given 2.3:1 and 3.5:1, both below
+ * WCAG AA for 13px body text. It is also how Obsidian's own callouts read:
+ * tinted panel, normal-weight body copy. */
 .vaultguard-status-msg.is-error {
-  background: var(--background-modifier-error);
-  color: var(--text-error);
+  background: rgba(var(--background-modifier-error-rgb), 0.12);
+  color: var(--text-normal);
 }
 
 .vaultguard-status-msg.is-success {
-  background: var(--background-modifier-success);
-  color: var(--text-success);
+  background: rgba(var(--background-modifier-success-rgb), 0.12);
+  color: var(--text-normal);
 }
 
 /* Inline-save button next to a settings text input */
@@ -5743,6 +5891,13 @@ button .vaultguard-btn-spinner:only-child {
 
 /* Reload-prompt Notice: spacing above the "Reload now" button row. */
 .vaultguard-reload-notice-actions {
+  display: flex;
+  /* The wrong-account notice carries two long-labelled buttons
+     (quick-260820-nqm); a Notice is far too narrow to hold them on one line,
+     so they wrap instead of overflowing. `gap` keeps them off each other in
+     both axes. Single-button notices are unaffected. */
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: 8px;
 }
 
@@ -5924,11 +6079,19 @@ button .vaultguard-btn-spinner:only-child {
 .vaultguard-rules-trace li {
   margin: 3px 0;
 }
+/* Flex lives on the inner wrapper, never on the <td>: a table cell with
+   display:flex stops stretching to the row height, so on any row tall enough to
+   wrap (the "Enforced by" sentence usually does) its border-bottom draws ~8px
+   above the rest of the row separator. */
 .vaultguard-rules-row-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+.vaultguard-rules-row-actions-inner {
   display: flex;
+  align-items: center;
   gap: 6px;
   justify-content: flex-end;
-  white-space: nowrap;
 }
 .vaultguard-rules-row-actions button {
   padding: 4px 9px;
@@ -8052,6 +8215,24 @@ button .vaultguard-btn-spinner:only-child {
 }
 .vaultguard-lock-curtain__input::placeholder {
   color: var(--text-faint);
+}
+.vaultguard-lock-curtain__hidden {
+  display: none;
+}
+/* In-curtain confirm panel. An Obsidian Modal cannot be used here: its
+   .modal-container sits at z-index var(--layer-modal) = 50, far below this
+   curtain's 2147483647, so it would render behind an opaque surface. */
+.vaultguard-lock-curtain__confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.vaultguard-lock-curtain__confirm-go {
+  background-color: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+.vaultguard-lock-curtain__confirm-go:hover {
+  background-color: var(--background-modifier-error-hover, var(--background-modifier-error));
 }
 .vaultguard-lock-curtain__error {
   min-height: 1.2em;

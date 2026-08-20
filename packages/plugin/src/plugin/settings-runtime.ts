@@ -22,6 +22,7 @@ import {
   DEFAULT_SETTINGS,
   SAAS_DEFAULTS,
   normalizeAgentTemplateAllowlist,
+  normalizeArtifactImportFolder,
 } from "./settings";
 import {
   DEFAULT_CLAUDE_SUBSCRIPTION_MODEL,
@@ -355,6 +356,9 @@ export class PluginSettingsRuntime {
     Object.assign(
       this.settings,
       normalizeDiscoveryPreferences(data as Record<string, unknown>),
+    );
+    this.settings.artifactImportFolder = normalizeArtifactImportFolder(
+      (data as Record<string, unknown>).artifactImportFolder,
     );
 
     // Migrate the legacy single "show permission indicators" toggle into the
@@ -995,9 +999,22 @@ export class PluginSettingsRuntime {
       | ProtectedSessionEnvelope
       | null;
     if (!protectedSession) {
-      // Desktop with broken keychain or mobile renderer — try the at-rest
-      // cipher before warning. On mobile this is the normal path and the
-      // user shouldn't see any Notice at all.
+      // Desktop with broken keychain or mobile renderer — the at-rest cipher
+      // is the fallback seal. On DESKTOP that seal is only acceptable while
+      // the LAK itself is safeStorage-wrapped: in the localstorage-fallback
+      // tier the LAK's wrapping KEK sits on disk beside the data, so an
+      // at-rest-sealed refresh token is recoverable from a copied profile
+      // directory alone — no OS credentials needed (account-change report
+      // §9.3). Refuse to persist there; the user re-authenticates per launch,
+      // the same posture as having no storage at all. On MOBILE the at-rest
+      // tier stays sanctioned: safeStorage never exists in the renderer, the
+      // OS app sandbox is the boundary desktop lacks, and a per-launch
+      // re-login is not a viable posture there (§9.6). Mobile keeps today's
+      // behavior byte-identical, Notice-free.
+      if (!Platform.isMobileApp && !this.isAtRestSessionSealKeychainBacked()) {
+        this.notifySafeStorageUnavailable();
+        return;
+      }
       protectedSession = await this.ctx.protectSessionWithAtRest(sessionToPersist) as
         | ProtectedSessionEnvelope
         | null;
@@ -1452,6 +1469,20 @@ export class PluginSettingsRuntime {
     } catch {
       // Storage may be unavailable in tests or restricted renderer contexts.
     }
+  }
+
+  /**
+   * True when sealing under the at-rest cipher does not weaken desktop session
+   * storage: the LAK must itself be safeStorage-wrapped, so unwrapping the
+   * sealed session still requires the OS keychain. In the
+   * localstorage-fallback tier the wrapping KEK sits beside the data on disk,
+   * and against a copied profile directory the seal adds nothing over
+   * plaintext. (A locked or ephemeral cipher fails this check too — the former
+   * cannot seal at all, the latter cannot outlive the process.)
+   */
+  private isAtRestSessionSealKeychainBacked(): boolean {
+    const status = this.ctx.atRestCipher?.getStatus();
+    return status?.kind === "unlocked" && status.method === "safe-storage";
   }
 
   private notifySafeStorageUnavailable(): void {

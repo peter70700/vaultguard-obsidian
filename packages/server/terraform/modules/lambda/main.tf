@@ -30,6 +30,16 @@ variable "session_enforcement_mode" {
     error_message = "session_enforcement_mode must be either observe or enforce."
   }
 }
+variable "guest_sweep_mode" {
+  type        = string
+  default     = "observe"
+  description = "Expired-guest sweeper posture. Read ONLY by the reconciler, so it is injected into that function's environment rather than common_env."
+
+  validation {
+    condition     = contains(["observe", "enforce"], var.guest_sweep_mode)
+    error_message = "guest_sweep_mode must be either observe or enforce."
+  }
+}
 variable "login_verification_mode" {
   type        = string
   default     = "disabled"
@@ -571,8 +581,16 @@ data "aws_iam_policy_document" "files_lambda" {
     actions   = ["dynamodb:PutItem"]
     resources = [var.audit_table_arn]
   }
+  # Organizations: GetItem/Query for the plan + quota lookup on every request.
+  # UpdateItem is storage accounting — files/handler.ts calls
+  # updateOrgStorageUsage (shared/utils.ts) at four sites (write, create, delete,
+  # restore) and that helper issues `ADD currentStorageBytes` on this table. It
+  # swallows failures into an ORG_STORAGE_UPDATE_FAILURE log line, so without
+  # UpdateItem every file write silently fails to account storage: confirmed
+  # live 2026-08-11 on an org whose currentStorageBytes had never incremented,
+  # leaving storage quotas unenforced.
   statement {
-    actions   = ["dynamodb:GetItem", "dynamodb:Query"]
+    actions   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
     resources = [var.organizations_table_arn, "${var.organizations_table_arn}/index/*"]
   }
   statement {
@@ -1206,12 +1224,54 @@ data "aws_iam_policy_document" "users_lambda" {
     actions   = ["dynamodb:Query", "dynamodb:UpdateItem"]
     resources = [var.leases_table_arn, "${var.leases_table_arn}/index/*"]
   }
+  # Vault membership: every invite seeds the invitee into the org's vaults.
+  # seedDefaultVaultMembershipForInvitee and seedGuestVaultMembershipsForInvitee
+  # (users/handler.ts) PutItem the membership row and GetItem it back to confirm;
+  # DeleteItem is the guest-seed ROLLBACK path that undoes a partial seed. The
+  # /index/* ARN is required by hasStoredGuestMembership, which Queries
+  # userId-index to detect a former guest during promotion. Absent this grant the
+  # seed is denied inside a best-effort try/catch, so the invite still returns
+  # 201 while the invitee lands with zero vault access — silent since the
+  # 2026-05-22 invite-seeding change.
+  statement {
+    actions = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"]
+    resources = [
+      var.vault_members_table_arn, "${var.vault_members_table_arn}/index/*",
+    ]
+  }
+  # Permission rules: the same invite seed writes each vault's default `/**`
+  # rule for the new member and re-reads it by primary key when self-healing a
+  # partial retry. DeleteItem is REQUIRED because an admin-initiated early
+  # revoke, and both org-level promotion doors, tear down a former temporary
+  # user's rule through shared/access-revocation — which is exactly why that
+  # teardown lives in shared/: the grant guard follows `../shared/<module>`
+  # imports and can therefore SEE this requirement. Without the grant the
+  # delete is denied inside a best-effort catch, so the request still returns
+  # success while the rule survives — instance four of a class this repo has
+  # already been bitten by three times. No dynamodb:Query and no /index/* on
+  # purpose — this role only writes, re-reads and deletes rules addressed by
+  # primary key; permission EVALUATION belongs to the permissions and files
+  # Lambdas, which carry their own (broader) grants.
+  statement {
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
+    resources = [var.permissions_table_arn]
+  }
+  # Vaults: listVaultsForOrg (shared/utils.ts) Queries the BASE table by orgId to
+  # enumerate the vaults an invitee must be seeded into. No /index/* — the only
+  # slug-index reader, getVaultBySlug, is not reachable from this handler. This
+  # is the grant whose absence raised the live AccessDeniedException on
+  # dynamodb:Query that made guest invites 500 outright.
+  statement {
+    actions   = ["dynamodb:Query"]
+    resources = [var.vaults_table_arn]
+  }
   # DynamoDB SSE-KMS caller decrypt — REQUIRED, do not remove. SD-12 dropped
   # this believing DynamoDB decrypts CMK-encrypted tables via a service grant;
   # in fact DynamoDB calls kms:Decrypt with the CALLER's credentials (proven by
   # the 2026-07-11 permissions-Lambda outage — see the twin comment on the
-  # permissions role). The users Lambda reads/writes Organizations/Sessions/
-  # Audit/Leases/Subscriptions rows, all CMK-encrypted, so without this grant
+  # permissions role). The users Lambda reads/writes RecoveryCodes/Organizations/
+  # Sessions/Audit/RevokedKeys/Leases/Subscriptions/Vaults/VaultMembers/
+  # Permissions rows, all CMK-encrypted, so without this grant
   # invite/revoke/list-user routes 500 on the first cold table key. Offboarding
   # crypto still lives in the reencryption Lambda (own KMS grant); ViaService
   # pins THIS grant to DynamoDB — no direct KMS use, and no GenerateDataKey
@@ -1553,11 +1613,94 @@ data "aws_iam_policy_document" "reconciler_lambda" {
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
     resources = [var.subscriptions_table_arn, "${var.subscriptions_table_arn}/index/*"]
   }
-  # Audit — one reconciler.org_reconciled row per active org per run.
+  # Audit — one reconciler.org_reconciled row per active org per run, plus one
+  # guest.access_ended row per user the sweeper tears down (endGuestAccess step 5).
   statement {
     actions   = ["dynamodb:PutItem"]
     resources = [var.audit_table_arn]
   }
+  # ─── Expired-guest sweeper (DR-5, reconciler/guest-sweeper.ts) ─────────────
+  # Everything below is reached from reconciler/guest-sweeper.ts, either directly
+  # or through `../shared/access-revocation`'s endGuestAccess. Paired with the
+  # sweeper code in the same plan, per the phase IAM rule; a missing grant here
+  # is swallowed by a try/catch and surfaces as a silent zero-effect success.
+  #
+  # Cognito account disable — sweeper step 1, the FIRST thing endGuestAccess
+  # does. Without it every teardown aborts at step 1 and the guest keeps signing
+  # in forever while the run reports per-org failures. Deliberately NOT paired
+  # with a per-user Cognito read: the `sub -> Username` map is built inside the
+  # ListUsers pagination the reconciler already performs, so the Cognito delta is
+  # exactly one action. (The excluded action names are spelled out only in
+  # tests/infrastructure-security-controls.test.ts, which asserts their absence
+  # from the granted set — naming them here would defeat that grep.)
+  statement {
+    actions   = ["cognito-idp:AdminDisableUser"]
+    resources = [var.cognito_user_pool_arn]
+  }
+  # Vaults — discovery step 1: listVaultsForOrg (shared/utils.ts) Queries the BASE
+  # table by orgId to enumerate the org's vaults. No /index/* — the only
+  # slug-index reader, getVaultBySlug, is not reachable from this Lambda. Without
+  # this grant discovery finds zero vaults and the sweep silently no-ops.
+  statement {
+    actions   = ["dynamodb:Query"]
+    resources = [var.vaults_table_arn]
+  }
+  # VaultMembers — discovery step 2 (listVaultMembers Queries the BASE table by
+  # vaultId) plus the row deletes that both sweeper branches perform: the
+  # conditional membership delete inside endGuestAccess step 4, and the
+  # restraint branch's delete of lapsed rows for a user who keeps their account.
+  # NO /index/* on purpose. Nothing on this path queries a GSI, and the only GSI
+  # that exists is the org-blind `userId-index` that discovery is forbidden to
+  # use (it is O(pool) and carries no org scope). If a future sibling does need
+  # a GSI here, the IAM guard demands the index ARN and the test fails loudly.
+  statement {
+    actions   = ["dynamodb:Query", "dynamodb:DeleteItem"]
+    resources = [var.vault_members_table_arn]
+  }
+  # Permissions — the `guest-invite#{vaultId}#{userId}` rule that rides every
+  # guest membership. Deleted by primary key only, so no Query and no /index/*.
+  # Without it a swept guest keeps a stale allow rule pointing at a vault they
+  # are no longer a member of.
+  statement {
+    actions   = ["dynamodb:DeleteItem"]
+    resources = [var.permissions_table_arn]
+  }
+  # RevokedKeys — the revocation marker written by revokeUserCryptoAccess. It is
+  # the ONLY tier that closes the residual window where a disabled account's
+  # unexpired JWT still passes offline verification. PutItem ONLY: that path
+  # issues zero GetCommands, and the sweeper's `markerWrite: 'ifAbsent'` variant
+  # is a CONDITIONAL Put, not a read-then-write. GetItem would be a pure
+  # over-grant, and the IAM guard is under-grant-only so it cannot catch one.
+  statement {
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.revoked_keys_table_arn]
+  }
+  # Sessions — revokeUserCryptoAccess Queries userId-index for the swept user's
+  # active sessions and updates each to isActive=false. The /index/* ARN is
+  # required by that Query; without it the teardown throws before the seat is
+  # released and the user keeps a live session.
+  statement {
+    actions   = ["dynamodb:Query", "dynamodb:UpdateItem"]
+    resources = [var.sessions_table_arn, "${var.sessions_table_arn}/index/*"]
+  }
+  # Leases — same shape: Query userId-index for active key leases, update each to
+  # status=revoked so a cached DEK stops being usable. Without it an expired
+  # guest can still decrypt vault content until the lease's own TTL elapses.
+  statement {
+    actions   = ["dynamodb:Query", "dynamodb:UpdateItem"]
+    resources = [var.leases_table_arn, "${var.leases_table_arn}/index/*"]
+  }
+  # NOT granted, deliberately: the EventBridge publish action. LD-4 keeps
+  # org-wide re-encryption off this scheduled path — the sweeper is the only
+  # caller that passes `triggerReEncryption: false`, which skips the EventBridge
+  # leg entirely. Adding that grant would make an accidental re-encryption storm
+  # possible on a nightly schedule with no human in the loop.
+  #
+  # The KMS statement that follows is UNCHANGED by the sweeper and must stay
+  # that way. Its ViaService condition is table-agnostic, so it already covers
+  # every table added above with no edit; and the recorded 2026-07-11 outage
+  # came from stripping a CMK decrypt grant off a role that touched DynamoDB.
+  # ─── End of expired-guest sweeper additions ───────────────────────────────
   # KMS — Organizations / Subscriptions / Audit tables are encrypted with the
   # project master key; without service-scoped Decrypt, the first table
   # access errors.
@@ -1610,6 +1753,10 @@ resource "aws_lambda_function" "reconciler" {
     variables = merge(local.common_env, {
       STRIPE_SECRET_ARN = var.stripe_secret_arn
       BASE_URL          = var.domain_name != "" ? "https://admin.${var.domain_name}" : ""
+      # Only the reconciler reads this, so it stays out of common_env. Anything
+      # other than "enforce" runs the sweep read-only: full discovery and the
+      # real decision logic, zero writes and zero Cognito calls.
+      GUEST_SWEEP_MODE = var.guest_sweep_mode
     })
   }
 
@@ -1784,9 +1931,17 @@ data "aws_iam_policy_document" "vaults_lambda" {
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query"]
     resources = [var.vault_members_table_arn, "${var.vault_members_table_arn}/index/*"]
   }
-  # Permissions table — write default member rules on vault create / member add/update/remove
+  # Permissions table — write default member rules on vault create / member
+  # add/update/remove. UpdateItem is REQUIRED by the temporary-access extension
+  # on PATCH /vaults/{vaultId}/members/{userId} (handleUpdateMember): it moves
+  # the boundary on the existing rule in place under an attribute_exists guard,
+  # deliberately rather than upserting, so a missing rule is reported instead of
+  # minted. Without this grant the update is denied inside a catch that only
+  # distinguishes a conditional failure, so the row's boundary moves while the
+  # rule's does not — a member who can read nothing, reported as success. No
+  # Query and no /index/*: this role addresses those rules by primary key only.
   statement {
-    actions   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+    actions   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"]
     resources = [var.permissions_table_arn]
   }
   # Leases table — revokeUserVaultLeases (called from member-remove and

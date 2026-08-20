@@ -86,6 +86,7 @@ export type SemanticPurgeReason =
   | "logout"
   | "lock"
   | "vault-switch"
+  | "account-takeover"
   | "provider-change"
   | "manual";
 
