@@ -291,7 +291,7 @@ describe('File Protection: Vault Adapter Interception', () => {
 
       expect(mockNotice).toHaveBeenCalledWith(
         expect.stringContaining('VaultGuard Sync: Login required to open "docs/readme.md".'),
-        9000
+        15000
       );
       expect(plugin.originalAdapterMethods.read).not.toHaveBeenCalled();
     });
@@ -516,7 +516,7 @@ describe('File Protection: Vault Adapter Interception', () => {
       plugin.noticeIfMediaOpenWhileLoggedOut('attachments/photo.png');
       expect(mockNotice).toHaveBeenCalledWith(
         expect.stringContaining('VaultGuard Sync: Login required to open "attachments/photo.png".'),
-        9000
+        15000
       );
     });
     it('stays silent for a signed-out text file (interceptedRead already notices those)', () => {

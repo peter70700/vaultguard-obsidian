@@ -321,6 +321,15 @@ const SESSION_REMINT_MIN_INTERVAL_MS = 60 * 1000;
 /** Minimum spacing between repeated login-required notices */
 const AUTH_REQUIRED_NOTICE_THROTTLE_MS = 5 * 1000;
 
+/**
+ * How long the login-required notice stays up. Longer than the 9s it used to
+ * get: the notice now carries a "Log in" button, and a toast meant to be
+ * CLICKED has to outlive reading it. Still timed rather than sticky — it
+ * describes one action the user just attempted, not a standing state like the
+ * wrong-account verdict.
+ */
+const AUTH_REQUIRED_NOTICE_DURATION_MS = 15 * 1000;
+
 /** Minimum spacing between repeated connection-lost notices */
 const CONNECTION_LOST_NOTICE_THROTTLE_MS = 30 * 1000;
 
@@ -1254,6 +1263,13 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Last time a login-required Notice was shown, used to avoid toast storms */
   private lastAuthRequiredNoticeAt: number | null = null;
+
+  /**
+   * The standing login-required Notice, tracked like the wrong-account and
+   * reconciliation-paused pair so it can be replaced instead of stacked, and so
+   * a successful login can drop a toast that no longer describes reality.
+   */
+  private loginRequiredNotice: Notice | null = null;
 
   /** Last time a connection-lost Notice was shown, used to avoid retry-loop toast storms */
   private lastConnectionLostNoticeAt: number | null = null;
@@ -5242,6 +5258,9 @@ export default class VaultGuardPlugin extends Plugin {
     // that verdict was about the previous identity (quick-260820-ki7
     // stale-toast fix); this identity gets its own answer below.
     this.hideWrongAccountNotice();
+    // Same reasoning for the login-required toast: it now carries a "Log in"
+    // button, and there is nothing to log into once a session exists.
+    this.hideLoginRequiredNotice();
     // POST /auth/session no longer issues a key lease — leases are vault-scoped
     // and are requested explicitly via /auth/key-lease/scoped after the vault
     // binding is resolved. This eliminates the org-wide DEK that used to leak
@@ -7252,14 +7271,56 @@ export default class VaultGuardPlugin extends Plugin {
       this.lastAuthRequiredNoticeAt === null ||
       now - this.lastAuthRequiredNoticeAt >= AUTH_REQUIRED_NOTICE_THROTTLE_MS
     ) {
-      new Notice(
-        `${message}\nLog in from the VaultGuard Sync shield menu or run "VaultGuard Sync: Login" from the command palette.`,
-        9000
-      );
+      this.raiseLoginRequiredNotice(message);
       this.lastAuthRequiredNoticeAt = now;
     }
 
     return message;
+  }
+
+  /**
+   * The actioned body of the login-required notice. This toast used to be a
+   * dead end in the same way the wrong-account one was before
+   * quick-260820-nqm: it named the state and then told the user to go find the
+   * shield menu or the command palette, for the one blocked state whose fix is
+   * a single click. Every caller guards on `!this.session` (a PIN-locked vault
+   * keeps its session and never reaches here), so "log in" is always the
+   * correct action to offer.
+   *
+   * Constructed ONCE with the plain fallback text and upgraded in place when
+   * the Notice can host DOM. The sticky builders' two-Notice shape
+   * (`new Notice("", 0)` then a fallback `new Notice(message, 0)`) would
+   * double the constructor call on every notice for headless hosts.
+   */
+  private raiseLoginRequiredNotice(message: string): void {
+    this.hideLoginRequiredNotice();
+    const notice = new Notice(
+      `${message}\nLog in from the VaultGuard Sync shield menu or run "VaultGuard Sync: Login" from the command palette.`,
+      AUTH_REQUIRED_NOTICE_DURATION_MS
+    );
+    this.loginRequiredNotice = notice;
+
+    const body = noticeBody(notice);
+    // No DOM-capable Notice (headless / unit harness): the plain string above
+    // already names both the state and the manual way in — nothing to upgrade.
+    if (!body) return;
+
+    // With a real button, the "go find the shield menu" sentence is noise, so
+    // the rendered body states the problem and offers the fix directly.
+    body.empty();
+    body.appendText(message);
+    const actions = body.createDiv();
+    actions.addClass("vaultguard-reload-notice-actions");
+    const loginBtn = actions.createEl("button", { text: "Log in" });
+    loginBtn.addEventListener("click", () => {
+      this.hideLoginRequiredNotice();
+      this.handleLogin();
+    });
+  }
+
+  private hideLoginRequiredNotice(): void {
+    this.loginRequiredNotice?.hide?.();
+    this.loginRequiredNotice = null;
   }
 
   /**
