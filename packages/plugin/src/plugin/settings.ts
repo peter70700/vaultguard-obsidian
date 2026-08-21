@@ -435,6 +435,16 @@ export interface GuestMemberControls {
   /** Temporary access, so it can be ended before its boundary. */
   showEndNow: boolean;
   /**
+   * This row IS the signed-in user.
+   *
+   * A row-level IDENTITY fact, not a guest fact — it is computed from the
+   * session regardless of access kind, and the vault-role dropdown reads it on
+   * every row, including permanent members who have no guest controls at all.
+   * It lives here only because this is the one place the row's decisions are
+   * observable from a test.
+   */
+  isSelf: boolean;
+  /**
    * The identity is disabled while its guest row still EXISTS.
    *
    * This is a narrow, rare state: it arises only when the teardown failed
@@ -3806,10 +3816,32 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       return;
     }
 
+    // DR-6. Both guest controls exist only for a row that IS temporary access.
+    // A guest whose access has fully lapsed has already had every membership
+    // row deleted, so they never appear in this list and neither control is
+    // ever rendered for them — their recovery lives on the user list.
+    //
+    // Computed before the dropdown because `isSelf` gates that too.
+    const guestControls = this.guestMemberControlsFor(
+      member,
+      statusByUser.get(member.userId),
+      canManage,
+      session.userId
+    );
+
     let nextRole = member.role;
     setting.addDropdown((dropdown) => {
       for (const role of VAULT_ROLES) {
         dropdown.addOption(role, VAULT_ROLE_LABELS[role]);
+      }
+      if (guestControls.isSelf) {
+        // This is the VAULT member role, not the org role, and it is genuinely
+        // unguarded server-side: `vaults/handler.ts` blocks removing the last
+        // vault admin but not demoting one. Freezing your own row here is
+        // cheap; the vault Lambda is out of scope for this change.
+        dropdown.setDisabled(true);
+        dropdown.selectEl.title =
+          "You cannot change your own role in this vault. Ask another vault or organization admin to do it.";
       }
       dropdown
         .setValue(member.role)
@@ -3828,16 +3860,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           }
         });
     });
-
-    // DR-6. Both controls exist only for a row that IS temporary access. A
-    // guest whose access has fully lapsed has already had every membership row
-    // deleted, so they never appear in this list and neither control is ever
-    // rendered for them — their recovery lives on the user list.
-    const guestControls = this.guestMemberControlsFor(
-      member,
-      statusByUser.get(member.userId),
-      canManage
-    );
 
     if (guestControls.showExtend) {
       setting.addButton((button) =>
@@ -4116,17 +4138,30 @@ export class VaultGuardSettingTab extends PluginSettingTab {
    * `accountStatus` is the target's ORG account status from `GET /users`, not
    * anything about this vault. It only ever selects between a one-step and a
    * two-step sequence; it never decides whether the controls appear.
+   *
+   * `sessionUserId` is the signed-in user, so the row can refuse to offer the
+   * destructive control that targets THEM. Defense in depth only — the server
+   * refuses a self-revoke outright — but a control that is going to be refused
+   * should not be rendered as if it would work.
    */
   private guestMemberControlsFor(
     member: VaultMemberRecord,
     accountStatus: string | undefined,
     canManage: boolean,
+    sessionUserId: string,
     nowMs = Date.now()
   ): GuestMemberControls {
     const manageableGuest = canManage && deriveGuestPresentation(member, nowMs) !== null;
+    const isSelf = member.userId === sessionUserId;
     return {
+      isSelf,
       showExtend: manageableGuest,
-      showEndNow: manageableGuest,
+      // "End now" calls `revokeUser`, which is the ORG-wide revoke, not a vault
+      // removal: on your own row it disables your own account. A sole admin who
+      // pressed it locked themselves out of their organization for good.
+      // `showExtend` is deliberately untouched — moving your own expiry boundary
+      // outward is not destructive.
+      showEndNow: manageableGuest && !isSelf,
       // Reaching this row at all means a membership row still exists. A
       // disabled identity that still has one is the narrow partial-teardown
       // state, NOT the ordinary post-expiry state — in that one the rows are

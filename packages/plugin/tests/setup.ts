@@ -100,7 +100,15 @@ class MockComponent {
 
 class MockButtonComponent extends MockComponent {}
 class MockTextComponent extends MockComponent {}
-class MockDropdownComponent extends MockComponent {}
+class MockDropdownComponent extends MockComponent {
+  /**
+   * Obsidian's real `DropdownComponent` exposes the underlying `<select>`, and
+   * `renderVaultMemberRow` writes `dropdown.selectEl.title` to explain a frozen
+   * own-row control. Without this stub the first test that renders that row
+   * dies on `undefined.title` instead of on whatever it meant to assert.
+   */
+  selectEl: { title: string } = { title: "" };
+}
 
 class MockModal {
   app: unknown;

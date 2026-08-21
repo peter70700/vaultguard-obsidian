@@ -627,18 +627,38 @@ async function handleListUsers(
 
 /**
  * ONE message and ONE status for BOTH the cross-org and the not-found outcome of
- * resolving an already-existing email on the guest path. Splitting them (403 vs
- * 404, or two wordings) would turn this route into an existence oracle over the
- * shared Cognito pool: an admin could type any address and read from the status
+ * resolving an already-existing email. Splitting them (403 vs 404, or two
+ * wordings) would turn this route into an existence oracle over the shared
+ * Cognito pool: an admin could type any address and read from the status
  * whether it belongs to somebody else's organization. Disclosure *within* the
  * caller's own org is fine — they can already list it — which is why the copy
  * may point at the user list.
+ *
+ * The `GUEST_` prefix is historical: this and `GUEST_ATTACH_REVOKED_MESSAGE`
+ * are now returned on the MEMBER collision path too, byte-identically and with
+ * the same status. That is the point — the anti-oracle property has to hold
+ * across both `accessKind`s, or an admin reads the answer off whichever route
+ * still leaks it.
  */
 const GUEST_ATTACH_UNRESOLVABLE_MESSAGE =
   'Guest access could not be granted to that email address. If they are already in your organization, grant access from the user list instead.';
 
 const GUEST_ATTACH_REVOKED_MESSAGE =
   "This user's access is revoked. Reactivate them first, then extend their guest access.";
+
+/**
+ * The member-invite collision that resolves to a live colleague in the caller's
+ * OWN organization. Safe to be specific: the caller can already see this person
+ * in `GET /users`, so nothing is disclosed that a list call would not.
+ *
+ * Deliberately NOT an attach. A guest invite carries an explicit vault list and
+ * an expiry, so attaching is a bounded, requested grant; a member invite says
+ * "create this person", and silently resolving it to somebody who already
+ * exists would report a creation that never happened and could re-grant access
+ * an admin had trimmed.
+ */
+const MEMBER_INVITE_EXISTS_MESSAGE =
+  'That person already has an account in your organization. Grant them vault access from the user list instead of inviting them again.';
 
 async function handleInviteUser(
   event: APIGatewayProxyEvent,
@@ -804,10 +824,17 @@ async function handleInviteUser(
     );
   } catch (error) {
     // CONTEXT.md DR-7 — a colleague who already has an account can be given
-    // temporary access to one more vault. Fires ONLY for a guest invite whose
-    // identity already exists; every other error and every member-path
-    // collision falls straight through to the compensation below and rethrows,
-    // which is what keeps the member path's behaviour unchanged.
+    // temporary access to one more vault. Fires for ANY invite whose identity
+    // already exists; every other error still falls through to the
+    // compensation below and rethrows.
+    //
+    // The member path used to be excluded from this branch, which meant an
+    // `UsernameExistsException` on a member invite rethrew into the top-level
+    // catch and came back as a bare 500 "Internal server error" — the exact
+    // wall a sole admin hits when trying to recover an org by re-inviting
+    // somebody who already exists. It now resolves the collision the same way
+    // the guest path does and then diverges on the OUTCOME: a guest invite
+    // attaches, a member invite refuses with an actionable 409.
     //
     // Nothing here creates, deletes, re-enables, re-groups or re-profiles an
     // identity: no AdminAddUserToGroup (it would put an existing editor in two
@@ -816,7 +843,7 @@ async function handleInviteUser(
     // profile), no AdminDeleteUser. Only membership rows are added, by the
     // seeding call further down, whose conditional writes already refuse to
     // overwrite a permanent membership.
-    if ((error as { name?: string }).name === 'UsernameExistsException' && accessKind === 'guest') {
+    if ((error as { name?: string }).name === 'UsernameExistsException') {
       let resolved: ResolvedTargetUser;
       try {
         resolved = await resolveTargetUserForOrg(
@@ -854,6 +881,27 @@ async function handleInviteUser(
           });
         });
         return formatError(409, GUEST_ATTACH_REVOKED_MESSAGE, requestId);
+      }
+
+      // The member path diverges HERE and nowhere earlier, so the two refusal
+      // outcomes above — unresolvable/foreign-org and revoked — stay
+      // byte-identical across both `accessKind`s. Anything that split them
+      // would hand an admin an existence oracle on whichever route still
+      // answered differently.
+      //
+      // The seat release is load-bearing on this return exactly as it is on the
+      // two above: the reservation was taken before AdminCreateUser and nothing
+      // downstream will commit or release it once we return from inside the
+      // catch, so skipping it leaks a seat on every collided member invite.
+      if (accessKind === 'member') {
+        await releaseInviteSeatReservation(org, seatReservationToken).catch((releaseError) => {
+          console.error('[USERS_INVITE_COMPENSATION_SEAT_FAILED]', {
+            orgId: admin.orgId,
+            seatReservationToken,
+            error: (releaseError as Error).message,
+          });
+        });
+        return formatError(409, MEMBER_INVITE_EXISTS_MESSAGE, requestId);
       }
 
       // No new identity means no new seat.
@@ -1106,6 +1154,31 @@ async function handleUpdateRole(
     admin.orgId,
     'Cannot modify user from another organization'
   );
+
+  // The milder half of the same hole as the revoke route: a sole admin who
+  // demotes THEMSELVES leaves the organization with zero admins. They can still
+  // sign in, but nobody can invite, revoke, re-role or manage anything ever
+  // again, and there is no in-product lever that restores an admin.
+  //
+  // Compared on the RESOLVED subject for the same reason as there — the path
+  // parameter may be a sub, a username or an email. Placed before the
+  // guest-membership gate, `clearExpiredGuestRowsForPromotion` and every
+  // Cognito group mutation, so a refused call writes nothing.
+  //
+  // Self→admin stays allowed: for an admin it is a no-op, and refusing it would
+  // be pure noise on a request that changes nothing.
+  //
+  // Deliberately no `getActiveOrg` call here. This handler has never read the
+  // org, the guard does not need it, and adding an org-status gate to a route
+  // that never had one would be an unrelated behaviour change.
+  if (target.subjectId === admin.userId && newRole !== 'admin') {
+    throw new AuthError(
+      'You cannot remove your own administrator access. Ask another organization admin to do it.',
+      409,
+      'self_demotion_forbidden'
+    );
+  }
+
   if (
     newRole !== 'viewer' &&
     await hasStoredGuestMembership([
@@ -1283,6 +1356,40 @@ async function handleRevokeUser(
     admin.orgId,
     'Cannot modify user from another organization'
   );
+
+  // A sole org admin who revokes THEMSELVES bricks the organization. Cognito
+  // refuses their next sign-in ("User is disabled"), `assertUserNotRevoked`
+  // inside `verifyActiveUser` blanket-403s their very next request, and every
+  // recovery lever needs something that no longer exists: reactivate needs an
+  // admin session, a member re-invite collides on the identity, a guest
+  // re-invite is refused as revoked, self-signup is refused as taken, and the
+  // superadmin surface is read-only.
+  //
+  // A SELF-guard, not a headcount. Counting the remaining admins would need a
+  // paginated Cognito ListUsers over the whole pool on every revoke, and would
+  // still race two admins acting at once. With self-revoke blocked, revoking
+  // the last admin is unreachable by construction: A can only revoke B, which
+  // always leaves A behind.
+  //
+  // Compared on the RESOLVED subject, never on `targetUserId`:
+  // `resolveTargetUserForOrg` above accepts a sub, a Cognito username OR an
+  // email, so a raw-path-parameter comparison would be bypassed by addressing
+  // yourself under any of the other two. Placed before the marker read, the
+  // transition claim and every Cognito mutation, so a refused call changes
+  // nothing at all.
+  //
+  // 409 rather than 403: the caller IS an org admin with full rights on this
+  // route, so "you lack permission" would be false and would mislead the admin
+  // panel into treating a policy refusal as a session failure. This is the same
+  // shape as the 'revocation is already in progress' conflict below — a
+  // well-formed, authorized request refused because of the target's state.
+  if (target.subjectId === admin.userId) {
+    throw new AuthError(
+      'You cannot revoke your own access. Ask another organization admin to do it.',
+      409,
+      'self_revoke_forbidden'
+    );
+  }
 
   const existingMarker = await getRevocationMarker(target.subjectId);
   if (existingMarker) {
