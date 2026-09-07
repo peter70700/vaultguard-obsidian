@@ -112,7 +112,6 @@ const RECOGNIZED_LEGACY_SETTINGS_KEYS = new Set<keyof VaultGuardSettings>([
   "cognitoClientId",
   "loginVerificationMode",
   "syncInterval",
-  "cacheEncryptionStrength",
   "localProjectMemoryMode",
   "localProjectMemoryModeAutoEnableSuppressed",
   "showStatusBar",

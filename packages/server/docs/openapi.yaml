@@ -100,6 +100,12 @@ paths:
                 $ref: '#/components/schemas/SignupResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '503':
+          description: Managed legal documents are not published at the version required by signup.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 
   /auth/login:
     post:
@@ -1857,6 +1863,13 @@ components:
           type: string
         turnstileToken:
           type: string
+        termsAccepted:
+          type: boolean
+          description: Required and true for managed Pro signup; not used by Community Edition.
+        legalVersion:
+          type: string
+          description: Exact managed legal-terms version accepted by the user.
+          pattern: '^\d{4}-\d{2}-\d{2}$'
       additionalProperties: true
 
     SignupResponse:

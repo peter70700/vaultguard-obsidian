@@ -276,9 +276,6 @@ export const DEFAULT_SETTINGS: VaultGuardSettings = {
   cognitoClientId: "",
   loginVerificationMode: "disabled",
   syncInterval: 30,
-  cacheEncryptionStrength: "standard",
-  offlineKeyLeaseDuration: 24,
-  autoWipeOnAuthFailure: false,
   showMyPermissionLevel: true,
   showOthersAccess: true,
   showPermissionBanner: true,
@@ -496,6 +493,7 @@ type SettingsCollapsibleSectionId =
   | "synchronization"
   | "access-unlock"
   | "display"
+  | "saved-artifacts"
   | "capabilities"
   | "manage-vaults-members"
   | "encryption-maintenance"
@@ -546,10 +544,28 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   private latestSettingsStatus: SettingsStatusMessage | null = null;
   private settingsStatusSequence = 0;
   private settingsStatusTimer: number | null = null;
-  /** Set while the filter opens disclosures programmatically. Without it the
-   *  native `toggle` listener would record those forced opens as user intent and
-   *  permanently mark every section as open once someone searched. */
-  private suppressCollapsibleTracking = false;
+  /**
+   * How many `toggle` events each disclosure still owes us from a
+   * programmatic `open` write that has not been observed yet.
+   *
+   * A boolean "suppress" flag cannot do this job. `<details>` fires `toggle`
+   * ASYNCHRONOUSLY — the HTML spec queues an element task on the DOM
+   * manipulation task source rather than dispatching inline — so a flag set and
+   * cleared around the assignment is always back to `false` by the time any
+   * listener runs. Verified in Chromium; the observed order for
+   * `open = true; flag = false;` is:
+   *
+   *     after-assignment → after-flag-reset → toggle (flag already false)
+   *
+   * The result was that every disclosure the search force-opened, and every one
+   * it force-closed, got recorded as a deliberate user choice: one search
+   * permanently rewrote the tab's layout, including popping "Danger zone" open.
+   *
+   * A per-element counter is immune to the timing because it is consumed by the
+   * listener rather than by the clock. Writes that do not change `open` queue no
+   * event and so must not increment it — see `setDisclosureOpenProgrammatically`.
+   */
+  private readonly pendingProgrammaticToggles = new WeakMap<HTMLDetailsElement, number>();
 
   constructor(app: App, plugin: VaultGuardPlugin) {
     super(app, plugin);
@@ -564,6 +580,26 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   private getOpenAiKeyStore(): OpenAiKeyStore {
     this.openAiKeyStore ??= new OpenAiKeyStore(this.plugin);
     return this.openAiKeyStore;
+  }
+
+  /**
+   * Makes Enter in a single-line field commit through its own Save button.
+   *
+   * Three fields in this tab (both API keys and the display name) deliberately
+   * do not write through on change — they pair an input with a small inline
+   * Save button. Enter did nothing in all three, which reads as the field being
+   * broken rather than as a deliberate explicit-save design; people type a key,
+   * press Enter, and leave believing it was stored.
+   *
+   * Only for `<input>`. A textarea needs Enter for newlines.
+   */
+  private submitOnEnter(inputEl: HTMLInputElement, submitBtn: HTMLButtonElement): void {
+    inputEl.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      if (submitBtn.disabled) return;
+      submitBtn.click();
+    });
   }
 
   private renderProviderKeyStorageSetting(
@@ -952,10 +988,8 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .setHeading();
 
     new Setting(containerEl)
-      .setName("Default search result limit")
-      .setDesc(
-        "Maximum number of Secure Discovery results shown by default. Individual searches remain bounded to 100 results."
-      )
+      .setName(this.i18n.t("discovery.semantic.resultLimit"))
+      .setDesc(this.i18n.t("discovery.semantic.resultLimitDetail"))
       .addDropdown((dropdown) =>
         dropdown
           .addOption("10", "10 results")
@@ -1009,8 +1043,21 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           }),
       );
 
-    let pendingOrigin = this.plugin.settings.semanticEmbeddingEndpoint;
-    let pendingModel = this.plugin.settings.semanticEmbeddingModel;
+    // Draft state. The two fields below do NOT write through on every
+    // keystroke; "Save provider" is what persists them. That made the adjacent
+    // "Test local provider" button lie: `testSemanticProvider()` reads the
+    // SAVED origin and model, so typing a new endpoint and pressing Test
+    // probed the old one and reported success for a provider that was no
+    // longer on screen. `draftIsDirty` is what closes that gap.
+    const savedOrigin = this.plugin.settings.semanticEmbeddingEndpoint;
+    const savedModel = this.plugin.settings.semanticEmbeddingModel;
+    let pendingOrigin = savedOrigin;
+    let pendingModel = savedModel;
+    const draftIsDirty = (): boolean =>
+      pendingOrigin !== savedOrigin || pendingModel !== savedModel;
+    // Populated once the provider row exists; both fields drive it.
+    let refreshDraftHint: () => void = () => undefined;
+
     new Setting(containerEl)
       .setName(this.i18n.t("discovery.semantic.origin"))
       .setDesc(this.i18n.t("discovery.semantic.originDetail"))
@@ -1020,6 +1067,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           .setValue(pendingOrigin)
           .onChange((value) => {
             pendingOrigin = value;
+            refreshDraftHint();
           }),
       );
     new Setting(containerEl)
@@ -1031,9 +1079,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           .setValue(pendingModel)
           .onChange((value) => {
             pendingModel = value;
+            refreshDraftHint();
           }),
       );
-    new Setting(containerEl)
+    const providerActionsSetting = new Setting(containerEl)
       .setName(this.i18n.t("discovery.semantic.providerActions"))
       .setDesc(this.i18n.t("discovery.semantic.providerActionsDetail"))
       .addButton((button) =>
@@ -1062,6 +1111,15 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           .setButtonText(this.i18n.t("discovery.semantic.test"))
           .setDisabled(this.plugin.settings.semanticSearchEnabled !== true)
           .onClick(async () => {
+            // Refuse rather than silently test the stale saved provider.
+            if (draftIsDirty()) {
+              this.showStatus(
+                containerEl,
+                this.i18n.t("discovery.semantic.testNeedsSave"),
+                true,
+              );
+              return;
+            }
             button.setDisabled(true);
             try {
               const dimensions = await this.plugin.testSemanticProvider();
@@ -1083,6 +1141,19 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             }
           }),
       );
+
+    // Standing "you have unsaved edits" line on the provider row. It lives
+    // outside the two text fields so it can update on every keystroke without
+    // rebuilding an input and losing the caret.
+    const draftHintEl = providerActionsSetting.descEl.createDiv({
+      cls: "vaultguard-settings-draft-hint",
+    });
+    refreshDraftHint = (): void => {
+      const dirty = draftIsDirty();
+      draftHintEl.setText(dirty ? this.i18n.t("discovery.semantic.unsavedDraft") : "");
+      draftHintEl.toggleClass("is-active", dirty);
+    };
+    refreshDraftHint();
 
     const status = this.plugin.getSemanticSearchStatus();
     let statusDescription = this.i18n.t(`discovery.semantic.status.${status.state}`, {
@@ -1694,6 +1765,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           text: "Save",
           cls: "mod-cta vaultguard-inline-save-btn",
         });
+        this.submitOnEnter(inputEl, saveBtn);
         saveBtn.addEventListener("click", async () => {
           const newKey = inputEl.value.trim();
           if (!newKey) {
@@ -1701,7 +1773,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             return;
           }
           saveBtn.disabled = true;
-          saveBtn.textContent = "Saving...";
+          saveBtn.textContent = "Saving…";
           try {
             await this.getAnthropicKeyStore().setKey(newKey);
             providerModelCatalog.invalidate("anthropic");
@@ -1931,6 +2003,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           text: "Save",
           cls: "mod-cta vaultguard-inline-save-btn",
         });
+        this.submitOnEnter(inputEl, saveBtn);
         saveBtn.addEventListener("click", async () => {
           const newKey = inputEl.value.trim();
           if (!newKey) {
@@ -1938,7 +2011,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             return;
           }
           saveBtn.disabled = true;
-          saveBtn.textContent = "Saving...";
+          saveBtn.textContent = "Saving…";
           try {
             await this.getOpenAiKeyStore().setKey(newKey);
             providerModelCatalog.invalidate("openai");
@@ -1985,7 +2058,10 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     const openAiModelSetting = new Setting(containerEl)
       .setName("Model")
-      .setDesc("OpenAI model used for AI chat turns. Available models load from your API account, including previews.")
+      .setDesc(
+        "OpenAI model used for AI chat turns. Available models load from your API account, including previews. " +
+          "OpenAI replies arrive complete rather than streaming token-by-token.",
+      )
       .addDropdown((dropdown) => {
         this.populateModelSelect(
           dropdown.selectEl,
@@ -2036,12 +2112,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
-
-    new Setting(containerEl)
-      .setName("OpenAI streaming")
-      .setDesc(
-        "OpenAI / GPT uses the non-streaming Responses API path in this phase. Anthropic streaming remains unchanged.",
-      );
   }
 
   private renderCodexSubscriptionProviderSettings(containerEl: HTMLElement): void {
@@ -2598,6 +2668,27 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   /**
+   * Opens or closes a disclosure on the tab's behalf rather than the user's.
+   *
+   * Records one owed `toggle` event so the listener installed in
+   * `renderCollapsibleSection` can discard it instead of writing it back into
+   * `openCollapsibleSectionIds`. Assigning the value it already holds fires
+   * nothing, so that case must not be counted — an uncollected debt would eat
+   * the user's next real toggle.
+   */
+  private setDisclosureOpenProgrammatically(
+    details: HTMLDetailsElement,
+    open: boolean,
+  ): void {
+    if (details.open === open) return;
+    this.pendingProgrammaticToggles.set(
+      details,
+      (this.pendingProgrammaticToggles.get(details) ?? 0) + 1,
+    );
+    details.open = open;
+  }
+
+  /**
    * Wraps a group of settings in a native <details>/<summary> disclosure so
    * heavy, rarely-touched sections can default to collapsed without becoming
    * unreachable to in-place search. Bodies are rendered eagerly; the summary
@@ -2628,15 +2719,26 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         this.openCollapsibleSectionIds.add(sectionId);
       }
     }
-    details.open = this.openCollapsibleSectionIds.has(sectionId);
+    // Seeding the initial state counts as programmatic: `details` starts closed,
+    // so re-opening a section the user had open queues a `toggle` that must not
+    // be read back as a fresh user action.
+    this.setDisclosureOpenProgrammatically(
+      details,
+      this.openCollapsibleSectionIds.has(sectionId),
+    );
     const stateEpoch = this.collapsibleSectionStateEpoch;
     details.addEventListener("toggle", () => {
       // Ignore a delayed native toggle from DOM belonging to an already-closed
       // Settings session.
       if (stateEpoch !== this.collapsibleSectionStateEpoch) return;
-      // A search forces sections open so results are reachable. That is the
-      // filter's doing, not the user's, so it must not become sticky state.
-      if (this.suppressCollapsibleTracking) return;
+      // A search forces sections open so results are reachable, and a re-render
+      // restores them. That is our doing, not the user's, so it must not become
+      // sticky state. Consume exactly one owed event per programmatic write.
+      const owed = this.pendingProgrammaticToggles.get(details) ?? 0;
+      if (owed > 0) {
+        this.pendingProgrammaticToggles.set(details, owed - 1);
+        return;
+      }
       if (details.open) {
         this.openCollapsibleSectionIds.add(sectionId);
       } else {
@@ -2747,30 +2849,49 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       heading.toggleClass(FILTER_HIDDEN_CLS, filtering && !survivingHeadings.has(heading));
     }
 
-    // 3. Disclosures. Force open around the tracking guard so a search can see
-    //    into Advanced / AI & automation / Manage vaults without the forced
-    //    state leaking into what the user chose to leave open.
-    this.suppressCollapsibleTracking = true;
-    try {
-      for (const details of Array.from(
-        rootEl.querySelectorAll<HTMLDetailsElement>(
-          "details.vaultguard-settings-section[data-vaultguard-settings-section]",
-        ),
-      )) {
-        const sectionId = details.dataset
-          .vaultguardSettingsSection as SettingsCollapsibleSectionId;
-        if (filtering) {
-          const hasHit = liveRowIn(details);
-          details.toggleClass(FILTER_HIDDEN_CLS, !hasHit);
-          details.open = hasHit;
-        } else {
-          details.removeClass(FILTER_HIDDEN_CLS);
-          details.open = this.openCollapsibleSectionIds.has(sectionId);
-        }
+    // 3. Disclosures. Force open through `setDisclosureOpenProgrammatically` so
+    //    a search can see into Advanced / AI & automation / Manage vaults
+    //    without the forced state leaking into what the user chose to leave
+    //    open — and, on the way back out, so restoring their state is not
+    //    itself mistaken for a fresh choice.
+    for (const details of Array.from(
+      rootEl.querySelectorAll<HTMLDetailsElement>(
+        "details.vaultguard-settings-section[data-vaultguard-settings-section]",
+      ),
+    )) {
+      const sectionId = details.dataset
+        .vaultguardSettingsSection as SettingsCollapsibleSectionId;
+      if (filtering) {
+        const hasHit = liveRowIn(details);
+        details.toggleClass(FILTER_HIDDEN_CLS, !hasHit);
+        this.setDisclosureOpenProgrammatically(details, hasHit);
+      } else {
+        details.removeClass(FILTER_HIDDEN_CLS);
+        this.setDisclosureOpenProgrammatically(
+          details,
+          this.openCollapsibleSectionIds.has(sectionId),
+        );
       }
-    } finally {
-      this.suppressCollapsibleTracking = false;
     }
+  }
+
+  /**
+   * Re-runs the filter for content that mounted after `display()` finished.
+   *
+   * The Vault, Manage-vaults and Members blocks are populated from `await`ed
+   * API calls, so they land after `display()` has already filtered the tab
+   * once. Without this they arrive unfiltered — a search for "recovery code"
+   * would sprout a full, unrelated vault-membership list a second later — and
+   * their enclosing disclosure keeps the hidden state it was given while it
+   * still held nothing but a "Loading…" line.
+   *
+   * A no-op when nothing is being searched, and when the tab has gone away.
+   */
+  private reapplyFilterForAsyncContent(): void {
+    if (this.settingsFilterQuery.trim().length === 0) return;
+    const root = this.containerEl;
+    if (!root || root.isConnected === false) return;
+    this.applySettingsFilter(root);
   }
 
   /**
@@ -3305,6 +3426,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         this.renderCreateVaultSettings(manageBody, rootEl, session);
       },
     );
+
+    // These rows exist only now, long after `display()` filtered the tab, so an
+    // active query has never been applied to them. `renderVaultMembersContent`
+    // resolves later still and re-runs this for itself.
+    this.reapplyFilterForAsyncContent();
   }
 
   private renderVaultBindingSettings(
@@ -3423,7 +3549,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             .setButtonText(isBound ? "Bound" : "Bind")
             .setDisabled(isBound || vault.archived)
             .onClick(async () => {
-              button.setButtonText("Binding...");
+              button.setButtonText("Binding…");
               button.setDisabled(true);
               try {
                 const changed = await this.plugin.bindServerVault({
@@ -3535,7 +3661,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               return;
             }
 
-            button.setButtonText("Creating...");
+            button.setButtonText("Creating…");
             button.setDisabled(true);
             try {
               const vault = await this.plugin.createServerVault({
@@ -3636,7 +3762,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               return;
             }
 
-            button.setButtonText("Saving...");
+            button.setButtonText("Saving…");
             button.setDisabled(true);
             try {
               await this.plugin.updateCurrentVault({
@@ -3676,7 +3802,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                 if (!confirmed) return;
               }
 
-              button.setButtonText(vault.archived ? "Reactivating..." : "Archiving...");
+              button.setButtonText(vault.archived ? "Reactivating…" : "Archiving…");
               button.setDisabled(true);
               try {
                 await this.plugin.updateCurrentVault({ archived: !vault.archived });
@@ -3790,6 +3916,12 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       new Setting(membersEl)
         .setName("Could not load vault members")
         .setDesc(this.errorMessage(error));
+    } finally {
+      // Member rows land after `display()` already filtered the tab. Every exit
+      // from the block above — the member list, either "Add member" explainer,
+      // or the load-failure row — has to face an active query, so this belongs
+      // in `finally` rather than on one branch.
+      this.reapplyFilterForAsyncContent();
     }
   }
 
@@ -3873,7 +4005,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             );
             if (days === null) return;
 
-            button.setButtonText("Extending...");
+            button.setButtonText("Extending…");
             button.setDisabled(true);
             const outcome = await this.runGuestExtendSequence(this.guestMemberActionClient(), {
               userId: member.userId,
@@ -3921,7 +4053,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             );
             if (!confirmed) return;
 
-            button.setButtonText("Ending...");
+            button.setButtonText("Ending…");
             button.setDisabled(true);
             try {
               await this.guestMemberActionClient().revokeUser(member.userId);
@@ -3949,7 +4081,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           );
           if (!confirmed) return;
 
-          button.setButtonText("Removing...");
+          button.setButtonText("Removing…");
           button.setDisabled(true);
           try {
             await this.plugin.removeCurrentVaultMember(member.userId);
@@ -4037,7 +4169,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             return;
           }
 
-          button.setButtonText("Adding...");
+          button.setButtonText("Adding…");
           button.setDisabled(true);
           try {
             await this.plugin.addCurrentVaultMember(nextUserId.trim(), nextRole);
@@ -4242,7 +4374,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     button: { setButtonText(text: string): unknown; setDisabled(disabled: boolean): unknown },
     restoreLabel = "Switch vault"
   ): Promise<void> {
-    button.setButtonText("Opening...");
+    button.setButtonText("Opening…");
     button.setDisabled(true);
     try {
       const changed = await this.plugin.switchServerVault();
@@ -4265,11 +4397,23 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
   display(): void {
     if (this.collapsibleSectionSessionActive) {
-      const collapsibleSections = Array.from(
-        this.containerEl.querySelectorAll<HTMLDetailsElement>(
-          "details.vaultguard-settings-section[data-vaultguard-settings-section]",
-        ),
-      );
+      // Belt-and-braces snapshot of the live DOM, for a `toggle` that the
+      // browser has queued but not yet delivered when a re-render tears the
+      // element down.
+      //
+      // Deliberately skipped while a search is active: the filter forces
+      // disclosures open and closed to expose results, so scraping `open` mid-
+      // search would read the FILTER's state as the user's and undo everything
+      // the programmatic-toggle accounting protects. While filtering, the
+      // listener is the only writer.
+      const filtering = this.settingsFilterQuery.trim().length > 0;
+      const collapsibleSections = filtering
+        ? []
+        : Array.from(
+            this.containerEl.querySelectorAll<HTMLDetailsElement>(
+              "details.vaultguard-settings-section[data-vaultguard-settings-section]",
+            ),
+          );
       for (const details of collapsibleSections) {
         const sectionId = details.dataset
           .vaultguardSettingsSection as SettingsCollapsibleSectionId;
@@ -4308,7 +4452,17 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
     containerEl.empty();
     containerEl.addClass("vaultguard-settings-tab");
-    this.i18n.applyToRoot(containerEl);
+    // Direction is applied per translated subtree, NOT to the tab root. Only
+    // the intro note and the "Optional modules" body draw their text from the
+    // message catalogue; the other ~119 rows are hardcoded English. Flipping
+    // the root to RTL for an Arabic user therefore used to mirror a tab that
+    // was still ~94% English — worse than either pure outcome, because English
+    // right-aligned and reordered reads as a rendering fault rather than as a
+    // translation gap. Scope the flip to the text that is actually translated
+    // and the untranslated remainder keeps its natural LTR layout.
+    //
+    // Widening this back to `containerEl` is only correct once the rest of the
+    // tab is in the catalogue. See reports/HANDOFF-2026-09-05-settings-tab-audit.md §4.
 
     // ── Header ──────────────────────────────────────────────────────────────
     // No top-level heading here: Obsidian already renders the plugin name as
@@ -4316,7 +4470,9 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // linter (settings-tab/no-problematic-settings-headings, which also bans
     // "settings"/"options"/"general" in setHeading labels). Lead with the
     // description paragraph instead.
-    this.renderSettingsNote(containerEl, this.i18n.t("settings.intro"), "lead");
+    this.i18n.applyToRoot(
+      this.renderSettingsNote(containerEl, this.i18n.t("settings.intro"), "lead"),
+    );
     this.renderSettingsSearch(containerEl);
     const statusHost = containerEl.createDiv({ cls: "vaultguard-settings-status-host" });
     this.renderSettingsStatus(statusHost);
@@ -4380,7 +4536,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           // the build uses api.example.com while it actually uses the bundled
           // default. Reading the value means the sentence cannot contradict it.
           .setDesc(
-            `Uses the bundled ${saasDefaultsHostLabel()} and Cognito configuration. Sign in from the Account section above.`
+            `Uses the bundled ${saasDefaultsHostLabel()} and Cognito configuration. Sign in from the Account section below.`
           )
           .addButton((button) =>
             button
@@ -4431,7 +4587,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                 this.showStatus(body, "Enter an organization slug first.", true);
                 return;
               }
-              button.setButtonText("Connecting...");
+              button.setButtonText("Connecting…");
               button.setDisabled(true);
               try {
                 await this.plugin.resolveOrgConfig(slug);
@@ -4484,7 +4640,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                 );
                 return;
               }
-              button.setButtonText("Redeeming...");
+              button.setButtonText("Redeeming…");
               button.setDisabled(true);
               try {
                 await this.plugin.redeemInvite(parsed);
@@ -4532,7 +4688,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                 this.showStatus(body, "Paste a server config URL first.", true);
                 return;
               }
-              button.setButtonText("Applying...");
+              button.setButtonText("Applying…");
               button.setDisabled(true);
               try {
                 await this.plugin.applyManualServerConfigUrl(raw);
@@ -4635,6 +4791,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                   text: 'Save',
                   cls: 'mod-cta vaultguard-inline-save-btn',
                 });
+                this.submitOnEnter(inputEl, saveBtn);
                 saveBtn.addEventListener('click', async () => {
                   const newName = inputEl.value.trim();
                   if (!newName) {
@@ -4642,7 +4799,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
                     return;
                   }
                   saveBtn.disabled = true;
-                  saveBtn.textContent = "Saving...";
+                  saveBtn.textContent = "Saving…";
                   try {
                     await this.plugin.updateUserProfile(session.userId, newName);
                     this.showStatus(body, "Display name updated.", false);
@@ -4823,7 +4980,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
         new Setting(body)
           .setName("Allowed community plugins")
           .setDesc(
-            "Not applicable in this mode — the allowlist is pushed by the server vault this folder is not bound to."
+            "Not applicable in this mode — this folder isn't bound to a server vault, so there's no admin allowlist to apply."
           );
         new Setting(body)
           .setName("Vault lock")
@@ -4944,27 +5101,37 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     });
 
     // ── Saved artifacts ─────────────────────────────────────────────────────
-    // One everyday preference, so it sits at the top level next to the other
-    // everyday settings rather than behind a disclosure — the commands that use
-    // it ("Save Claude artifact from clipboard" / "Import Claude artifact
-    // file…") are always available, including on mobile for the clipboard one.
-    new Setting(containerEl)
-      .setName("Claude artifact folder")
-      .setDesc(
-        "Where the \"Save Claude artifact\" commands create notes. Leave empty to use the vault root.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.artifactImportFolder)
-          .setValue(this.plugin.settings.artifactImportFolder)
-          .onChange(async (value) => {
-            // Normalize on the way in as well as on load: this is the path that
-            // reaches vault.create(), so an absolute path or a `..` segment
-            // typed here must be rejected, not stored and rejected later.
-            this.plugin.settings.artifactImportFolder = normalizeArtifactImportFolder(value);
-            await this.plugin.saveSettings();
-          }),
-      );
+    // Behind its own disclosure like every other block on this tab. It used to
+    // sit bare at the top level, which made it the ONE control still showing on
+    // an all-collapsed tab — a stray row between two summaries, with no heading
+    // to say what it belonged to.
+    //
+    // Its own section rather than a home inside "AI & automation": that section
+    // renders only while `aiChat` or `agentAccess` is on, whereas the commands
+    // this folder feeds ("Save Claude artifact from clipboard" / "Import Claude
+    // artifact file…") are registered unconditionally, the clipboard one on
+    // mobile too. Folding it in there would hide the destination of a feature
+    // that still works.
+    this.renderCollapsibleSection(containerEl, "saved-artifacts", "Saved artifacts", (body) => {
+      new Setting(body)
+        .setName("Claude artifact folder")
+        .setDesc(
+          "Where the \"Save Claude artifact\" commands create notes. Leave empty to use the vault root.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_SETTINGS.artifactImportFolder)
+            .setValue(this.plugin.settings.artifactImportFolder)
+            .onChange(async (value) => {
+              // Normalize on the way in as well as on load: this is the path
+              // that reaches vault.create(), so an absolute path or a `..`
+              // segment typed here must be rejected, not stored and rejected
+              // later.
+              this.plugin.settings.artifactImportFolder = normalizeArtifactImportFolder(value);
+              await this.plugin.saveSettings();
+            }),
+        );
+    });
 
     // ── Capabilities ────────────────────────────────────────────────────────
     // Placed after the everyday preferences and immediately before the sections
@@ -4972,16 +5139,18 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     // below, so they read as the switchboard for what follows rather than as
     // more configuration competing with first-run setup at the top.
     this.renderCollapsibleSection(containerEl, "capabilities", "Optional modules", (body) => {
+      // Every row these two build comes from the message catalogue, so this
+      // body is the one subtree on the tab that can carry the locale's
+      // direction honestly. The disclosure's own summary stays outside it and
+      // stays English/LTR, which is accurate — the label is not translated.
+      this.i18n.applyToRoot(body);
       this.renderOptionalModulesSection(body, true);
       this.renderSemanticDiscoverySection(body);
     });
 
     // ── Advanced (collapsed) ─────────────────────────────────────────────────
-    // Security + Reliability + at-rest maintenance live behind one disclosure.
+    // Reliability tuning knobs only: retry budget and debug logging.
     this.renderCollapsibleSection(containerEl, "advanced", "Advanced", (body) => {
-      // ── Reliability (formerly the top-level "Advanced" heading) ──────────
-      new Setting(body).setName("Reliability").setHeading();
-
       new Setting(body)
         .setName("Max retry attempts")
         .setDesc(
@@ -5015,7 +5184,6 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       // At-rest encryption used to be rendered here. It now lives in the
       // Protection section at the top of the tab, beside the exclusion rules
       // that govern the same layer — see `renderProtectionScopeSection`.
-      // Advanced keeps only the tuning knobs: Security and Reliability.
     });
 
     // ── AI & automation (collapsed) ──────────────────────────────────────────
@@ -5293,7 +5461,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     } else {
       summaryEl.createDiv({
         cls: "setting-item-description",
-        text: "Loading orientation metadata...",
+        text: "Loading orientation metadata…",
       });
     }
 
@@ -5344,7 +5512,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       )
       .addButton((button) =>
         button.setButtonText("Refresh").onClick(async () => {
-          button.setDisabled(true).setButtonText("Refreshing...");
+          button.setDisabled(true).setButtonText("Refreshing…");
           await renderSnapshot(true);
           if (button.buttonEl.isConnected !== false) {
             button.setDisabled(false).setButtonText("Refresh");
@@ -5353,7 +5521,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       )
       .addButton((button) =>
         button.setButtonText("Copy diagnostics").onClick(async () => {
-          button.setDisabled(true).setButtonText("Copying...");
+          button.setDisabled(true).setButtonText("Copying…");
           const snapshot = await renderSnapshot(true);
           const copied = snapshot
             ? await this.writeClipboard(JSON.stringify(snapshot, null, 2))
@@ -5440,7 +5608,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           .setWarning()
           .setDisabled(sessions.length === 0)
           .onClick(async () => {
-            button.setDisabled(true).setButtonText("Revoking...");
+            button.setDisabled(true).setButtonText("Revoking…");
             try {
               const revoked = this.plugin.revokeAllChatGptConnectorSessions();
               this.latestChatGptConnectorReveal = null;
@@ -5482,7 +5650,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private renderGovernedAutomationSection(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Governed automation (desktop only.)").setHeading();
+    new Setting(containerEl).setName("Governed automation (desktop only)").setHeading();
 
     const desktopUnavailable = Platform.isDesktopApp !== true;
     const registry = normalizeAutomationRegistry(this.plugin.settings.automationRegistry);
@@ -5580,7 +5748,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               return;
             }
             const previous = this.plugin.settings.automationRegistry;
-            button.setDisabled(true).setButtonText("Importing...");
+            button.setDisabled(true).setButtonText("Importing…");
             try {
               this.plugin.settings.automationRegistry = result.registry;
               await this.plugin.saveSettings();
@@ -5647,7 +5815,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
               return;
             }
             const previous = this.plugin.settings.agentTemplateAllowlist;
-            button.setDisabled(true).setButtonText("Saving...");
+            button.setDisabled(true).setButtonText("Saving…");
             try {
               this.plugin.settings.agentTemplateAllowlist = result.paths;
               await this.plugin.saveSettings();
@@ -5671,7 +5839,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private renderAgentBridgeSection(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Agent bridge connections (desktop only.)").setHeading();
+    new Setting(containerEl).setName("Agent bridge connections (desktop only)").setHeading();
 
     const localProjectMemoryMode = this.plugin.isLocalProjectMemoryModeEnabled();
     if (localProjectMemoryMode) {
@@ -5700,7 +5868,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       text:
         localProjectMemoryMode
           ? "Create a scoped bearer lease for a local MCP client such as Codex, Claudian, Claude Code, or Cursor. The bridge remains on 127.0.0.1 and keeps the existing scope, write-confirmation, hidden-path, and audit gates. A server vault binding is not required."
-          : "Agent bridge leases let an external agent (Codex, Claudian, Claude Code, Cursor, custom MCP client) talk to this vault through VaultGuard Sync tools. Each lease has its own bearer token; revoking or rotating one does not disturb the others. Hidden paths (.obsidian, .trash, .git, ...) are always blocked.",
+          : "Agent bridge leases let an external agent (Codex, Claudian, Claude Code, Cursor, custom MCP client) talk to this vault through VaultGuard Sync tools. Each lease has its own bearer token; revoking or rotating one does not disturb the others. Hidden paths (.obsidian, .trash, .git, …) are always blocked.",
     });
 
     const surface = this.plugin.getAgentBridge();
@@ -5736,7 +5904,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
           .setWarning()
           .setDisabled(activeLeases.length === 0)
           .onClick(async () => {
-            button.setDisabled(true).setButtonText("Revoking...");
+            button.setDisabled(true).setButtonText("Revoking…");
             try {
               this.plugin.revokeAllAgentBridgeLeases();
               await this.plugin.stopAgentBridgeServer();
@@ -5776,7 +5944,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private async createChatGptConnectorSession(button: ButtonComponent): Promise<void> {
-    button.setDisabled(true).setButtonText("Creating...");
+    button.setDisabled(true).setButtonText("Creating…");
     try {
       const session: ChatGptConnectorSessionSecret = await this.plugin.createChatGptConnectorSession({
         agentName: "ChatGPT connector",
@@ -5824,7 +5992,11 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     const block = containerEl.createDiv({ cls: "vaultguard-agent-bridge-lease" });
     block.addClass("is-ephemeral");
     block.createEl("strong", { text: session.agentName });
-    const details = block.createDiv({ cls: "vaultguard-agent-bridge-lease-details" });
+    // A <dl>, matching `renderAgentBridgeLeaseRow`. `addAgentBridgeLeaseDetail`
+    // emits <dt>/<dd> pairs, which are only valid inside a description list —
+    // a plain <div> left them orphaned, so assistive technology read the labels
+    // and values as unrelated runs of text.
+    const details = block.createEl("dl", { cls: "vaultguard-agent-bridge-lease-details" });
     this.addAgentBridgeLeaseDetail(details, "Session ID", session.sessionId);
     this.addAgentBridgeLeaseDetail(details, "Profile", session.profile);
     this.addAgentBridgeLeaseDetail(details, "Scope", session.pathScopes.join(", "));
@@ -5844,7 +6016,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       .setButtonText("Revoke session")
       .setWarning()
       .onClick(async () => {
-        revokeBtn.setDisabled(true).setButtonText("Revoking...");
+        revokeBtn.setDisabled(true).setButtonText("Revoking…");
         try {
           const revoked = this.plugin.revokeChatGptConnectorSession(session.sessionId);
           if (this.latestChatGptConnectorReveal?.sessionId === session.sessionId) {
@@ -5909,7 +6081,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             .setButtonText("Start bridge server")
             .setCta()
             .onClick(async () => {
-              button.setDisabled(true).setButtonText("Starting...");
+              button.setDisabled(true).setButtonText("Starting…");
               try {
                 await this.plugin.startAgentBridgeServer();
                 this.display();
@@ -6008,7 +6180,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName("Codex skill")
         .setDesc(
-          "Not available on this device - installing the skill needs Node filesystem access (desktop Obsidian only)."
+          "Not available on this device — installing the skill needs Node filesystem access (desktop Obsidian only)."
         );
       return;
     }
@@ -6094,7 +6266,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     options: { overwriteUnmanaged?: boolean; force?: boolean } = {}
   ): Promise<void> {
     const original = button.buttonEl.textContent ?? "Install skill";
-    button.setDisabled(true).setButtonText("Installing...");
+    button.setDisabled(true).setButtonText("Installing…");
     try {
       const result = await this.plugin.installAgentBridgeSkill(options);
       const verb =
@@ -6117,7 +6289,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private async runSkillUninstall(button: ButtonComponent): Promise<void> {
-    button.setDisabled(true).setButtonText("Removing...");
+    button.setDisabled(true).setButtonText("Removing…");
     try {
       const result = await this.plugin.uninstallAgentBridgeSkill();
       if (result.removed) {
@@ -6140,7 +6312,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     options: { overwriteUnmanaged?: boolean; force?: boolean } = {}
   ): Promise<void> {
     const original = button.buttonEl.textContent ?? "Install skill";
-    button.setDisabled(true).setButtonText("Installing...");
+    button.setDisabled(true).setButtonText("Installing…");
     try {
       const result = await this.plugin.installAgentBridgeCodexSkill(options);
       const verb =
@@ -6163,7 +6335,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
   }
 
   private async runCodexSkillUninstall(button: ButtonComponent): Promise<void> {
-    button.setDisabled(true).setButtonText("Removing...");
+    button.setDisabled(true).setButtonText("Removing…");
     try {
       const result = await this.plugin.uninstallAgentBridgeCodexSkill();
       if (result.removed) {
@@ -6296,7 +6468,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     lease: AgentBridgeLeaseSummary,
     button: ButtonComponent
   ): Promise<void> {
-    button.setDisabled(true).setButtonText("Rotating...");
+    button.setDisabled(true).setButtonText("Rotating…");
     try {
       const server = await this.plugin.startAgentBridgeServer();
       const refreshed = this.plugin.rotateAgentBridgeLeaseToken(lease.leaseId);
@@ -6340,7 +6512,7 @@ export class VaultGuardSettingTab extends PluginSettingTab {
     lease: AgentBridgeLeaseSummary,
     button: ButtonComponent
   ): Promise<void> {
-    button.setDisabled(true).setButtonText("Revoking...");
+    button.setDisabled(true).setButtonText("Revoking…");
     try {
       const revoked = this.plugin.revokeAgentBridgeLease(lease.leaseId);
       if (!revoked) {

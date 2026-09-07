@@ -122,8 +122,12 @@ describe("settings-support", () => {
     const discoverySection = settingsSource.indexOf(
       "private renderSemanticDiscoverySection",
     );
+    // Row name moved into the message catalogue when the RTL flip was scoped to
+    // the translated subtree; the invariant under test is unchanged — the
+    // result-limit row must render BEFORE the desktop-only boundary, so it
+    // stays available on mobile.
     const resultLimit = settingsSource.indexOf(
-      '.setName("Default search result limit")',
+      '.setName(this.i18n.t("discovery.semantic.resultLimit"))',
       discoverySection,
     );
     const desktopBoundary = settingsSource.indexOf(

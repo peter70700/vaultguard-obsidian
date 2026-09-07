@@ -2269,6 +2269,8 @@ export interface OrgRecord {
   currentStorageBytes: number;
   stripeCustomerId?: string;
   stripeSubscriptionId?: string;
+  legalTermsVersion?: string;
+  legalAcceptedAt?: string;
   createdAt?: string;
   updatedAt?: string;
   settings?: Partial<PersistedOrgSettings> | null;

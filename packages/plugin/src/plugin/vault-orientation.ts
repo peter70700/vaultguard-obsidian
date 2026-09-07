@@ -482,15 +482,28 @@ async function pathExists(target: string): Promise<boolean> {
   }
 }
 
+/**
+ * Read-only git invocation for the orientation tool. The vault's own
+ * `.git/config` is attacker-writable by anyone with local write access, and
+ * `git status` honours `core.fsmonitor` from it — a hook that runs an
+ * arbitrary command. Pin the risky knobs off on the command line (which
+ * outranks every config file) and keep the system config out of the picture.
+ */
+export const GIT_HARDENING_ARGS: readonly string[] = [
+  "-c", "core.fsmonitor=false",
+  "-c", "core.hooksPath=/dev/null",
+];
+
 function runGit(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       "git",
-      ["-C", cwd, ...args],
+      [...GIT_HARDENING_ARGS, "-C", cwd, ...args],
       {
         timeout: GIT_TIMEOUT_MS,
         windowsHide: true,
         maxBuffer: GIT_MAX_BUFFER,
+        env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
       },
       (error, stdout) => {
         if (error) {

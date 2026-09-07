@@ -454,6 +454,17 @@ export interface VaultAdapterOriginalMethods {
     | null;
   remove: ((normalizedPath: string) => Promise<void>) | null;
   rename: ((oldPath: string, newPath: string) => Promise<void>) | null;
+  // AR-1: the three remaining DataAdapter content mutators. `append` and
+  // `process` reach the disk through fs.appendFile / fs.writeFile inside
+  // Obsidian's FileSystemAdapter, and `copy` through fs.copyFile — none of
+  // them route through `read`/`write`, so left unwrapped they would put
+  // plaintext after a VG1 envelope (append), rewrite a note from its raw
+  // ciphertext (process) or clone an excluded plaintext file into the managed
+  // tree (copy). Captured so the interceptor can express them through the
+  // intercepted read/write helpers instead.
+  append: ((normalizedPath: string, data: string) => Promise<void>) | null;
+  process: ((normalizedPath: string, fn: (data: string) => string) => Promise<string>) | null;
+  copy: ((normalizedPath: string, normalizedNewPath: string) => Promise<void>) | null;
   // BIN-A preview: getResourcePath is the sync method Obsidian's renderer calls
   // to load media (returns an app://… URL read directly from disk). Captured so
   // the interceptor can serve at-rest-encrypted images/PDFs as decrypted blobs.

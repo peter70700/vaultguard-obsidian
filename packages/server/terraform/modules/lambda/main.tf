@@ -119,6 +119,11 @@ variable "allow_public_signup" {
   default     = false
   description = "When true, Community Edition keeps public signup open after the first org."
 }
+variable "signup_legal_version" {
+  type        = string
+  default     = ""
+  description = "Exact published managed legal version. Empty or mismatched values make Pro signup fail closed."
+}
 variable "billing_exempt_domains" {
   type        = string
   default     = ""
@@ -1114,6 +1119,7 @@ resource "aws_lambda_function" "signup" {
       CLIENT_ID                      = var.cognito_client_id
       LOGIN_VERIFICATION_MODE        = var.login_verification_mode
       VAULTGUARD_ALLOW_PUBLIC_SIGNUP = tostring(var.allow_public_signup)
+      SIGNUP_LEGAL_VERSION           = var.signup_legal_version
       BILLING_EXEMPT_DOMAINS         = var.billing_exempt_domains
       TURNSTILE_SECRET_ARN           = var.turnstile_secret_arn
       TURNSTILE_EXPECTED_HOSTNAMES   = var.turnstile_expected_hostnames

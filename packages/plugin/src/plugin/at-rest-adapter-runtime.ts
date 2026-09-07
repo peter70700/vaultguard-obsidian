@@ -112,6 +112,19 @@ const PRIOR_PLUGIN_IDS_FOR_LAK_MIGRATION: Record<string, string[]> = {
   "vaultguard-sync": ["vaultguard"],
 };
 
+/**
+ * True for the "file does not exist" failures Node/Electron surface from a
+ * read: an `ENOENT` code, or Obsidian's own not-found wording. Used so an
+ * `append` onto a missing file behaves like fs.appendFile (creates it).
+ */
+function isMissingFileError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  if (code === "ENOENT") return true;
+  const message = String((error as { message?: unknown }).message ?? "");
+  return /ENOENT|no such file|does not exist|not found/i.test(message);
+}
+
 const emptyAdapterMethods = (): VaultAdapterOriginalMethods => ({
   read: null,
   write: null,
@@ -120,6 +133,9 @@ const emptyAdapterMethods = (): VaultAdapterOriginalMethods => ({
   list: null,
   remove: null,
   rename: null,
+  append: null,
+  process: null,
+  copy: null,
   getResourcePath: null,
 });
 
@@ -2636,6 +2652,26 @@ export class AtRestAdapterRuntime {
       this.originalAdapterMethods.rename = resolveAdapterMethodBase(fn) ?? fn.bind(adapter);
       this.capturedAdapterMethodNames.add("rename");
     }
+    // AR-1: capture the content mutators that bypass read/write inside
+    // Obsidian's FileSystemAdapter (fs.appendFile / fs.writeFile / fs.copyFile).
+    const rawAppend = (adapter as unknown as Record<string, unknown>).append;
+    if (typeof rawAppend === "function") {
+      const fn = rawAppend as (p: string, d: string) => Promise<void>;
+      this.originalAdapterMethods.append = resolveAdapterMethodBase(fn) ?? fn.bind(adapter);
+      this.capturedAdapterMethodNames.add("append");
+    }
+    const rawProcess = (adapter as unknown as Record<string, unknown>).process;
+    if (typeof rawProcess === "function") {
+      const fn = rawProcess as (p: string, f: (data: string) => string) => Promise<string>;
+      this.originalAdapterMethods.process = resolveAdapterMethodBase(fn) ?? fn.bind(adapter);
+      this.capturedAdapterMethodNames.add("process");
+    }
+    const rawCopy = (adapter as unknown as Record<string, unknown>).copy;
+    if (typeof rawCopy === "function") {
+      const fn = rawCopy as (p: string, n: string) => Promise<void>;
+      this.originalAdapterMethods.copy = resolveAdapterMethodBase(fn) ?? fn.bind(adapter);
+      this.capturedAdapterMethodNames.add("copy");
+    }
     const rawGetResourcePath = (adapter as unknown as Record<string, unknown>).getResourcePath;
     if (typeof rawGetResourcePath === "function") {
       const fn = rawGetResourcePath as (p: string) => string;
@@ -2715,6 +2751,45 @@ export class AtRestAdapterRuntime {
       adapter.rename = this.installedAdapterMethods.rename;
     }
 
+    // AR-1: express append / process / copy through the intercepted read and
+    // write paths. Those helpers already pass excluded paths straight through
+    // and apply the permission gate, at-rest encryption, corruption
+    // classification and sync bookkeeping to managed ones — so a plugin (or
+    // Obsidian core) calling `Vault.append`, `Vault.process` or `Vault.copy`
+    // can no longer put plaintext next to a VG1 envelope or clone bytes across
+    // the exclusion boundary.
+    const baseAppend = this.originalAdapterMethods.append;
+    if (baseAppend) {
+      this.installedAdapterMethods.append = markAdapterWrapper(
+        async (normalizedPath: string, data: string): Promise<void> =>
+          this.interceptedAppend(normalizedPath, data),
+        baseAppend,
+      );
+      (adapter as unknown as { append: (p: string, d: string) => Promise<void> }).append =
+        this.installedAdapterMethods.append;
+    }
+    const baseProcess = this.originalAdapterMethods.process;
+    if (baseProcess) {
+      this.installedAdapterMethods.process = markAdapterWrapper(
+        async (normalizedPath: string, fn: (data: string) => string): Promise<string> =>
+          this.interceptedProcess(normalizedPath, fn),
+        baseProcess,
+      );
+      (adapter as unknown as {
+        process: (p: string, fn: (data: string) => string) => Promise<string>;
+      }).process = this.installedAdapterMethods.process;
+    }
+    const baseCopy = this.originalAdapterMethods.copy;
+    if (baseCopy) {
+      this.installedAdapterMethods.copy = markAdapterWrapper(
+        async (normalizedPath: string, normalizedNewPath: string): Promise<void> =>
+          this.interceptedCopy(normalizedPath, normalizedNewPath),
+        baseCopy,
+      );
+      (adapter as unknown as { copy: (p: string, n: string) => Promise<void> }).copy =
+        this.installedAdapterMethods.copy;
+    }
+
     // Intercept getResourcePath so at-rest-encrypted media (images, PDFs, ...)
     // renders. Obsidian's renderer loads media via getResourcePath()→app:// which
     // reads the on-disk bytes directly, bypassing readBinary decryption — without
@@ -2776,6 +2851,9 @@ export class AtRestAdapterRuntime {
     restoreMethod("list");
     restoreMethod("remove");
     restoreMethod("rename");
+    restoreMethod("append");
+    restoreMethod("process");
+    restoreMethod("copy");
     restoreMethod("getResourcePath");
 
     if (superseded.length > 0) {
@@ -2800,6 +2878,9 @@ export class AtRestAdapterRuntime {
       list: null,
       remove: null,
       rename: null,
+      append: null,
+      process: null,
+      copy: null,
       getResourcePath: null,
     };
     this.log("Vault adapter methods restored.");
@@ -3199,6 +3280,45 @@ export class AtRestAdapterRuntime {
    * @param data - File content to write
    * @throws Error if the user lacks WRITE permission
    */
+  /**
+   * AR-1: `DataAdapter.append` — read the current plaintext (an absent file
+   * appends onto an empty document, matching fs.appendFile semantics) and
+   * write the concatenation through the intercepted write path so the result
+   * is one valid VG1 envelope, never plaintext trailing ciphertext.
+   */
+  async interceptedAppend(path: string, data: string): Promise<void> {
+    const current = await this.readForMutation(path);
+    await this.interceptedWrite(path, current + data);
+  }
+
+  /** AR-1: `DataAdapter.process` — read, transform and write through the intercepted paths. */
+  async interceptedProcess(path: string, fn: (data: string) => string): Promise<string> {
+    const current = await this.readForMutation(path);
+    const next = fn(current);
+    if (next !== current) await this.interceptedWrite(path, next);
+    return next;
+  }
+
+  /**
+   * AR-1: `DataAdapter.copy` — a byte copy through the intercepted binary
+   * read/write so the destination is encrypted (or plaintext) according to ITS
+   * OWN path, not the source's, and a copy of a denied source is refused by the
+   * same permission gate a read would hit.
+   */
+  async interceptedCopy(path: string, newPath: string): Promise<void> {
+    const bytes = await this.interceptedReadBinary(path);
+    await this.interceptedWriteBinary(newPath, bytes);
+  }
+
+  private async readForMutation(path: string): Promise<string> {
+    try {
+      return await this.interceptedRead(path);
+    } catch (error) {
+      if (isMissingFileError(error)) return "";
+      throw error;
+    }
+  }
+
   async interceptedWrite(path: string, data: string): Promise<void> {
     // SD-06-F1 / DECISION 6: capture the local-new probe at the EARLIEST point
     // in the function — before the ciphertext check and therefore before any
@@ -3449,6 +3569,18 @@ export class AtRestAdapterRuntime {
 
   private async rememberAtRestProtected(path: string): Promise<void> {
     await this.atRestProtectionState?.markProtected(path);
+  }
+
+  /**
+   * AR-6: a file removed through a path the interceptor does not see
+   * (`Vault.trash` → `trashLocal`/`trashSystem`, a folder delete, an external
+   * `rm`) still carries its durable protection marker. A later plaintext file
+   * dropped at the same path would then be classified as damaged VG1 and
+   * refused instead of encrypted in place. The plugin calls this from the
+   * `vault.on("delete")` listener so the marker follows the file.
+   */
+  async forgetProtectionMarkerForDeletedPath(path: string): Promise<void> {
+    await this.forgetAtRestProtected(path);
   }
 
   private async forgetAtRestProtected(path: string): Promise<void> {

@@ -1716,6 +1716,8 @@ const CHATGPT_CONNECTOR_REQUIRED_SCOPES: Record<ChatGptConnectorToolName, ChatGp
   graph: ["vg.vault.read", "vg.graph.read"],
 };
 const HTTP_BODY_LIMIT_BYTES = 1024 * 1024;
+/** Permission evaluations a not-found read may spend on path suggestions (mirrors the mention picker). */
+const MAX_SUGGESTION_PERMISSION_CHECKS = 200;
 const AGENT_BRIDGE_CLOSE_TIMEOUT_MS = 500;
 // Try this localhost port first so the URL pasted into Claudian / .mcp.json
 // stays stable across plugin reloads. Falls back to a random port if the
@@ -3064,7 +3066,7 @@ export class VaultGuardAgentBridge {
       throw new Error("VaultGuard agent lease is read-only.");
     }
     const from = this.requirePathInLease(args.path, lease);
-    const to = this.requirePathInLease(args.newPath ?? "", lease);
+    const to = this.requirePathInLease(args.newPath ?? "", lease, "target");
     if (!this.isTextPath(from) || !this.isTextPath(to)) {
       throw new Error("VaultGuard agent bridge only renames text notes.");
     }
@@ -5518,7 +5520,7 @@ export class VaultGuardAgentBridge {
     operation: "create" | "apply_patch" | "delete",
     preview: string
   ): Promise<string> {
-    const path = this.requirePathInLease(rawPath, lease);
+    const path = this.requirePathInLease(rawPath, lease, operation === "create" ? "target" : "access");
 
     if (!this.isTextPath(path)) {
       throw new Error(`VaultGuard agent bridge refuses to write non-text file "${path}".`);
@@ -5570,9 +5572,15 @@ export class VaultGuardAgentBridge {
     lease: AgentBridgeLease,
   ): Promise<string[]> {
     const allowedPaths: string[] = [];
+    // Bounded like the mention picker (MENTION_MAX_PERMISSION_CHECKS): every
+    // not-found read would otherwise pay one permission evaluation per vault
+    // file — up to three server round-trips each on a cold cache.
+    let permissionChecks = 0;
     for (const rawPath of this.deps.getAllFilePaths().slice(0, 5_000)) {
+      if (permissionChecks >= MAX_SUGGESTION_PERMISSION_CHECKS) break;
       const path = this.normalizePath(rawPath);
       if (!path || !this.isPathAgentReadable(path, lease, null)) continue;
+      permissionChecks += 1;
       const permission = await this.deps.getPermission(path);
       if (permission >= PermissionLevel.READ) allowedPaths.push(path);
     }
@@ -5587,8 +5595,12 @@ export class VaultGuardAgentBridge {
     });
   }
 
-  private requirePathInLease(rawPath: string, lease: AgentBridgeLease): string {
-    const path = this.normalizePath(rawPath);
+  private requirePathInLease(
+    rawPath: string,
+    lease: AgentBridgeLease,
+    purpose: "access" | "target" = "access",
+  ): string {
+    const path = this.canonicalizeAgentPath(this.normalizePath(rawPath), purpose);
     if (!path) {
       throw new Error("VaultGuard agent bridge requires a vault-relative path.");
     }
@@ -5599,6 +5611,38 @@ export class VaultGuardAgentBridge {
       throw new Error(`VaultGuard agent lease does not cover "${path}".`);
     }
     return path;
+  }
+
+  /**
+   * Every gate below keys on the STRING the agent supplied, but the disk
+   * operation behind it goes to the OS, which on case-insensitive and
+   * normalisation-insensitive filesystems (macOS APFS default, Windows NTFS)
+   * resolves `secret/x.md` or an NFD spelling to the very file a rule denies
+   * as `Secret/x.md`. Resolve the agent's spelling against the vault index
+   * first: when no file has exactly that path but one exists under a fold-
+   * equivalent path, the permission check and the disk access both run on the
+   * real object. For a write TARGET (create / rename destination) such a
+   * collision is refused outright, so a variant spelling can never overwrite
+   * a file the agent could not name directly.
+   */
+  private canonicalizeAgentPath(path: string, purpose: "access" | "target"): string {
+    if (!path) return path;
+    const all = this.deps.getAllFilePaths();
+    const fold = (value: string): string => value.normalize("NFC").toLowerCase();
+    const folded = fold(path);
+    let canonical: string | null = null;
+    for (const rawCandidate of all) {
+      const candidate = this.normalizePath(rawCandidate);
+      if (candidate === path) return path;
+      if (canonical === null && fold(candidate) === folded) canonical = candidate;
+    }
+    if (canonical === null) return path;
+    if (purpose === "target") {
+      throw new Error(
+        `VaultGuard agent bridge refuses "${path}": it would overwrite "${canonical}" on a case-insensitive filesystem.`,
+      );
+    }
+    return canonical;
   }
 
   private isPathAgentReadable(path: string, lease: AgentBridgeLease, toolScope: string | null): boolean {
@@ -5962,6 +6006,18 @@ export class VaultGuardAgentBridge {
       throw new Error("VaultGuard agent lease scope cannot be empty.");
     }
     if (trimmed === "/**" || trimmed === "**") return "/**";
+    // A scope with many wildcard runs compiles to a regex whose backtracking
+    // grows super-linearly, and `matchesScope` runs it once per vault file on
+    // the main thread. Bound it before it becomes a lease or a tool argument.
+    const wildcardRuns = (trimmed.match(/\*+/g) ?? []).length;
+    if (wildcardRuns > MAX_SCOPE_WILDCARD_RUNS) {
+      throw new Error(
+        `VaultGuard agent lease scope "${trimmed}" has too many wildcards (max ${MAX_SCOPE_WILDCARD_RUNS}).`,
+      );
+    }
+    if (trimmed.length > MAX_SCOPE_LENGTH) {
+      throw new Error(`VaultGuard agent lease scope is too long (max ${MAX_SCOPE_LENGTH} characters).`);
+    }
 
     const normalized = this.normalizePath(trimmed);
     if (!normalized) {
@@ -6004,7 +6060,7 @@ export class VaultGuardAgentBridge {
       return normalizedPath.slice(prefix.length + 1).indexOf("/") === -1;
     }
     if (normalizedScope.includes("*")) {
-      return globToRegExp(normalizedScope).test(normalizedPath);
+      return compiledScopeRegExp(normalizedScope).test(normalizedPath);
     }
     return normalizedPath === normalizedScope || normalizedPath.startsWith(`${normalizedScope}/`);
   }
@@ -6126,6 +6182,30 @@ export class VaultGuardAgentBridge {
     );
   }
 
+  /** A missing Host header (non-browser local clients, test doubles) counts as loopback. */
+  private isLoopbackHost(req: NodeIncomingMessage): boolean {
+    const rawHost = req.headers["host"];
+    const host = ((Array.isArray(rawHost) ? rawHost[0] : rawHost) ?? "").trim();
+    if (!host) return true;
+    const hostname = host.startsWith("[")
+      ? host.slice(0, host.indexOf("]") + 1)
+      : host.split(":")[0];
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]" ||
+      hostname === "::1"
+    );
+  }
+
+  private isConnectorPath(url: string): boolean {
+    return (
+      url === CHATGPT_CONNECTOR_METADATA_PATH ||
+      url === CHATGPT_CONNECTOR_METADATA_ALT_PATH ||
+      url === CHATGPT_CONNECTOR_MCP_PATH
+    );
+  }
+
   private async handleHttpRequest(req: NodeIncomingMessage, res: NodeServerResponse): Promise<void> {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
@@ -6139,6 +6219,20 @@ export class VaultGuardAgentBridge {
     }
 
     const url = (req.url ?? "").split("?")[0] || "/";
+
+    // Host guard. The bridge binds 127.0.0.1, so a request whose Host header is
+    // not a loopback name arrived either through a DNS-rebinding page (which
+    // sends no Origin on a same-origin GET) or through the tunnel that fronts
+    // the ChatGPT connector. Neither may reach the lease-bearing /rpc and /mcp
+    // transports: confine them to the read-only connector paths.
+    if (!this.isLoopbackHost(req) && !this.isConnectorPath(url)) {
+      this.writeJson(res, 403, {
+        ok: false,
+        error: { message: "Forbidden: this transport is only served on the local loopback host." },
+      });
+      return;
+    }
+
     if (req.method === "GET" && (url === CHATGPT_CONNECTOR_METADATA_PATH || url === CHATGPT_CONNECTOR_METADATA_ALT_PATH)) {
       this.writeJson(res, 200, this.handleChatGptConnectorMetadata());
       return;
@@ -7081,18 +7175,38 @@ export class VaultGuardAgentBridge {
 
   private readHttpBody(req: NodeIncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
+      // Accumulate raw bytes and decode ONCE at the end: Node delivers chunks
+      // on arbitrary boundaries, so decoding per chunk turns a multi-byte
+      // UTF-8 sequence split across two chunks into U+FFFD — silently
+      // corrupting a note written through MCP/RPC before the confirm preview.
+      // The limit is enforced in BYTES and the socket is closed on overflow so
+      // an oversized sender cannot keep streaming into a rejected request.
       let size = 0;
-      const chunks: string[] = [];
-      req.on("data", (chunk) => {
-        const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-        size += text.length;
+      let rejected = false;
+      const chunks: Uint8Array[] = [];
+      req.on("data", (chunk: string | Uint8Array) => {
+        if (rejected) return;
+        const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk;
+        size += bytes.byteLength;
         if (size > HTTP_BODY_LIMIT_BYTES) {
+          rejected = true;
+          chunks.length = 0;
           reject(new Error("VaultGuard agent bridge request body is too large."));
+          (req as unknown as { destroy?: () => void }).destroy?.();
           return;
         }
-        chunks.push(text);
+        chunks.push(bytes);
       });
-      req.on("end", () => resolve(chunks.join("")));
+      req.on("end", () => {
+        if (rejected) return;
+        const merged = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) {
+          merged.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        resolve(new TextDecoder().decode(merged));
+      });
       req.on("error", reject);
     });
   }
@@ -7101,6 +7215,29 @@ export class VaultGuardAgentBridge {
     res.statusCode = statusCode;
     res.end(JSON.stringify(body));
   }
+}
+
+/** Upper bounds on a lease / tool `scope` glob (see normalizeScope). */
+export const MAX_SCOPE_WILDCARD_RUNS = 4;
+export const MAX_SCOPE_LENGTH = 1024;
+const SCOPE_REGEXP_CACHE_LIMIT = 256;
+const scopeRegExpCache = new Map<string, RegExp>();
+
+/**
+ * Compile a scope glob once and reuse it: `matchesScope` is evaluated per
+ * vault file inside list/search sweeps, and recompiling the same pattern for
+ * every path was the dominant cost even for benign scopes.
+ */
+function compiledScopeRegExp(scope: string): RegExp {
+  const cached = scopeRegExpCache.get(scope);
+  if (cached) return cached;
+  const compiled = globToRegExp(scope);
+  if (scopeRegExpCache.size >= SCOPE_REGEXP_CACHE_LIMIT) {
+    const oldest = scopeRegExpCache.keys().next().value;
+    if (oldest !== undefined) scopeRegExpCache.delete(oldest);
+  }
+  scopeRegExpCache.set(scope, compiled);
+  return compiled;
 }
 
 function globToRegExp(pattern: string): RegExp {

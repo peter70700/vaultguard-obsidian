@@ -10950,6 +10950,12 @@ export default class VaultGuardPlugin extends Plugin {
 
   private handleVaultFileDeleted(path: string): void {
     if (this.isWipeSuppressedDelete(path, false)) return; // 13-02/HI-01: never DELETE a wiped path on the server
+    // AR-6: trash/folder deletes bypass the adapter `remove` interceptor, so the
+    // durable at-rest protection marker must be cleared here or a later
+    // plaintext file at this path is refused as "damaged VG1".
+    void this.ensureAtRestAdapterRuntimeObject()
+      .forgetProtectionMarkerForDeletedPath?.(path)
+      ?.catch((error) => this.logError(`At-rest: could not clear protection marker for deleted "${path}"`, error));
     return this.ensureSyncRuntime().handleVaultFileDeleted(path);
   }
 

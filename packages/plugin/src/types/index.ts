@@ -190,9 +190,6 @@ export interface KeyLease {
   deniedPaths?: Array<{ pathPattern: string; ruleId: string }>;
 }
 
-/** Supported encryption strength levels for local cache */
-export type CacheEncryptionStrength = "standard" | "high" | "maximum";
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Authentication & Sessions
 // ─────────────────────────────────────────────────────────────────────────────
@@ -539,12 +536,6 @@ export interface VaultGuardSettings {
   serverFeaturesResolvedAt?: string;
   /** Sync interval in seconds (minimum 10, default 30) */
   syncInterval: number;
-  /** Encryption strength for local file cache */
-  cacheEncryptionStrength: CacheEncryptionStrength;
-  /** Hours before offline key lease expires (default 24) */
-  offlineKeyLeaseDuration: number;
-  /** Whether to wipe local cache on authentication failure */
-  autoWipeOnAuthFailure: boolean;
   /**
    * @deprecated Legacy single "show permission indicators" toggle. Split into
    * the three granular toggles below (`showMyPermissionLevel`,

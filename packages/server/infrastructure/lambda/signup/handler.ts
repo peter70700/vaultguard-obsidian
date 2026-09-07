@@ -78,6 +78,8 @@ const TURNSTILE_EXPECTED_HOSTNAMES = (
 // website events, so it must never be empty.
 const ADMIN_BASE_URL = process.env.BASE_URL || 'https://admin.example.com';
 const SIGNUP_JSON_BODY_MAX_BYTES = 16 * 1024;
+export const SIGNUP_LEGAL_VERSION = '2026-08-24';
+const PUBLISHED_SIGNUP_LEGAL_VERSION = (process.env.SIGNUP_LEGAL_VERSION || '').trim();
 
 // Email domains flagged as internal/company accounts. LA6: a domain match is
 // NOT proof of mailbox ownership (signup never verifies email), so it no
@@ -252,6 +254,35 @@ async function handleSignup(
   }
 
   const body = parseBody(event, SIGNUP_JSON_BODY_MAX_BYTES);
+
+  // Managed signup creates the contract and records the exact accepted
+  // version. Keep provisioning unavailable unless the deployer explicitly
+  // confirms that this exact version is published; a partial landing/admin
+  // rollout must never collect acceptance for a gated draft. Community
+  // Edition is operator-owned and governed separately.
+  if (
+    EDITION === 'pro' &&
+    PUBLISHED_SIGNUP_LEGAL_VERSION !== SIGNUP_LEGAL_VERSION
+  ) {
+    return formatError(
+      503,
+      'Managed signup is unavailable until the current legal documents are published.',
+      requestId,
+      'legal_documents_unpublished'
+    );
+  }
+
+  if (
+    EDITION === 'pro' &&
+    (body.termsAccepted !== true || body.legalVersion !== SIGNUP_LEGAL_VERSION)
+  ) {
+    return formatError(
+      400,
+      'You must accept the current Terms of Service and Acceptable Use Policy.',
+      requestId,
+      'legal_acceptance_required'
+    );
+  }
 
   // Turnstile CAPTCHA verification.
   //   Pro / managed SaaS: TURNSTILE_SECRET_ARN is set → token required + verified.
@@ -479,6 +510,9 @@ async function handleSignup(
     createdAt: now,
     updatedAt: now,
     status: 'active',
+    ...(EDITION === 'pro'
+      ? { legalTermsVersion: SIGNUP_LEGAL_VERSION, legalAcceptedAt: now }
+      : {}),
     ...(marketingConsent ? { metaMarketingConsent: true } : {}),
   };
 

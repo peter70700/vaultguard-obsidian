@@ -219,9 +219,6 @@ function createTestPlugin() {
     cognitoUserPoolId: '',
     cognitoClientId: '',
     syncInterval: 30,
-    cacheEncryptionStrength: 'standard',
-    offlineKeyLeaseDuration: 24,
-    autoWipeOnAuthFailure: false,
     showMyPermissionLevel: true,
     showOthersAccess: true,
     showPermissionBanner: true,
@@ -573,6 +570,35 @@ describe('File Protection: Vault Adapter Interception', () => {
       const [wbPath, wbBytes] = plugin.originalAdapterMethods.writeBinary.mock.calls[0];
       expect(wbPath).toBe('docs/editable.md');
       expect(new TextDecoder().decode(wbBytes)).toBe('updated content');
+    });
+
+    it('routes adapter.append through the intercepted read + write so the result is one encrypted document (AR-1)', async () => {
+      plugin.session = makeSession('editor');
+      plugin.permissionCache.set('docs/editable.md', PermissionLevel.WRITE);
+      plugin.connectionState.status = 'offline';
+
+      const runtime = plugin.ensureAtRestAdapterRuntimeObject();
+      await runtime.interceptedAppend('docs/editable.md', '\n- [ ] appended task');
+
+      // Never a raw append: the plaintext concatenation is re-written through
+      // the managed (encrypting) write path.
+      expect(plugin.originalAdapterMethods.read).toHaveBeenCalledWith('docs/editable.md');
+      expect(plugin.originalAdapterMethods.writeBinary).toHaveBeenCalledTimes(1);
+      const [wbPath, wbBytes] = plugin.originalAdapterMethods.writeBinary.mock.calls[0];
+      expect(wbPath).toBe('docs/editable.md');
+      expect(new TextDecoder().decode(wbBytes)).toBe('local file content\n- [ ] appended task');
+    });
+
+    it('refuses adapter.append and adapter.process on a path the user may only read (AR-1)', async () => {
+      plugin.session = makeSession('member');
+      plugin.permissionCache.set('docs/readonly.md', PermissionLevel.READ);
+      plugin.connectionState.status = 'offline';
+
+      const runtime = plugin.ensureAtRestAdapterRuntimeObject();
+      await expect(runtime.interceptedAppend('docs/readonly.md', 'x')).rejects.toThrow('Access denied');
+      await expect(runtime.interceptedProcess('docs/readonly.md', (s: string) => `${s}!`)).rejects.toThrow('Access denied');
+      expect(plugin.originalAdapterMethods.writeBinary).not.toHaveBeenCalled();
+      expect(plugin.originalAdapterMethods.write).not.toHaveBeenCalled();
     });
 
     it('allows write when permission is ADMIN', async () => {

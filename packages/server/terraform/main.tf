@@ -142,6 +142,7 @@ module "lambda" {
   max_file_size_bytes              = var.max_file_size_bytes
   vaultguard_edition               = var.vaultguard_edition
   allow_public_signup              = var.vaultguard_allow_public_signup
+  signup_legal_version             = var.signup_legal_version
   billing_exempt_domains           = var.billing_exempt_domains
   # Stage credentials are explicit inputs. Never fall back from an omitted
   # non-production value to the production Turnstile secret.

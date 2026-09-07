@@ -212,6 +212,17 @@ variable "vaultguard_allow_public_signup" {
   default     = false
 }
 
+variable "signup_legal_version" {
+  description = "Exact published managed-service legal version (YYYY-MM-DD). Keep empty until registered operator details and external legal review are complete; a Pro signup Lambda with an empty or mismatched value fails closed."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.signup_legal_version == "" || can(regex("^\\d{4}-\\d{2}-\\d{2}$", var.signup_legal_version))
+    error_message = "signup_legal_version must be empty or an ISO date in YYYY-MM-DD format."
+  }
+}
+
 variable "super_admin_emails" {
   description = "Comma-separated lowercase emails allowed to call the /superadmin/* platform-stats API. Fail-closed: empty disables the API entirely. Set per-stage in environments/<stage>.tfvars."
   type        = string

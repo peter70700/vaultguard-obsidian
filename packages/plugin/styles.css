@@ -2011,6 +2011,18 @@ body.vaultguard-auth-logged-in .workspace-tab-header[data-type="vaultguard-permi
   list-style-position: outside;
 }
 
+/* Inline "you have unsaved edits" hint on a settings row whose fields are held
+ * as a draft until an explicit Save (Secure Discovery's provider origin/model).
+ * Hidden when empty so a clean row keeps its original spacing. */
+.vaultguard-settings-draft-hint:empty {
+  display: none;
+}
+
+.vaultguard-settings-draft-hint {
+  margin-top: var(--size-4-1, 4px);
+  color: var(--text-warning, var(--text-accent));
+}
+
 /* Standalone explanatory copy in the settings tab.
  *
  * Obsidian's `.setting-item-description` is a CAPTION style meant for one line
