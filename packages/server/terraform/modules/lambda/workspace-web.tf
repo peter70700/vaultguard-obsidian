@@ -321,8 +321,8 @@ resource "aws_lambda_function" "workspace_web" {
       USER_POOL_ID                        = var.cognito_user_pool_id
       CONNECTOR_AUTH_TABLE                = var.connector_auth_table_name
       WORKSPACE_WEB_ORIGIN                = var.workspace_web_origin
-      SIGNUP_LEGAL_VERSION                 = var.signup_legal_version
-      WORKSPACE_LEGAL_TERMS_URL            = var.signup_legal_version == "" ? "" : "https://example.com/terms"
+      SIGNUP_LEGAL_VERSION                = var.signup_legal_version
+      WORKSPACE_LEGAL_TERMS_URL           = var.signup_legal_version == "" ? "" : "https://example.com/terms"
       WORKSPACE_COHORT_CONTROL_TABLE      = var.workspace_revisions_table_name
       WORKSPACE_REVISIONS_TABLE           = var.workspace_revisions_table_name
       FILE_VERSIONS_TABLE                 = var.file_versions_table_name

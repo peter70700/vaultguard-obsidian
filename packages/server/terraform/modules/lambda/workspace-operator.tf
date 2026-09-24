@@ -104,8 +104,8 @@ resource "aws_lambda_function" "workspace_operator" {
   environment {
     variables = merge(local.common_env, {
       WORKSPACE_OPERATOR_ENABLED = "true"
-      WORKSPACE_REVISIONS_TABLE = var.workspace_revisions_table_name
-      WORKSPACE_ECONOMICS_TABLE = var.workspace_economics_table_name
+      WORKSPACE_REVISIONS_TABLE  = var.workspace_revisions_table_name
+      WORKSPACE_ECONOMICS_TABLE  = var.workspace_economics_table_name
     })
   }
   depends_on = [aws_iam_role_policy.workspace_operator, aws_iam_role_policy_attachment.workspace_operator_logging]

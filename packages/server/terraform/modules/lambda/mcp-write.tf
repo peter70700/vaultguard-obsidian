@@ -15,10 +15,10 @@ locals {
   mcp_write_enabled = local.mcp_read_enabled && var.workspace_mcp_profile != "workspace-read-v1"
   mcp_write_count   = local.mcp_write_enabled ? 1 : 0
   mcp_write_env = merge(local.mcp_read_env, {
-    CONNECTOR_SCOPE_PROFILE             = var.workspace_mcp_profile
-    CONNECTOR_WRITE_ADMISSION           = "enabled"
-    MCP_TRANSFER_NONCE_KEY_SECRET_ARN    = var.mcp_transfer_nonce_key_secret_arn
-    WORKSPACE_COHORT_CONTROL_TABLE      = var.workspace_revisions_table_name
+    CONNECTOR_SCOPE_PROFILE           = var.workspace_mcp_profile
+    CONNECTOR_WRITE_ADMISSION         = "enabled"
+    MCP_TRANSFER_NONCE_KEY_SECRET_ARN = var.mcp_transfer_nonce_key_secret_arn
+    WORKSPACE_COHORT_CONTROL_TABLE    = var.workspace_revisions_table_name
   })
 }
 check "mcp_write_owners_are_explicit" {

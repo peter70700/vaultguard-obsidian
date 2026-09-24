@@ -98,27 +98,27 @@ module "lambda" {
   connector_auth_table_arn     = module.dynamodb.connector_auth_table_arn
   mcp_cursor_key_secret_arn    = var.mcp_cursor_key_secret_arn
 
-  workspace_revisions_table_name      = module.dynamodb.workspace_revisions_table_name
-  workspace_revisions_table_arn       = module.dynamodb.workspace_revisions_table_arn
-  workspace_capabilities              = var.workspace_capabilities
-  workspace_web_cursor_key_secret_arn = var.workspace_web_cursor_key_secret_arn
-  workspace_web_origin                = var.workspace_web_origin
-  workspace_cohort_controls_enabled   = var.workspace_cohort_controls_enabled
-  workspace_operator_enabled          = var.workspace_operator_enabled
-  workspace_operator_environment_id   = var.workspace_operator_environment_id
+  workspace_revisions_table_name               = module.dynamodb.workspace_revisions_table_name
+  workspace_revisions_table_arn                = module.dynamodb.workspace_revisions_table_arn
+  workspace_capabilities                       = var.workspace_capabilities
+  workspace_web_cursor_key_secret_arn          = var.workspace_web_cursor_key_secret_arn
+  workspace_web_origin                         = var.workspace_web_origin
+  workspace_cohort_controls_enabled            = var.workspace_cohort_controls_enabled
+  workspace_operator_enabled                   = var.workspace_operator_enabled
+  workspace_operator_environment_id            = var.workspace_operator_environment_id
   workspace_migration_redaction_key_secret_arn = var.workspace_migration_redaction_key_secret_arn
-  workspace_projection_delivery_enabled = var.workspace_projection_delivery_enabled
-  workspace_mcp_profile               = var.workspace_mcp_profile
-  workspace_mcp_write_admission       = var.workspace_mcp_write_admission
-  mcp_transfer_nonce_key_secret_arn    = var.mcp_transfer_nonce_key_secret_arn
-  workspace_cost_controls             = var.workspace_cost_controls
-  workspace_cost_telemetry             = var.workspace_cost_telemetry
-  workspace_slo_telemetry              = var.workspace_slo_telemetry
-  workspace_economics_table_name       = module.dynamodb.workspace_economics_table_name
-  workspace_economics_table_arn        = module.dynamodb.workspace_economics_table_arn
-  workspace_semantic_provider_profile = var.workspace_semantic_provider_profile
-  workspace_semantic_secret_arn       = var.workspace_semantic_secret_arn
-  source                              = "./modules/lambda"
+  workspace_projection_delivery_enabled        = var.workspace_projection_delivery_enabled
+  workspace_mcp_profile                        = var.workspace_mcp_profile
+  workspace_mcp_write_admission                = var.workspace_mcp_write_admission
+  mcp_transfer_nonce_key_secret_arn            = var.mcp_transfer_nonce_key_secret_arn
+  workspace_cost_controls                      = var.workspace_cost_controls
+  workspace_cost_telemetry                     = var.workspace_cost_telemetry
+  workspace_slo_telemetry                      = var.workspace_slo_telemetry
+  workspace_economics_table_name               = module.dynamodb.workspace_economics_table_name
+  workspace_economics_table_arn                = module.dynamodb.workspace_economics_table_arn
+  workspace_semantic_provider_profile          = var.workspace_semantic_provider_profile
+  workspace_semantic_secret_arn                = var.workspace_semantic_secret_arn
+  source                                       = "./modules/lambda"
 
   stage                            = var.stage
   is_prod                          = local.is_prod
@@ -323,8 +323,8 @@ resource "aws_api_gateway_base_path_mapping" "api" {
 
 module "monitoring" {
   workspace_recovery_failure_queue_name = module.lambda.workspace_recovery_failure_queue_name
-  workspace_revisions_table_name = module.dynamodb.workspace_revisions_table_name
-  source                         = "./modules/monitoring"
+  workspace_revisions_table_name        = module.dynamodb.workspace_revisions_table_name
+  source                                = "./modules/monitoring"
 
   stage             = var.stage
   admin_email       = var.admin_email

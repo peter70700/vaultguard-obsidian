@@ -187,12 +187,12 @@ data "aws_caller_identity" "current" {}
 locals {
   common_env = {
     WORKSPACE_COHORT_CONTROL_TABLE     = var.workspace_cohort_controls_enabled ? var.workspace_revisions_table_name : ""
-    WORKSPACE_REMOTE_MCP_ENABLED      = tostring(var.workspace_capabilities.remote_mcp)
-    WORKSPACE_REVISION_READS_ENABLED  = tostring(var.workspace_capabilities.revision_reads)
-    WORKSPACE_REVISION_WRITES_ENABLED = tostring(var.workspace_capabilities.revision_writes)
-    WORKSPACE_PROJECTIONS_ENABLED     = tostring(var.workspace_capabilities.projections)
-    WORKSPACE_CONTEXT_ENABLED         = tostring(var.workspace_capabilities.context)
-    WORKSPACE_WEB_EDITING_ENABLED     = tostring(var.workspace_capabilities.web_editing)
+    WORKSPACE_REMOTE_MCP_ENABLED       = tostring(var.workspace_capabilities.remote_mcp)
+    WORKSPACE_REVISION_READS_ENABLED   = tostring(var.workspace_capabilities.revision_reads)
+    WORKSPACE_REVISION_WRITES_ENABLED  = tostring(var.workspace_capabilities.revision_writes)
+    WORKSPACE_PROJECTIONS_ENABLED      = tostring(var.workspace_capabilities.projections)
+    WORKSPACE_CONTEXT_ENABLED          = tostring(var.workspace_capabilities.context)
+    WORKSPACE_WEB_EDITING_ENABLED      = tostring(var.workspace_capabilities.web_editing)
     WORKSPACE_FIRST_PARTY_SYNC_ENABLED = tostring(var.workspace_capabilities.first_party_sync)
 
     STAGE                    = var.stage
@@ -705,10 +705,10 @@ resource "aws_lambda_function" "files" {
 
   environment {
     variables = merge(local.common_env, {
-      VAULT_S3_BUCKET     = var.vault_bucket_name
+      VAULT_S3_BUCKET           = var.vault_bucket_name
       WORKSPACE_REVISIONS_TABLE = var.workspace_revisions_table_name
-      FILE_VERSIONS_TABLE = var.file_versions_table_name
-      MAX_FILE_SIZE       = tostring(var.max_file_size_bytes)
+      FILE_VERSIONS_TABLE       = var.file_versions_table_name
+      MAX_FILE_SIZE             = tostring(var.max_file_size_bytes)
     })
   }
 

@@ -146,13 +146,13 @@ resource "aws_lambda_function" "workspace_migration" {
   source_code_hash               = data.archive_file.workspace_migration[0].output_base64sha256
   environment {
     variables = merge(local.common_env, {
-      WORKSPACE_OPERATOR_ENABLED = "true"
-      WORKSPACE_REVISIONS_TABLE = var.workspace_revisions_table_name
-      FILE_VERSIONS_TABLE = var.file_versions_table_name
-      WORKSPACE_SOURCE_COMMIT = data.external.lambda_build.result.commit
-      WORKSPACE_OPERATOR_ENVIRONMENT_ID = var.workspace_operator_environment_id
+      WORKSPACE_OPERATOR_ENABLED                   = "true"
+      WORKSPACE_REVISIONS_TABLE                    = var.workspace_revisions_table_name
+      FILE_VERSIONS_TABLE                          = var.file_versions_table_name
+      WORKSPACE_SOURCE_COMMIT                      = data.external.lambda_build.result.commit
+      WORKSPACE_OPERATOR_ENVIRONMENT_ID            = var.workspace_operator_environment_id
       WORKSPACE_MIGRATION_REDACTION_KEY_SECRET_ARN = var.workspace_migration_redaction_key_secret_arn
-      WORKSPACE_WEB_CURSOR_KEY_SECRET_ARN = var.workspace_web_cursor_key_secret_arn
+      WORKSPACE_WEB_CURSOR_KEY_SECRET_ARN          = var.workspace_web_cursor_key_secret_arn
     })
   }
   depends_on = [aws_iam_role_policy.workspace_migration, aws_iam_role_policy_attachment.workspace_migration_logging]

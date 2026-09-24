@@ -68,8 +68,8 @@ resource "aws_cloudwatch_event_rule" "workspace_recovery" {
   schedule_expression = "rate(1 minute)"
 }
 resource "aws_cloudwatch_event_target" "workspace_recovery" {
-  rule = aws_cloudwatch_event_rule.workspace_recovery.name
-  arn  = aws_lambda_function.workspace_recovery.arn
+  rule  = aws_cloudwatch_event_rule.workspace_recovery.name
+  arn   = aws_lambda_function.workspace_recovery.arn
   input = jsonencode({ kind = "recover_workspace_page" })
   dead_letter_config { arn = aws_sqs_queue.workspace_recovery_failures.arn }
   retry_policy {

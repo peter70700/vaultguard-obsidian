@@ -55,8 +55,8 @@ variable "workspace_slo_telemetry" {
 }
 
 variable "workspace_cohort_controls_enabled" {
-  type    = bool
-  default = false
+  type        = bool
+  default     = false
   description = "Explicit shared writer-fence/routing participation; not first-party sync activation. Keep enabled for any adopted cohort even while product capabilities are off."
 }
 

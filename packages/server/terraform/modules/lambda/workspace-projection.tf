@@ -5,7 +5,7 @@ locals {
 }
 check "workspace_projection_owners" {
   assert {
-    condition = local.workspace_projection_count == 0 || (var.workspace_capabilities.revision_reads && var.workspace_cohort_controls_enabled)
+    condition     = local.workspace_projection_count == 0 || (var.workspace_capabilities.revision_reads && var.workspace_cohort_controls_enabled)
     error_message = "Projection preparation needs revision reads and the shared cohort controls."
   }
 }
@@ -50,9 +50,9 @@ data "aws_iam_policy_document" "workspace_projection" {
     resources = [var.file_versions_table_arn, var.user_keys_table_arn]
   }
   statement {
-    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
+    actions = ["s3:GetObject", "s3:GetObjectVersion"]
     resources = ["${var.vault_bucket_arn}/vault/*", "${var.vault_bucket_arn}/_vaultguard-workspace-revisions/*",
-      "${var.vault_bucket_arn}/X3ZhdWx0Z3VhcmQtYXBwbHk/*", "${var.vault_bucket_arn}/${local.mcp_knowledge_prefix}/*"]
+    "${var.vault_bucket_arn}/X3ZhdWx0Z3VhcmQtYXBwbHk/*", "${var.vault_bucket_arn}/${local.mcp_knowledge_prefix}/*"]
   }
   statement {
     actions = ["s3:PutObject"]
@@ -62,7 +62,7 @@ data "aws_iam_policy_document" "workspace_projection" {
       "${var.vault_bucket_arn}/${local.mcp_knowledge_prefix}/*/graph-links/*",
       "${var.vault_bucket_arn}/${local.mcp_knowledge_prefix}/*/graph-progress/*",
       "${var.vault_bucket_arn}/${local.mcp_knowledge_prefix}/*/lexical-file/*",
-      "${var.vault_bucket_arn}/${local.mcp_knowledge_prefix}/*/lexical-revision/*"]
+    "${var.vault_bucket_arn}/${local.mcp_knowledge_prefix}/*/lexical-revision/*"]
   }
   statement {
     actions   = ["kms:Decrypt"]
@@ -128,7 +128,7 @@ resource "aws_lambda_function" "workspace_projection" {
   environment {
     variables = merge(local.common_env, local.workspace_runtime_env, {
       WORKSPACE_REVISIONS_TABLE = var.workspace_revisions_table_name
-      FILE_VERSIONS_TABLE = var.file_versions_table_name
+      FILE_VERSIONS_TABLE       = var.file_versions_table_name
     })
   }
   depends_on = [aws_iam_role_policy.workspace_projection, aws_iam_role_policy_attachment.workspace_projection_logging]
@@ -204,6 +204,6 @@ resource "aws_iam_role_policy" "workspace_projection_discovery" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = "dynamodb:Query", Resource = "${var.workspace_revisions_table_arn}/index/workspace-record-type-index" },
     { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = var.workspace_revisions_table_arn,
-      Condition = { "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = ["PROJECTION-WORKER"] } } }
+    Condition = { "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = ["PROJECTION-WORKER"] } } }
   ] })
 }
