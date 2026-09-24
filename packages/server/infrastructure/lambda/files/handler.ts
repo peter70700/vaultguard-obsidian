@@ -31,18 +31,49 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { createHash } from 'node:crypto';
-import { KMSClient, DecryptCommand } from '@aws-sdk/client-kms';
 import { emitSecurityMetric } from '../shared/metrics';
+import { DynamoWorkspaceCohortControl } from '../shared/workspace-cohort-control';
+import { DurableWorkspaceCohortRouter, WorkspaceRoutingError, type WorkspaceCohortRoute } from '../shared/workspace-routing';
+import type { WorkspaceScope } from '../workspace-revisions/types';
+import { RevisionFileReadView } from './revision-read-view';
+import { WorkspaceRevisionService } from '../workspace-revisions/service';
+import { S3WorkspaceManifestStore } from '../workspace-revisions/manifest-store';
+import { DynamoWorkspaceRevisionRepository } from '../workspace-revisions/head-store';
+import {
+  DynamoFileVersionStore,
+  FILE_VERSION_METADATA,
+  FileVersionIntegrityError,
+  FileVersionNotFoundError,
+  bindStorageVersion,
+  createFileVersionDraft,
+  fileVersionFromStorageObservation,
+  exactFileVersionStorageKey,
+  legacyFileId,
+  legacyFileVersionId,
+  makeFileId,
+  makeFileVersionId,
+  metadataForFileVersion,
+  verifyCiphertextIntegrity,
+  verifyPlaintextIntegrity,
+  verifyStorageBinding,
+  type FileVersionDraft,
+  type FileVersionRecord as LogicalFileVersionRecord,
+} from './file-version-service';
 import {
   acquireVaultMutationPermit,
   releaseVaultMutationPermit,
 } from '../shared/rotation-fence';
 import {
-  aesDecrypt,
-  aesEncrypt,
-  getActiveScopeDataKey,
-  scopeKmsContext,
-} from '../reencryption/handler';
+  decryptCurrentVaultBlobForRead,
+  decryptExactVaultVersion,
+  encryptPlaintextWithActiveVaultKey,
+  getActiveKeyIdForVault,
+} from '../shared/vault-crypto';
+import {
+  bindAuthorizationGenerations,
+  revalidateAuthorizationBeforeEgress,
+  type AuthorizationGenerationBinding,
+} from '../shared/authorization-generations';
 import {
   docClient,
   verifyActiveUser,
@@ -98,75 +129,8 @@ const MAX_OVERVIEW_LIMIT = 10000;
 // DEK metadata. Normal writes read only `keyId`; exact historical reads/restores
 // resolve the matching wrapped DEK and unwrap it through the vault-bound KMS
 // encryption context.
+const FILE_VERSIONS_TABLE = process.env.FILE_VERSIONS_TABLE;
 const USER_KEYS_TABLE = process.env.USER_KEYS_TABLE || 'UserKeysTable';
-
-// ─── Active DEK keyId lookup (Plan 06-02) ────────────────────────────────────
-//
-// These three helpers mirror the equivalent definitions in
-// `infrastructure/lambda/reencryption/handler.ts` (the canonical home of
-// `scopeKeyPk` / `encodedScope`). They're inline-copied here to avoid pulling
-// reencryption-specific symbols into the files handler. If a third caller
-// appears (Phase 7 restore endpoint is a likely candidate), extract into
-// `shared/utils.ts` instead.
-
-function encodedScope(scope: string): string {
-  return Buffer.from(scope, 'utf8')
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
-}
-
-function scopeKeyPk(orgId: string, scope: string, vaultId?: string): string {
-  const scopePart = encodedScope(scope);
-  if (vaultId) {
-    return `ORG#${orgId}#VAULT#${vaultId}#SCOPE#${scopePart}`;
-  }
-  return `ORG#${orgId}#SCOPE#${scopePart}`;
-}
-
-/**
- * Returns the active DEK's `keyId` for a vault, or `null` if no active row
- * exists yet (pre-backfill / first-ever write).
- *
- * Pre-backfill rows that exist but lack the `keyId` attribute return the
- * `'legacy'` sentinel — matching `getActiveScopeDataKey` in the reencryption
- * handler. Exact historical reads/restores treat that sentinel as unavailable
- * because the object cannot be bound to a specific historical envelope.
- *
- * Implementation note: this is a single DDB Get on `user_keys` with NO KMS
- * Decrypt call — we only need the metadata id here, not the plaintext key
- * material. The reencryption handler's `getActiveScopeDataKey` does the
- * heavier round-trip when actual decryption is required.
- *
- * Defensive try/catch: T-06-02-05 mitigation — a DDB hiccup must not block
- * the user-visible write. On any failure we log and return null so the write
- * proceeds without keyId tagging.
- */
-async function getActiveKeyIdForVault(
-  orgId: string,
-  vaultId: string
-): Promise<string | null> {
-  try {
-    const result = await docClient.send(
-      new GetCommand({
-        TableName: USER_KEYS_TABLE,
-        Key: { pk: scopeKeyPk(orgId, '/**', vaultId), sk: 'ACTIVE' },
-      })
-    );
-    const item = result.Item as { keyId?: string; status?: string } | undefined;
-    if (!item || item.status !== 'active') return null;
-    if (typeof item.keyId === 'string' && item.keyId.length > 0) {
-      return item.keyId;
-    }
-    // Row exists but is pre-backfill — surface the 'legacy' sentinel so
-    // downstream metadata writers know there's no canonical keyId.
-    return 'legacy';
-  } catch (err) {
-    console.error('[VaultGuard] getActiveKeyIdForVault failed:', err);
-    return null;
-  }
-}
 
 /**
  * Sentinel filename the plugin writes into every server-side folder so that
@@ -218,6 +182,78 @@ async function fileOpPermissionOptions(
     userAliases: user.email ? [user.email] : [],
     respectAdminBypass,
   };
+}
+
+async function bindFileAuthorizationGenerations(
+  user: UserContext,
+  vault: VaultRecord,
+): Promise<AuthorizationGenerationBinding> {
+  const orgResult = await getActiveOrg(user.orgId, { consistentRead: true });
+  if (!orgResult.allowed || !orgResult.org) {
+    throw new AuthError('Organization access denied', 403);
+  }
+  return bindAuthorizationGenerations({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    subject: user.userId,
+    membershipRevision: vault.membershipRevision ?? 0,
+    permissionRevision: vault.permissionRevision ?? 0,
+    policyRevision: orgResult.org.policyRevision ?? 0,
+  });
+}
+
+/** Re-run the live membership, policy, and path permission owners before disclosure/commit. */
+async function revalidateFileAuthorization(
+  bound: AuthorizationGenerationBinding,
+  user: UserContext,
+  vaultId: string,
+  filePath: string,
+  action: 'read' | 'write',
+  requiredRole: 'viewer' | 'admin',
+  deniedStatus: number,
+  deniedMessage: string,
+  event: APIGatewayProxyEvent,
+): Promise<void> {
+  try {
+    // Session/user revocation is owned by the existing route authenticator.
+    // Reusing the initial UserContext would miss a logout during slow crypto.
+    user = await verifyActiveUser(event);
+    await revalidateAuthorizationBeforeEgress(bound, async () => {
+      const pendingAuthorizationChange = (
+        await listPendingVaultMutationIntents(vaultId, 100, { requireComplete: true })
+      ).some((intent) => (
+        intent.authorizationGenerations?.includes('membership') ||
+        intent.authorizationGenerations?.includes('permission')
+      ));
+      if (pendingAuthorizationChange) {
+        throw new AuthError(deniedMessage, deniedStatus);
+      }
+      const currentVault = await requireVaultMember(user, vaultId, requiredRole);
+      const roles = await resolveFileOpRoles(user, currentVault);
+      const currentOrg = await getActiveOrg(user.orgId, { consistentRead: true });
+      if (!currentOrg.allowed || !currentOrg.org) throw new AuthError(deniedMessage, deniedStatus);
+      const permission = await evaluatePermission(
+        user.userId,
+        roles,
+        action,
+        '/' + filePath,
+        user.orgId,
+        currentVault.vaultId,
+        {
+          userAliases: user.email ? [user.email] : [],
+          respectAdminBypass: currentOrg.org.settings?.allowAdminPerFileRestrictions !== true,
+        },
+      );
+      if (!permission.allowed) {
+        throw new AuthError(deniedMessage, deniedStatus);
+      }
+      return bindFileAuthorizationGenerations(user, currentVault);
+    });
+  } catch {
+    // Keep revocation and generation races absence-equivalent to the route's
+    // ordinary deny response; never reveal whether bytes were already fetched.
+    throw new AuthError(deniedMessage, deniedStatus, 'AUTHORIZATION_CHANGED');
+  }
 }
 
 /**
@@ -276,193 +312,6 @@ function eventWithFilePathParameter(event: APIGatewayProxyEvent, filePath: strin
       filePath,
     },
   };
-}
-
-async function decryptCurrentVaultBlobForRead(
-  ciphertext: Buffer,
-  user: UserContext,
-  vault: VaultRecord
-): Promise<{ plaintext: Buffer; keyId: string }> {
-  const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
-  if (!active) {
-    throw new AuthError('Vault key unavailable for server-side decrypt.', 409);
-  }
-
-  try {
-    return { plaintext: aesDecrypt(ciphertext, active.key), keyId: active.keyId };
-  } finally {
-    active.key.fill(0);
-  }
-}
-
-type HistoricalDekItem = {
-  keyId: string;
-  orgId: string;
-  vaultId: string;
-  scope: string;
-  encryptedDataKey: string;
-};
-
-function vaultBoundHistoricalDekItem(
-  item: unknown,
-  sourceKeyId: string,
-  user: UserContext,
-  vault: VaultRecord
-): HistoricalDekItem | null {
-  if (!item || typeof item !== 'object') return null;
-  const candidate = item as Partial<HistoricalDekItem>;
-  if (
-    candidate.keyId !== sourceKeyId ||
-    candidate.orgId !== user.orgId ||
-    candidate.vaultId !== vault.vaultId ||
-    typeof candidate.scope !== 'string' ||
-    candidate.scope.length === 0 ||
-    typeof candidate.encryptedDataKey !== 'string' ||
-    candidate.encryptedDataKey.length === 0
-  ) {
-    return null;
-  }
-  return candidate as HistoricalDekItem;
-}
-
-/**
- * Resolves a historical envelope only inside the authenticated org + vault.
- * `keyId-index` is global, so the hash-key predicate alone is not a tenant
- * boundary. The server-side filter limits normal results and the application
- * check remains authoritative before any row can influence a KMS context.
- */
-async function lookupHistoricalDekForVault(
-  sourceKeyId: string,
-  user: UserContext,
-  vault: VaultRecord
-): Promise<HistoricalDekItem | null> {
-  const attempts = 3;
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    const result = await docClient.send(
-      new QueryCommand({
-        TableName: USER_KEYS_TABLE,
-        IndexName: 'keyId-index',
-        KeyConditionExpression: 'keyId = :kid',
-        FilterExpression: '#orgId = :orgId AND #vaultId = :vaultId',
-        ExpressionAttributeNames: {
-          '#orgId': 'orgId',
-          '#vaultId': 'vaultId',
-        },
-        ExpressionAttributeValues: {
-          ':kid': sourceKeyId,
-          ':orgId': user.orgId,
-          ':vaultId': vault.vaultId,
-        },
-        Limit: 25,
-      })
-    );
-    for (const item of result.Items ?? []) {
-      const match = vaultBoundHistoricalDekItem(item, sourceKeyId, user, vault);
-      if (match) return match;
-    }
-    if (attempt < attempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-  }
-  return null;
-}
-
-async function encryptHistoricalPlaintextForRestore(
-  plaintext: Buffer,
-  user: UserContext,
-  vault: VaultRecord
-): Promise<{
-  newCiphertext: Buffer;
-  plaintextSize: number;
-  plaintextSha256: string;
-  encryptedSha256: string;
-  currentKeyId: string;
-}> {
-  try {
-    const plaintextSize = plaintext.byteLength;
-    const plaintextSha256 = sha256Hex(plaintext);
-    const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
-    if (!active) {
-      throw new Error('No active DEK for vault — cannot complete restore');
-    }
-
-    try {
-      const newCiphertext = aesEncrypt(plaintext, active.key);
-      return {
-        newCiphertext,
-        plaintextSize,
-        plaintextSha256,
-        encryptedSha256: sha256Hex(newCiphertext),
-        currentKeyId: active.keyId,
-      };
-    } finally {
-      active.key.fill(0);
-    }
-  } finally {
-    plaintext.fill(0);
-  }
-}
-
-/**
- * Decrypts an explicitly selected S3 version with the DEK recorded on that
- * version. Historical objects can pre-date one or more vault-key rotations,
- * so using the current lease key here would either fail or, worse, make the
- * endpoint's behaviour depend on rotation timing. The key-id lookup is scoped
- * back through the KMS encryption context before any plaintext is returned.
- */
-async function decryptHistoricalVaultBlobForRead(
-  ciphertext: Buffer,
-  metadata: Record<string, string> | undefined,
-  user: UserContext,
-  vault: VaultRecord
-): Promise<{ plaintext: Buffer; keyId: string }> {
-  const sourceKeyId = metadata?.['vaultguard-key-id'];
-  if (!sourceKeyId || sourceKeyId === 'legacy') {
-    throw new AuthError('Historical key material is no longer available', 410);
-  }
-
-  // Most version reads are still on the active DEK. Avoid the eventually
-  // consistent GSI lookup in that common case, while preserving exact key-id
-  // matching and best-effort key zeroing.
-  const active = await getActiveScopeDataKey(user.orgId, vault.vaultId, '/**');
-  if (active) {
-    try {
-      if (active.keyId === sourceKeyId) {
-        return { plaintext: aesDecrypt(ciphertext, active.key), keyId: sourceKeyId };
-      }
-    } finally {
-      active.key.fill(0);
-    }
-  }
-
-  const dekItem = await lookupHistoricalDekForVault(sourceKeyId, user, vault);
-  if (!dekItem) {
-    throw new AuthError('Historical key material is no longer available', 410);
-  }
-
-  let decryptResponse;
-  try {
-    decryptResponse = await kmsClient.send(
-      new DecryptCommand({
-        CiphertextBlob: Buffer.from(dekItem.encryptedDataKey, 'base64'),
-        EncryptionContext: scopeKmsContext(user.orgId, dekItem.scope, vault.vaultId),
-      })
-    );
-  } catch (error) {
-    await emitSecurityMetric('KMSDecryptFailure');
-    throw error;
-  }
-  if (!decryptResponse.Plaintext) {
-    await emitSecurityMetric('KMSDecryptFailure');
-    throw new Error('KMS Decrypt returned no plaintext for historical DEK');
-  }
-  const historicalDek = Buffer.from(decryptResponse.Plaintext);
-  decryptResponse.Plaintext.fill(0);
-  try {
-    return { plaintext: aesDecrypt(ciphertext, historicalDek), keyId: sourceKeyId };
-  } finally {
-    historicalDek.fill(0);
-  }
 }
 
 /**
@@ -697,13 +546,241 @@ function readDirectUploadMetadata(metadata: Record<string, string> | undefined):
 }
 
 const s3Client = new S3Client({ region: REGION });
+const fileVersionStore = FILE_VERSIONS_TABLE
+  ? new DynamoFileVersionStore(docClient, FILE_VERSIONS_TABLE)
+  : null;
 
 // Phase 7 (Plan 07-01): KMS client for cross-DEK restore. The restore endpoint
 // reaches into the keyId-index GSI for a historical user_keys row, then asks
 // KMS to unwrap that row's envelope with the row's EncryptionContext (orgId +
 // scope + vaultId). Mirroring the s3Client singleton pattern keeps the cold
 // start fast and avoids per-request client construction.
-const kmsClient = new KMSClient({ region: REGION });
+type S3VersionObservation = {
+  VersionId?: string;
+  ETag?: string;
+  Metadata?: Record<string, string>;
+  ContentType?: string;
+  ContentLength?: number;
+  LastModified?: Date;
+};
+
+function logicalLineageForHead(
+  head: S3VersionObservation | null | undefined,
+  user: UserContext,
+  vault: VaultRecord,
+  filePath: string,
+): { fileId: string; parentFileVersionIds: string[] } {
+  if (!head?.VersionId) {
+    return { fileId: makeFileId(generateId()), parentFileVersionIds: [] };
+  }
+  const fileId =
+    head.Metadata?.[FILE_VERSION_METADATA.fileId] ??
+    legacyFileId(user.orgId, vault.vaultId, filePath);
+  const parentFileVersionId =
+    head.Metadata?.[FILE_VERSION_METADATA.fileVersionId] ??
+    legacyFileVersionId(user.orgId, vault.vaultId, filePath, head.VersionId);
+  return { fileId, parentFileVersionIds: [parentFileVersionId] };
+}
+
+function logicalVersionMetadata(
+  draft: FileVersionDraft,
+  existing: Record<string, string> = {},
+): Record<string, string> {
+  return { ...existing, ...metadataForFileVersion(draft) };
+}
+
+function requireLogicalVersionStore(): DynamoFileVersionStore {
+  if (!fileVersionStore) {
+    throw new AuthError('Logical file-version storage is not configured', 503);
+  }
+  return fileVersionStore;
+}
+
+async function putLogicalVersion(
+  record: LogicalFileVersionRecord,
+): Promise<LogicalFileVersionRecord> {
+  return fileVersionStore ? fileVersionStore.putImmutable(record) : record;
+}
+
+async function findLogicalVersionByStorage(input: {
+  orgId: string;
+  vaultId: string;
+  storageBucket: string;
+  storageKey: string;
+  storageVersionId: string;
+}): Promise<LogicalFileVersionRecord | null> {
+  return fileVersionStore
+    ? fileVersionStore.findByStorageVersion(input)
+    : null;
+}
+
+async function persistBoundFileVersion(
+  draft: FileVersionDraft,
+  input: {
+    storageKey: string;
+    storageVersionId?: string;
+    storageEtag?: string | null;
+  },
+): Promise<LogicalFileVersionRecord> {
+  const record = bindStorageVersion(draft, {
+    storageBucket: S3_BUCKET,
+    storageKey: input.storageKey,
+    storageVersionId: input.storageVersionId ?? '',
+    storageEtag: input.storageEtag,
+  });
+  return putLogicalVersion(record);
+}
+
+async function observeFileVersion(
+  user: UserContext,
+  vault: VaultRecord,
+  filePath: string,
+  observation: S3VersionObservation,
+  options: {
+    logicalRecord?: LogicalFileVersionRecord;
+    state?: 'content' | 'tombstone';
+    fallbackFileId?: string;
+    fallbackFileVersionId?: string;
+    parentFileVersionIds?: string[];
+    actorIdentityId?: string;
+  } = {},
+): Promise<LogicalFileVersionRecord | null> {
+  if (!observation.VersionId) return null;
+  const storageKey = options.logicalRecord
+    ? exactFileVersionStorageKey(options.logicalRecord, { orgId: user.orgId, vaultId: vault.vaultId }, S3_BUCKET, filePath)
+    : vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+  const metadataFileVersionId =
+    observation.Metadata?.[FILE_VERSION_METADATA.fileVersionId];
+  const existing = (storageKey !== vaultS3Prefix(user.orgId, vault.vaultId) + filePath ? options.logicalRecord : undefined) ?? (!fileVersionStore
+    ? null
+    : metadataFileVersionId
+      ? await fileVersionStore.get(user.orgId, vault.vaultId, metadataFileVersionId)
+      : await fileVersionStore.findByStorageVersion({
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        storageBucket: S3_BUCKET,
+        storageKey,
+        storageVersionId: observation.VersionId,
+      }));
+  const storageObservation = {
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    path: filePath,
+    storageBucket: S3_BUCKET,
+    storageKey,
+    storageVersionId: observation.VersionId,
+    storageEtag: observation.ETag,
+    contentType: observation.ContentType,
+    ciphertextBytes:
+      options.state === 'tombstone' ? 0 : (observation.ContentLength ?? 0),
+    lastModified: observation.LastModified?.toISOString(),
+    metadata: observation.Metadata,
+    state: options.state,
+    fallbackFileId: options.fallbackFileId,
+    fallbackFileVersionId: options.fallbackFileVersionId,
+    parentFileVersionIds: options.parentFileVersionIds,
+    actorIdentityId: options.actorIdentityId,
+  } as const;
+  if (existing) {
+    verifyStorageBinding(existing, storageObservation);
+    return existing;
+  }
+  return putLogicalVersion(
+    fileVersionFromStorageObservation(storageObservation),
+  );
+}
+
+function readBoundedLogicalVersionId(
+  value: string | undefined,
+  field: string,
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (
+    value.trim().length === 0 ||
+    value.length > 128 ||
+    !/^fver_[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value) ||
+    value.includes('..')
+  ) {
+    throw new AuthError(`${field} is invalid`, 400);
+  }
+  return value;
+}
+
+async function resolveReadVersion(
+  event: APIGatewayProxyEvent,
+  user: UserContext,
+  vault: VaultRecord,
+  filePath: string,
+  view?: RevisionFileReadView,
+): Promise<{
+  storageVersionId?: string;
+  logicalRecord?: LogicalFileVersionRecord;
+  historical: boolean;
+}> {
+  const storageVersionId = event.queryStringParameters?.versionId;
+  if (
+    storageVersionId !== undefined &&
+    (storageVersionId.trim().length === 0 ||
+      storageVersionId.length > 1024 ||
+      /[\r\n]/.test(storageVersionId))
+  ) {
+    throw new AuthError('versionId is invalid', 400);
+  }
+  const fileVersionId = readBoundedLogicalVersionId(
+    event.queryStringParameters?.fileVersionId,
+    'fileVersionId',
+  );
+  if (storageVersionId && fileVersionId) {
+    throw new AuthError('Specify versionId or fileVersionId, not both', 400);
+  }
+  if (!fileVersionId) {
+    if (!storageVersionId && view) {
+      const record = await view.current(filePath);
+      return { storageVersionId: record.storageVersionId, logicalRecord: record, historical: false };
+    }
+    return { storageVersionId, historical: Boolean(storageVersionId) };
+  }
+  const record = await requireLogicalVersionStore().require(
+    user.orgId,
+    vault.vaultId,
+    fileVersionId,
+  );
+  if (record.path !== filePath || record.state !== 'content') {
+    throw new FileVersionNotFoundError();
+  }
+  exactFileVersionStorageKey(record, { orgId: user.orgId, vaultId: vault.vaultId }, S3_BUCKET, filePath);
+  return {
+    storageVersionId: record.storageVersionId,
+    logicalRecord: record,
+    historical: true,
+  };
+}
+
+function logicalVersionFields(record: LogicalFileVersionRecord | null | undefined) {
+  if (!record) return {};
+  return {
+    fileId: record.fileId,
+    fileVersionId: record.fileVersionId,
+    plaintextSha256: record.plaintextSha256,
+    ciphertextSha256: record.ciphertextSha256,
+    integrity: record.integrity,
+  };
+}
+
+function assertRequestedLogicalVersion(
+  requested: LogicalFileVersionRecord | undefined | null,
+  observed: LogicalFileVersionRecord | undefined | null,
+): void {
+  if (requested && (!observed || observed.fileVersionId !== requested.fileVersionId ||
+    observed.fileId !== requested.fileId || observed.orgId !== requested.orgId || observed.vaultId !== requested.vaultId ||
+    observed.path !== requested.path || observed.storageBucket !== requested.storageBucket || observed.storageKey !== requested.storageKey ||
+    observed.storageVersionId !== requested.storageVersionId || observed.ciphertextBytes !== requested.ciphertextBytes ||
+    observed.plaintextSha256 !== requested.plaintextSha256 || observed.ciphertextSha256 !== requested.ciphertextSha256)) {
+    throw new FileVersionIntegrityError(
+      'Requested logical version does not match the stored S3 version',
+    );
+  }
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -715,15 +792,25 @@ interface FileMetadata {
   contentType: string;
   versionId: string;
   checksum: string;
+  fileId?: string;
+  fileVersionId?: string;
+  plaintextSha256?: string | null;
+  ciphertextSha256?: string | null;
 }
 
 /** A version history entry for a file. */
 interface FileVersion {
   versionId: string;
+  storageVersionId: string;
+  fileId: string;
+  fileVersionId: string;
   lastModified: string;
   size: number;
   isLatest: boolean;
   isDeleteMarker: boolean;
+  plaintextSha256: string | null;
+  ciphertextSha256: string | null;
+  integrity: LogicalFileVersionRecord['integrity'];
   modifiedBy?: string;
 }
 
@@ -782,7 +869,54 @@ interface MutableVaultOverviewFolder {
  * @param event - API Gateway proxy event
  * @returns API Gateway proxy result with JSON body
  */
+export interface FilesCohortDependencies {
+  readControl(scope: WorkspaceScope): Promise<WorkspaceCohortRoute>;
+  /** Trusted composition loads and verifies the committed manifest through
+   * WorkspaceRevisionService. The built-in adapter preserves file ACLs and
+   * response contracts; unsupported inventory/sync surfaces fail closed. */
+  readRevisionView?(scope: WorkspaceScope, route: WorkspaceCohortRoute): Promise<RevisionFileReadView>;
+  /** Must preserve the path API's per-file permissions, response contract and
+   * exact-version integrity checks. Membership is established before dispatch. */
+  readRevision?(context: {
+    event: APIGatewayProxyEvent; user: UserContext; vault: VaultRecord;
+    requestId: string; route: WorkspaceCohortRoute;
+  }): Promise<APIGatewayProxyResult>;
+}
+
+/** Dependency injection is trusted composition, never request-supplied routing. */
+export function createFilesHandler(cohort: FilesCohortDependencies) {
+  return (event: APIGatewayProxyEvent) => dispatchFiles(event, cohort);
+}
+
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  const tableName = process.env.WORKSPACE_COHORT_CONTROL_TABLE;
+  // Default-off preserves existing deployments. A configured revision route
+  // without its compatible adapter fails closed; it cannot fall through to S3.
+  if (!tableName) return dispatchFiles(event);
+  const readControl = (scope: WorkspaceScope) => new DynamoWorkspaceCohortControl({
+      tableName, writerTableName: USER_KEYS_TABLE,
+      send: command => docClient.send(command as Parameters<typeof docClient.send>[0]),
+    }).read(scope);
+  const cohort: FilesCohortDependencies = { readControl };
+  const revisionTable = process.env.WORKSPACE_REVISIONS_TABLE;
+  if (revisionTable && fileVersionStore) {
+    cohort.readRevisionView = async (scope, route) => {
+      const revisions = new WorkspaceRevisionService(
+        new S3WorkspaceManifestStore({ bucket: S3_BUCKET, send: command => s3Client.send(command as Parameters<typeof s3Client.send>[0]) }),
+        new DynamoWorkspaceRevisionRepository({ tableName: revisionTable, send: command => docClient.send(command as Parameters<typeof docClient.send>[0]) }),
+        new DurableWorkspaceCohortRouter(scope, readControl).revisionGate(route),
+      );
+      const revision = await revisions.readCurrent(scope);
+      if (!revision) throw new WorkspaceRoutingError('COHORT_CONTROL_UNAVAILABLE');
+      return new RevisionFileReadView({ scope, bucket: S3_BUCKET, revision,
+        requireVersion: (orgId, vaultId, id) => fileVersionStore.require(orgId, vaultId, id),
+      });
+    };
+  }
+  return dispatchFiles(event, cohort);
+}
+
+async function dispatchFiles(event: APIGatewayProxyEvent, cohort?: FilesCohortDependencies): Promise<APIGatewayProxyResult> {
   const requestId = event.requestContext?.requestId || generateId();
   const method = event.httpMethod?.toUpperCase();
   const resource = event.resource || '';
@@ -874,15 +1008,26 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     const isDeletedFileReadResource =
       isDeletedRouteResource && requestedFileOperation === 'read';
 
+    const pathApi = async (view?: RevisionFileReadView): Promise<APIGatewayProxyResult> => {
+    if (view) {
+      view.assertScope({ orgId, vaultId }, S3_BUCKET);
+      const supported = (method === 'GET' && (resource === '/vaults/{vaultId}/files' ||
+        isDeletedFileReadResource || isReadDecryptedResource(resource) ||
+        (isFilePathResource && !isHistoryResource && !isDeletedListResource))) ||
+        (method === 'POST' && isDirectDownloadIssueResource);
+      // History, deleted lists, overview and sync need the full migration capture
+      // and legacy cursor binding. Never answer those using a mutable fallback.
+      if (!supported || isOverviewResource) throw new WorkspaceRoutingError('COHORT_CONTROL_UNAVAILABLE');
+    }
     switch (true) {
       case method === 'GET' && resource === '/vaults/{vaultId}/files':
-        return await handleListFiles(event, user, vault, requestId);
+        return await handleListFiles(event, user, vault, requestId, view);
 
       case method === 'GET' && isOverviewResource:
         return await handleVaultOverview(event, user, vault, requestId);
 
       case method === 'GET' && isDeletedFileReadResource:
-        return await handleReadFile(deletedFileEvent, user, vault, requestId);
+        return await handleReadFile(deletedFileEvent, user, vault, requestId, view);
 
       case method === 'GET' && isDeletedListResource:
         return await handleListDeleted(event, user, vault, requestId);
@@ -900,16 +1045,16 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         return await handleIssueDirectUpload(event, user, vault, requestId);
 
       case method === 'POST' && isDirectDownloadIssueResource:
-        return await handleIssueDirectDownload(event, user, vault, requestId);
+        return await handleIssueDirectDownload(event, user, vault, requestId, view);
 
       case method === 'GET' && isHistoryResource:
         return await handleGetHistory(event, user, vault, requestId);
 
       case method === 'GET' && isReadDecryptedResource(resource):
-        return await handleReadDecrypted(event, user, vault, requestId);
+        return await handleReadDecrypted(event, user, vault, requestId, view);
 
       case method === 'GET' && isFilePathResource:
-        return await handleReadFile(event, user, vault, requestId);
+        return await handleReadFile(event, user, vault, requestId, view);
 
       case method === 'PUT' && isDeletedStaticResource:
         return await handleWriteFile(deletedFileEvent, user, vault, requestId);
@@ -932,6 +1077,49 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       default:
         return formatError(404, `Route not found: ${method} ${resource}`, requestId);
     }
+    };
+    if (method === 'GET' && resource === '/vaults/{vaultId}/sync-cursor') {
+      const router = cohort ? new DurableWorkspaceCohortRouter({ orgId, vaultId }, scope => cohort.readControl(scope)) : null;
+      const route = router ? await router.snapshot() : null;
+      const mode = route?.mode === 'revision-read' ? 'workspace' : route?.mode === 'paused' ? 'paused' : 'legacy';
+      const syncCompatibility = { mode, contractVersion: mode === 'workspace' ? 'vaultguard-sync-v2' : null,
+        endpoint: mode === 'workspace' ? `/vaults/${encodeURIComponent(vaultId)}/workspace/sync` : null };
+      // An activity counter from the old path owner is not a revision checkpoint.
+      // No legacy reconciliation or content write is attempted in workspace mode.
+      const result = mode === 'legacy' ? await handleSyncCursorGet(event, user, vault, requestId) :
+        formatSuccess(200, { revision: null, lastChangedAt: null, reconciliationRequired: false, serverTime: new Date().toISOString() }, requestId);
+      if (router && JSON.stringify(await router.snapshot()) !== JSON.stringify(route)) throw new WorkspaceRoutingError('COHORT_CHANGED');
+      return { ...result, body: JSON.stringify({ ...JSON.parse(result.body), syncCompatibility }) };
+    }
+    if (!cohort) return await pathApi();
+    const router = new DurableWorkspaceCohortRouter({ orgId, vaultId }, scope => cohort.readControl(scope));
+    // Sync and signed exact downloads are reads despite their POST method.
+    const read = method === 'GET' || (method === 'POST' &&
+      (resource === '/vaults/{vaultId}/files/sync' || isDirectDownloadIssueResource));
+    if (!read) return await router.write(pathApi);
+    return await router.read(pathApi, async route => {
+      if (cohort.readRevisionView) {
+        const bound = await bindFileAuthorizationGenerations(user, vault);
+        const result = await pathApi(await cohort.readRevisionView({ orgId, vaultId }, route));
+        // A slow immutable lookup must not disclose metadata, bytes or a signed
+        // URL after session revocation or a membership/policy change. Per-file
+        // ACLs run inside the existing handlers; their generations are bound here.
+        try {
+          await revalidateAuthorizationBeforeEgress(bound, async () => {
+            const currentUser = await verifyActiveUser(event);
+            const pending = await listPendingVaultMutationIntents(vaultId, 100, { requireComplete: true });
+            if (pending.some(intent => intent.authorizationGenerations?.some(kind => kind === 'membership' || kind === 'permission'))) throw new Error();
+            const currentVault = await requireVaultMember(currentUser, vaultId, 'viewer');
+            return bindFileAuthorizationGenerations(currentUser, currentVault);
+          });
+        } catch {
+          throw new AuthError('File access changed during the request', isReadDecryptedResource(resource) ? 404 : 403);
+        }
+        return result;
+      }
+      if (!cohort.readRevision) throw new WorkspaceRoutingError('COHORT_CONTROL_UNAVAILABLE');
+      return cohort.readRevision({ event, user, vault, requestId, route });
+    });
   } catch (err: unknown) {
     if (err && typeof err === 'object' && 'statusCode' in err) {
       const typed = err as { statusCode: number; message: string; code?: string };
@@ -960,6 +1148,28 @@ async function handleVaultOverview(
   // Tighten this route beyond the handler-level viewer gate without using the
   // write-oriented archived-vault guard in requireVaultMember(..., 'admin').
   await requireVaultOverviewAdmin(user, vault);
+
+  // Per-file rules bind here exactly as on every other file route. A vault
+  // admin who is not an org admin is always subject to deny rules, and an org
+  // admin is subject to them when `allowAdminPerFileRestrictions` is on. Only
+  // an org admin under the default bypass skips the per-row evaluation, which
+  // keeps the common case at one S3 round-trip per page.
+  const permissionOptions = await fileOpPermissionOptions(user, vault);
+  const callerBypassesFileRules = permissionOptions.respectAdminBypass && isAdmin(user);
+  const permRoles = callerBypassesFileRules ? null : await resolveFileOpRoles(user, vault);
+  const canSeeOverviewPath = async (relativePath: string): Promise<boolean> => {
+    if (permRoles === null) return true;
+    const perm = await evaluatePermission(
+      user.userId,
+      permRoles,
+      'list',
+      '/' + relativePath.replace(/^\/+/, ''),
+      user.orgId,
+      vault.vaultId,
+      permissionOptions
+    );
+    return perm.allowed;
+  };
 
   const limit = parseOverviewLimit(event.queryStringParameters?.limit);
   let continuationToken = event.queryStringParameters?.continuationToken || undefined;
@@ -1000,12 +1210,17 @@ async function handleVaultOverview(
       // file count, storage total, file-type stats, or "largest files" list.
       if (isFolderMarkerPath(relativePath)) {
         const folderPath = folderPathFromMarker(relativePath);
+        // Probe with a synthetic child so glob inheritance (`/secret/**`)
+        // hides the folder the same way it hides the files inside it.
+        if (folderPath && !(await canSeeOverviewPath(`${folderPath}/__vaultguard_marker_probe__`))) continue;
         ensureOverviewFolder(root, folderPath, lastModified);
         latestModified = maxIsoTimestamp(latestModified, lastModified);
         const folderDepth = folderPath.split('/').filter(Boolean).length;
         maxDepth = Math.max(maxDepth, folderDepth);
         continue;
       }
+
+      if (!(await canSeeOverviewPath(relativePath))) continue;
 
       const normalizedPath = `/${relativePath.replace(/^\/+/, '')}`;
       const size = obj.Size || 0;
@@ -1271,7 +1486,8 @@ async function handleListFiles(
   event: APIGatewayProxyEvent,
   user: UserContext,
   vault: VaultRecord,
-  requestId: string
+  requestId: string,
+  view?: RevisionFileReadView,
 ): Promise<APIGatewayProxyResult> {
   const prefix = normalizeFileListPrefix(event.queryStringParameters?.prefix);
   const limit = parseFileListLimit(event.queryStringParameters?.limit);
@@ -1286,7 +1502,12 @@ async function handleListFiles(
   // One API cursor always maps to one complete S3 page. Asking S3 for more
   // than `limit` and breaking after enough authorized rows skips the
   // unprocessed tail because NextContinuationToken points past that tail.
-  const s3Response = await s3Client.send(
+  const revisionPage = view?.page(prefix, limit, continuationToken);
+  const s3Response = revisionPage ? {
+    Contents: revisionPage.paths.map(path => ({ Key: vaultS3Prefix(user.orgId, vault.vaultId) + path, Size: 0, LastModified: undefined as Date | undefined, ETag: '' })),
+    NextContinuationToken: revisionPage.nextContinuationToken,
+    IsTruncated: revisionPage.isTruncated,
+  } : await s3Client.send(
     new ListObjectsV2Command({
       Bucket: S3_BUCKET,
       Prefix: vaultS3Prefix(user.orgId, vault.vaultId) + prefix,
@@ -1317,13 +1538,41 @@ async function handleListFiles(
     );
 
     if (permResult.allowed) {
+      // Content-derived fields (plaintextSha256 / ciphertextSha256 / version
+      // ids) are only disclosed to callers who may READ the row. `list` and
+      // `read` are independent actions, so a `deny read` + `allow list` rule
+      // must still hide a digest of the denied content: SHA-256 of a short or
+      // predictable note is dictionary-reversible offline.
+      const readResult = await evaluatePermission(
+        user.userId,
+        permRoles,
+        'read',
+        '/' + relativePath,
+        user.orgId,
+        vault.vaultId,
+        permissionOptions
+      );
+      // Resolve only authorized rows. Read exact object metadata: a logical
+      // draft's createdAt can precede S3 LastModified and is not interchangeable
+      // with the path API timestamp. A newer head cannot replace this version.
+      const pinned = view ? await view.current(relativePath) : undefined;
+      const head = await headObjectOrNull({
+        Key: pinned?.storageKey ?? vaultS3Prefix(user.orgId, vault.vaultId) + relativePath,
+        ...(pinned ? { VersionId: pinned.storageVersionId } : {}),
+      });
+      if (view && !head) throw new FileVersionNotFoundError();
+      const logicalVersion = head
+        ? await observeFileVersion(user, vault, relativePath, head, { logicalRecord: pinned })
+        : null;
+      assertRequestedLogicalVersion(pinned, logicalVersion);
       files.push({
         path: '/' + relativePath,
-        size: obj.Size || 0,
-        lastModified: obj.LastModified?.toISOString() || '',
-        contentType: 'application/octet-stream', // Would need HeadObject for actual type
-        versionId: '', // Would need ListObjectVersions for this
-        checksum: obj.ETag || '',
+        size: view ? head?.ContentLength ?? 0 : obj.Size || 0,
+        lastModified: (view ? head?.LastModified : obj.LastModified)?.toISOString() || '',
+        contentType: head?.ContentType || 'application/octet-stream',
+        versionId: head?.VersionId || '',
+        checksum: (view ? head?.ETag : obj.ETag) || '',
+        ...(readResult.allowed ? logicalVersionFields(logicalVersion) : {}),
       });
     }
   }
@@ -1338,7 +1587,11 @@ async function handleListFiles(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { resultCount: files.length, prefix },
+    metadata: {
+      resultCount: files.length,
+      prefix,
+      workspaceRevisionId: view?.workspaceRevisionId ?? null,
+    },
   });
 
   return formatSuccess(
@@ -1368,7 +1621,8 @@ async function handleReadFile(
   event: APIGatewayProxyEvent,
   user: UserContext,
   vault: VaultRecord,
-  requestId: string
+  requestId: string,
+  view?: RevisionFileReadView,
 ): Promise<APIGatewayProxyResult> {
   const rawPath = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
   const filePath = sanitizeFilePath(rawPath);
@@ -1396,18 +1650,28 @@ async function handleReadFile(
     return formatError(403, 'Access denied: insufficient permissions to read this file', requestId);
   }
 
+  const requestedVersion = await resolveReadVersion(event, user, vault, filePath, view);
+
   // Fetch from S3
   try {
     const s3Response = await s3Client.send(
       new GetObjectCommand({
         Bucket: S3_BUCKET,
-        Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+        Key: requestedVersion.logicalRecord?.storageKey ?? vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+        ...(requestedVersion.storageVersionId
+          ? { VersionId: requestedVersion.storageVersionId }
+          : {}),
       })
     );
 
     const bodyBytes = await s3Response.Body?.transformToByteArray();
     const encryptedBody = bodyBytes ? Buffer.from(bodyBytes) : Buffer.alloc(0);
     const responseBody = encryptedBody;
+    const logicalVersion = await observeFileVersion(user, vault, filePath, s3Response, { logicalRecord: requestedVersion.logicalRecord });
+    assertRequestedLogicalVersion(requestedVersion.logicalRecord, logicalVersion);
+    if (logicalVersion) {
+      verifyCiphertextIntegrity(logicalVersion, encryptedBody, s3Response.Metadata);
+    }
 
     const content = responseBody.toString('base64');
 
@@ -1424,6 +1688,8 @@ async function handleReadFile(
       metadata: {
         size: s3Response.ContentLength,
         versionId: s3Response.VersionId,
+        fileVersionId: logicalVersion?.fileVersionId,
+        workspaceRevisionId: view?.workspaceRevisionId ?? null,
       },
     });
     // SD-09-F1: FileAccessCount backs the data-exfil alarm (Sum > 500 / 5min).
@@ -1442,11 +1708,20 @@ async function handleReadFile(
         lastModified: s3Response.LastModified?.toISOString(),
         versionId: s3Response.VersionId,
         checksum: s3Response.ETag,
+        historical: requestedVersion.historical,
+        ...logicalVersionFields(logicalVersion),
       },
       requestId
     );
   } catch (err: unknown) {
-    if (err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'NoSuchKey') {
+    if (
+      err &&
+      typeof err === 'object' &&
+      'name' in err &&
+      ['NoSuchKey', 'NoSuchVersion', 'NotFound', 'MethodNotAllowed'].includes(
+        (err as { name: string }).name,
+      )
+    ) {
       return formatError(404, `File not found: ${filePath}`, requestId);
     }
     throw err;
@@ -1477,7 +1752,8 @@ async function handleReadDecrypted(
   event: APIGatewayProxyEvent,
   user: UserContext,
   vault: VaultRecord,
-  requestId: string
+  requestId: string,
+  view?: RevisionFileReadView,
 ): Promise<APIGatewayProxyResult> {
   const rawPath = decodeURIComponent((event.pathParameters?.filePath ?? event.pathParameters?.path) || '');
   const filePath = sanitizeFilePath(rawPath);
@@ -1528,6 +1804,9 @@ async function handleReadDecrypted(
     });
     return formatError(404, 'File not found', requestId);
   }
+  const authorizationBinding = await bindFileAuthorizationGenerations(user, vault);
+
+  const requestedVersion = await resolveReadVersion(event, user, vault, filePath, view);
 
   // Fetch ciphertext from S3.
   let s3Response;
@@ -1535,8 +1814,10 @@ async function handleReadDecrypted(
     s3Response = await s3Client.send(
       new GetObjectCommand({
         Bucket: S3_BUCKET,
-        Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
-        ...(requestedVersionId ? { VersionId: requestedVersionId } : {}),
+        Key: requestedVersion.logicalRecord?.storageKey ?? vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+        ...(requestedVersion.storageVersionId
+          ? { VersionId: requestedVersion.storageVersionId }
+          : {}),
       })
     );
   } catch (err: unknown) {
@@ -1562,16 +1843,41 @@ async function handleReadDecrypted(
 
   const bodyBytes = await s3Response.Body?.transformToByteArray();
   const ciphertext = bodyBytes ? Buffer.from(bodyBytes) : Buffer.alloc(0);
+  const logicalVersion = await observeFileVersion(user, vault, filePath, s3Response, { logicalRecord: requestedVersion.logicalRecord });
+  assertRequestedLogicalVersion(requestedVersion.logicalRecord, logicalVersion);
+  if (logicalVersion) {
+    verifyCiphertextIntegrity(logicalVersion, ciphertext, s3Response.Metadata);
+  }
 
   // Reuse the existing scope-DEK unwrap helper (Phase 6/7 plumbing) — KMS Decrypt
   // with EncryptionContext is the tampering defense (T-08-03). Helper zeros the
   // DEK in its own finally; we zero the plaintext buffer below (T-08-06).
-  const { plaintext, keyId } = requestedVersionId
-    ? await decryptHistoricalVaultBlobForRead(ciphertext, s3Response.Metadata, user, vault)
-    : await decryptCurrentVaultBlobForRead(ciphertext, user, vault);
+  // A revision's current file is still an exact stored version and can use a
+  // historical cloud key. Keep its public historical flag false for compatibility.
+  const { plaintext, keyId } = requestedVersion.storageVersionId
+    ? await decryptExactVaultVersion(ciphertext, s3Response.Metadata, {
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+      })
+    : await decryptCurrentVaultBlobForRead(ciphertext, {
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+      }, s3Response.Metadata);
 
   let content: string;
   try {
+    await revalidateFileAuthorization(
+      authorizationBinding,
+      user,
+      vault.vaultId,
+      filePath,
+      'read',
+      'viewer',
+      404,
+      'File not found',
+      event,
+    );
+    if (logicalVersion) verifyPlaintextIntegrity(logicalVersion, plaintext);
     content = plaintext.toString('base64');
   } finally {
     plaintext.fill(0);
@@ -1590,8 +1896,10 @@ async function handleReadDecrypted(
     metadata: {
       size: s3Response.ContentLength,
       versionId: s3Response.VersionId,
+      fileVersionId: logicalVersion?.fileVersionId,
       keyId,
-      historical: Boolean(requestedVersionId),
+      historical: requestedVersion.historical,
+      workspaceRevisionId: view?.workspaceRevisionId ?? null,
     },
   });
   // SD-09-F1: FileAccessCount (server-side decrypt read path). Fire-and-forget
@@ -1610,7 +1918,8 @@ async function handleReadDecrypted(
       size: s3Response.ContentLength,
       lastModified: s3Response.LastModified?.toISOString(),
       versionId: s3Response.VersionId,
-      historical: Boolean(requestedVersionId),
+      historical: requestedVersion.historical,
+      ...logicalVersionFields(logicalVersion),
     },
     requestId
   );
@@ -1760,6 +2069,18 @@ async function handleIssueDirectUpload(
   if (expectedVersionId && (expectedVersionId.length > 1024 || /[\r\n]/.test(expectedVersionId))) {
     return formatError(400, 'expectedVersionId is invalid', requestId);
   }
+  if (body.hash !== undefined && !isSha256Hex(body.hash)) {
+    return formatError(400, 'hash must be a lowercase SHA-256 digest when provided', requestId);
+  }
+  if (
+    body.plaintextSize !== undefined &&
+    (typeof body.plaintextSize !== 'number' ||
+      !Number.isSafeInteger(body.plaintextSize) ||
+      body.plaintextSize < 0 ||
+      body.plaintextSize > MAX_FILE_SIZE)
+  ) {
+    return formatError(400, 'plaintextSize is invalid', requestId);
+  }
   const canonicalKey = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
   const current = await headObjectOrNull({ Key: canonicalKey });
   if (expectedVersionId && current?.VersionId !== expectedVersionId) {
@@ -1843,7 +2164,8 @@ function directUploadResult(
   encryptedSize: number,
   plaintextSha256: string,
   contentType: string,
-  lastModified = new Date().toISOString()
+  lastModified = new Date().toISOString(),
+  logicalVersion?: LogicalFileVersionRecord | null,
 ) {
   return {
     path: '/' + filePath,
@@ -1854,6 +2176,7 @@ function directUploadResult(
     contentType,
     lastModified,
     transferId,
+    ...logicalVersionFields(logicalVersion),
   };
 }
 
@@ -1895,6 +2218,7 @@ async function handleFinalizeDirectUpload(
       finalHead?.Metadata?.['vaultguard-transfer-id'] === transferId &&
       finalHead.Metadata['modified-by'] === user.userId
     ) {
+      const logicalVersion = await observeFileVersion(user, vault, filePath, finalHead);
       return formatSuccess(200, directUploadResult(
         filePath,
         transferId,
@@ -1903,7 +2227,8 @@ async function handleFinalizeDirectUpload(
         finalHead.ContentLength || 0,
         finalHead.Metadata['vaultguard-plaintext-sha256'] || '',
         finalHead.ContentType || 'application/octet-stream',
-        finalHead.LastModified?.toISOString()
+        finalHead.LastModified?.toISOString(),
+        logicalVersion,
       ), requestId);
     }
     return formatError(410, 'Direct upload is missing or expired', requestId);
@@ -1953,6 +2278,7 @@ async function handleFinalizeDirectUpload(
     } catch {
       // Lifecycle expiry is the fallback; never fail an already-durable copy.
     }
+    const logicalVersion = await observeFileVersion(user, vault, filePath, current);
     return formatSuccess(200, directUploadResult(
       filePath,
       transferId,
@@ -1961,7 +2287,8 @@ async function handleFinalizeDirectUpload(
       current.ContentLength || transfer.encryptedSize,
       transfer.plaintextSha256,
       transfer.contentType,
-      current.LastModified?.toISOString()
+      current.LastModified?.toISOString(),
+      logicalVersion,
     ), requestId);
   }
   if (
@@ -1987,6 +2314,25 @@ async function handleFinalizeDirectUpload(
     actorUserId: user.userId,
     verification: { kind: 'object-metadata' },
   });
+  const lineage = logicalLineageForHead(current, user, vault, filePath);
+  const createdAt = new Date().toISOString();
+  const logicalDraft = createFileVersionDraft({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    path: filePath,
+    fileId: lineage.fileId,
+    fileVersionId: makeFileVersionId(generateId()),
+    parentFileVersionIds: lineage.parentFileVersionIds,
+    contentType: transfer.contentType,
+    plaintextBytes: transfer.plaintextSize,
+    ciphertextBytes: transfer.encryptedSize,
+    plaintextSha256: transfer.plaintextSha256,
+    ciphertextSha256: transfer.encryptedSha256,
+    cloudKeyId: transfer.activeKeyId,
+    createdAt,
+    actorIdentityId: user.userId,
+    agentSessionId: user.sessionId,
+  });
   let copied;
   try {
     copied = await s3Client.send(new CopyObjectCommand({
@@ -1996,16 +2342,16 @@ async function handleFinalizeDirectUpload(
       CopySourceIfMatch: staged.ETag,
       MetadataDirective: 'REPLACE',
       ContentType: transfer.contentType,
-      Metadata: {
+      Metadata: logicalVersionMetadata(logicalDraft, {
         'modified-by': user.userId,
-        'modified-at': new Date().toISOString(),
+        'modified-at': createdAt,
         'vaultguard-key-id': transfer.activeKeyId,
         'vaultguard-transfer-id': transferId,
         'vaultguard-plaintext-sha256': transfer.plaintextSha256,
         'vaultguard-plaintext-size': String(transfer.plaintextSize),
         'vaultguard-encrypted-sha256': transfer.encryptedSha256,
         'vaultguard-mutation-id': mutationIntent.intentId,
-      },
+      }),
       ...(current?.ETag ? { IfMatch: current.ETag } : { IfNoneMatch: '*' }),
     }));
   } catch (error: unknown) {
@@ -2022,6 +2368,12 @@ async function handleFinalizeDirectUpload(
     }
     throw error;
   }
+
+  const logicalVersion = await persistBoundFileVersion(logicalDraft, {
+    storageKey: canonicalKey,
+    storageVersionId: copied.VersionId,
+    storageEtag: copied.CopyObjectResult?.ETag,
+  });
 
   await publishMutationIntentOrThrow(mutationIntent);
 
@@ -2044,6 +2396,7 @@ async function handleFinalizeDirectUpload(
       encryptedSize: transfer.encryptedSize,
       contentType: transfer.contentType,
       versionId: copied.VersionId,
+      fileVersionId: logicalVersion.fileVersionId,
       keyId: transfer.activeKeyId,
     },
   }, event);
@@ -2063,7 +2416,8 @@ async function handleFinalizeDirectUpload(
     transfer.encryptedSize,
     transfer.plaintextSha256,
     transfer.contentType,
-    copied.CopyObjectResult?.LastModified?.toISOString()
+    copied.CopyObjectResult?.LastModified?.toISOString(),
+    logicalVersion,
   ), requestId);
   } finally {
     await releaseVaultMutationPermit(mutationPermit);
@@ -2075,7 +2429,8 @@ async function handleIssueDirectDownload(
   event: APIGatewayProxyEvent,
   user: UserContext,
   vault: VaultRecord,
-  requestId: string
+  requestId: string,
+  view?: RevisionFileReadView,
 ): Promise<APIGatewayProxyResult> {
   const filePath = directActionPath(event, '/direct-download');
   const denied = await requireDirectPermission(
@@ -2089,15 +2444,39 @@ async function handleIssueDirectDownload(
   );
   if (denied) return denied;
   const body = parseBody(event);
-  const versionId = typeof body.versionId === 'string' && body.versionId.length > 0
+  let versionId = typeof body.versionId === 'string' && body.versionId.length > 0
     ? body.versionId
     : undefined;
+  const requestedFileVersionId =
+    typeof body.fileVersionId === 'string'
+      ? readBoundedLogicalVersionId(body.fileVersionId, 'fileVersionId')
+      : undefined;
+  if (versionId && requestedFileVersionId) {
+    return formatError(400, 'Specify versionId or fileVersionId, not both', requestId);
+  }
   if (versionId && (versionId.length > 1024 || /[\r\n]/.test(versionId))) {
     return formatError(400, 'versionId is invalid', requestId);
   }
-  const key = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+  let key = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
+  const requestedLogicalVersion = requestedFileVersionId
+    ? await requireLogicalVersionStore().require(
+        user.orgId,
+        vault.vaultId,
+        requestedFileVersionId,
+      )
+    : !versionId && view ? await view.current(filePath) : null;
+  if (
+    requestedLogicalVersion &&
+    (requestedLogicalVersion.path !== filePath || requestedLogicalVersion.state !== 'content')
+  ) {
+    throw new FileVersionNotFoundError();
+  }
+  if (requestedLogicalVersion) key = exactFileVersionStorageKey(requestedLogicalVersion, { orgId: user.orgId, vaultId: vault.vaultId }, S3_BUCKET, filePath);
+  versionId = requestedLogicalVersion?.storageVersionId ?? versionId;
   const head = await headObjectOrNull({ Key: key, VersionId: versionId });
   if (!head) return formatError(404, 'File not found', requestId);
+  const logicalVersion = await observeFileVersion(user, vault, filePath, head, { logicalRecord: requestedLogicalVersion ?? undefined });
+  assertRequestedLogicalVersion(requestedLogicalVersion, logicalVersion);
   const plaintextSha256 = head.Metadata?.['vaultguard-plaintext-sha256'];
   const encryptedSha256 = head.Metadata?.['vaultguard-encrypted-sha256'];
   const plaintextSize = Number(head.Metadata?.['vaultguard-plaintext-size']);
@@ -2125,7 +2504,14 @@ async function handleIssueDirectDownload(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { transferId, versionId: head.VersionId, encryptedSize: head.ContentLength || 0, expiresAtMs },
+    metadata: {
+      transferId,
+      versionId: head.VersionId,
+      fileVersionId: logicalVersion?.fileVersionId,
+      encryptedSize: head.ContentLength || 0,
+      expiresAtMs,
+      workspaceRevisionId: view?.workspaceRevisionId ?? null,
+    },
   }, event);
   return formatSuccess(200, {
     transferId,
@@ -2134,6 +2520,7 @@ async function handleIssueDirectDownload(
     headers: {},
     expiresAt: new Date(expiresAtMs).toISOString(),
     versionId: head.VersionId,
+    ...logicalVersionFields(logicalVersion),
     encryptedSize: head.ContentLength || 0,
     encryptedSha256,
     plaintextSize,
@@ -2450,6 +2837,7 @@ async function handleWriteFile(
   // of `expectedVersionId`, so it is unmistakable that `must-be-absent` and
   // `force` skip this HEAD entirely. Nothing inside the block changed.
   let currentEtag: string | undefined;
+  let currentHead: S3VersionObservation | null = null;
   if (writeIntent === 'expect-version') {
     try {
       const headResponse = await s3Client.send(
@@ -2458,6 +2846,7 @@ async function handleWriteFile(
           Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
         })
       );
+      currentHead = headResponse;
 
       if (headResponse.VersionId && headResponse.VersionId !== expectedVersionId) {
         return formatError(
@@ -2488,6 +2877,11 @@ async function handleWriteFile(
       throw err;
     }
   }
+  if (fileVersionStore && (writeIntent === 'force' || writeIntent === 'legacy')) {
+    currentHead = await headObjectOrNull({
+      Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+    });
+  }
 
   // Phase 6 (Plan 06-02): annotate the object with the DEK keyId so Phase 7's
   // cross-DEK restore endpoint can match noncurrent versions back to their DEK.
@@ -2497,6 +2891,28 @@ async function handleWriteFile(
   });
   try {
   const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
+  const lineage = logicalLineageForHead(currentHead, user, vault, filePath);
+  const createdAt = new Date().toISOString();
+  const plaintextSha256 = isSha256Hex(body.hash) ? body.hash : null;
+  const plaintextBytes = typeof body.plaintextSize === 'number' ? body.plaintextSize : null;
+  const ciphertextSha256 = sha256Hex(contentBuffer);
+  const logicalDraft = createFileVersionDraft({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    path: filePath,
+    fileId: lineage.fileId,
+    fileVersionId: makeFileVersionId(generateId()),
+    parentFileVersionIds: lineage.parentFileVersionIds,
+    contentType,
+    plaintextBytes,
+    ciphertextBytes: contentBuffer.byteLength,
+    plaintextSha256,
+    ciphertextSha256,
+    cloudKeyId: activeKeyId,
+    createdAt,
+    actorIdentityId: user.userId,
+    agentSessionId: user.sessionId,
+  });
 
   // SD-06-F1 (DECISION 5) — the S3 precondition, resolved per lane:
   //   expect-version  → IfMatch (unchanged; the HEAD above already 409s when
@@ -2540,13 +2956,14 @@ async function handleWriteFile(
         Bucket: S3_BUCKET,
         Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
         Body: contentBuffer,
+        ChecksumSHA256: checksumBase64FromHex(ciphertextSha256),
         ContentType: contentType,
-        Metadata: {
+        Metadata: logicalVersionMetadata(logicalDraft, {
           'modified-by': user.userId,
-          'modified-at': new Date().toISOString(),
+          'modified-at': createdAt,
           'vaultguard-mutation-id': mutationIntent.intentId,
           ...(activeKeyId ? { 'vaultguard-key-id': activeKeyId } : {}),
-        },
+        }),
         ...writeCondition,
       })
     );
@@ -2585,6 +3002,12 @@ async function handleWriteFile(
     throw err;
   }
 
+  const logicalVersion = await persistBoundFileVersion(logicalDraft, {
+    storageKey: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+    storageVersionId: putResponse.VersionId,
+    storageEtag: putResponse.ETag,
+  });
+
   await publishMutationIntentOrThrow(mutationIntent);
 
   // Track storage usage (best-effort, non-blocking)
@@ -2617,6 +3040,7 @@ async function handleWriteFile(
     metadata: {
       size: contentBuffer.length,
       versionId: putResponse.VersionId,
+      fileVersionId: logicalVersion.fileVersionId,
       contentType,
       ...(activeKeyId ? { keyId: activeKeyId } : {}),
     },
@@ -2628,8 +3052,9 @@ async function handleWriteFile(
       path: '/' + filePath,
       size: contentBuffer.length,
       versionId: putResponse.VersionId,
-      lastModified: new Date().toISOString(),
+      lastModified: createdAt,
       checksum: putResponse.ETag,
+      ...logicalVersionFields(logicalVersion),
     },
     requestId
   );
@@ -2699,6 +3124,7 @@ async function handleDeleteFile(
   // optional optimistic delete locking.
   let fileSize = 0;
   let currentEtag: string | undefined;
+  let currentHead: S3VersionObservation | null = null;
   try {
     const headResult = await s3Client.send(
       new HeadObjectCommand({
@@ -2706,6 +3132,7 @@ async function handleDeleteFile(
         Key: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
       })
     );
+    currentHead = headResult;
     fileSize = headResult.ContentLength || 0;
     currentEtag = headResult.ETag;
     if (expectedVersionId) {
@@ -2748,6 +3175,20 @@ async function handleDeleteFile(
   });
   try {
   const activeKeyId = await getActiveKeyIdForVault(user.orgId, vault.vaultId);
+  const lineage = logicalLineageForHead(currentHead, user, vault, filePath);
+  const deletedAt = new Date().toISOString();
+  const tombstoneDraft = createFileVersionDraft({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    path: filePath,
+    fileId: lineage.fileId,
+    fileVersionId: makeFileVersionId(generateId()),
+    parentFileVersionIds: lineage.parentFileVersionIds,
+    state: 'tombstone',
+    createdAt: deletedAt,
+    actorIdentityId: user.userId,
+    agentSessionId: user.sessionId,
+  });
   const mutationIntent = await beginVaultMutationIntent({
     orgId: user.orgId,
     vaultId: vault.vaultId,
@@ -2782,6 +3223,11 @@ async function handleDeleteFile(
     throw err;
   }
 
+  const tombstone = await persistBoundFileVersion(tombstoneDraft, {
+    storageKey: vaultS3Prefix(user.orgId, vault.vaultId) + filePath,
+    storageVersionId: deleteResponse.VersionId,
+  });
+
   await publishMutationIntentOrThrow(mutationIntent);
 
   // Decrement storage usage
@@ -2804,6 +3250,7 @@ async function handleDeleteFile(
     userAgent: getUserAgent(event),
     metadata: {
       deleteMarkerVersionId: deleteResponse.VersionId,
+      fileVersionId: tombstone.fileVersionId,
       softDelete: true,
       freedBytes: fileSize,
       ...(activeKeyId ? { keyId: activeKeyId } : {}),
@@ -2816,6 +3263,9 @@ async function handleDeleteFile(
       path: '/' + filePath,
       deleted: true,
       deleteMarkerVersionId: deleteResponse.VersionId,
+      fileId: tombstone.fileId,
+      fileVersionId: tombstone.fileVersionId,
+      deletedAt,
       recoverable: true,
       message: 'File soft-deleted. Previous versions remain accessible via history.',
     },
@@ -2891,29 +3341,91 @@ async function handleGetHistory(
   );
 
   const versions: FileVersion[] = [];
+  const storageKey = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
 
   // Process object versions
   for (const version of versionsResponse.Versions || []) {
-    if (version.Key === vaultS3Prefix(user.orgId, vault.vaultId) + filePath) {
+    if (version.Key === storageKey && version.VersionId) {
+      const persisted = await findLogicalVersionByStorage({
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        storageBucket: S3_BUCKET,
+        storageKey,
+        storageVersionId: version.VersionId,
+      });
+      const head = persisted || !fileVersionStore
+        ? null
+        : await headObjectOrNull({ Key: storageKey, VersionId: version.VersionId });
+      const logicalVersion =
+        persisted ??
+        (await putLogicalVersion(
+          fileVersionFromStorageObservation({
+            orgId: user.orgId,
+            vaultId: vault.vaultId,
+            path: filePath,
+            storageBucket: S3_BUCKET,
+            storageKey,
+            storageVersionId: version.VersionId,
+            storageEtag: head?.ETag,
+            contentType: head?.ContentType,
+            ciphertextBytes: head?.ContentLength ?? version.Size ?? 0,
+            lastModified: version.LastModified?.toISOString(),
+            metadata: head?.Metadata,
+          }),
+        ));
       versions.push({
-        versionId: version.VersionId || '',
+        versionId: version.VersionId,
+        storageVersionId: version.VersionId,
+        fileId: logicalVersion.fileId,
+        fileVersionId: logicalVersion.fileVersionId,
         lastModified: version.LastModified?.toISOString() || '',
         size: version.Size || 0,
         isLatest: version.IsLatest || false,
         isDeleteMarker: false,
+        plaintextSha256: logicalVersion.plaintextSha256,
+        ciphertextSha256: logicalVersion.ciphertextSha256,
+        integrity: logicalVersion.integrity,
       });
     }
   }
 
   // Process delete markers
   for (const marker of versionsResponse.DeleteMarkers || []) {
-    if (marker.Key === vaultS3Prefix(user.orgId, vault.vaultId) + filePath) {
+    if (marker.Key === storageKey && marker.VersionId) {
+      const persisted = await findLogicalVersionByStorage({
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        storageBucket: S3_BUCKET,
+        storageKey,
+        storageVersionId: marker.VersionId,
+      });
+      const logicalVersion =
+        persisted ??
+        (await putLogicalVersion(
+          fileVersionFromStorageObservation({
+            orgId: user.orgId,
+            vaultId: vault.vaultId,
+            path: filePath,
+            storageBucket: S3_BUCKET,
+            storageKey,
+            storageVersionId: marker.VersionId,
+            ciphertextBytes: 0,
+            lastModified: marker.LastModified?.toISOString(),
+            state: 'tombstone',
+          }),
+        ));
       versions.push({
-        versionId: marker.VersionId || '',
+        versionId: marker.VersionId,
+        storageVersionId: marker.VersionId,
+        fileId: logicalVersion.fileId,
+        fileVersionId: logicalVersion.fileVersionId,
         lastModified: marker.LastModified?.toISOString() || '',
         size: 0,
         isLatest: marker.IsLatest || false,
         isDeleteMarker: true,
+        plaintextSha256: null,
+        ciphertextSha256: null,
+        integrity: 'tombstone',
       });
     }
   }
@@ -3102,6 +3614,93 @@ async function handleRestoreDelete(
     return formatError(409, 'No recoverable prior version', requestId);
   }
 
+  // A version-list row does not carry object metadata. Read the exact prior
+  // version before lazily materializing it so a post-P1-003 object keeps the
+  // fileVersionId and integrity commitments written with its ciphertext. This
+  // is metadata-only and does not rewrite historical content.
+  const priorObservation = fileVersionStore
+    ? await headObjectOrNull({ Key: key, VersionId: priorNonMarker.VersionId })
+    : null;
+
+  const restoredLogicalVersion =
+    (await findLogicalVersionByStorage({
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      storageBucket: S3_BUCKET,
+      storageKey: key,
+      storageVersionId: priorNonMarker.VersionId,
+    })) ??
+    (await putLogicalVersion(
+      fileVersionFromStorageObservation({
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        path: filePath,
+        storageBucket: S3_BUCKET,
+        storageKey: key,
+        storageVersionId: priorNonMarker.VersionId,
+        storageEtag: priorObservation?.ETag,
+        contentType: priorObservation?.ContentType,
+        ciphertextBytes: priorObservation?.ContentLength ?? priorNonMarker.Size ?? 0,
+        lastModified: priorNonMarker.LastModified?.toISOString(),
+        metadata: priorObservation?.Metadata,
+      }),
+    ));
+  const deleteMarkerLogicalVersion =
+    (await findLogicalVersionByStorage({
+      orgId: user.orgId,
+      vaultId: vault.vaultId,
+      storageBucket: S3_BUCKET,
+      storageKey: key,
+      storageVersionId: currentMarker.VersionId,
+    })) ??
+    (await putLogicalVersion(
+      fileVersionFromStorageObservation({
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        path: filePath,
+        storageBucket: S3_BUCKET,
+        storageKey: key,
+        storageVersionId: currentMarker.VersionId,
+        ciphertextBytes: 0,
+        lastModified: currentMarker.LastModified?.toISOString(),
+        state: 'tombstone',
+        fallbackFileId: restoredLogicalVersion.fileId,
+        parentFileVersionIds: [restoredLogicalVersion.fileVersionId],
+      }),
+    ));
+  verifyStorageBinding(restoredLogicalVersion, {
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    path: filePath,
+    storageBucket: S3_BUCKET,
+    storageKey: key,
+    storageVersionId: priorNonMarker.VersionId,
+    storageEtag: priorObservation?.ETag,
+    contentType: priorObservation?.ContentType,
+    ciphertextBytes: priorObservation?.ContentLength ?? priorNonMarker.Size ?? 0,
+    metadata: priorObservation?.Metadata,
+  });
+  verifyStorageBinding(deleteMarkerLogicalVersion, {
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    path: filePath,
+    storageBucket: S3_BUCKET,
+    storageKey: key,
+    storageVersionId: currentMarker.VersionId,
+    ciphertextBytes: 0,
+    state: 'tombstone',
+  });
+  if (
+    deleteMarkerLogicalVersion.fileId !== restoredLogicalVersion.fileId ||
+    (!deleteMarkerLogicalVersion.fileVersionId.startsWith('fver_legacy_') &&
+      deleteMarkerLogicalVersion.parentFileVersionIds[0] !==
+        restoredLogicalVersion.fileVersionId)
+  ) {
+    throw new FileVersionIntegrityError(
+      'Delete-marker lineage does not match the version being restored',
+    );
+  }
+
   const mutationIntent = await beginVaultMutationIntent({
     orgId: user.orgId,
     vaultId: vault.vaultId,
@@ -3157,6 +3756,8 @@ async function handleRestoreDelete(
     metadata: {
       removedDeleteMarkerVersionId: currentMarker.VersionId,
       restoredVersionId: priorNonMarker.VersionId,
+      restoredFileVersionId: restoredLogicalVersion.fileVersionId,
+      removedTombstoneFileVersionId: deleteMarkerLogicalVersion.fileVersionId,
       restoredSizeBytes,
       ...(activeKeyId ? { keyId: activeKeyId } : {}),
     },
@@ -3168,6 +3769,9 @@ async function handleRestoreDelete(
       path: filePath,
       versionId: priorNonMarker.VersionId,
       restoredFrom: currentMarker.VersionId,
+      fileId: restoredLogicalVersion.fileId,
+      fileVersionId: restoredLogicalVersion.fileVersionId,
+      restoredFromFileVersionId: deleteMarkerLogicalVersion.fileVersionId,
     },
     requestId
   );
@@ -3267,14 +3871,25 @@ async function handleRestoreVersion(
   // free of side effects until requireVaultMember runs, and getting a 400 for
   // a malformed body before the role check matches the rest of this handler).
   const body = parseBody(event);
-  const sourceVersionId = body?.versionId;
+  const requestedSourceVersionId = body?.versionId;
+  const requestedSourceFileVersionId =
+    typeof body?.fileVersionId === 'string'
+      ? readBoundedLogicalVersionId(body.fileVersionId, 'fileVersionId')
+      : undefined;
   if (
-    !sourceVersionId ||
-    typeof sourceVersionId !== 'string' ||
-    sourceVersionId.length > 1024 ||
-    /[\r\n]/.test(sourceVersionId)
+    (requestedSourceVersionId === undefined && !requestedSourceFileVersionId) ||
+    (requestedSourceVersionId !== undefined && requestedSourceFileVersionId) ||
+    (requestedSourceVersionId !== undefined &&
+      (typeof requestedSourceVersionId !== 'string' ||
+        requestedSourceVersionId.length === 0 ||
+        requestedSourceVersionId.length > 1024 ||
+        /[\r\n]/.test(requestedSourceVersionId)))
   ) {
-    return formatError(400, 'Missing or invalid body field: versionId', requestId);
+    return formatError(
+      400,
+      'Provide exactly one valid body field: versionId or fileVersionId',
+      requestId,
+    );
   }
   const expectedCurrentVersionId = body?.expectedCurrentVersionId;
   if (
@@ -3342,6 +3957,23 @@ async function handleRestoreVersion(
     );
     return formatError(403, 'Access denied: insufficient permissions to restore this file', requestId);
   }
+  const authorizationBinding = await bindFileAuthorizationGenerations(user, vault);
+
+  const requestedLogicalVersion = requestedSourceFileVersionId
+    ? await requireLogicalVersionStore().require(
+        user.orgId,
+        vault.vaultId,
+        requestedSourceFileVersionId,
+      )
+    : null;
+  if (
+    requestedLogicalVersion &&
+    (requestedLogicalVersion.path !== filePath || requestedLogicalVersion.state !== 'content')
+  ) {
+    throw new FileVersionNotFoundError();
+  }
+  const sourceVersionId =
+    requestedLogicalVersion?.storageVersionId ?? String(requestedSourceVersionId);
 
   const bucket = S3_BUCKET;
   const key = vaultS3Prefix(user.orgId, vault.vaultId) + filePath;
@@ -3349,7 +3981,15 @@ async function handleRestoreVersion(
   // Bind the restore to the exact head the caller inspected. The ETag is then
   // carried into the conditional PUT below, closing the HEAD -> PUT race.
   const currentHead = await headObjectOrNull({ Key: key });
-  if (!currentHead?.VersionId || currentHead.VersionId !== expectedCurrentVersionId || !currentHead.ETag) {
+  // The outgoing head's size is needed later to account for the active-byte
+  // delta this restore causes, so it is part of what binding the head means.
+  const previousHeadSizeBytes = currentHead?.ContentLength;
+  if (
+    !currentHead?.VersionId ||
+    currentHead.VersionId !== expectedCurrentVersionId ||
+    !currentHead.ETag ||
+    typeof previousHeadSizeBytes !== 'number'
+  ) {
     await logAudit(
       {
         userId: user.userId,
@@ -3365,18 +4005,31 @@ async function handleRestoreVersion(
           sourceVersionId,
           expectedCurrentVersionId,
           observedCurrentVersionId: currentHead?.VersionId ?? null,
-          reason: currentHead?.ETag ? 'version_mismatch' : 'current_head_unavailable',
+          reason:
+            currentHead?.VersionId && currentHead.VersionId !== expectedCurrentVersionId
+              ? 'version_mismatch'
+              : 'current_head_unavailable',
         },
       },
       event
     );
     return formatError(409, 'Conflict: the current file version changed before restore', requestId);
   }
+  const currentLogicalVersion = await observeFileVersion(
+    user,
+    vault,
+    filePath,
+    currentHead,
+  );
 
   // STEP 1 — GET the historical ciphertext by VersionId.
   type S3GetResp = {
     Metadata?: Record<string, string>;
     ContentType?: string;
+    ContentLength?: number;
+    ETag?: string;
+    LastModified?: Date;
+    VersionId?: string;
     Body?: { transformToByteArray: () => Promise<Uint8Array> };
     DeleteMarker?: boolean;
   };
@@ -3423,49 +4076,31 @@ async function handleRestoreVersion(
     vaultId: vault.vaultId,
   });
   try {
-  // STEP 4 — Query the eventually-consistent `keyId-index` through the shared
-  // org/vault-bound resolver. A global key-id match is never sufficient by
-  // itself to select key material or construct the KMS EncryptionContext.
-  const dekItem = await lookupHistoricalDekForVault(sourceKeyId, user, vault);
-
-  // STEP 5 — still empty after retries → 410. Same generic message as the
-  // missing-metadata and 'legacy' branches above (T-07-03 mitigation).
-  if (!dekItem) {
-    return formatError(410, 'Historical key material is no longer available', requestId);
+  // STEPS 4–7 — resolve the exact version's tenant-bound DEK, reconstruct
+  // the original KMS EncryptionContext, unwrap, decrypt, and wipe key material
+  // inside the shared crypto service.
+  const ciphertextBody = await getResp.Body!.transformToByteArray();
+  const ciphertext = Buffer.from(ciphertextBody);
+  const sourceLogicalVersion = await observeFileVersion(user, vault, filePath, {
+    ...getResp,
+    VersionId: getResp.VersionId ?? sourceVersionId,
+    ContentLength: getResp.ContentLength ?? ciphertext.byteLength,
+  });
+  if (sourceLogicalVersion) {
+    assertRequestedLogicalVersion(requestedLogicalVersion, sourceLogicalVersion);
+    verifyCiphertextIntegrity(sourceLogicalVersion, ciphertext, getResp.Metadata);
   }
+  const { plaintext } = await decryptExactVaultVersion(
+    ciphertext,
+    getResp.Metadata,
+    { orgId: user.orgId, vaultId: vault.vaultId },
+  );
 
-  // STEP 6 — KMS Decrypt the historical envelope. The EncryptionContext is
-  // reconstructed from the GSI row's (orgId, scope, vaultId) — KMS refuses
-  // with InvalidCiphertextException BEFORE producing plaintext if these don't
-  // match what was used at GenerateDataKey time (T-07-02 mitigation).
-  let decryptResp;
   try {
-    decryptResp = await kmsClient.send(
-      new DecryptCommand({
-        CiphertextBlob: Buffer.from(dekItem.encryptedDataKey, 'base64'),
-        EncryptionContext: scopeKmsContext(user.orgId, dekItem.scope, vault.vaultId),
-      })
-    );
-  } catch (err) {
-    // SD-09-F1: real KMS reject (AccessDenied / InvalidCiphertext) on the
-    // historical-DEK decrypt path. Awaited before rethrowing the original error.
-    await emitSecurityMetric('KMSDecryptFailure');
-    throw err;
-  }
-  if (!decryptResp.Plaintext) {
-    await emitSecurityMetric('KMSDecryptFailure');
-    throw new Error('KMS Decrypt returned no plaintext for historical DEK');
-  }
-  const oldDek = Buffer.from(decryptResp.Plaintext);
-  decryptResp.Plaintext.fill(0);
-
-  // STEP 7 — AES-decrypt the historical ciphertext.
-  let plaintext: Buffer;
-  try {
-    const ciphertextBody = await getResp.Body!.transformToByteArray();
-    plaintext = aesDecrypt(Buffer.from(ciphertextBody), oldDek);
-  } finally {
-    oldDek.fill(0);
+    if (sourceLogicalVersion) verifyPlaintextIntegrity(sourceLogicalVersion, plaintext);
+  } catch (error) {
+    plaintext.fill(0);
+    throw error;
   }
 
   // STEPS 8–10 — re-encrypt under the current vault DEK, then zero both the
@@ -3476,7 +4111,55 @@ async function handleRestoreVersion(
     plaintextSha256,
     encryptedSha256,
     currentKeyId,
-  } = await encryptHistoricalPlaintextForRestore(plaintext, user, vault);
+  } = await encryptPlaintextWithActiveVaultKey(plaintext, {
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+  });
+  // Read the length now: the buffer is zeroed on every path below, and a
+  // zeroed buffer still reports its byteLength but the value is only correct
+  // to use before the PUT has consumed it.
+  const newCiphertextSizeBytes = newCiphertext.byteLength;
+  const createdAt = new Date().toISOString();
+  const restoredLogicalDraft = createFileVersionDraft({
+    orgId: user.orgId,
+    vaultId: vault.vaultId,
+    path: filePath,
+    fileId:
+      currentLogicalVersion?.fileId ??
+      sourceLogicalVersion?.fileId ??
+      legacyFileId(user.orgId, vault.vaultId, filePath),
+    fileVersionId: makeFileVersionId(generateId()),
+    parentFileVersionIds: currentLogicalVersion
+      ? [currentLogicalVersion.fileVersionId]
+      : [],
+    contentType: getResp.ContentType || 'application/octet-stream',
+    plaintextBytes: plaintextSize,
+    ciphertextBytes: newCiphertext.byteLength,
+    plaintextSha256,
+    ciphertextSha256: encryptedSha256,
+    cloudKeyId: currentKeyId,
+    createdAt,
+    actorIdentityId: user.userId,
+    agentSessionId: user.sessionId,
+    restoredFromFileVersionId: sourceLogicalVersion?.fileVersionId ?? null,
+  });
+
+  try {
+    await revalidateFileAuthorization(
+      authorizationBinding,
+      user,
+      vault.vaultId,
+      filePath,
+      'write',
+      'admin',
+      403,
+      'Access denied: insufficient permissions to restore this file',
+      event,
+    );
+  } catch (error) {
+    newCiphertext.fill(0);
+    throw error;
+  }
 
   let mutationIntent: VaultMutationIntent;
   try {
@@ -3504,9 +4187,9 @@ async function handleRestoreVersion(
         ChecksumSHA256: checksumBase64FromHex(encryptedSha256),
         ContentType: getResp.ContentType || 'application/octet-stream',
         IfMatch: currentHead.ETag,
-        Metadata: {
+        Metadata: logicalVersionMetadata(restoredLogicalDraft, {
           'modified-by': user.userId,
-          'modified-at': new Date().toISOString(),
+          'modified-at': createdAt,
           'vaultguard-key-id': currentKeyId,
           'vaultguard-plaintext-sha256': plaintextSha256,
           'vaultguard-plaintext-size': String(plaintextSize),
@@ -3514,7 +4197,7 @@ async function handleRestoreVersion(
           'vaultguard-mutation-id': mutationIntent.intentId,
           'restored-from-version': sourceVersionId,
           'restore-expected-version': expectedCurrentVersionId,
-        },
+        }),
       })
     );
   } catch (error: unknown) {
@@ -3563,7 +4246,27 @@ async function handleRestoreVersion(
   }
   newCiphertext.fill(0);
 
+  const targetLogicalVersion = await persistBoundFileVersion(restoredLogicalDraft, {
+    storageKey: key,
+    storageVersionId: (putResp as { VersionId?: string }).VersionId,
+    storageEtag: (putResp as { ETag?: string }).ETag,
+  });
+
   await publishMutationIntentOrThrow(mutationIntent);
+
+  // A restore swaps one active ciphertext head for another, so only the
+  // active-byte delta is billable. The noncurrent versions this leaves behind
+  // are governed by the bucket's retention contract and are not part of org
+  // active-storage use. Both sizes are already in hand, so this adds no S3
+  // read. Every sibling write path in this handler accounts for its bytes;
+  // restore was the one that did not, which let org usage drift on each call.
+  const storageDeltaBytes = newCiphertextSizeBytes - previousHeadSizeBytes;
+  if (storageDeltaBytes !== 0) {
+    const orgResult = await getActiveOrg(user.orgId);
+    if (orgResult.org) {
+      await updateOrgStorageUsage(orgResult.org.slug, storageDeltaBytes);
+    }
+  }
 
   // STEP 12 — capture the new head versionId.
   const targetVersionId = (putResp as { VersionId?: string }).VersionId || '';
@@ -3582,9 +4285,12 @@ async function handleRestoreVersion(
       userAgent: getUserAgent(event),
       metadata: {
         sourceVersionId,
+        sourceFileVersionId: sourceLogicalVersion?.fileVersionId,
+        parentFileVersionId: currentLogicalVersion?.fileVersionId,
         expectedCurrentVersionId,
         sourceKeyId,
         targetVersionId,
+        targetFileVersionId: targetLogicalVersion.fileVersionId,
         targetKeyId: currentKeyId,
       },
     },
@@ -3596,7 +4302,13 @@ async function handleRestoreVersion(
     200,
     {
       versionId: targetVersionId,
-      restoredFrom: { versionId: sourceVersionId, keyId: sourceKeyId },
+      fileId: targetLogicalVersion.fileId,
+      fileVersionId: targetLogicalVersion.fileVersionId,
+      restoredFrom: {
+        versionId: sourceVersionId,
+        fileVersionId: sourceLogicalVersion?.fileVersionId,
+        keyId: sourceKeyId,
+      },
       targetKeyId: currentKeyId,
     },
     requestId
@@ -3637,6 +4349,8 @@ async function handleListDeleted(
   interface DeletedFileEntry {
     path: string;
     deleteMarkerVersionId: string;
+    fileId: string;
+    fileVersionId: string;
     deletedAt: string;
   }
 
@@ -3684,10 +4398,33 @@ async function handleListDeleted(
       marker.LastModified instanceof Date
         ? marker.LastModified.toISOString()
         : String(marker.LastModified);
+    const logicalVersion =
+      (await findLogicalVersionByStorage({
+        orgId: user.orgId,
+        vaultId: vault.vaultId,
+        storageBucket: S3_BUCKET,
+        storageKey: marker.Key,
+        storageVersionId: marker.VersionId,
+      })) ??
+      (await putLogicalVersion(
+        fileVersionFromStorageObservation({
+          orgId: user.orgId,
+          vaultId: vault.vaultId,
+          path: relPath,
+          storageBucket: S3_BUCKET,
+          storageKey: marker.Key,
+          storageVersionId: marker.VersionId,
+          ciphertextBytes: 0,
+          lastModified: deletedAt,
+          state: 'tombstone',
+        }),
+      ));
 
     files.push({
       path: relPath,
       deleteMarkerVersionId: marker.VersionId,
+      fileId: logicalVersion.fileId,
+      fileVersionId: logicalVersion.fileVersionId,
       deletedAt,
     });
   }

@@ -401,6 +401,10 @@ export function formatAttachmentPreviewReport(report: AttachmentPreviewReport): 
 }
 
 export function registerVaultGuardCommands(ctx: VaultGuardCommandContext): void {
+  if (ctx.openWorkspaceSyncRecovery) ctx.addCommand({
+    id: "workspace-sync-recovery", name: "Review pending workspace changes and sync recovery",
+    callback: () => ctx.openWorkspaceSyncRecovery!(),
+  });
   ctx.addCommand({
     id: "login",
     name: "Login",

@@ -1,3 +1,5 @@
+import { connectorAuthorizationDays } from '../shared/connector-authorization-policy';
+import { acquireHumanMutationLease, advanceHumanRoleCutoff, currentHumanDirectory, HumanMutationBusy, releaseHumanMutationLease } from '../shared/current-human-directory';
 /**
  * VaultGuard — User Management Lambda Handler
  *
@@ -102,17 +104,34 @@ import {
   summarizeGuestAccess,
 } from '../shared/guest-access';
 import { UsersRouteContext, resolveUsersRouteContext } from '../shared/route-utils';
+import {
+  REMOTE_MCP_POLICY_FEATURES,
+  normalizeDisabledRemoteMcpFeatures,
+  remoteMcpFeaturePolicyChange,
+  unknownRemoteMcpFeatures,
+} from '../shared/remote-mcp-feature-policy';
+import {
+  organizationConnectorPolicyChange,
+  settingsUpdateMovesPolicyRevision,
+  validateSubmittedOrganizationConnectorPolicy,
+  type OrganizationConnectorPolicy,
+} from '../shared/organization-connector-policy';
 // Seat accounting and crypto-access teardown live in shared/ so the reconciler's
 // guest-expiry sweeper can call the SAME implementation, and so the IAM grant
 // guard can see the tables they touch. Layering is one-directional: this handler
 // imports the module, never the reverse.
 import {
+  connectorRevocationAuditMetadata,
   deleteGuestAccessRows,
+  endRevokedUserConnectorAccess,
   ensureRevokedSeatIdentity,
   releaseRevokedUserSeat,
   reserveReactivatedUserSeat,
   revokeUserCryptoAccess,
 } from '../shared/access-revocation';
+// VAULTGUARD-129: reactivation ends the user's connector grants itself, and
+// refuses to reactivate when it cannot.
+import { endUserConnectorAccess } from '../shared/connector-subject-revocation';
 import { sendEmail } from '../email/handler';
 import { syncStripeSeats } from '../billing/handler';
 
@@ -374,9 +393,14 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
   try {
     // All user management endpoints require admin privileges
-    const user = await verifyActiveUser(event);
-    const orgId = requireOrgId(user);
-    if (!isAdmin(user)) {
+    const verified = await verifyActiveUser(event);
+    const orgId = requireOrgId(verified);
+    const current = async (): Promise<UserContext> => {
+      const directory = await currentHumanDirectory(verified, { userPoolId: USER_POOL_ID, send: command => cognitoClient.send(command as never) });
+      return { ...verified, roles: directory.roles, groups: directory.roles };
+    };
+    const requireCurrentAdmin = async (user: UserContext) => {
+      if (isAdmin(user)) return;
       await logAudit({
         userId: user.userId,
         userEmail: user.email,
@@ -388,8 +412,16 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         userAgent: getUserAgent(event),
         metadata: { reason: 'insufficient_privileges' },
       });
-      return formatError(403, 'Admin privileges required', requestId);
-    }
+      throw new AuthError('Admin privileges required', 403);
+    };
+    const first = await current();
+    await requireCurrentAdmin(first);
+    const lease = method && method !== 'GET'
+      ? await acquireHumanMutationLease({ orgId, tableName: SESSIONS_TABLE, send: command => docClient.send(command as never) })
+      : null;
+    try {
+    const user = lease ? await current() : first;
+    if (lease) await requireCurrentAdmin(user);
 
     switch (true) {
       case method === 'GET' && path === '/users':
@@ -434,7 +466,11 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       default:
         return formatError(404, `Route not found: ${method} ${path}`, requestId);
     }
+    } finally {
+      if (lease) await releaseHumanMutationLease(lease, { tableName: SESSIONS_TABLE, send: command => docClient.send(command as never) });
+    }
   } catch (err) {
+    if (err instanceof HumanMutationBusy) return formatError(409, err.message, requestId);
     if (err instanceof AuthError) {
       return formatError(err.statusCode, err.message, requestId, err.code);
     }
@@ -1214,22 +1250,23 @@ async function handleUpdateRole(
       ]);
 
   // Get current groups and remove user from all role groups
-  const currentGroups = await cognitoClient.send(
-    new AdminListGroupsForUserCommand({
-      UserPoolId: USER_POOL_ID,
-      Username: target.username,
-    })
-  );
+  const currentGroups = await listCurrentCognitoGroups(target.username);
 
-  const oldRole = resolveRole((currentGroups.Groups || []).map((g) => g.GroupName!));
+  const oldRole = resolveRole(currentGroups);
 
-  for (const group of currentGroups.Groups || []) {
-    if (VALID_ROLES.includes(group.GroupName as UserRole)) {
+  // From this durable write onward every previously minted JWT for the target
+  // fails the shared active-user guard. The org mutation lease keeps two role
+  // writers from crossing this point concurrently.
+  await advanceHumanRoleCutoff(target.subjectId, { tableName: SESSIONS_TABLE,
+    send: command => docClient.send(command as never) });
+
+  for (const group of currentGroups) {
+    if (VALID_ROLES.includes(group as UserRole)) {
       await cognitoClient.send(
         new AdminRemoveUserFromGroupCommand({
           UserPoolId: USER_POOL_ID,
           Username: target.username,
-          GroupName: group.GroupName!,
+          GroupName: group,
         })
       );
     }
@@ -1245,6 +1282,7 @@ async function handleUpdateRole(
       GroupName: newRole,
     })
   );
+  await syncRoleAttributes(target.username, newRole);
 
   await logAudit({
     userId: admin.userId,
@@ -1400,6 +1438,15 @@ async function handleRevokeUser(
       throw new AuthError('User reactivation is already in progress', 409);
     }
     if (existingMarker.transitionState === 'revoked' || !existingMarker.transitionState) {
+      // VAULTGUARD-129: a repeated revoke re-drives the connector teardown, so an
+      // administrator can complete one an earlier revoke recorded as incomplete.
+      // It is idempotent: grants and sessions already revoked are only counted.
+      const connectorAccess = await endRevokedUserConnectorAccess({
+        orgId: admin.orgId,
+        userId: target.subjectId,
+        actorUserId: admin.userId,
+        reason: existingMarker.reason || 'admin_user_revoked',
+      });
       return formatSuccess(200, {
         message: `Access is already revoked for user ${target.username}`,
         userId: target.subjectId,
@@ -1407,6 +1454,7 @@ async function handleRevokeUser(
         idempotent: true,
         revokedAt: existingMarker.revokedAt || null,
         reEncryptionJobId: null,
+        connectorAccess: connectorAccess.state,
       }, requestId);
     }
   } else if (target.user.Enabled === false) {
@@ -1546,6 +1594,9 @@ async function handleRevokeUser(
         action: 'revoked',
         invalidatedSessions: cryptoRevocation.invalidatedSessions,
         revokedLeases: cryptoRevocation.revokedLeases,
+        // VAULTGUARD-129: counts and state only. Each revoked grant and session
+        // also has its own `connector.revoked` row, committed with the revoke.
+        ...connectorRevocationAuditMetadata(cryptoRevocation.connectorAccess),
         guestMembershipsDeleted,
         guestPermissionRulesDeleted,
         // Null on the happy path. Non-null is the only record that rows were
@@ -1562,6 +1613,7 @@ async function handleRevokeUser(
       revokedLeases: cryptoRevocation.revokedLeases,
       revokedAt: cryptoRevocation.revokedAt,
       reEncryptionJobId: cryptoRevocation.reEncryptionJobId,
+      connectorAccess: cryptoRevocation.connectorAccess.state,
     }, requestId);
   } catch (error) {
     if (!revocationCommitted) {
@@ -1673,6 +1725,22 @@ async function handleReactivateUser(
     throw new AuthError(orgResult.reason || 'Organization access denied', 403);
   }
 
+  // VAULTGUARD-129 (D-022): reactivation restores the account, never its
+  // remote-MCP connections. Before anything is reactivated, while the marker
+  // still refuses every connector request, the user's connector cutoff moves to
+  // now and every grant and session they hold is revoked, completing whatever
+  // the revocation's own teardown did not. Any failure refuses the reactivation
+  // with nothing changed, so a pre-revocation grant can never outlive the
+  // marker. An AI host reconnects through consent.
+  const connectorAccess = await endUserConnectorAccess({
+    orgId: admin.orgId,
+    userId: target.subjectId,
+    actorUserId: admin.userId,
+    reason: marker.reason || 'admin_user_revoked',
+    cause: 'reactivation',
+    event,
+  });
+
   const transitionId = generateId();
   if (!await claimReactivationTransition(target.subjectId, transitionId)) {
     throw new AuthError('User reactivation is already in progress', 409);
@@ -1730,6 +1798,7 @@ async function handleReactivateUser(
         GroupName: role,
       })
     );
+    await syncRoleAttributes(target.username, role);
 
     await docClient.send(
       new DeleteCommand({
@@ -1803,6 +1872,7 @@ async function handleReactivateUser(
       role,
       guestMembershipsDeleted: promotionCleanup.membershipsDeleted,
       guestPermissionRulesDeleted: promotionCleanup.permissionRulesDeleted,
+      ...connectorRevocationAuditMetadata(connectorAccess),
     },
   });
 
@@ -1974,11 +2044,25 @@ async function handleResetMfa(
   // their OWN MFA, since that's covered by the self-service recovery flow.
   // (Admins resetting their own MFA via this route is also fine — same
   // user, same authority.)
-  // Block path: cross-admin reset where target ≠ caller.
-  const targetIsAdmin = (target.attributes['custom:orgRole'] || target.attributes['custom:role'] || '')
+  // Block path: cross-admin reset where target ≠ caller. Admin status is the
+  // UNION of the token attributes and the Cognito group: an identity promoted
+  // to admin through `PUT /users/{id}/role` carries the group but may still
+  // hold a stale `custom:role`, and the guard exists to protect CURRENT admins.
+  const targetAttributeIsAdmin = (target.attributes['custom:orgRole'] || target.attributes['custom:role'] || '')
     .toLowerCase()
     .split(/[,\s]+/)
     .includes('admin');
+  const targetGroups = target.subjectId !== admin.userId
+    ? await cognitoClient.send(
+        new AdminListGroupsForUserCommand({
+          UserPoolId: USER_POOL_ID,
+          Username: target.username,
+        })
+      )
+    : { Groups: [] };
+  const targetGroupIsAdmin =
+    resolveRole((targetGroups.Groups || []).map((g) => g.GroupName!)) === 'admin';
+  const targetIsAdmin = targetAttributeIsAdmin || targetGroupIsAdmin;
   if (targetIsAdmin && target.subjectId !== admin.userId) {
     await logAudit({
       userId: admin.userId,
@@ -2294,11 +2378,54 @@ async function ensureGroupExists(groupName: string): Promise<void> {
  * Resolves a user's primary role from their Cognito group memberships.
  * Priority: admin > editor > viewer
  */
+/**
+ * Keeps the `custom:role` / `custom:orgRole` token attributes in step with the
+ * Cognito group that the admin UI and the rest of this handler treat as the
+ * role. `extractRolesFromTokenPayload` (shared/utils) UNIONS the group with
+ * both attributes, so an attribute left at `admin` (invite) or `owner`
+ * (signup) would keep `isAdmin()` true on the server after a demotion that
+ * the UI already reports as complete. Written after the group mutation so a
+ * failure here surfaces as a 500 to the caller instead of a silent split.
+ */
+async function syncRoleAttributes(username: string, role: string): Promise<void> {
+  await cognitoClient.send(
+    new AdminUpdateUserAttributesCommand({
+      UserPoolId: USER_POOL_ID,
+      Username: username,
+      UserAttributes: [
+        { Name: 'custom:role', Value: role },
+        { Name: 'custom:orgRole', Value: role },
+      ],
+    })
+  );
+}
+
 function resolveRole(groups: string[]): 'admin' | 'editor' | 'viewer' | 'custom' {
   if (groups.includes('admin')) return 'admin';
   if (groups.includes('editor')) return 'editor';
   if (groups.includes('viewer')) return 'viewer';
   return groups.length > 0 ? 'custom' : 'viewer';
+}
+
+/** Read every current group before replacing role groups. A privileged group
+ * on a later page must never survive a successful demotion. */
+async function listCurrentCognitoGroups(username: string): Promise<string[]> {
+  const names: string[] = [], seen = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 10; page += 1) {
+    const result = await cognitoClient.send(new AdminListGroupsForUserCommand({ UserPoolId: USER_POOL_ID,
+      Username: username, Limit: 60, ...(cursor ? { NextToken: cursor } : {}) }));
+    if (!Array.isArray(result.Groups) || result.Groups.length > 60) throw new Error('Current role groups unavailable');
+    for (const group of result.Groups) {
+      const name = group.GroupName;
+      if (typeof name !== 'string' || !name || seen.has(name)) throw new Error('Current role groups unavailable');
+      seen.add(name); names.push(name);
+    }
+    if (!result.NextToken) return names;
+    if (result.NextToken === cursor || result.NextToken.length > 2048) throw new Error('Current role groups unavailable');
+    cursor = result.NextToken;
+  }
+  throw new Error('Current role groups unavailable');
 }
 
 /**
@@ -2319,7 +2446,8 @@ function mapCognitoStatus(
 
 async function loadAuthorizedOrgRecord(
   requestedOrgId: string | undefined,
-  admin: UserContext
+  admin: UserContext,
+  options: { consistentRead?: boolean } = {}
 ): Promise<OrgRecord> {
   if (!requestedOrgId) {
     throw new ValidationError('Missing orgId path parameter');
@@ -2328,7 +2456,10 @@ async function loadAuthorizedOrgRecord(
     throw new AuthError('Cannot access settings for another organization');
   }
 
-  const orgResult = await getActiveOrg(admin.orgId);
+  // A settings write merges the submitted fields into what is stored now, so it
+  // reads the base record consistently (VAULTGUARD-91 review VG91-SEC-1): a
+  // stale index read must never supply an omitted field such as the kill switch.
+  const orgResult = await getActiveOrg(admin.orgId, options.consistentRead ? { consistentRead: true } : undefined);
   if (!orgResult.allowed || !orgResult.org) {
     throw new AuthError(
       orgResult.reason || 'Organization access denied',
@@ -2339,12 +2470,29 @@ async function loadAuthorizedOrgRecord(
   return orgResult.org;
 }
 
-async function persistOrgSettings(org: OrgRecord, settings: OrgSettings): Promise<void> {
+/** The settings revision a stored organization record carries (absent reads as 0). */
+function settingsRevisionOf(org: OrgRecord): number {
+  return Number.isSafeInteger(org.settingsRevision) && Number(org.settingsRevision) >= 0 ? Number(org.settingsRevision) : 0;
+}
+
+const SETTINGS_CHANGED_CONCURRENTLY =
+  'Organization settings changed while this update was being saved. Reload the settings and try again.';
+
+/**
+ * Writes the whole settings map, only while the record still carries the
+ * settings revision it was read at (VAULTGUARD-91 review findings F3 and
+ * VG91-SEC-1): a concurrent save answers 409 and changes nothing, rather than
+ * persisting fields merged from a superseded read. `policyRevision` moves
+ * exactly as `settingsUpdateMovesPolicyRevision` decides, so a change confined
+ * to the connector admission fields keeps every credential (D-020).
+ */
+async function persistOrgSettings(org: OrgRecord, before: OrgSettings, settings: OrgSettings): Promise<number> {
   const persistedSettings: PersistedOrgSettings = {
     syncMode: settings.syncMode,
     syncIntervalMinutes: settings.syncIntervalMinutes,
     enforceEncryption: settings.enforceEncryption,
     maxSessionDurationHours: settings.maxSessionDurationHours,
+    connectorAuthorizationDays: settings.connectorAuthorizationDays,
     requireMfa: settings.requireMfa,
     allowedDomains: settings.allowedDomains,
     retentionDays: settings.retentionDays,
@@ -2352,26 +2500,78 @@ async function persistOrgSettings(org: OrgRecord, settings: OrgSettings): Promis
     idleAction: settings.idleAction,
     allowAdminPerFileRestrictions: settings.allowAdminPerFileRestrictions,
     disabledAuditActions: settings.disabledAuditActions,
+    disabledRemoteMcpFeatures: settings.disabledRemoteMcpFeatures,
+    blockedConnectorClientIds: settings.blockedConnectorClientIds,
+    blockedConnectorHostKinds: settings.blockedConnectorHostKinds,
+    remoteMcpKillSwitch: settings.remoteMcpKillSwitch,
   };
 
-  await docClient.send(
-    new UpdateCommand({
-      TableName: ORGANIZATIONS_TABLE,
-      Key: { slug: org.slug },
-      UpdateExpression: 'SET #name = :name, #settings = :settings, updatedAt = :updatedAt',
-      ExpressionAttributeNames: {
-        '#name': 'name',
-        '#settings': 'settings',
-      },
-      ExpressionAttributeValues: {
-        ':name': settings.orgName,
-        ':settings': persistedSettings,
-        ':updatedAt': new Date().toISOString(),
-      },
-    })
+  const movesPolicyRevision = settingsUpdateMovesPolicyRevision(
+    before as unknown as Record<string, unknown>,
+    settings as unknown as Record<string, unknown>
   );
+  const expected = settingsRevisionOf(org);
+  const stored = Number.isSafeInteger(org.settingsRevision);
+  try {
+    await docClient.send(
+      new UpdateCommand({
+        TableName: ORGANIZATIONS_TABLE,
+        Key: { slug: org.slug },
+        UpdateExpression: movesPolicyRevision
+          ? 'ADD #policyRevision :one, #settingsRevision :one SET #name = :name, #settings = :settings, updatedAt = :updatedAt'
+          : 'ADD #settingsRevision :one SET #name = :name, #settings = :settings, updatedAt = :updatedAt',
+        ConditionExpression: stored
+          ? 'attribute_exists(slug) AND #settingsRevision = :expectedSettingsRevision'
+          : 'attribute_exists(slug) AND attribute_not_exists(#settingsRevision)',
+        ExpressionAttributeNames: {
+          '#name': 'name',
+          '#settings': 'settings',
+          '#settingsRevision': 'settingsRevision',
+          ...(movesPolicyRevision ? { '#policyRevision': 'policyRevision' } : {}),
+        },
+        ExpressionAttributeValues: {
+          ':name': settings.orgName,
+          ':settings': persistedSettings,
+          ':updatedAt': new Date().toISOString(),
+          ':one': 1,
+          ...(stored ? { ':expectedSettingsRevision': expected } : {}),
+        },
+      })
+    );
+  } catch (error) {
+    if (isConditionalCheckFailure(error)) {
+      throw new AuthError(SETTINGS_CHANGED_CONCURRENTLY, 409);
+    }
+    throw error;
+  }
 
   invalidateOrgSettingsCache(settings.orgId);
+  return expected + 1;
+}
+
+/**
+ * An optional `expectedSettingsRevision` in the request body: the revision the
+ * administrator's page loaded. A save made from a page another administrator
+ * has since changed answers 409 instead of replacing their lists.
+ */
+function assertExpectedSettingsRevision(body: Record<string, unknown>, org: OrgRecord): void {
+  if (body.expectedSettingsRevision === undefined) return;
+  const value = body.expectedSettingsRevision;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new ValidationError('expectedSettingsRevision must be a non-negative integer.');
+  }
+  if (value !== settingsRevisionOf(org)) {
+    throw new AuthError(SETTINGS_CHANGED_CONCURRENTLY, 409);
+  }
+}
+
+/** The connector admission policy a settings view carries (VAULTGUARD-91). */
+function connectorPolicyOf(settings: OrgSettings): OrganizationConnectorPolicy {
+  return {
+    blockedClientIds: settings.blockedConnectorClientIds ?? [],
+    blockedHostKinds: settings.blockedConnectorHostKinds ?? [],
+    killSwitch: settings.remoteMcpKillSwitch === true,
+  };
 }
 
 // ─── GET /orgs/{orgId}/settings ─────────────────────────────────────────────
@@ -2386,7 +2586,7 @@ async function handleGetOrgSettings(
   const org = await loadAuthorizedOrgRecord(orgId, admin);
   const settings = buildOrgSettings(orgId!, org);
 
-  return formatSuccess(200, settings, requestId);
+  return formatSuccess(200, { ...settings, settingsRevision: settingsRevisionOf(org) }, requestId);
 }
 
 // ─── PUT /orgs/{orgId}/settings ─────────────────────────────────────────────
@@ -2398,8 +2598,9 @@ async function handleUpdateOrgSettings(
   route: UsersRouteContext
 ): Promise<APIGatewayProxyResult> {
   const orgId = route.orgId;
-  const org = await loadAuthorizedOrgRecord(orgId, admin);
+  const org = await loadAuthorizedOrgRecord(orgId, admin, { consistentRead: true });
   const body = parseBody(event);
+  assertExpectedSettingsRevision(body, org);
   const currentSettings = buildOrgSettings(orgId!, org);
 
   if (body.enforceEncryption === false) {
@@ -2408,7 +2609,41 @@ async function handleUpdateOrgSettings(
     );
   }
 
+  // D-014: the organization's remote MCP family policy. Refuse anything but a
+  // list of known feature ids, so an administrator never believes a family is
+  // disabled because a mistyped id was silently dropped.
+  if (body.disabledRemoteMcpFeatures !== undefined) {
+    if (!Array.isArray(body.disabledRemoteMcpFeatures)) {
+      throw new ValidationError('disabledRemoteMcpFeatures must be a list of remote MCP feature ids.');
+    }
+    const unknown = unknownRemoteMcpFeatures(body.disabledRemoteMcpFeatures);
+    if (unknown.length > 0) {
+      throw new ValidationError(
+        `Unknown remote MCP feature ids: ${unknown.slice(0, 5).join(', ')}. Must be among: ${REMOTE_MCP_POLICY_FEATURES.join(', ')}`
+      );
+    }
+  }
+
+  // VAULTGUARD-91: the organization's connector admission policy. Refuse
+  // anything but the documented shape rather than dropping an entry an
+  // administrator believed was blocked.
+  const connectorPolicy = validateSubmittedOrganizationConnectorPolicy(body, connectorPolicyOf(currentSettings));
+  if (connectorPolicy.errors.length > 0) {
+    throw new ValidationError(connectorPolicy.errors.join(' '));
+  }
+
+  let authorizationDays: number;
+  try { authorizationDays = connectorAuthorizationDays(body.connectorAuthorizationDays === undefined ? currentSettings.connectorAuthorizationDays : body.connectorAuthorizationDays); }
+  catch { throw new ValidationError('Connection authorization must be a whole number of days from 1 to 90.'); }
+  const admissionChanged = organizationConnectorPolicyChange(connectorPolicyOf(currentSettings), connectorPolicy.policy);
+  if (admissionChanged || authorizationDays !== (currentSettings.connectorAuthorizationDays ?? 30)) {
+    const now = Date.now();
+    if (typeof admin.authTime !== 'number' || admin.authTime * 1000 > now || now - admin.authTime * 1000 > 300_000 ||
+        (currentSettings.requireMfa && !admin.mfaAuthenticated))
+      throw new AuthError('Sign in again to confirm this security action.', 403, 'step_up_required');
+  }
   const settings: OrgSettings = {
+    connectorAuthorizationDays: authorizationDays,
     orgId: orgId!,
     orgName:
       typeof body.orgName === 'string' && body.orgName.trim().length > 0
@@ -2444,9 +2679,15 @@ async function handleUpdateOrgSettings(
     disabledAuditActions:
       normalizeDisabledAuditActions(body.disabledAuditActions, currentSettings.disabledAuditActions) ??
       currentSettings.disabledAuditActions,
+    disabledRemoteMcpFeatures:
+      normalizeDisabledRemoteMcpFeatures(body.disabledRemoteMcpFeatures, currentSettings.disabledRemoteMcpFeatures) ??
+      currentSettings.disabledRemoteMcpFeatures,
+    blockedConnectorClientIds: [...connectorPolicy.policy.blockedClientIds],
+    blockedConnectorHostKinds: [...connectorPolicy.policy.blockedHostKinds],
+    remoteMcpKillSwitch: connectorPolicy.policy.killSwitch,
   };
 
-  await persistOrgSettings(org, settings);
+  const settingsRevision = await persistOrgSettings(org, currentSettings, settings);
 
   await logAudit({
     userId: admin.userId,
@@ -2457,10 +2698,20 @@ async function handleUpdateOrgSettings(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { orgId },
+    metadata: {
+      orgId,
+      // D-014: enabling an AI connector's propose, apply or administration
+      // family is a deliberate human decision, so the row says which families
+      // this update enabled and disabled (closed vocabulary, no other content).
+      ...remoteMcpFeaturePolicyChange(currentSettings.disabledRemoteMcpFeatures ?? [], settings.disabledRemoteMcpFeatures ?? []),
+      // VAULTGUARD-91: which connector clients and host kinds this update
+      // blocked or unblocked, and whether it engaged or released the kill
+      // switch (identifiers and closed vocabulary only).
+      ...organizationConnectorPolicyChange(connectorPolicyOf(currentSettings), connectorPolicyOf(settings)),
+    },
   });
 
-  return formatSuccess(200, settings, requestId);
+  return formatSuccess(200, { ...settings, settingsRevision }, requestId);
 }
 
 // ─── DELETE /orgs/{orgId}/settings ──────────────────────────────────────────
@@ -2472,15 +2723,23 @@ async function handleResetOrgSettings(
   route: UsersRouteContext
 ): Promise<APIGatewayProxyResult> {
   const orgId = route.orgId;
-  const org = await loadAuthorizedOrgRecord(orgId, admin);
+  const org = await loadAuthorizedOrgRecord(orgId, admin, { consistentRead: true });
   const currentSettings = buildOrgSettings(orgId!, org);
   const resetSettings: OrgSettings = {
     orgId: orgId!,
     orgName: currentSettings.orgName,
     ...DEFAULT_ORG_SETTINGS,
+    // VAULTGUARD-91 review findings F2 and VG91-SEC-2: a reset never lifts a
+    // connector restriction. The deny-lists and the kill switch are released
+    // only through their own, separately confirmed controls, so a general
+    // "reset to defaults" cannot silently re-admit a blocked connector.
+    blockedConnectorClientIds: [...(currentSettings.blockedConnectorClientIds ?? [])],
+    blockedConnectorHostKinds: [...(currentSettings.blockedConnectorHostKinds ?? [])],
+    remoteMcpKillSwitch: currentSettings.remoteMcpKillSwitch === true,
+    connectorAuthorizationDays: currentSettings.connectorAuthorizationDays,
   };
 
-  await persistOrgSettings(org, resetSettings);
+  const settingsRevision = await persistOrgSettings(org, currentSettings, resetSettings);
 
   await logAudit({
     userId: admin.userId,
@@ -2491,10 +2750,20 @@ async function handleResetOrgSettings(
     outcome: 'success',
     ipAddress: getClientIp(event),
     userAgent: getUserAgent(event),
-    metadata: { orgId },
+    metadata: {
+      orgId,
+      // A reset returns the remote MCP families to the D-014 defaults; the row
+      // records which families that enabled or disabled.
+      ...remoteMcpFeaturePolicyChange(currentSettings.disabledRemoteMcpFeatures ?? [], resetSettings.disabledRemoteMcpFeatures ?? []),
+      // A reset keeps the connector admission policy, so this adds nothing to
+      // the row (a stored policy that was not the documented shape is kept as
+      // the restrictive view it is read as: kill switch engaged, every host
+      // kind blocked).
+      ...organizationConnectorPolicyChange(connectorPolicyOf(currentSettings), connectorPolicyOf(resetSettings)),
+    },
   });
 
-  return formatSuccess(200, resetSettings, requestId);
+  return formatSuccess(200, { ...resetSettings, settingsRevision }, requestId);
 }
 
 // ─── Vault-membership bootstrap for newly invited members ──────────────────

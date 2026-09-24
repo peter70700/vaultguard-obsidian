@@ -18,8 +18,10 @@
     "experimentalDecorators": true,
     "strictPropertyInitialization": false,
     "outDir": "./dist",
-    "rootDir": ".",
-    "typeRoots": ["./node_modules/@types"]
+    "rootDir": "..",
+    "typeRoots": ["./node_modules/@types"],
+    "resolveJsonModule": true,
+    "esModuleInterop": true
   },
   "include": ["lambda/**/*.ts"],
   "exclude": ["node_modules", "dist"]

@@ -47,6 +47,8 @@ import { ReadOnlyGuard } from "./readonly-guard";
 import { PermissionStore } from "./permission-store";
 import { UpdateChecker } from "./update-checker";
 import { SyncDiagnostics } from "./sync-diagnostics";
+import { WorkspaceSyncRuntime, type ReplicaSnapshot, type ReplicaStatus } from "./workspace-sync-runtime";
+import { WorkspaceSyncModal } from "./workspace-sync-modal";
 import type { AtRestCipher, AtRestRestoreOutcome } from "../crypto/at-rest-cipher";
 import {
   PinLockManager,
@@ -1365,6 +1367,13 @@ export default class VaultGuardPlugin extends Plugin {
 
   /** Per-file server version state used for optimistic write guards. */
   private remoteFileState = new RemoteFileStateStore();
+  private workspaceSyncRuntime: WorkspaceSyncRuntime | null = null;
+  private workspaceSyncScheduleTimer: ReturnType<typeof setTimeout> | null = null;
+  private workspaceSyncScheduledRun = false;
+  private workspaceSyncSchedulingStopped = false;
+  private remoteFileStateLoadPromise: Promise<void> | null = null;
+  private workspaceRecoveryBlocked = false;
+  private workspacePersistSuspended = false;
 
   /** Debounce handle for the encrypted remote-file-state envelope. */
   private remoteFileStatePersistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1514,6 +1523,9 @@ export default class VaultGuardPlugin extends Plugin {
   private createAtRestAdapterRuntimeContext(): AtRestAdapterRuntimeContext {
     const thisPlugin = this;
     return {
+      shouldReadWorkspaceLocally: () => !!this.settings.serverVaultId && this.workspaceSyncRuntime?.status().mode !== "legacy",
+      handleWorkspaceWrite: (path, bytes) => this.handleWorkspaceWrite(path, bytes),
+      handleWorkspaceMutation: (operation, path, newPath) => this.handleWorkspaceMutation(operation, path, newPath),
       app: this.app,
       manifestId: this.manifest?.id,
       get settings() {
@@ -1662,8 +1674,169 @@ export default class VaultGuardPlugin extends Plugin {
     return this.atRestAdapterRuntime;
   }
 
+  private async ensureWorkspaceRecoveryLoaded(): Promise<void> {
+    if (!this.remoteFileStateLoadPromise || (this.workspaceRecoveryBlocked && this.atRestCipher?.isReady())) {
+      this.remoteFileStateLoadPromise = this.loadPersistedRemoteFileState();
+    }
+    await this.remoteFileStateLoadPromise;
+    if (this.workspaceRecoveryBlocked) throw Error("Revision sync recovery is unavailable; local files are preserved.");
+  }
+
+  private ensureWorkspaceSyncRuntime(): WorkspaceSyncRuntime {
+    if (!this.workspaceSyncRuntime) this.workspaceSyncRuntime = new WorkspaceSyncRuntime({
+      api: () => { if (!this.apiClient) throw Error("Sync client unavailable"); return this.apiClient; },
+      binding: () => this.session && this.settings.serverVaultId
+        ? JSON.stringify([this.session.organizationId, this.session.userId, this.settings.serverVaultId]) : null,
+      vaultId: () => this.settings.serverVaultId,
+      generation: () => this.sessionEpoch,
+      ready: () => !!this.session && !this.isLocalProjectMemoryModeEnabled() && !this.isVaultLocked && this.getProtectedContentGate().ok && !this.workspaceRecoveryBlocked,
+      online: () => this.isOnline(),
+      origin: () => this.apiClient?.getMutationOrigin() ?? "unknown",
+      excluded: path => this.isPathExcluded(path) || this.isFolderMarkerPath(path) || path === this.app.vault.configDir || path.startsWith(this.app.vault.configDir + "/"),
+      read: async path => await this.app.vault.adapter.exists(path) ? this.readPlainBinaryFromDisk(path) : null,
+      saveLocal: (path, bytes) => this.writePlainBinaryToDisk(path, bytes),
+      removeEmptyFolder: async path => {
+        const folder = this.app.vault.getAbstractFileByPath(path);
+        if (!(folder instanceof TFolder) || folder.children.length) return;
+        const previous = this.applyingRemoteWrite; this.applyingRemoteWrite = true;
+        try { await this.app.vault.trash(folder, false); } finally { this.applyingRemoteWrite = previous; }
+      },
+      write: async (path, bytes) => {
+        const previous = this.applyingRemoteWrite; this.applyingRemoteWrite = true;
+        try {
+          await this.ensureParentFoldersForPath(path);
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (file instanceof TFile) await this.app.vault.modifyBinary(file, bytes);
+          else if (!file) await this.app.vault.createBinary(path, bytes);
+          else throw Error("A folder occupies the remote file path");
+        } finally { this.applyingRemoteWrite = previous; }
+      },
+      rename: async (from, to) => {
+        const file = this.app.vault.getAbstractFileByPath(from);
+        if (!file || this.app.vault.getAbstractFileByPath(to)) throw Error("Local rename needs recovery");
+        const previous = this.applyingRemoteWrite; this.applyingRemoteWrite = true;
+        try { await this.ensureParentFoldersForPath(to); await this.app.vault.rename(file, to); }
+        finally { this.applyingRemoteWrite = previous; }
+      },
+      trash: async path => {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile)) return !file;
+        const previous = this.applyingRemoteWrite; this.applyingRemoteWrite = true;
+        try { await this.app.vault.trash(file, false); return true; }
+        finally { this.applyingRemoteWrite = previous; }
+      },
+      ensureFolder: async path => {
+        const previous = this.applyingRemoteWrite; this.applyingRemoteWrite = true;
+        try { await this.ensureLocalFolderPath(path); } finally { this.applyingRemoteWrite = previous; }
+      },
+      localFiles: () => this.app.vault.getFiles().map(file => file.path),
+      persist: () => this.enqueueRemoteFileStatePersist(() => this.persistRemoteFileState(true)),
+      changed: status => this.updateWorkspaceSyncStatus(status),
+    });
+    return this.workspaceSyncRuntime;
+  }
+
+  private updateWorkspaceSyncStatus(status: ReplicaStatus): void {
+    this.syncState.workspace = status;
+    if (status.mode !== "legacy") {
+      this.syncState.pendingChanges = status.pending;
+      this.syncState.lastError = status.lastError;
+    }
+    this.updateStatusBar();
+  }
+
+  private async handleWorkspaceWrite(path: string, bytes: ArrayBuffer): Promise<boolean> {
+    if (this.isLocalProjectMemoryModeEnabled() || !this.settings.serverVaultId) return false;
+    await this.ensureWorkspaceRecoveryLoaded();
+    const runtime = this.ensureWorkspaceSyncRuntime();
+    if (!await runtime.route()) return false;
+    await runtime.write(this.normalizeVaultPath(path), bytes);
+    this.scheduleWorkspaceSync();
+    return true;
+  }
+
+  private async handleWorkspaceMutation(operation: "delete" | "rename" | "create_folder" | "move_folder" | "delete_folder", path: string, newPath?: string): Promise<boolean> {
+    if (this.applyingRemoteWrite) return true;
+    if (this.isLocalProjectMemoryModeEnabled() || !this.session || !this.settings.serverVaultId) return false;
+    await this.ensureWorkspaceRecoveryLoaded();
+    const runtime = this.ensureWorkspaceSyncRuntime();
+    if (!await runtime.route()) return false;
+    if (operation === "rename" || operation === "move_folder") {
+      await this.awaitPermissionReadiness();
+      if (await this.getEffectivePermission(path) < PermissionLevel.WRITE ||
+        (newPath !== undefined && await this.getEffectivePermission(newPath) < PermissionLevel.WRITE)) {
+        throw Error("Access denied: write permission is required at both rename paths");
+      }
+    }
+    await runtime.mutation(operation, this.normalizeVaultPath(path), newPath === undefined ? undefined : this.normalizeVaultPath(newPath));
+    this.scheduleWorkspaceSync();
+    return true;
+  }
+
+  /** Native saves are debounced into bounded exact-base batches. The ordinary sync engine
+   * still supplies reconnect/periodic delivery; this timer never runs around the LAK/session gate. */
+  private scheduleWorkspaceSync(delayMs = 500): void {
+    if (this.workspaceSyncSchedulingStopped || this.workspaceSyncScheduleTimer || this.workspaceSyncScheduledRun || !this.session || !this.isOnline() || this.isVaultLocked || !this.getProtectedContentGate().ok) return;
+    this.workspaceSyncScheduleTimer = setTimeout(() => {
+      this.workspaceSyncScheduleTimer = null;
+      if (!this.session || !this.isOnline() || this.isVaultLocked || !this.getProtectedContentGate().ok) return;
+      this.workspaceSyncScheduledRun = true;
+      void this.performWorkspaceSync().catch(() => {}).finally(() => {
+        this.workspaceSyncScheduledRun = false;
+        const pending = this.workspaceSyncRuntime?.pending() ?? [];
+        if (pending.some(item => item.status === "pending" || item.status === "publishing" || item.publication?.state === "retired"))
+          this.scheduleWorkspaceSync(pending.some(item => item.publication?.state === "applied") ? 500 : 30_000);
+      });
+    }, delayMs);
+  }
+
+  private async performWorkspaceSync(): Promise<boolean> {
+    if (this.isLocalProjectMemoryModeEnabled() || !this.session || !this.settings.serverVaultId) return false;
+    await this.ensureWorkspaceRecoveryLoaded();
+    const runtime = this.ensureWorkspaceSyncRuntime();
+    const previousStatus = this.syncState.status;
+    let operation: LongOperationHandle | null = null;
+    this.syncState.status = "syncing";
+    try {
+      if (!await runtime.route(true)) { this.syncState.status = previousStatus; return false; }
+      operation = this.beginLongOperation({
+        kind: "sync", operationName: "Workspace revision sync", phase: "Reconciling exact revision",
+        placement: "background", capabilities: { protectedPhase: false, canCancel: false, canPause: false },
+        conflictsWith: ["sync", "background-sync", "vault-encrypt", "vault-decrypt", "initial-reconciliation"],
+      });
+      if (this.offlineQueueLoadPromise) await this.offlineQueueLoadPromise;
+      await runtime.importLegacy(this.offlineQueue, Object.keys(this.settings.deletionTombstones ?? {}));
+      // The exact old byte images and deletion intent are now durably held in the
+      // encrypted revision journal. They must never replay later through path sync.
+      if (this.offlineQueue.length) { this.offlineQueue = []; this.scheduleOfflineQueuePersist(); }
+      if (Object.keys(this.settings.deletionTombstones ?? {}).length) { delete this.settings.deletionTombstones; await this.saveSettings(); }
+      const handled = await runtime.sync();
+      this.syncState.status = handled ? (runtime.status().pending ? "paused" : "idle") : previousStatus;
+      if (handled && !runtime.status().pending) this.syncState.lastSync = new Date().toISOString();
+      this.updateWorkspaceSyncStatus(runtime.status());
+      operation.complete(runtime.status().pending ? "Local changes remain pending publication, review, or recovery." : "Workspace replica checkpoint downloaded.");
+      return handled;
+    } catch (error) {
+      operation?.fail(error);
+      this.syncState.status = "error";
+      this.updateWorkspaceSyncStatus(runtime.status());
+      throw error;
+    }
+  }
+
+  private openWorkspaceSyncRecovery(): void {
+    new WorkspaceSyncModal(this.app, this.ensureWorkspaceSyncRuntime(), async () => { await this.performSync({ userInitiated: true }); }, proposalId => {
+      const base = SAAS_DEFAULTS.adminBaseUrl.trim().replace(/\/+$/, "");
+      if (!base || !this.settings.serverVaultId) { new Notice("No hosted review workspace is configured."); return; }
+      const url = new URL(base);
+      if (url.protocol !== "https:" && url.hostname !== "localhost") { new Notice("Review URL is unavailable."); return; }
+      window.open(`${base}/workspace/${encodeURIComponent(this.settings.serverVaultId)}/changes/${encodeURIComponent(proposalId)}`, "_blank", "noopener,noreferrer");
+    }).open();
+  }
+
   private createSyncRuntimeContext(): SyncRuntimeContext {
     return {
+      performWorkspaceSync: () => this.performWorkspaceSync(),
       app: this.app,
       normalizeVaultPath: (path) => this.normalizeVaultPath(path),
       isPathExcluded: (path) => this.isPathExcluded(path),
@@ -2146,6 +2319,7 @@ export default class VaultGuardPlugin extends Plugin {
       isSessionTokenExpiring: () =>
         this.session ? this.isSessionTokenExpiring(this.session) : false,
       performSync: (options) => this.performSync(options),
+      openWorkspaceSyncRecovery: () => this.openWorkspaceSyncRecovery(),
       getEffectivePermission: (path) => this.getEffectivePermission(path),
       runConnectionDiagnostics: () => this.runConnectionDiagnostics(),
       featureEnabled: (name) => this.featureEnabled(name),
@@ -2654,7 +2828,8 @@ export default class VaultGuardPlugin extends Plugin {
     // structurally impossible.
     this.offlineQueueLoadPromise = this.loadPersistedOfflineQueue().catch(() => undefined);
     void this.offlineQueueLoadPromise;
-    void this.loadPersistedRemoteFileState();
+    this.remoteFileStateLoadPromise = this.loadPersistedRemoteFileState();
+    void this.remoteFileStateLoadPromise;
 
     // Restore session — synchronous safeStorage path first, async at-rest
     // path second. On desktop this is effectively zero-cost; on mobile it
@@ -2987,6 +3162,9 @@ export default class VaultGuardPlugin extends Plugin {
    * sensitive data from memory.
    */
   async onunload(): Promise<void> {
+    this.workspaceSyncSchedulingStopped = true;
+    if (this.workspaceSyncScheduleTimer) clearTimeout(this.workspaceSyncScheduleTimer);
+    this.workspaceSyncScheduleTimer = null;
     this.unloading = true;
     this.lifecycleGeneration += 1;
     this.log("Unloading VaultGuard plugin...");
@@ -10236,7 +10414,10 @@ export default class VaultGuardPlugin extends Plugin {
     if (this.offlineQueueFlushPromise) indeterminate = true;
     if (this.syncState.status === "syncing") indeterminate = true;
 
+    if (this.remoteFileStateLoadPromise) await this.remoteFileStateLoadPromise;
+    if (this.workspaceRecoveryBlocked) indeterminate = true;
     const items = new Set<string>();
+    for (const op of this.workspaceSyncRuntime?.pending() ?? []) items.add(op.path);
     for (const op of this.offlineQueue) {
       items.add(this.normalizeVaultPath(op.path));
     }
@@ -10932,23 +11113,35 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   private handleFolderCreated(path: string): void {
-    return this.ensureSyncRuntime().handleFolderCreated(path);
+    if (this.applyingRemoteWrite) return;
+    void this.handleWorkspaceMutation("create_folder", path).then(handled => {
+      if (!handled) this.ensureSyncRuntime().handleFolderCreated(path);
+    }).catch(error => this.logError("Workspace change remains pending", error));
   }
 
-  private handleFolderDeleted(path: string): void {
+  private async handleFolderDeleted(path: string): Promise<void> {
     if (this.isWipeSuppressedDelete(path, true)) return; // 13-02/HI-01: never DELETE a wiped path on the server
-    return this.ensureSyncRuntime().handleFolderDeleted(path);
+    if (this.applyingRemoteWrite) return;
+    try {
+      if (!await this.handleWorkspaceMutation("delete_folder", path)) this.ensureSyncRuntime().handleFolderDeleted(path);
+    } catch (error) { this.logError("Workspace change remains pending", error); }
   }
 
   private handleFolderRenamed(path: string, oldPath: string): void {
-    return this.ensureSyncRuntime().handleFolderRenamed(path, oldPath);
+    if (this.applyingRemoteWrite) return;
+    void this.handleWorkspaceMutation("move_folder", oldPath, path).then(handled => {
+      if (!handled) this.ensureSyncRuntime().handleFolderRenamed(path, oldPath);
+    }).catch(error => this.logError("Workspace change remains pending", error));
   }
 
   private handleVaultFileRenamed(path: string, oldPath: string): void {
-    return this.ensureSyncRuntime().handleVaultFileRenamed(path, oldPath);
+    if (this.applyingRemoteWrite) return;
+    void this.handleWorkspaceMutation("rename", oldPath, path).then(handled => {
+      if (!handled) this.ensureSyncRuntime().handleVaultFileRenamed(path, oldPath);
+    }).catch(error => this.logError("Workspace change remains pending", error));
   }
 
-  private handleVaultFileDeleted(path: string): void {
+  private async handleVaultFileDeleted(path: string): Promise<void> {
     if (this.isWipeSuppressedDelete(path, false)) return; // 13-02/HI-01: never DELETE a wiped path on the server
     // AR-6: trash/folder deletes bypass the adapter `remove` interceptor, so the
     // durable at-rest protection marker must be cleared here or a later
@@ -10956,7 +11149,11 @@ export default class VaultGuardPlugin extends Plugin {
     void this.ensureAtRestAdapterRuntimeObject()
       .forgetProtectionMarkerForDeletedPath?.(path)
       ?.catch((error) => this.logError(`At-rest: could not clear protection marker for deleted "${path}"`, error));
-    return this.ensureSyncRuntime().handleVaultFileDeleted(path);
+    if (this.applyingRemoteWrite) return;
+    try {
+      if (!await this.handleWorkspaceMutation("delete", path)) this.ensureSyncRuntime().handleVaultFileDeleted(path);
+    } catch (error) { this.logError("Workspace change remains pending", error); }
+
   }
 
   /**
@@ -11062,6 +11259,7 @@ export default class VaultGuardPlugin extends Plugin {
    * then DELETEs the old key.
    */
   private async syncFileRenameToServer(oldPath: string, newPath: string): Promise<void> {
+    if (await this.handleWorkspaceMutation("rename", oldPath, newPath)) return;
     return this.ensureSyncRuntime().syncFileRenameToServer(oldPath, newPath);
   }
 
@@ -11071,6 +11269,7 @@ export default class VaultGuardPlugin extends Plugin {
    * only path that fires for child files of a deleted folder.
    */
   private async syncFileDeleteToServer(path: string): Promise<void> {
+    if (await this.handleWorkspaceMutation("delete", path)) return;
     return this.ensureSyncRuntime().syncFileDeleteToServer(path);
   }
 
@@ -11103,6 +11302,7 @@ export default class VaultGuardPlugin extends Plugin {
    * and the regular sync engine may proceed; false if the user cancelled.
    */
   private async performInitialReconciliation(): Promise<boolean> {
+    if (await this.performWorkspaceSync()) return true;
     return this.ensureSyncRuntime().performInitialReconciliation();
   }
 
@@ -11681,11 +11881,13 @@ export default class VaultGuardPlugin extends Plugin {
   }
 
   /**
-   * Removes every server-side file/folder marker whose path is currently
-   * covered by `settings.excludedPaths`. Used to clean up files that were
-   * uploaded before the user added the corresponding exclusion — without
+   * Soft-deletes every server-visible file/folder marker whose path is
+   * currently covered by `settings.excludedPaths`. Used to clean up files that
+   * were uploaded before the user added the corresponding exclusion — without
    * this, members on other devices would keep pulling the file back down
-   * indefinitely.
+   * indefinitely. The method name and the audit identifiers still say "purge",
+   * but the vault-scoped DELETE calls create recoverable delete markers and do
+   * not permanently erase retained object versions.
    *
    * Returns counts so the caller can show a Notice. Throws on hard failures
    * (auth, network) so the caller can react appropriately.
@@ -11696,7 +11898,7 @@ export default class VaultGuardPlugin extends Plugin {
     failed: number;
   }> {
     if (this.isLocalProjectMemoryModeEnabled()) {
-      throw new Error("Server purge is disabled in Local Project Memory Mode.");
+      throw new Error("Server removal is disabled in Local Project Memory Mode.");
     }
     if (!this.session || !this.settings.serverVaultId) {
       throw new Error("Not connected to a server vault.");
@@ -11743,11 +11945,14 @@ export default class VaultGuardPlugin extends Plugin {
           this.permissionStore.emit("changed", { path });
         } else {
           failed += 1;
-          this.logError(`Purge: DELETE "${path}" failed`, new Error(response.error?.message ?? "unknown"));
+          this.logError(
+            `Excluded-path removal: DELETE "${path}" failed`,
+            new Error(response.error?.message ?? "unknown")
+          );
         }
       } catch (err) {
         failed += 1;
-        this.logError(`Purge: DELETE "${path}" threw`, err);
+        this.logError(`Excluded-path removal: DELETE "${path}" threw`, err);
       }
     }
 
@@ -13157,6 +13362,13 @@ export default class VaultGuardPlugin extends Plugin {
       maxAttempts?: number;
     }
   ): Promise<ApiResponse<T>> {
+    if (this.session && ["PUT", "DELETE", "POST"].includes(method) && /\/files\//.test(endpoint) && !/\/history/.test(endpoint)) {
+      await this.ensureWorkspaceRecoveryLoaded();
+      if (await this.ensureWorkspaceSyncRuntime().route()) return {
+        success: false, data: null, requestId: "", error: { code: "upgrade_required", statusCode: 426,
+          message: "This vault uses exact workspace sync. Open pending workspace changes for review and recovery.", details: null },
+      };
+    }
     if (!idTokenOverride && this.session) {
       if (this.isSessionTokenExpiring(this.session)) {
         const refreshResult = await this.refreshAccessToken(this.session);
@@ -13925,6 +14137,13 @@ export default class VaultGuardPlugin extends Plugin {
       return;
     }
 
+    const replica = this.syncState.workspace;
+    if (replica && replica.mode !== "legacy" && (replica.pending || replica.lastError)) {
+      this.statusBarEl.setText(`VaultGuard: ${replica.pending} pending workspace changes`);
+      this.statusBarEl.setAttr("title", "Local changes are retained. Use ‘Review pending workspace changes and sync recovery’ to review, retry, or recover them.");
+      return;
+    }
+
     const connectionIcon =
       this.connectionState.status === "online"
         ? "\u2713"
@@ -14383,6 +14602,10 @@ export default class VaultGuardPlugin extends Plugin {
       await this.settleVaultIndexAfterWipe(wipedPaths);
 
       if (rebind) {
+        this.workspaceSyncRuntime?.clear();
+        this.workspaceRecoveryBlocked = false;
+        this.workspacePersistSuspended = false;
+        await this.removePersistedEnvelope(this.remoteFileStateEnvelopePath());
         // The local cache no longer belongs to this binding — on takeover
         // because the folder changed hands, on a vault switch because it now
         // points at a different vault. Either way none of the previous
@@ -14788,6 +15011,7 @@ export default class VaultGuardPlugin extends Plugin {
   async clearLocalCache(): Promise<void> {
     const queuedOperationsBeforeReset = [...this.offlineQueue];
     const remoteFileStateBeforeReset = this.remoteFileState.snapshot();
+    const workspaceBeforeReset = this.workspaceSyncRuntime?.snapshot();
 
     if (this.offlineQueuePersistTimer) {
       clearTimeout(this.offlineQueuePersistTimer);
@@ -14800,6 +15024,9 @@ export default class VaultGuardPlugin extends Plugin {
 
     this.offlineQueue = [];
     this.remoteFileState.clear();
+    this.workspaceSyncRuntime?.clear();
+    this.workspaceRecoveryBlocked = false;
+    this.workspacePersistSuspended = false;
 
     try {
       // Reset is a user-confirmed destructive action, so do not use the normal
@@ -14831,6 +15058,7 @@ export default class VaultGuardPlugin extends Plugin {
         restoredRemoteEntries.set(entry.path, entry);
       }
       this.remoteFileState.load(Array.from(restoredRemoteEntries.values()));
+      this.ensureWorkspaceSyncRuntime().restore(workspaceBeforeReset);
       this.scheduleOfflineQueuePersist();
       this.scheduleRemoteFileStatePersist();
       this.logError("Failed to reset persisted local sync state", error);
@@ -14884,6 +15112,10 @@ export default class VaultGuardPlugin extends Plugin {
     this.permissionStore.invalidate();
     this.offlineQueue = [];
     this.remoteFileState.clear();
+    if (this.workspaceSyncRuntime?.snapshot()) this.workspacePersistSuspended = true;
+    this.workspaceSyncRuntime?.clear();
+    this.workspaceSyncRuntime = null;
+    this.remoteFileStateLoadPromise = null;
     // SY5: an empty queue removes the persisted envelope, so a logout/lock
     // never leaves another user's queued edits on disk for the next session.
     if (persistClearedState) {
@@ -15202,23 +15434,29 @@ export default class VaultGuardPlugin extends Plugin {
     return run;
   }
 
-  private async persistRemoteFileState(): Promise<void> {
+  private async persistRemoteFileState(strict = false): Promise<void> {
     const path = this.remoteFileStateEnvelopePath();
+    if (this.workspacePersistSuspended) { if (strict) throw Error("Revision journal persistence is paused"); return; }
+    const generation = this.sessionEpoch;
     try {
-      if (this.remoteFileState.isEmpty()) {
+      const workspace = this.workspaceSyncRuntime?.snapshot() ?? null;
+      if (this.remoteFileState.isEmpty() && !workspace) {
         await this.removePersistedEnvelope(path);
         return;
       }
       if (!this.atRestCipher?.isReady() || !this.originalAdapterMethods.writeBinary) {
+        if (strict) throw Error("Unlock local encryption before saving the revision journal");
         return;
       }
       await this.ensureParentFoldersForPath(path);
       const envelope = await this.atRestCipher.encryptString(
-        JSON.stringify(this.remoteFileState.snapshot())
+        JSON.stringify({ ...this.remoteFileState.snapshot(), ...(workspace ? { workspace } : {}) })
       );
+      if (this.workspacePersistSuspended || generation !== this.sessionEpoch) throw Error("Session changed before journal persistence");
       await this.originalAdapterMethods.writeBinary(path, envelope);
     } catch (error) {
       this.logError("Failed to persist the remote file state envelope", error);
+      if (strict) throw error;
     }
   }
 
@@ -15227,21 +15465,31 @@ export default class VaultGuardPlugin extends Plugin {
     if (!readBinary) return;
     const path = this.remoteFileStateEnvelopePath();
     try {
-      if (!(await this.app.vault.adapter.exists(path))) return;
+      if (!(await this.app.vault.adapter.exists(path))) {
+        this.workspacePersistSuspended = false;
+        this.workspaceRecoveryBlocked = false;
+        return;
+      }
       await this.waitForCipherInit(10_000);
       if (!this.atRestCipher?.isReady()) {
-        this.log("Remote file state envelope present but the at-rest cipher is not ready; leaving it for the next launch.");
+        this.workspaceRecoveryBlocked = true;
+        this.log("Remote file state envelope present but the at-rest cipher is not ready; leaving it for unlock.");
         return;
       }
       const plaintext = await this.atRestCipher.decryptString(await readBinary(path));
       const parsed = JSON.parse(plaintext) as {
         v?: number;
         entries?: RemoteFileStateEntry[];
+        workspace?: ReplicaSnapshot;
       };
-      if (parsed?.v !== 1 || !Array.isArray(parsed.entries)) return;
+      if (parsed?.v !== 1 || !Array.isArray(parsed.entries)) throw Error("Unsupported remote state envelope");
+      this.ensureWorkspaceSyncRuntime().restore(parsed.workspace);
+      this.workspaceRecoveryBlocked = false;
+      this.workspacePersistSuspended = false;
       this.remoteFileState.load(parsed.entries);
       this.log(`Restored remote version state for ${parsed.entries.length} path(s).`);
     } catch (error) {
+      this.workspaceRecoveryBlocked = true;
       this.logError("Failed to restore the remote file state envelope", error);
     }
   }

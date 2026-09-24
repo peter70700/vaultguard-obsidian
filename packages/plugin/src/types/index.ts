@@ -89,6 +89,8 @@ export type SyncStatus = "idle" | "syncing" | "error" | "offline" | "paused";
  * Tracks pending changes, last successful sync, and any conflicts.
  */
 export interface SyncState {
+  /** Separate local, publication and index observations for the optional revision replica. */
+  workspace?: import("../plugin/workspace-sync-runtime").ReplicaStatus;
   /** ISO 8601 timestamp of last successful sync operation */
   lastSync: string | null;
   /** Number of local changes pending upload */

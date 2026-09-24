@@ -794,6 +794,8 @@ export class SyncRuntime {
       return;
     }
 
+    if (this.ctx.performWorkspaceSync && await this.ctx.performWorkspaceSync()) return;
+
     let operation: LongOperationHandle;
     try {
       operation = this.ctx.beginLongOperation({

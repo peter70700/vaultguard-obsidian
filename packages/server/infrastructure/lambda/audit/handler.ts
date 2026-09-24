@@ -43,30 +43,21 @@ import {
   GetCommand,
   UpdateCommand,
   AUDIT_TABLE,
-  DEFAULT_ORG_SETTINGS,
-  getEffectiveOrgSettings,
 } from '../shared/utils';
 import { FEATURES } from '../shared/edition';
 import { isOffHours } from '../shared/time';
+import { applyRetentionWindow } from '../shared/audit-retention';
+
+// The Community-edition retention cap and the query-window clamp live in
+// shared/audit-retention.ts so the remote MCP audit read applies the same
+// policy. Re-exported here so existing importers keep one stable entry point.
+export { applyRetentionWindow, CE_AUDIT_RETENTION_DAYS } from '../shared/audit-retention';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 // Required env var — see shared/utils.ts for rationale on dropping silent fallbacks.
 const ALERTS_TABLE = process.env.ALERTS_TABLE!;
 const ANOMALY_THRESHOLD_DENIED = parseInt(process.env.ANOMALY_THRESHOLD_DENIED || '5', 10);
-
-/**
- * Soft cap on the retention window for audit-log queries on Community Edition.
- *
- * Pro Edition honors the full `orgSettings.retentionDays` (default 365 days).
- * Community Edition clamps the query window to the most recent 30 days,
- * matching the ProUpsellModal copy and the SERVER_README marketing table.
- *
- * This is a *query-time* cap only — records are still stored per the org's
- * retentionDays and any DynamoDB TTL. CE users can upgrade to Pro to read
- * older entries without re-ingesting data.
- */
-export const CE_AUDIT_RETENTION_DAYS = 30;
 
 const ANOMALY_THRESHOLD_BULK = parseInt(process.env.ANOMALY_THRESHOLD_BULK || '50', 10);
 const ANOMALY_THRESHOLD_SYNC_CHANGES = parseInt(process.env.ANOMALY_THRESHOLD_SYNC_CHANGES || '100', 10);
@@ -843,6 +834,8 @@ async function handleBridgeAudit(
   return formatSuccess(200, { logged: true }, requestId);
 }
 
+const BRIDGE_RESERVED_METADATA_KEYS: ReadonlySet<string> = new Set(['channel', 'workflow']);
+
 /**
  * Shallow-sanitizes the caller-supplied metadata bag attached to a bridge
  * audit event. Caps are intentionally aggressive so the audit log can't
@@ -858,6 +851,10 @@ function sanitizeBridgeMetadata(input: unknown): Record<string, unknown> {
   for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
     if (count >= 32) break;
     if (typeof k !== 'string' || k.length > 64) continue;
+    // VAULTGUARD-113: an audit channel and a workflow correlation are server
+    // attribution. A member-supplied one is never kept (`buildAuditEntry` removes
+    // them again for every writer).
+    if (BRIDGE_RESERVED_METADATA_KEYS.has(k)) continue;
     if (v === null || ['string', 'number', 'boolean'].includes(typeof v)) {
       out[k] = typeof v === 'string' ? v.slice(0, 1024) : v;
     } else {
@@ -1173,29 +1170,6 @@ function normalizeEndTimestamp(value?: string): string | undefined {
 
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
-}
-
-export async function applyRetentionWindow(
-  orgId: string,
-  startDate?: string,
-  endDate?: string
-): Promise<{ startDate?: string; endDate?: string }> {
-  const settings = await getEffectiveOrgSettings(orgId);
-  const orgRetentionDays = settings?.retentionDays ?? DEFAULT_ORG_SETTINGS.retentionDays;
-  const retentionDays = FEATURES.advancedAudit
-    ? orgRetentionDays
-    : Math.min(orgRetentionDays, CE_AUDIT_RETENTION_DAYS);
-  const retentionStart = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
-
-  let effectiveStartDate = startDate;
-  if (!effectiveStartDate || new Date(effectiveStartDate).getTime() < new Date(retentionStart).getTime()) {
-    effectiveStartDate = retentionStart;
-  }
-
-  return {
-    startDate: effectiveStartDate,
-    endDate,
-  };
 }
 
 function decodeCursor(cursor?: string): Record<string, unknown> | undefined {

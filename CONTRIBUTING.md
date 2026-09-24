@@ -8,7 +8,7 @@ https://github.com/peter70700/vaultguard-obsidian.
 
 Be excellent to each other. Report serious conduct issues to peter@sedmak.sk.
 
-## How to Contribute
+## How to Contribute to the Public Artifact Repository
 
 1. Open an issue describing the bug or proposal before opening a PR for anything
    non-trivial. The maintainer (single-developer project for v1) will confirm scope

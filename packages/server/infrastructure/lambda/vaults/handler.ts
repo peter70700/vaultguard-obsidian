@@ -1,3 +1,5 @@
+import { authorityMutationRequest } from "../shared/authority-request";
+import { authorityCommand, type AuthorityMutationRequest } from "../shared/authority-mutation";
 /**
  * VaultGuard — Vaults Lambda Handler
  *
@@ -32,8 +34,7 @@ import {
   getVaultBySlug,
   getVaultMembership,
   getStoredVaultMembership,
-  listVaultsForUser,
-  listVaultsForOrg,
+  listVisibleVaults,
   listVaultMembers,
   slugifyVaultName,
   isAdmin,
@@ -147,6 +148,7 @@ async function performMemberRoleMutation<T>(
     ...params,
     action: 'permission_changed',
     path: '/**',
+    authorizationGenerations: ['membership', 'permission'],
     verification: { kind: 'permission-state' },
   });
   // A failed SDK response can be ambiguous, so leave the durable intent for
@@ -201,13 +203,13 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         return await handleListMembers(event, user, requestId);
 
       case method === 'POST' && resource === '/vaults/{vaultId}/members':
-        return await handleAddMember(event, user, requestId);
+        return await addVaultMember(authorityMutationRequest(event, true), user, requestId);
 
       case method === 'PATCH' && resource === '/vaults/{vaultId}/members/{userId}':
-        return await handleUpdateMember(event, user, requestId);
+        return await updateVaultMember(authorityMutationRequest(event, true), user, requestId);
 
       case method === 'DELETE' && resource === '/vaults/{vaultId}/members/{userId}':
-        return await handleRemoveMember(event, user, requestId);
+        return await removeVaultMember(authorityMutationRequest(event), user, requestId);
 
       default:
         return formatError(404, `Route not found: ${method} ${resource}`, requestId);
@@ -232,15 +234,11 @@ async function handleListVaults(
   user: UserContext,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  const orgId = requireOrgId(user);
-
-  // Org admins see every vault in the org. Everyone else sees only the
-  // vaults they are a direct member of.
-  const vaults = isAdmin(user)
-    ? await listVaultsForOrg(orgId)
-    : await listVaultsForUser(orgId, user.userId);
-
-  const visible = vaults.filter((v) => !v.archived || isAdmin(user));
+  // Org admins see every vault in the org, archived included. Everyone else
+  // sees only the non-archived vaults they are an active member of. The rule
+  // lives in shared/utils so the remote MCP `list_vaults` tool applies the
+  // identical one.
+  const visible = await listVisibleVaults(user);
 
   return formatSuccess(200, { vaults: visible }, requestId);
 }
@@ -300,7 +298,7 @@ async function handleCreateVault(
     ...(description ? { description } : {}),
   };
 
-  await docClient.send(
+  await authorityCommand(docClient,
     new PutCommand({
       TableName: VAULTS_TABLE,
       Item: vault,
@@ -316,7 +314,7 @@ async function handleCreateVault(
     joinedAt: nowIso,
     invitedBy: user.userId,
   };
-  await docClient.send(
+  await authorityCommand(docClient,
     new PutCommand({
       TableName: VAULT_MEMBERS_TABLE,
       Item: membership,
@@ -452,7 +450,7 @@ async function handleUpdateVault(
     return formatSuccess(200, { vault }, requestId);
   }
 
-  const result = await docClient.send(
+  const result = await authorityCommand(docClient,
     new UpdateCommand({
       TableName: VAULTS_TABLE,
       Key: { orgId: vault.orgId, vaultId: vault.vaultId },
@@ -495,7 +493,7 @@ async function handleArchiveVault(
     return formatError(404, `Vault not found: ${vaultId}`, requestId);
   }
 
-  await docClient.send(
+  await authorityCommand(docClient,
     new UpdateCommand({
       TableName: VAULTS_TABLE,
       Key: { orgId, vaultId },
@@ -546,15 +544,15 @@ async function handleListMembers(
 
 // ─── POST /vaults/{vaultId}/members ──────────────────────────────────────────
 
-async function handleAddMember(
-  event: APIGatewayProxyEvent,
+export async function addVaultMember(
+  request: AuthorityMutationRequest,
   user: UserContext,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  const vaultId = event.pathParameters?.vaultId || '';
+  const vaultId = request.vaultId;
   const vault = await requireVaultMember(user, vaultId, 'admin');
 
-  const body = parseBody(event);
+  const body = request.body;
   validateRequiredFields(body, ['userId']);
 
   const targetUserId = String(body.userId).trim();
@@ -586,6 +584,19 @@ async function handleAddMember(
     return formatError(409, `User ${targetUserId} is already a member of this vault.`, requestId);
   }
 
+  // Guests are viewer-only and their lifecycle is owned by the org admin who
+  // granted the temporary access: one permanent row anywhere flips the org-wide
+  // guest summary to "member", removes the guest badge and stops the sweeper
+  // from ever tearing the identity down. Every other promotion door refuses
+  // that for a guest; this one must too, unless the caller IS an org admin.
+  if (!isAdmin(user) && await holdsActiveGuestAccessElsewhere(targetUserId, vaultId, nowMs)) {
+    return formatError(
+      409,
+      'This user holds temporary guest access; only an organization admin can grant permanent membership.',
+      requestId
+    );
+  }
+
   const membership: VaultMemberRecord = {
     vaultId,
     userId: targetUserId,
@@ -611,16 +622,32 @@ async function handleAddMember(
         };
 
   try {
-    // A whole-item Put, never an in-place edit: replacing the item is what drops
-    // the stale expiry off a reclaimed row. Editing it in place would hand back a
-    // permanent member still carrying an expiry, which every fail-closed layer
-    // would then honour -- silent, invisible access loss.
-    await docClient.send(
-      new PutCommand({
-        TableName: VAULT_MEMBERS_TABLE,
-        Item: membership,
-        ...writeGuard,
-      })
+    await performMemberRoleMutation(
+      { orgId: vault.orgId, vaultId, actorUserId: user.userId },
+      async () => {
+        // A whole-item Put, never an in-place edit: replacing the item is what
+        // drops the stale expiry off a reclaimed row.
+        await authorityCommand(docClient,
+          new PutCommand({
+            TableName: VAULT_MEMBERS_TABLE,
+            Item: membership,
+            ...writeGuard,
+          })
+        );
+
+        // Ordering is load-bearing: stale guest rule first, then the permanent
+        // member baseline. Both land before the generation publication.
+        if (reclaimedExpiredGuest) {
+          await deleteGuestPermissionRule(vaultId, targetUserId);
+        }
+        await upsertDefaultMemberPermission(
+          vault,
+          targetUserId,
+          role,
+          user.userId,
+          membership.joinedAt
+        );
+      },
     );
   } catch (error) {
     if ((error as { name?: string }).name === 'ConditionalCheckFailedException') {
@@ -629,22 +656,6 @@ async function handleAddMember(
     throw error;
   }
 
-  // Ordering is load-bearing: the stale guest rule must go BEFORE the default
-  // rule is written. The two-rule cleanup helper used on removal is deliberately
-  // not reachable from here -- it would also drop the rule the upsert below
-  // creates, leaving a member who can read nothing.
-  if (reclaimedExpiredGuest) {
-    await deleteGuestPermissionRule(vaultId, targetUserId);
-  }
-
-  await upsertDefaultMemberPermission(
-    vault,
-    targetUserId,
-    role,
-    user.userId,
-    membership.joinedAt
-  );
-
   await logAudit({
     userId: user.userId,
     userEmail: user.email,
@@ -652,26 +663,59 @@ async function handleAddMember(
     action: 'vault.member_added',
     resourcePath: `/vaults/${vaultId}/members/${targetUserId}`,
     outcome: 'success',
-    ipAddress: getClientIp(event),
-    userAgent: getUserAgent(event),
+    ipAddress: request.ipAddress,
+    userAgent: request.userAgent,
     metadata: { vaultId, targetUserId, role, reclaimedExpiredGuest },
   });
 
   return formatSuccess(201, { membership }, requestId);
 }
 
+/**
+ * Whether `userId` currently holds an ACTIVE temporary (guest) membership in
+ * any vault other than `excludeVaultId`. Mirrors the per-identity lookup the
+ * users Lambda runs before promoting a guest; the row in the target vault
+ * itself is judged separately by the caller (active guest → 409, elapsed → reclaim).
+ */
+async function holdsActiveGuestAccessElsewhere(
+  userId: string,
+  excludeVaultId: string,
+  nowMs: number
+): Promise<boolean> {
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  do {
+    const result = await authorityCommand(docClient, new QueryCommand({
+      TableName: VAULT_MEMBERS_TABLE,
+      IndexName: 'userId-index',
+      KeyConditionExpression: 'userId = :userId',
+      ExpressionAttributeValues: { ':userId': userId },
+      ExclusiveStartKey: exclusiveStartKey,
+    }));
+    const rows = (result?.Items ?? []) as Array<{ vaultId?: string; accessKind?: string; expiresAt?: string }>;
+    if (rows.some((row) =>
+      row.vaultId !== excludeVaultId &&
+      row.accessKind === 'guest' &&
+      isExpiringAccessActive(row.expiresAt, nowMs)
+    )) {
+      return true;
+    }
+    exclusiveStartKey = result?.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (exclusiveStartKey);
+  return false;
+}
+
 // ─── PATCH /vaults/{vaultId}/members/{userId} ────────────────────────────────
 
-async function handleUpdateMember(
-  event: APIGatewayProxyEvent,
+export async function updateVaultMember(
+  request: AuthorityMutationRequest,
   user: UserContext,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  const vaultId = event.pathParameters?.vaultId || '';
-  const targetUserId = event.pathParameters?.userId || '';
+  const vaultId = request.vaultId;
+  const targetUserId = request.targetId ?? '';
   const vault = await requireVaultMember(user, vaultId, 'admin');
 
-  const body = parseBody(event);
+  const body = request.body;
 
   // DR-6. This route now carries TWO mutually exclusive mutations: the role
   // change it has always done, and pushing a temporary member's boundary out.
@@ -714,27 +758,6 @@ async function handleUpdateMember(
       throw error;
     }
 
-    try {
-      await docClient.send(
-        new UpdateCommand({
-          TableName: VAULT_MEMBERS_TABLE,
-          Key: { vaultId, userId: targetUserId },
-          UpdateExpression: 'SET expiresAt = :expiresAt',
-          // Re-asserted at write time: a row promoted or replaced between the
-          // read above and this update must never be handed an expiry, which
-          // would silently put a permanent member on a countdown.
-          ConditionExpression: '#kind = :guest',
-          ExpressionAttributeNames: { '#kind': 'accessKind' },
-          ExpressionAttributeValues: { ':expiresAt': extendedTo, ':guest': 'guest' },
-        })
-      );
-    } catch (error) {
-      if ((error as { name?: string }).name === 'ConditionalCheckFailedException') {
-        return formatError(409, 'Only temporary access carries an expiry date.', requestId);
-      }
-      throw error;
-    }
-
     // Row and rule must carry the SAME boundary. A rule outliving its row
     // grants nothing extra (every enforcement site reads the row too), but a
     // row outliving its rule is a member who can read nothing. Deliberately
@@ -746,25 +769,50 @@ async function handleUpdateMember(
     // own best-effort schedule, out from under the expiry sweeper.
     let permissionRuleUpdated = false;
     try {
-      await docClient.send(
-        new UpdateCommand({
-          TableName: PERMISSIONS_TABLE,
-          Key: {
-            pk: guestMemberPermissionRuleId(vaultId, targetUserId),
-            sk: DEFAULT_MEMBER_RULE_SK,
-          },
-          UpdateExpression: 'SET expiresAt = :expiresAt, updatedAt = :now',
-          ConditionExpression: 'attribute_exists(pk) AND attribute_exists(sk)',
-          ExpressionAttributeValues: {
-            ':expiresAt': extendedTo,
-            ':now': new Date(nowMs).toISOString(),
-          },
-        })
+      await performMemberRoleMutation(
+        { orgId: vault.orgId, vaultId, actorUserId: user.userId },
+        async () => {
+          await authorityCommand(docClient,
+            new UpdateCommand({
+              TableName: VAULT_MEMBERS_TABLE,
+              Key: { vaultId, userId: targetUserId },
+              UpdateExpression: 'SET expiresAt = :expiresAt',
+              // Re-asserted at write time: a promoted/replaced row must never
+              // be handed an expiry.
+              ConditionExpression: '#kind = :guest',
+              ExpressionAttributeNames: { '#kind': 'accessKind' },
+              ExpressionAttributeValues: { ':expiresAt': extendedTo, ':guest': 'guest' },
+            })
+          );
+
+          try {
+            await authorityCommand(docClient,
+              new UpdateCommand({
+                TableName: PERMISSIONS_TABLE,
+                Key: {
+                  pk: guestMemberPermissionRuleId(vaultId, targetUserId),
+                  sk: DEFAULT_MEMBER_RULE_SK,
+                },
+                UpdateExpression: 'SET expiresAt = :expiresAt, updatedAt = :now',
+                ConditionExpression: 'attribute_exists(pk) AND attribute_exists(sk)',
+                ExpressionAttributeValues: {
+                  ':expiresAt': extendedTo,
+                  ':now': new Date(nowMs).toISOString(),
+                },
+              })
+            );
+            permissionRuleUpdated = true;
+          } catch (error) {
+            if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
+            console.error('[VAULTS_MEMBER_EXTEND_RULE_MISSING]', { vaultId, targetUserId });
+          }
+        },
       );
-      permissionRuleUpdated = true;
     } catch (error) {
-      if ((error as { name?: string }).name !== 'ConditionalCheckFailedException') throw error;
-      console.error('[VAULTS_MEMBER_EXTEND_RULE_MISSING]', { vaultId, targetUserId });
+      if ((error as { name?: string }).name === 'ConditionalCheckFailedException') {
+        return formatError(409, 'Only temporary access carries an expiry date.', requestId);
+      }
+      throw error;
     }
 
     await logAudit({
@@ -774,8 +822,8 @@ async function handleUpdateMember(
       action: 'vault.guest_access_extended',
       resourcePath: `/vaults/${vaultId}/members/${targetUserId}`,
       outcome: 'success',
-      ipAddress: getClientIp(event),
-      userAgent: getUserAgent(event),
+      ipAddress: request.ipAddress,
+      userAgent: request.userAgent,
       metadata: {
         vaultId,
         targetUserId,
@@ -814,7 +862,7 @@ async function handleUpdateMember(
   }
 
   const persistRole = async (): Promise<void> => {
-    await docClient.send(
+    await authorityCommand(docClient,
       new UpdateCommand({
         TableName: VAULT_MEMBERS_TABLE,
         Key: { vaultId, userId: targetUserId },
@@ -863,8 +911,8 @@ async function handleUpdateMember(
     action: 'vault.member_role_changed',
     resourcePath: `/vaults/${vaultId}/members/${targetUserId}`,
     outcome: 'success',
-    ipAddress: getClientIp(event),
-    userAgent: getUserAgent(event),
+    ipAddress: request.ipAddress,
+    userAgent: request.userAgent,
     metadata: { vaultId, targetUserId, oldRole: existing.role, newRole: role, revokedLeases },
   });
 
@@ -873,13 +921,13 @@ async function handleUpdateMember(
 
 // ─── DELETE /vaults/{vaultId}/members/{userId} ───────────────────────────────
 
-async function handleRemoveMember(
-  event: APIGatewayProxyEvent,
+export async function removeVaultMember(
+  request: AuthorityMutationRequest,
   user: UserContext,
   requestId: string
 ): Promise<APIGatewayProxyResult> {
-  const vaultId = event.pathParameters?.vaultId || '';
-  const targetUserId = event.pathParameters?.userId || '';
+  const vaultId = request.vaultId;
+  const targetUserId = request.targetId ?? '';
   const vault = await requireVaultMember(user, vaultId, 'admin');
 
   const existing = await getStoredVaultMembership(vaultId, targetUserId);
@@ -901,14 +949,18 @@ async function handleRemoveMember(
     }
   }
 
-  await docClient.send(
-    new DeleteCommand({
-      TableName: VAULT_MEMBERS_TABLE,
-      Key: { vaultId, userId: targetUserId },
-    })
+  await performMemberRoleMutation(
+    { orgId: vault.orgId, vaultId, actorUserId: user.userId },
+    async () => {
+      await authorityCommand(docClient,
+        new DeleteCommand({
+          TableName: VAULT_MEMBERS_TABLE,
+          Key: { vaultId, userId: targetUserId },
+        })
+      );
+      await deleteMemberPermissions(vaultId, targetUserId, existing.accessKind);
+    },
   );
-
-  await deleteMemberPermissions(vaultId, targetUserId, existing.accessKind);
 
   // Cut the cryptographic-key plane in the same step as the data plane.
   // Without this, the removed user's outstanding leases stay active and they
@@ -928,8 +980,8 @@ async function handleRemoveMember(
     action: 'vault.member_removed',
     resourcePath: `/vaults/${vaultId}/members/${targetUserId}`,
     outcome: 'success',
-    ipAddress: getClientIp(event),
-    userAgent: getUserAgent(event),
+    ipAddress: request.ipAddress,
+    userAgent: request.userAgent,
     metadata: { vaultId, targetUserId, oldRole: existing.role, revokedLeases },
   });
 
@@ -948,7 +1000,7 @@ async function revokeUserVaultLeases(
   orgId: string,
   revokedBy: string
 ): Promise<number> {
-  const result = await docClient.send(
+  const result = await authorityCommand(docClient,
     new QueryCommand({
       TableName: LEASES_TABLE,
       IndexName: 'userId-index',
@@ -968,7 +1020,7 @@ async function revokeUserVaultLeases(
   const now = new Date().toISOString();
 
   for (const lease of activeLeases) {
-    await docClient.send(
+    await authorityCommand(docClient,
       new UpdateCommand({
         TableName: LEASES_TABLE,
         Key: { leaseId: lease.leaseId as string },
@@ -1021,7 +1073,7 @@ async function upsertDefaultMemberPermission(
   nowIso: string
 ): Promise<void> {
   const ruleId = defaultMemberPermissionRuleId(vault.vaultId, userId);
-  await docClient.send(
+  await authorityCommand(docClient,
     new PutCommand({
       TableName: PERMISSIONS_TABLE,
       Item: {
@@ -1195,7 +1247,7 @@ function guestMemberPermissionRuleId(vaultId: string, userId: string): string {
  * `upsertDefaultMemberPermission`, leaving a member who can read nothing.
  */
 async function deleteGuestPermissionRule(vaultId: string, userId: string): Promise<void> {
-  await docClient.send(
+  await authorityCommand(docClient,
     new DeleteCommand({
       TableName: PERMISSIONS_TABLE,
       Key: { pk: guestMemberPermissionRuleId(vaultId, userId), sk: DEFAULT_MEMBER_RULE_SK },
@@ -1212,7 +1264,7 @@ async function deleteMemberPermissions(
   if (accessKind === 'guest') {
     ruleIds.push(guestMemberPermissionRuleId(vaultId, userId));
   }
-  await Promise.all(ruleIds.map((ruleId) => docClient.send(
+  await Promise.all(ruleIds.map((ruleId) => authorityCommand(docClient,
     new DeleteCommand({
       TableName: PERMISSIONS_TABLE,
       Key: { pk: ruleId, sk: DEFAULT_MEMBER_RULE_SK },

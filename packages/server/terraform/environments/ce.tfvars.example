@@ -17,12 +17,31 @@ sender_domain = "example.com"
 cognito_callback_urls = ["http://localhost:5173"]
 cognito_logout_urls   = ["http://localhost:5173"]
 
+# Remote MCP OAuth stays disabled unless an operator explicitly supplies the
+# exact staging resource and provider callbacks. Never guess callback URLs.
+connector_oauth_resource = ""
+connector_oauth_clients  = {}
+
 # Lease + session knobs (defaults are sensible).
 key_lease_duration_seconds = 14400  # 4 hours
 session_duration_seconds   = 28800  # 8 hours
 max_file_size_bytes        = 26214400  # 25 MiB
-vaultguard_edition              = "community"
-vaultguard_allow_public_signup  = false
+
+# Cognito threat protection (compromised-credential and risk detection).
+# "OFF" keeps the user pool on the ESSENTIALS feature plan. "AUDIT"/"ENFORCED"
+# move it to PLUS, which costs more per monthly active user (eu-central-1 tier 1:
+# ESSENTIALS $0.0150/MAU, PLUS $0.0200/MAU).
+#
+# This line MUST stay present. The root default in variables.tf is "AUDIT", so a
+# ce.tfvars that simply omits the setting inherits PLUS and bills you at the
+# higher per-MAU rate without ever saying so. Self-hosters choose their own
+# posture here; the default we ship is the one that does not raise your bill.
+# Set "AUDIT" if you want threat protection and accept the PLUS rate.
+# (VAULTGUARD-44.)
+cognito_advanced_security_mode = "OFF"
+
+vaultguard_edition             = "community"
+vaultguard_allow_public_signup = false
 
 # Community Edition explicitly selects no managed Turnstile secret. This is
 # valid only while managed signup/login verification controls stay disabled.

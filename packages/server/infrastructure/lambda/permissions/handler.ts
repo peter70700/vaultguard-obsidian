@@ -1,3 +1,5 @@
+import { authorityMutationRequest } from "../shared/authority-request";
+import { authorityCommand, type AuthorityMutationRequest } from "../shared/authority-mutation";
 /**
  * VaultGuard — Permissions Management Lambda Handler
  *
@@ -73,6 +75,39 @@ const VALID_ACTIONS: PermissionAction[] = ['read', 'write', 'delete', 'admin', '
 /** Valid permission effects. */
 const VALID_EFFECTS = ['allow', 'deny'] as const;
 
+/** Upper bounds for a permission-rule `pathPattern` accepted by the writers. */
+export const MAX_PATH_PATTERN_LENGTH = 1024;
+export const MAX_PATH_PATTERN_GLOBSTARS = 4;
+
+/**
+ * Validates a permission-rule path pattern before it is stored. Returns a
+ * user-facing reason when the pattern is rejected, or `null` when it is
+ * acceptable. Every writer (create / update / set-level) must run this: the
+ * matcher (`pathMatchesPattern`) compiles patterns into regular expressions on
+ * every evaluation, so an unbounded pattern authored by a delegated
+ * file-admin is a denial-of-service lever against every other member of the
+ * vault (measured: ~4× more work per extra pair of `**`).
+ */
+export function validatePathPattern(pattern: unknown): string | null {
+  if (typeof pattern !== 'string') return 'pathPattern must be a string';
+  if (!pattern.startsWith('/')) return 'pathPattern must start with /';
+  if (pattern.length > MAX_PATH_PATTERN_LENGTH) {
+    return `pathPattern must be at most ${MAX_PATH_PATTERN_LENGTH} characters`;
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(pattern)) return 'pathPattern must not contain control characters';
+  if (pattern.includes('\\')) return 'pathPattern must use forward slashes';
+  const segments = pattern.split('/');
+  if (segments.some((segment) => segment === '.' || segment === '..')) {
+    return 'pathPattern must not contain . or .. segments';
+  }
+  const globstars = (pattern.match(/\*\*/g) ?? []).length;
+  if (globstars > MAX_PATH_PATTERN_GLOBSTARS) {
+    return `pathPattern must contain at most ${MAX_PATH_PATTERN_GLOBSTARS} ** wildcards`;
+  }
+  return null;
+}
+
 /** Permission rules may be long-lived, but accidental century-scale values are rejected. */
 const MAX_PERMISSION_EXPIRY_YEARS = 10;
 
@@ -100,6 +135,7 @@ async function performPermissionMutation<T>(
   const intent: VaultMutationIntent = await beginVaultMutationIntent({
     ...params,
     action: 'permission_changed',
+    authorizationGenerations: ['permission'],
     verification: { kind: 'permission-state' },
   });
 
@@ -194,7 +230,7 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         assertVaultWritable(vault);
         const probe = parseBody(event);
         if (typeof probe.level === 'string') {
-          return await handleSetLevel(event, user, vault, requestId, probe);
+          return await setVaultPathLevel(authorityMutationRequest(event, true), user, vault, requestId, probe);
         }
         return await handleCreatePermission(event, user, vault, requestId);
       }
@@ -323,7 +359,7 @@ async function handleListPermissions(
   const collected: PermissionRule[] = [];
   let exclusiveStartKey: Record<string, unknown> | undefined;
   do {
-    const page = await docClient.send(
+    const page = await authorityCommand(docClient,
       new ScanCommand({ ...scanParams, ExclusiveStartKey: exclusiveStartKey } as any)
     );
     collected.push(...((page.Items || []) as PermissionRule[]));
@@ -511,8 +547,9 @@ async function handleCreatePermission(
   }
 
   // Validate path pattern
-  if (typeof pathPattern !== 'string' || !pathPattern.startsWith('/')) {
-    return formatError(400, 'pathPattern must start with /', requestId);
+  const patternError = validatePathPattern(pathPattern);
+  if (patternError) {
+    return formatError(400, patternError, requestId);
   }
   if (requestedPriority === null) {
     return formatError(400, 'priority must be a non-negative whole number', requestId);
@@ -578,7 +615,7 @@ async function handleCreatePermission(
           path: pathPattern,
           actorUserId: user.userId,
         },
-        () => docClient.send(
+        () => authorityCommand(docClient,
           new UpdateCommand({
             TableName: PERMISSIONS_TABLE,
             Key: { pk: duplicate.id, sk: RULE_SK },
@@ -684,7 +721,7 @@ async function handleCreatePermission(
       path: pathPattern,
       actorUserId: user.userId,
     },
-    () => docClient.send(
+    () => authorityCommand(docClient,
       new PutCommand({
         TableName: PERMISSIONS_TABLE,
         Item: item,
@@ -757,7 +794,7 @@ async function handleUpdatePermission(
   }
 
   // Fetch existing rule
-  const existingResult = await docClient.send(
+  const existingResult = await authorityCommand(docClient,
     new QueryCommand({
       TableName: PERMISSIONS_TABLE,
       KeyConditionExpression: 'pk = :pk AND sk = :sk',
@@ -774,16 +811,22 @@ async function handleUpdatePermission(
   const updates: Record<string, unknown> = {};
 
   // Validate and apply updates
+  // Same shape validation as create: a malformed update must be a 400, never a
+  // TypeError-turned-500, and must never store a value the matcher or the
+  // priority ordering cannot interpret.
   if (body.pathPattern !== undefined) {
-    const pathPattern = body.pathPattern as string;
-    if (!pathPattern.startsWith('/')) {
-      return formatError(400, 'pathPattern must start with /', requestId);
+    const patternError = validatePathPattern(body.pathPattern);
+    if (patternError) {
+      return formatError(400, patternError, requestId);
     }
-    updates.pathPattern = pathPattern;
+    updates.pathPattern = body.pathPattern;
   }
 
   if (body.actions !== undefined) {
-    const actions = body.actions as string[];
+    const actions = body.actions;
+    if (!Array.isArray(actions) || actions.length === 0 || actions.some((action) => typeof action !== 'string')) {
+      return formatError(400, 'actions must be a non-empty array of permission action strings', requestId);
+    }
     for (const action of actions) {
       if (!VALID_ACTIONS.includes(action as PermissionAction)) {
         return formatError(400, `Invalid action: '${action}'`, requestId);
@@ -799,7 +842,13 @@ async function handleUpdatePermission(
     updates.effect = body.effect;
   }
 
-  if (body.priority !== undefined) updates.priority = body.priority;
+  if (body.priority !== undefined) {
+    const priority = parseOptionalPriority(body.priority);
+    if (priority === null) {
+      return formatError(400, 'priority must be a non-negative whole number', requestId);
+    }
+    if (priority !== undefined) updates.priority = priority;
+  }
   if (body.userId !== undefined) {
     const canonicalUserId = await canonicalizeRuleUserId(body.userId as string, vault.orgId);
     if (!canonicalUserId) {
@@ -913,7 +962,7 @@ async function handleUpdatePermission(
       path: affectedPath,
       actorUserId: user.userId,
     },
-    () => docClient.send(
+    () => authorityCommand(docClient,
       new UpdateCommand({
         TableName: PERMISSIONS_TABLE,
         Key: { pk: ruleId, sk: RULE_SK },
@@ -1016,7 +1065,7 @@ async function handleDeletePermission(
   }
 
   // Verify rule exists
-  const existingResult = await docClient.send(
+  const existingResult = await authorityCommand(docClient,
     new QueryCommand({
       TableName: PERMISSIONS_TABLE,
       KeyConditionExpression: 'pk = :pk AND sk = :sk',
@@ -1057,7 +1106,7 @@ async function handleDeletePermission(
       path: existingRule.pathPattern,
       actorUserId: user.userId,
     },
-    () => docClient.send(
+    () => authorityCommand(docClient,
       new DeleteCommand({
         TableName: PERMISSIONS_TABLE,
         Key: { pk: ruleId, sk: RULE_SK },
@@ -1416,14 +1465,14 @@ async function handleBatchPathAccess(
 // The legacy POST/PUT /permissions endpoints remain for raw rule edits
 // (the advanced rule editor) and for API consumers that want exact
 // control over actions/effect; they are NOT removed.
-async function handleSetLevel(
-  event: APIGatewayProxyEvent,
+export async function setVaultPathLevel(
+  request: AuthorityMutationRequest,
   user: UserContext,
   vault: VaultRecord,
   requestId: string,
   preParsedBody?: Record<string, unknown>
 ): Promise<APIGatewayProxyResult> {
-  const body = preParsedBody ?? parseBody(event);
+  const body = preParsedBody ?? request.body;
   validateRequiredFields(body, ['pathPattern', 'level']);
 
   let userId = (body.userId as string) || '*';
@@ -1431,8 +1480,9 @@ async function handleSetLevel(
   const pathPattern = body.pathPattern as string;
   const level = body.level as PathAccessLevel;
 
-  if (!pathPattern.startsWith('/')) {
-    return formatError(400, 'pathPattern must start with /', requestId);
+  const patternError = validatePathPattern(pathPattern);
+  if (patternError) {
+    return formatError(400, patternError, requestId);
   }
   if (!['none', 'read', 'write', 'admin'].includes(level)) {
     return formatError(400, `Invalid level: '${level}'`, requestId);
@@ -1532,7 +1582,7 @@ async function handleSetLevel(
       });
       await performPermissionMutation(
         { orgId: vault.orgId, vaultId: vault.vaultId, path: pathPattern, actorUserId: user.userId },
-        () => docClient.send(
+        () => authorityCommand(docClient,
           new UpdateCommand({
             TableName: PERMISSIONS_TABLE,
             Key: { pk: existing.id, sk: RULE_SK },
@@ -1564,7 +1614,7 @@ async function handleSetLevel(
       if (item.role === null) delete item.role;
       await performPermissionMutation(
         { orgId: vault.orgId, vaultId: vault.vaultId, path: pathPattern, actorUserId: user.userId },
-        () => docClient.send(
+        () => authorityCommand(docClient,
           new PutCommand({
             TableName: PERMISSIONS_TABLE,
             Item: item,
@@ -1591,8 +1641,8 @@ async function handleSetLevel(
       action: 'permissions.set-level',
       resourcePath: `/vaults/${vault.vaultId}/permissions/set-level`,
       outcome: 'success',
-      ipAddress: getClientIp(event),
-      userAgent: getUserAgent(event),
+      ipAddress: request.ipAddress,
+      userAgent: request.userAgent,
       metadata: {
         decision,
         ruleId: resultRule.id,
@@ -1656,8 +1706,8 @@ async function handleSetLevel(
         action: 'permissions.set-level',
         resourcePath: `/vaults/${vault.vaultId}/permissions/set-level`,
         outcome: 'success',
-        ipAddress: getClientIp(event),
-        userAgent: getUserAgent(event),
+        ipAddress: request.ipAddress,
+        userAgent: request.userAgent,
         metadata: {
           decision: 'noop',
           pathPattern,
@@ -1702,7 +1752,7 @@ async function handleSetLevel(
         path: existing.pathPattern,
         actorUserId: user.userId,
       },
-      () => docClient.send(
+      () => authorityCommand(docClient,
         new DeleteCommand({
           TableName: PERMISSIONS_TABLE,
           Key: { pk: existing.id, sk: RULE_SK },
@@ -1725,8 +1775,8 @@ async function handleSetLevel(
       action: 'permissions.set-level',
       resourcePath: `/vaults/${vault.vaultId}/permissions/set-level`,
       outcome: 'success',
-      ipAddress: getClientIp(event),
-      userAgent: getUserAgent(event),
+      ipAddress: request.ipAddress,
+      userAgent: request.userAgent,
       metadata: {
         decision: 'delete',
         deletedRuleId: existing.id,
@@ -1791,7 +1841,7 @@ async function handleSetLevel(
     });
     await performPermissionMutation(
       { orgId: vault.orgId, vaultId: vault.vaultId, path: pathPattern, actorUserId: user.userId },
-      () => docClient.send(
+      () => authorityCommand(docClient,
         new UpdateCommand({
           TableName: PERMISSIONS_TABLE,
           Key: { pk: existing.id, sk: RULE_SK },
@@ -1823,7 +1873,7 @@ async function handleSetLevel(
     if (item.role === null) delete item.role;
     await performPermissionMutation(
       { orgId: vault.orgId, vaultId: vault.vaultId, path: pathPattern, actorUserId: user.userId },
-      () => docClient.send(
+      () => authorityCommand(docClient,
         new PutCommand({
           TableName: PERMISSIONS_TABLE,
           Item: item,
@@ -1850,8 +1900,8 @@ async function handleSetLevel(
     action: 'permissions.set-level',
     resourcePath: `/vaults/${vault.vaultId}/permissions/set-level`,
     outcome: 'success',
-    ipAddress: getClientIp(event),
-    userAgent: getUserAgent(event),
+    ipAddress: request.ipAddress,
+    userAgent: request.userAgent,
     metadata: {
       decision,
       ruleId: resultRule.id,
@@ -2538,7 +2588,7 @@ async function revokeOverlappingLeases(
       pathMatchesPattern(leaseScope, pathPattern);
 
     if (scopeOverlaps) {
-      await docClient.send(
+      await authorityCommand(docClient,
         new UpdateCommand({
           TableName: LEASES_TABLE,
           Key: { leaseId: lease.leaseId as string },
@@ -2570,7 +2620,7 @@ async function queryActiveLeasesForUser(
   orgId: string,
   vaultId: string
 ): Promise<Record<string, unknown>[]> {
-  const result = await docClient.send(
+  const result = await authorityCommand(docClient,
     new QueryCommand({
       TableName: LEASES_TABLE,
       IndexName: 'userId-index',
@@ -2596,7 +2646,7 @@ async function scanActiveLeasesForVault(
   let ExclusiveStartKey: Record<string, unknown> | undefined;
 
   do {
-    const result = await docClient.send(
+    const result = await authorityCommand(docClient,
       new ScanCommand({
         TableName: LEASES_TABLE,
         FilterExpression: '#s = :active AND orgId = :orgId AND (attribute_not_exists(vaultId) OR vaultId = :vaultId)',

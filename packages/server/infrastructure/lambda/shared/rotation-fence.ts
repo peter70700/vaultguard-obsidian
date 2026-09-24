@@ -1,5 +1,8 @@
 import { randomUUID } from 'crypto';
-import { UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { TransactWriteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { rotationControlPk, ROTATION_CONTROL_SK } from './rotation-fence-keys';
+import { DynamoWorkspaceCohortControl } from './workspace-cohort-control';
+import { WorkspaceRoutingError } from './workspace-routing';
 
 import {
   AuthError,
@@ -13,31 +16,41 @@ import {
 // the files and re-encryption handlers without adding a second data owner.
 const USER_KEYS_TABLE = process.env.USER_KEYS_TABLE || 'UserKeysTable';
 
-export const ROTATION_CONTROL_SK = 'ROTATION_CONTROL';
+export { rotationControlPk, ROTATION_CONTROL_SK } from './rotation-fence-keys';
 export const DEFAULT_FENCE_LEASE_MS = 20 * 60 * 1000;
 
-function encodedScope(scope: string): string {
-  return Buffer.from(scope, 'utf8')
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
+function cohortControl() {
+  const tableName = process.env.WORKSPACE_COHORT_CONTROL_TABLE;
+  return tableName ? new DynamoWorkspaceCohortControl({ tableName, writerTableName: USER_KEYS_TABLE, send: command => docClient.send(command as Parameters<typeof docClient.send>[0]) }) : null;
 }
 
-export function rotationControlPk(orgId: string, vaultId: string, scope = '/**'): string {
-  if (!orgId || !vaultId || !scope) {
-    throw new Error('Rotation fence requires orgId, vaultId, and scope');
+async function publishPermit(command: UpdateCommand, scope: { orgId: string; vaultId: string }, enforceCohortAdmission = true, contract?: 'path' | 'workspace-revision') {
+  const control = cohortControl();
+  if (!control || !enforceCohortAdmission) return docClient.send(command);
+  const condition = await control.writerCondition(scope, contract);
+  return docClient.send(new TransactWriteCommand({ TransactItems: [
+    { ConditionCheck: condition },
+    { Update: { ...command.input, UpdateExpression: command.input.UpdateExpression! } },
+  ] }));
+}
+
+function controlledScope(requested: string | undefined): string {
+  // Cohort transitions cover the entire vault. Every participating rotation,
+  // including a path-scoped job, must contend on that same physical fence.
+  return process.env.WORKSPACE_COHORT_CONTROL_TABLE ? '/**' : (requested ?? '/**');
+}
+
+function validateControlledLease(now: number, expiry: number) {
+  if (process.env.WORKSPACE_COHORT_CONTROL_TABLE && (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(expiry) || expiry <= now || expiry - now > DEFAULT_FENCE_LEASE_MS)) {
+    throw new WorkspaceRoutingError('COHORT_FENCE_REQUIRED');
   }
-  return `ORG#${orgId}#VAULT#${vaultId}#SCOPE#${encodedScope(scope)}`;
 }
 
 function isConditionalConflict(error: unknown): boolean {
-  return Boolean(
-    error &&
-      typeof error === 'object' &&
-      'name' in error &&
-      (error as { name?: unknown }).name === 'ConditionalCheckFailedException',
-  );
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { name?: unknown; CancellationReasons?: { Code?: unknown }[] };
+  return candidate.name === 'ConditionalCheckFailedException' ||
+    (candidate.name === 'TransactionCanceledException' && candidate.CancellationReasons?.some(reason => reason.Code === 'ConditionalCheckFailed') === true);
 }
 
 export interface RotationLease {
@@ -61,19 +74,33 @@ export interface VaultMutationPermit {
  * condition and owner publication are one DynamoDB update, so a normal write
  * can never pass the writer condition after this returns.
  */
-export async function acquireRotationLease(options: {
+interface RotationLeaseOptions {
   orgId: string;
   vaultId: string;
   scope?: string;
   jobId: string;
   nowMs?: number;
   leaseMs?: number;
-}): Promise<RotationLease> {
-  const scope = options.scope ?? '/**';
+}
+
+export async function acquireRotationLease(options: RotationLeaseOptions): Promise<RotationLease> {
+  return acquireRotationLeaseWithAdmission(options, true);
+}
+
+/** Operator-only acquisition for a conditional cohort transition. This permits
+ * acquiring the existing exclusive fence while cohort writes are paused. */
+export async function acquireWorkspaceCohortFence(options: RotationLeaseOptions): Promise<RotationLease> {
+  if (!process.env.WORKSPACE_COHORT_CONTROL_TABLE) throw new WorkspaceRoutingError('COHORT_FENCE_REQUIRED');
+  return acquireRotationLeaseWithAdmission({ ...options, scope: '/**' }, false);
+}
+
+async function acquireRotationLeaseWithAdmission(options: RotationLeaseOptions, enforceCohortAdmission: boolean): Promise<RotationLease> {
+  const scope = controlledScope(options.scope);
   const now = options.nowMs ?? Date.now();
   const expiresAt = now + (options.leaseMs ?? DEFAULT_FENCE_LEASE_MS);
+  validateControlledLease(now, expiresAt);
   try {
-    await docClient.send(
+    await publishPermit(
       new UpdateCommand({
         TableName: USER_KEYS_TABLE,
         Key: { pk: rotationControlPk(options.orgId, options.vaultId, scope), sk: ROTATION_CONTROL_SK },
@@ -94,7 +121,7 @@ export async function acquireRotationLease(options: {
           ':now': now,
           ':updatedAt': new Date(now).toISOString(),
         },
-      }),
+      }), options, enforceCohortAdmission,
     );
   } catch (error) {
     if (isConditionalConflict(error)) {
@@ -116,12 +143,13 @@ export async function acquireRotationLease(options: {
 }
 
 export async function releaseRotationLease(lease: RotationLease, nowMs = Date.now()): Promise<void> {
+  const controlled = !!process.env.WORKSPACE_COHORT_CONTROL_TABLE;
   await docClient.send(
     new UpdateCommand({
       TableName: USER_KEYS_TABLE,
       Key: { pk: rotationControlPk(lease.orgId, lease.vaultId, lease.scope), sk: ROTATION_CONTROL_SK },
       UpdateExpression: 'SET #updatedAt = :updatedAt REMOVE #rotationOwner, #rotationExpiresAt',
-      ConditionExpression: '#rotationOwner = :owner',
+      ConditionExpression: '#rotationOwner = :owner' + (controlled ? ' AND #rotationExpiresAt = :expectedExpiry' : ''),
       ExpressionAttributeNames: {
         '#rotationOwner': 'rotationOwner',
         '#rotationExpiresAt': 'rotationExpiresAt',
@@ -130,6 +158,7 @@ export async function releaseRotationLease(lease: RotationLease, nowMs = Date.no
       ExpressionAttributeValues: {
         ':owner': lease.jobId,
         ':updatedAt': new Date(nowMs).toISOString(),
+        ...(controlled ? { ':expectedExpiry': lease.expiresAt } : {}),
       },
     }),
   );
@@ -141,6 +170,8 @@ export async function releaseRotationLease(lease: RotationLease, nowMs = Date.no
  * no crash-prone counters. Expired owners recover automatically.
  */
 export async function acquireVaultMutationPermit(options: {
+  /** Trusted server composition only. Request bodies never select this admission. */
+  contract?: 'workspace-revision';
   orgId: string;
   vaultId: string;
   scope?: string;
@@ -148,12 +179,13 @@ export async function acquireVaultMutationPermit(options: {
   nowMs?: number;
   leaseMs?: number;
 }): Promise<VaultMutationPermit> {
-  const scope = options.scope ?? '/**';
+  const scope = controlledScope(options.scope);
   const owner = options.owner ?? randomUUID();
   const now = options.nowMs ?? Date.now();
   const expiresAt = now + (options.leaseMs ?? DEFAULT_FENCE_LEASE_MS);
+  validateControlledLease(now, expiresAt);
   try {
-    await docClient.send(
+    await publishPermit(
       new UpdateCommand({
         TableName: USER_KEYS_TABLE,
         Key: { pk: rotationControlPk(options.orgId, options.vaultId, scope), sk: ROTATION_CONTROL_SK },
@@ -174,7 +206,7 @@ export async function acquireVaultMutationPermit(options: {
           ':now': now,
           ':updatedAt': new Date(now).toISOString(),
         },
-      }),
+      }), options, true, options.contract ?? 'path',
     );
   } catch (error) {
     if (isConditionalConflict(error)) {
@@ -193,12 +225,13 @@ export async function releaseVaultMutationPermit(
   permit: VaultMutationPermit,
   nowMs = Date.now(),
 ): Promise<void> {
+  const controlled = !!process.env.WORKSPACE_COHORT_CONTROL_TABLE;
   await docClient.send(
     new UpdateCommand({
       TableName: USER_KEYS_TABLE,
       Key: { pk: rotationControlPk(permit.orgId, permit.vaultId, permit.scope), sk: ROTATION_CONTROL_SK },
       UpdateExpression: 'SET #updatedAt = :updatedAt REMOVE #writerOwner, #writerExpiresAt',
-      ConditionExpression: '#writerOwner = :owner',
+      ConditionExpression: '#writerOwner = :owner' + (controlled ? ' AND #writerExpiresAt = :expectedExpiry' : ''),
       ExpressionAttributeNames: {
         '#writerOwner': 'writerOwner',
         '#writerExpiresAt': 'writerExpiresAt',
@@ -207,6 +240,7 @@ export async function releaseVaultMutationPermit(
       ExpressionAttributeValues: {
         ':owner': permit.owner,
         ':updatedAt': new Date(nowMs).toISOString(),
+        ...(controlled ? { ':expectedExpiry': permit.expiresAt } : {}),
       },
     }),
   );

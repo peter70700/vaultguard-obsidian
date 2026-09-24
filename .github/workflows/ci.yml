@@ -145,6 +145,50 @@ jobs:
         working-directory: ${{ steps.tfroot.outputs.dir }}
         run: terraform validate
 
+  use-case-source-coverage:
+    # P6-005: intentionally no paths filter. A source owner, test, specification,
+    # contract, tool registry or provider profile change must regenerate the map.
+    # Source mapping never proves deployment or human/provider acceptance.
+    if: github.repository == 'peter70700/vaultguard-obsidian-plugin'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install source checker dependencies
+        id: install
+        run: |
+          npm ci --no-audit --no-fund
+          npm --prefix infrastructure ci --no-audit --no-fund
+
+      - name: Build local contract libraries for registry parity fixtures
+        run: |
+          npm run contracts:build
+          npm run knowledge:build
+
+      - name: Exercise source mapping and mutation fixtures
+        run: npx vitest run tests/use-case-coverage.test.ts tests/use-case-source-coverage.test.ts
+
+      - name: Enforce complete source coverage and generate traceability
+        if: always() && steps.install.outcome == 'success'
+        run: npm run check:use-case-source-coverage -- --artifact-dir "${RUNNER_TEMP}/use-case-traceability"
+
+      - name: Retain traceability including unresolved gaps
+        if: always() && steps.install.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spec-021-use-case-traceability-${{ github.sha }}
+          path: ${{ runner.temp }}/use-case-traceability/
+          if-no-files-found: error
+          retention-days: 14
+
   private-build-test-lint:
     # The private source repo has a flat root plus nested infrastructure and
     # admin-panel packages. Keep its authoritative verifier here instead of in
@@ -160,7 +204,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22
+          node-version-file: infrastructure/.nvmrc
           cache: npm
           cache-dependency-path: |
             package-lock.json
@@ -174,6 +218,22 @@ jobs:
 
       - name: Install nested test dependencies
         run: npm run setup:test-deps
+
+      - name: Check Spec 021 use-case traceability
+        run: npm run check:use-case-coverage
+
+      # P2-001. Fails if a fixture's bytes, digest, encoding, or anchor offsets
+      # drift from the manifest, or if a vocabulary feature loses its last
+      # anchor. Named separately from `npm run verify` so a corpus regression is
+      # obvious in the job list instead of buried in a test summary.
+      - name: Check Obsidian fidelity corpus
+        run: npm run check:fidelity-corpus
+
+      # P2-002. Fails if a Markdown or Canvas snapshot stops projecting an
+      # anchored feature, starts projecting one of the deliberately negative
+      # ones, or can no longer re-slice a fixture to identical bytes.
+      - name: Check Obsidian parser fidelity
+        run: npm run check:parser-fidelity
 
       - name: Verify private repo
         run: npm run verify
@@ -208,7 +268,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22
+          node-version-file: packages/server/infrastructure/.nvmrc
           cache: npm
 
       - name: Install workspace dependencies

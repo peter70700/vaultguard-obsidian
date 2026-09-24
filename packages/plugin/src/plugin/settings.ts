@@ -1538,15 +1538,16 @@ export class VaultGuardSettingTab extends PluginSettingTab {
 
   private renderPurgeExcludedPathsSetting(containerEl: HTMLElement, localMode: boolean): void {
     new Setting(containerEl)
-      .setName("Purge excluded paths from server")
+      .setName("Remove excluded paths from server (recoverable)")
       .setDesc(
-        "Delete every server-side copy of files that match the excluded paths above. " +
+        "Remove the current server-visible copies of files that match the excluded paths above. " +
         "Useful after adding a new exclusion: without this, other members on other " +
-        "devices keep pulling the file down. This affects the shared server vault."
+        "devices keep pulling the file down. The server keeps retained prior versions, so this " +
+        "is recoverable and is not permanent erasure. This affects the shared server vault."
       )
       .addButton((button) => {
         button
-          .setButtonText("Purge from server")
+          .setButtonText("Remove from server")
           .setWarning()
           .setDisabled(localMode)
           .onClick(async () => {
@@ -1557,30 +1558,31 @@ export class VaultGuardSettingTab extends PluginSettingTab {
             }
             const confirmed = await this.showDestructiveConfirmation(
               containerEl,
-              "PURGE FROM SERVER",
-              "Delete every matching file from the shared server vault? " +
-                "Other members will lose these files on their next sync. " +
+              "REMOVE FROM SERVER",
+              "Remove every matching file from the shared server vault? " +
+                "This creates recoverable delete markers; it does not permanently erase retained versions. " +
+                "Other members' active copies will be removed on their next sync. " +
                 "Local copies on this device are kept.\n\n" +
                 `Patterns:\n${patterns.join("\n")}\n\n` +
-                "Type PURGE FROM SERVER to confirm."
+                "Type REMOVE FROM SERVER to confirm."
             );
             if (!confirmed) return;
             try {
               button.setDisabled(true);
-              button.setButtonText("Purging…");
+              button.setButtonText("Removing…");
               const result = await this.plugin.purgeExcludedFromServer();
-              const summary = `Matched ${result.matched}, deleted ${result.deleted}` +
+              const summary = `Matched ${result.matched}, removed ${result.deleted}` +
                 (result.failed > 0 ? `, ${result.failed} failed` : "");
               this.showStatus(containerEl, summary, result.failed > 0);
             } catch (err) {
               this.showStatus(
                 containerEl,
-                err instanceof Error ? err.message : "Purge failed.",
+                err instanceof Error ? err.message : "Removal failed.",
                 true
               );
             } finally {
               button.setDisabled(false);
-              button.setButtonText("Purge from server");
+              button.setButtonText("Remove from server");
             }
           });
       });

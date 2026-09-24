@@ -1,3 +1,4 @@
+import { selectLegacySync } from "./helpers/legacy-sync-fixture";
 /**
  * File Protection test suite — vault adapter interception layer
  *
@@ -233,6 +234,7 @@ function createTestPlugin() {
     status: 'idle', bytesUploaded: 0, bytesDownloaded: 0, lastError: null,
   };
 
+  selectLegacySync(plugin);
   return plugin;
 }
 

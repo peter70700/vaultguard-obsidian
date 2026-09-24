@@ -96,20 +96,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "vault" {
     }
   }
 
-  rule {
-    id     = "cleanup-noncurrent-versions"
-    status = "Enabled"
-    filter {}
-
-    noncurrent_version_expiration {
-      noncurrent_days = var.production_hardening ? 365 : 30
-      # Keep a deep rollback window in hardened stacks. Ten overwrites is easy
-      # for a runaway sync loop (or an attacker with write access) to exhaust
-      # before an operator can respond; 100 preserves bounded lifecycle cost
-      # while making version history a meaningful recovery control.
-      newer_noncurrent_versions = var.production_hardening ? 100 : 3
-    }
-  }
+  # Exact immutable revisions and encrypted workspace artifacts retain their
+  # referenced S3 VersionIds indefinitely. Never expire all noncurrent objects by
+  # age/count: only an explicit reference/hold/recovery-aware owner may reclaim.
+  # Direct-transfer staging below is isolated and never an immutable version target.
 
   rule {
     id     = "abort-incomplete-uploads"

@@ -787,3 +787,7 @@ documentation pass.
   org-recoverable protection of *cloud-side* content, use the hybrid
   ZK / org recovery flow at the cloud layer; that's a different
   problem with a different solution.
+
+## Revision replica recovery journal
+
+**Implemented (source; verification deferred):** the optional revision replica extends the existing encrypted remote-file-state envelope with account/vault-bound exact bases, native byte images and pending transfer/proposal references. Normal saves still use approved plaintext helpers; local agent origin survives reconnect without storing lease secrets or remote OAuth tokens. See the [dated source handoff](../reports/p6-002-obsidian-revision-replica-2026-09-20.md) for limits, reviewed publication and the full final-check registry.

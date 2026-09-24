@@ -198,3 +198,239 @@ resource "aws_api_gateway_integration_response" "cors_options" {
     "method.response.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
   }
 }
+
+# The OAuth protected-resource document is a counted, disabled-by-default
+# resource and cannot live in the static for_each map above. Keep its browser
+# preflight explicit so source-derived route inventory still fails closed.
+resource "aws_api_gateway_method" "oauth_protected_resource_options" {
+  count = var.connector_oauth_resource == "" ? 0 : 1
+
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.oauth_protected_resource[0].id
+  http_method   = "OPTIONS"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "oauth_protected_resource_options" {
+  count = var.connector_oauth_resource == "" ? 0 : 1
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = aws_api_gateway_resource.oauth_protected_resource[0].id
+  http_method = aws_api_gateway_method.oauth_protected_resource_options[0].http_method
+  type        = "MOCK"
+
+  request_templates = { "application/json" = "{\"statusCode\": 200}" }
+}
+
+resource "aws_api_gateway_method_response" "oauth_protected_resource_options" {
+  count = var.connector_oauth_resource == "" ? 0 : 1
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = aws_api_gateway_resource.oauth_protected_resource[0].id
+  http_method = aws_api_gateway_method.oauth_protected_resource_options[0].http_method
+  status_code = "200"
+
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = true
+    "method.response.header.Access-Control-Allow-Methods" = true
+    "method.response.header.Access-Control-Allow-Origin"  = true
+  }
+}
+
+resource "aws_api_gateway_integration_response" "oauth_protected_resource_options" {
+  count = var.connector_oauth_resource == "" ? 0 : 1
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = aws_api_gateway_resource.oauth_protected_resource[0].id
+  http_method = aws_api_gateway_method.oauth_protected_resource_options[0].http_method
+  status_code = aws_api_gateway_method_response.oauth_protected_resource_options[0].status_code
+
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization'"
+    "method.response.header.Access-Control-Allow-Methods" = "'GET,OPTIONS'"
+    "method.response.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
+  }
+}
+
+# VaultGuard's own connector authorization server (VAULTGUARD-49 / ADR-003).
+# Counted, disabled-by-default resources cannot live in the static for_each map
+# above, so their browser preflight stays explicit — same reason and same shape
+# as the protected-resource document. The repo's standing CORS rule is that
+# every API Gateway resource a browser touches carries an OPTIONS method; this
+# lane's authorize/callback/consent legs are browser-driven.
+locals {
+  # /oauth/{action} includes POST/GET reauthorize; no separate unprotected path.
+  connector_oauth_cors_resources = var.connector_oauth_resource == "" ? {} : {
+    authorization_server = aws_api_gateway_resource.oauth_authorization_server[0].id
+    action               = aws_api_gateway_resource.oauth_action[0].id
+  }
+}
+
+resource "aws_api_gateway_method" "connector_oauth_options" {
+  for_each = local.connector_oauth_cors_resources
+
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = each.value
+  http_method   = "OPTIONS"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "connector_oauth_options" {
+  for_each = local.connector_oauth_cors_resources
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = each.value
+  http_method = aws_api_gateway_method.connector_oauth_options[each.key].http_method
+  type        = "MOCK"
+
+  request_templates = { "application/json" = "{\"statusCode\": 200}" }
+}
+
+resource "aws_api_gateway_method_response" "connector_oauth_options" {
+  for_each = local.connector_oauth_cors_resources
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = each.value
+  http_method = aws_api_gateway_method.connector_oauth_options[each.key].http_method
+  status_code = "200"
+
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = true
+    "method.response.header.Access-Control-Allow-Methods" = true
+    "method.response.header.Access-Control-Allow-Origin"  = true
+  }
+}
+
+resource "aws_api_gateway_integration_response" "connector_oauth_options" {
+  for_each = local.connector_oauth_cors_resources
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = each.value
+  http_method = aws_api_gateway_method.connector_oauth_options[each.key].http_method
+  status_code = aws_api_gateway_method_response.connector_oauth_options[each.key].status_code
+
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization'"
+    "method.response.header.Access-Control-Allow-Methods" = "'GET,POST,OPTIONS'"
+    "method.response.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
+  }
+}
+
+
+# MCP read transport: explicit counted preflight, registered here with every
+# other browser-facing resource. Credentials are checked by the Lambda.
+resource "aws_api_gateway_method" "mcp_read_options" {
+  count         = var.mcp_read_enabled ? 1 : 0
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = aws_api_gateway_resource.mcp_read[0].id
+  http_method   = "OPTIONS"
+  authorization = "NONE"
+}
+resource "aws_api_gateway_integration" "mcp_read_options" {
+  count             = var.mcp_read_enabled ? 1 : 0
+  rest_api_id       = aws_api_gateway_rest_api.vaultguard.id
+  resource_id       = aws_api_gateway_resource.mcp_read[0].id
+  http_method       = aws_api_gateway_method.mcp_read_options[0].http_method
+  type              = "MOCK"
+  request_templates = { "application/json" = jsonencode({ statusCode = 200 }) }
+}
+resource "aws_api_gateway_method_response" "mcp_read_options" {
+  count       = var.mcp_read_enabled ? 1 : 0
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = aws_api_gateway_resource.mcp_read[0].id
+  http_method = aws_api_gateway_method.mcp_read_options[0].http_method
+  status_code = "200"
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers"  = true
+    "method.response.header.Access-Control-Allow-Methods"  = true
+    "method.response.header.Access-Control-Allow-Origin"   = true
+    "method.response.header.Access-Control-Expose-Headers" = true
+    "method.response.header.Cache-Control"                 = true
+  }
+}
+resource "aws_api_gateway_integration_response" "mcp_read_options" {
+  count       = var.mcp_read_enabled ? 1 : 0
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = aws_api_gateway_resource.mcp_read[0].id
+  http_method = aws_api_gateway_method.mcp_read_options[0].http_method
+  status_code = aws_api_gateway_method_response.mcp_read_options[0].status_code
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers"  = "'Content-Type,Authorization,MCP-Protocol-Version,Mcp-Session-Id,Last-Event-ID'"
+    "method.response.header.Access-Control-Allow-Methods"  = "'GET,POST,DELETE,OPTIONS'"
+    "method.response.header.Access-Control-Allow-Origin"   = "'${local.allowed_cors_origin}'"
+    "method.response.header.Access-Control-Expose-Headers" = "'Mcp-Session-Id,MCP-Protocol-Version,WWW-Authenticate,Retry-After'"
+    "method.response.header.Cache-Control"                 = "'no-store'"
+  }
+}
+
+# Workspace browser preflight stays separate from the static map while disabled.
+locals {
+  workspace_web_cors_resources = var.workspace_web_lambda_name == "" ? {} : {
+    sync              = aws_api_gateway_resource.workspace_web_sync[0].id
+    history           = aws_api_gateway_resource.workspace_web_history[0].id
+    transfers         = aws_api_gateway_resource.workspace_web_transfers[0].id
+    changes           = aws_api_gateway_resource.workspace_web_changes[0].id
+    governance        = aws_api_gateway_resource.workspace_account_governance[0].id
+    account_workspace = aws_api_gateway_resource.workspace_account[0].id
+    knowledge         = aws_api_gateway_resource.workspace_web_knowledge[0].id
+    approvals         = aws_api_gateway_resource.workspace_web_approvals[0].id
+    access            = aws_api_gateway_resource.workspace_web_access[0].id
+    workspace         = aws_api_gateway_resource.workspace_web[0].id
+    tree              = aws_api_gateway_resource.workspace_web_tree[0].id
+    node              = aws_api_gateway_resource.workspace_web_node[0].id
+    text              = aws_api_gateway_resource.workspace_web_text[0].id
+    preview           = aws_api_gateway_resource.workspace_web_preview[0].id
+    asset             = aws_api_gateway_resource.workspace_web_asset[0].id
+    base              = aws_api_gateway_resource.workspace_web_base[0].id
+  }
+}
+
+resource "aws_api_gateway_method" "workspace_web_options" {
+  for_each = local.workspace_web_cors_resources
+
+  rest_api_id   = aws_api_gateway_rest_api.vaultguard.id
+  resource_id   = each.value
+  http_method   = "OPTIONS"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "workspace_web_options" {
+  for_each = local.workspace_web_cors_resources
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = each.value
+  http_method = aws_api_gateway_method.workspace_web_options[each.key].http_method
+  type        = "MOCK"
+
+  request_templates = { "application/json" = "{\"statusCode\": 200}" }
+}
+
+resource "aws_api_gateway_method_response" "workspace_web_options" {
+  for_each = local.workspace_web_cors_resources
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = each.value
+  http_method = aws_api_gateway_method.workspace_web_options[each.key].http_method
+  status_code = "200"
+
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = true
+    "method.response.header.Access-Control-Allow-Methods" = true
+    "method.response.header.Access-Control-Allow-Origin"  = true
+  }
+}
+
+resource "aws_api_gateway_integration_response" "workspace_web_options" {
+  for_each = local.workspace_web_cors_resources
+
+  rest_api_id = aws_api_gateway_rest_api.vaultguard.id
+  resource_id = each.value
+  http_method = aws_api_gateway_method.workspace_web_options[each.key].http_method
+  status_code = aws_api_gateway_method_response.workspace_web_options[each.key].status_code
+
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization,X-VaultGuard-Session-Id'"
+    "method.response.header.Access-Control-Allow-Methods" = "'GET,POST,OPTIONS'"
+    "method.response.header.Access-Control-Allow-Origin"  = "'${local.allowed_cors_origin}'"
+  }
+}

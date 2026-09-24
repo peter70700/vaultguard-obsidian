@@ -18,6 +18,21 @@ output "user_pool_client_id" {
   value       = module.cognito.client_id
 }
 
+output "connector_oauth_client_ids" {
+  description = "Non-secret client IDs for explicitly configured remote MCP OAuth provider clients"
+  value       = module.cognito.connector_client_ids
+}
+
+output "connector_oauth_resource" {
+  description = "Exact RFC 8707 remote MCP resource identifier; empty when the isolated lane is disabled"
+  value       = module.cognito.connector_resource_identifier
+}
+
+output "connector_authorization_server" {
+  description = "Canonical Cognito issuer used by protected-resource metadata"
+  value       = module.cognito.authorization_server_issuer
+}
+
 output "vault_bucket_name" {
   description = "S3 vault storage bucket name"
   value       = module.s3.bucket_name
@@ -51,6 +66,11 @@ output "sessions_table_name" {
 output "user_keys_table_name" {
   description = "DynamoDB user keys table name"
   value       = module.dynamodb.user_keys_table_name
+}
+
+output "file_versions_table_name" {
+  description = "DynamoDB immutable logical file-version table name"
+  value       = module.dynamodb.file_versions_table_name
 }
 
 output "domain_nameservers" {

@@ -7,6 +7,10 @@
  */
 
 import { RequestUrlResponse, requestUrl } from "obsidian";
+import type {
+  SyncClientSignal, SyncCommand, SyncNegotiation, SyncPageInput, SyncInventoryPage,
+  SyncActivityPage, SyncIndexCheckpoint, SyncCompatibilityDiscovery,
+} from "../../packages/workspace-contracts";
 import {
   looksLikeAwsSignatureError,
   normalizeVaultGuardApiBaseUrl,
@@ -953,6 +957,33 @@ export class VaultGuardApiClient {
 
   // ─── File Operations (vault-scoped) ─────────────────────────────────
 
+  /** P6-001 transport only. A caller must deliberately advertise the capabilities it
+   * implements; existing path sync never silently claims support for this contract.
+   * All writes retain their canonical idempotency/base and human approval fields. */
+  async workspaceSync<T>(command: SyncCommand): Promise<T> {
+    return this.request<T>("POST", `${this.vaultBase()}/workspace/sync`, command);
+  }
+
+  async getSyncCompatibility(): Promise<{ syncCompatibility?: SyncCompatibilityDiscovery; revision: number | null }> {
+    return this.request("GET", `${this.vaultBase()}/sync-cursor`);
+  }
+
+  async getWorkspaceSyncContract(client?: SyncClientSignal): Promise<SyncNegotiation> {
+    return this.workspaceSync({ action: "negotiate", ...(client ? { client } : {}) });
+  }
+
+  async getWorkspaceSyncInventory(input: SyncPageInput, client?: SyncClientSignal): Promise<SyncInventoryPage> {
+    return this.workspaceSync({ action: "inventory", input, ...(client ? { client } : {}) });
+  }
+
+  async getWorkspaceSyncActivity(input: SyncPageInput & { sinceWorkspaceRevisionId: string }, client?: SyncClientSignal): Promise<SyncActivityPage> {
+    return this.workspaceSync({ action: "activity", input, ...(client ? { client } : {}) });
+  }
+
+  async getWorkspaceSyncIndex(input: { workspaceRevisionId: string; cursor?: string }, client?: SyncClientSignal): Promise<SyncIndexCheckpoint> {
+    return this.workspaceSync({ action: "index", input, ...(client ? { client } : {}) });
+  }
+
   async getFiles(folderPath?: string): Promise<FileMetadata[]> {
     const params = folderPath ? `?prefix=${encodeURIComponent(folderPath)}` : "";
     const response = await this.request<{ files: FileMetadata[] }>("GET", `${this.vaultBase()}/files${params}`);
@@ -1615,6 +1646,11 @@ export class VaultGuardApiClient {
   // server enforces an action allowlist — only `bridge.*` actions are
   // accepted — so this surface can't be used to forge file/auth audit rows.
 
+  /** Only attribution category leaves this client; tokens and lease identifiers stay separate. */
+  getMutationOrigin(): "human" | "local-agent" {
+    return this.agentContextStack.length ? "local-agent" : "human";
+  }
+
   /**
    * Runs `fn` with the given agent context pushed onto the LIFO stack.
    * While the stack is non-empty, all outbound requests (auth-bearing or
@@ -1918,6 +1954,12 @@ export class VaultGuardApiClient {
 
       // Caller should retry after refresh
       throw new RetryableError(errorBody.message, errorBody);
+    }
+
+    // This permanent protocol refusal must not enter the retry queue or fall
+    // back to the legacy force-write path. The replica retains its local edits.
+    if (response.status === 426 && errorBody.code === "upgrade_required") {
+      throw new ClientUpgradeRequiredError(errorBody.message, errorBody);
     }
 
     // Categorize error
@@ -2343,6 +2385,15 @@ export class VaultGuardError extends Error {
     super(message);
     this.name = "VaultGuardError";
     this.apiError = apiError;
+  }
+}
+
+/** Server selected read-only compatibility. Local changes must remain recoverable. */
+export class ClientUpgradeRequiredError extends VaultGuardError {
+  readonly readOnly = true;
+  constructor(message: string, apiError?: ApiError) {
+    super(message, apiError);
+    this.name = "ClientUpgradeRequiredError";
   }
 }
 

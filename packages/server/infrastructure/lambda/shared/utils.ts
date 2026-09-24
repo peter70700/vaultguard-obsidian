@@ -1,3 +1,5 @@
+import { authorizationMutationAdmission } from "./authorization-mutation-lease";
+import { authorityCommand, currentAuthorityAuditCorrelation, currentAuthorizationMutationLease, type AuthorityAuditCorrelation } from "./authority-mutation";
 /**
  * VaultGuard — Shared Utilities
  *
@@ -31,6 +33,23 @@ import { EDITION } from './edition';
 import { emitSecurityMetric } from './metrics';
 import { isOffHours } from './time';
 import { isExpiringAccessActive } from './guest-access';
+import {
+  DEFAULT_DISABLED_REMOTE_MCP_FEATURES,
+  REMOTE_MCP_POLICY_FEATURES,
+  readStoredRemoteMcpFeaturePolicy,
+  type RemoteMcpPolicyFeature,
+} from './remote-mcp-feature-policy';
+import {
+  CONNECTOR_HOST_KINDS,
+  organizationConnectorPolicyOf,
+  readStoredOrganizationConnectorPolicy,
+  type ConnectorHostKind,
+  type OrganizationConnectorPolicy,
+} from './organization-connector-policy';
+import {
+  uniqueVaultGenerationKinds,
+  type VaultAuthorizationGenerationKind,
+} from './authorization-generations';
 
 // ─── Environment Configuration ───────────────────────────────────────────────
 
@@ -205,6 +224,10 @@ export interface VaultRecord {
    * skip work for idle vaults.
    */
   revision?: number;
+  /** Monotonic invalidation counter for vault membership changes. */
+  membershipRevision?: number;
+  /** Monotonic invalidation counter for permission-rule changes. */
+  permissionRevision?: number;
   /** ISO timestamp of the most recent file write/delete in this vault. */
   lastChangedAt?: string;
 }
@@ -468,6 +491,15 @@ async function assertOrgMfaSatisfied(user: UserContext): Promise<void> {
   }
 }
 
+/** Current connector authentication-strength policy, read from the active
+ * organization rather than a token or a stale consent snapshot. */
+export async function readOrganizationMfaRequirement(orgId: string): Promise<boolean | null> {
+  const active = await getActiveOrg(orgId, { consistentRead: true });
+  if (!active.allowed || !active.org) return null;
+  const required = active.org.settings?.requireMfa;
+  return required === undefined ? false : typeof required === 'boolean' ? required : null;
+}
+
 const ALLOWED_SUBSCRIPTION_STATUSES = new Set(['trialing', 'active', 'past_due']);
 
 /**
@@ -659,11 +691,50 @@ async function assertSubscriptionAllowsAccess(user: UserContext): Promise<void> 
   );
 }
 
-export async function assertUserNotRevoked(user: UserContext): Promise<void> {
+/**
+ * VAULTGUARD-91: whether an organization's subscription currently allows access,
+ * by exactly the rule `assertSubscriptionAllowsAccess` enforces. A billing web
+ * handoff completes only while this holds. An edition without billing has no
+ * billing ceremony to complete.
+ */
+export async function organizationSubscriptionAllowsAccess(orgId: string): Promise<boolean> {
+  if (EDITION !== 'pro') return false;
+  const result = await docClient.send(
+    new GetCommand({ TableName: SUBSCRIPTIONS_TABLE, Key: { orgId }, ConsistentRead: true })
+  );
+  if (result.Item?.comped === true) return true;
+  const status = result.Item?.status;
+  return typeof status === 'string' && ALLOWED_SUBSCRIPTION_STATUSES.has(status);
+}
+
+/**
+ * VAULTGUARD-91: epoch seconds at which a user's CURRENT recovery-code set was
+ * stored, or null when none is. Only the creation instant is projected: a
+ * recovery handoff proves a new set was issued and never sees a code or hash.
+ */
+export async function recoveryCodeSetStoredAt(userId: string): Promise<number | null> {
+  const result = await docClient.send(
+    new QueryCommand({
+      TableName: RECOVERY_CODES_TABLE,
+      KeyConditionExpression: 'userId = :u',
+      ExpressionAttributeValues: { ':u': userId },
+      ProjectionExpression: 'createdAt',
+      ConsistentRead: true,
+      Limit: 32,
+    })
+  );
+  const instants = (result.Items ?? [])
+    .map((item) => (typeof item.createdAt === 'string' ? Date.parse(item.createdAt) : Number.NaN))
+    .filter((value) => Number.isFinite(value));
+  return instants.length === 0 ? null : Math.floor(Math.max(...instants) / 1000);
+}
+
+export async function assertUserNotRevoked(user: UserContext, options: { consistentRead?: boolean } = {}): Promise<void> {
   const result = await docClient.send(
     new GetCommand({
       TableName: REVOKED_KEYS_TABLE,
       Key: { userId: user.userId },
+      ...(options.consistentRead ? { ConsistentRead: true } : {}),
     })
   );
 
@@ -671,6 +742,25 @@ export async function assertUserNotRevoked(user: UserContext): Promise<void> {
     await emitSecurityMetric('RevokedSessionAccess');
     throw new AuthError('Access has been revoked. Contact your administrator.', 403);
   }
+}
+
+/**
+ * VAULTGUARD-129: whether the admin user-revocation marker exists for this user
+ * right now, in any transition state (`revoking`, `revoked`, `reactivating`).
+ * The same row `assertUserNotRevoked` refuses on, read consistently, for owners
+ * that must refuse without an HTTP error: the connector store's subject
+ * admission (`DynamoConnectorAuthorizationStore.admitsGrantSubject`). A store
+ * error propagates, and those owners refuse on it.
+ */
+export async function isUserAccessRevoked(userId: string): Promise<boolean> {
+  const result = await docClient.send(
+    new GetCommand({
+      TableName: REVOKED_KEYS_TABLE,
+      Key: { userId },
+      ConsistentRead: true,
+    })
+  );
+  return result.Item !== undefined;
 }
 
 /**
@@ -695,11 +785,14 @@ async function assertTokenNewerThanLogoutCutoff(user: UserContext): Promise<void
     new GetCommand({
       TableName: SESSIONS_TABLE,
       Key: { sessionId: `logout-cutoff#${user.userId}` },
+      ConsistentRead: true,
     })
   );
 
-  const logoutAt = result.Item?.logoutAt;
-  if (typeof logoutAt !== 'number') return; // no cutoff recorded → unchanged behaviour
+  if (!result.Item) return;
+  const logoutAt = result.Item.logoutAt;
+  if (typeof logoutAt !== 'number' || !Number.isSafeInteger(logoutAt) || logoutAt < 0)
+    throw new AuthError('Session authority is unavailable. Sign in again.', 503);
 
   // `auth_time` / `iat` are epoch SECONDS; `logoutAt` is epoch MS — compare in ms.
   // Prefer `iat` (when THIS token was minted) over `auth_time`: Cognito
@@ -711,7 +804,8 @@ async function assertTokenNewerThanLogoutCutoff(user: UserContext): Promise<void
   // refreshing. A token with neither claim is left untouched (fail-open,
   // unchanged behaviour); Cognito tokens always carry `iat`.
   const tokenIssuedSec = user.iat ?? user.authTime;
-  if (typeof tokenIssuedSec !== 'number') return;
+  if (typeof tokenIssuedSec !== 'number' || !Number.isSafeInteger(tokenIssuedSec))
+    throw new AuthError('Session authority is unavailable. Sign in again.', 401);
 
   if (tokenIssuedSec * 1000 < logoutAt) {
     await emitSecurityMetric('RevokedSessionAccess');
@@ -1073,8 +1167,38 @@ export async function evaluatePermission(
     vaultId
   );
 
+  return evaluatePermissionFromRules(userId, roles, action, path, orgId, vaultId, rules, options);
+}
+
+/** Trusted already-scoped rule snapshots use the same policy as the legacy
+ * fetch path. This is an internal service seam, never a public rule-array API.
+ * The membership seam permits one generation-bound membership snapshot to be
+ * reused for many path decisions without changing legacy membership behavior.
+ */
+export async function evaluatePermissionFromRules(
+  userId: string,
+  roles: string[],
+  action: PermissionAction,
+  path: string,
+  _orgId: string,
+  vaultId: string,
+  rules: readonly PermissionRule[],
+  options: PermissionEvaluationOptions = {},
+  dependencies: {
+    membership?: (vaultId: string, userId: string) => Promise<Pick<VaultMemberRecord, 'role'> | null>;
+    now?: () => string;
+  } = {},
+): Promise<PermissionCheckResult> {
+  if (!vaultId) {
+    throw new Error('CRITICAL: evaluatePermission called without vaultId — vault isolation breach prevented');
+  }
+  const callerIsOrgAdmin = rolesIncludeOrgAdmin(roles);
+  if (options.respectAdminBypass !== false && callerIsOrgAdmin) {
+    return { allowed: true, matchedRule: null, evaluatedRules: [] };
+  }
+
   // Drop expired time-bound rules.
-  const now = new Date().toISOString();
+  const now = dependencies.now?.() ?? new Date().toISOString();
   // Hypothetical-removal seam: `excludeRuleIds` lets the set-level endpoint
   // ask "what would this user's level be if rule X did not exist?" so it can
   // decide between (a) deleting the exact rule because inheritance already
@@ -1107,7 +1231,7 @@ export async function evaluatePermission(
     // files at vault root, etc.), grant access at the membership role's
     // baseline. Without this, anyone whose default rule wasn't created
     // gets 403 on every file in their own vault.
-    const membership = await getActiveVaultMembership(vaultId, userId);
+    const membership = await (dependencies.membership ?? getActiveVaultMembership)(vaultId, userId);
     if (membership && vaultRoleAllowsAction(membership.role, action)) {
       return { allowed: true, matchedRule: null, evaluatedRules: liveRules };
     }
@@ -1131,6 +1255,72 @@ export async function evaluatePermission(
     matchedRule: winningRule,
     evaluatedRules: matchingRules,
   };
+}
+
+/** Evaluates one already-bound principal against one path. */
+export type PermissionEvaluator = (
+  action: PermissionAction,
+  path: string
+) => Promise<PermissionCheckResult>;
+
+/**
+ * One principal, many paths, one request — `evaluatePermission` without the
+ * repeated rule fetch.
+ *
+ * List reads that filter every row by the caller's read permission (share
+ * pointers, vault activity, audit rows) would otherwise call
+ * `evaluatePermission` once per row, and each call re-issues the identical
+ * user/alias, role and wildcard rule queries. This fetches the applicable
+ * rules ONCE, through the same private `fetchApplicableRules` union that
+ * `evaluatePermission` uses — so there is still exactly one definition of which
+ * rules apply to a principal — and decides every path through
+ * `evaluatePermissionFromRules`, the same policy seam. The org-admin bypass is
+ * decided exactly as `evaluatePermission` decides it, before any fetch.
+ *
+ * The rules and the membership default are captured when the evaluator is
+ * created. Create one per request and never cache it across requests: a rule or
+ * membership change must be visible to the next request.
+ */
+export async function createPermissionEvaluator(
+  userId: string,
+  roles: string[],
+  orgId: string,
+  vaultId: string,
+  options: PermissionEvaluationOptions = {}
+): Promise<PermissionEvaluator> {
+  if (!vaultId) {
+    throw new Error('CRITICAL: createPermissionEvaluator called without vaultId — vault isolation breach prevented');
+  }
+  const ownedRoles = [...roles];
+  const ownedOptions: PermissionEvaluationOptions = {
+    ...options,
+    ...(options.userAliases ? { userAliases: [...options.userAliases] } : {}),
+    ...(options.excludeRuleIds ? { excludeRuleIds: [...options.excludeRuleIds] } : {}),
+  };
+  if (ownedOptions.respectAdminBypass !== false && rolesIncludeOrgAdmin(ownedRoles)) {
+    return async () => ({ allowed: true, matchedRule: null, evaluatedRules: [] });
+  }
+  const rules = await fetchApplicableRules(
+    principalLookupValues(userId, ownedOptions.userAliases),
+    ownedRoles,
+    orgId,
+    vaultId
+  );
+  let membership: Promise<VaultMemberRecord | null> | undefined;
+  const membershipOnce = (memberVaultId: string, memberUserId: string) =>
+    (membership ??= getActiveVaultMembership(memberVaultId, memberUserId));
+  return (action, path) =>
+    evaluatePermissionFromRules(
+      userId,
+      ownedRoles,
+      action,
+      path,
+      orgId,
+      vaultId,
+      rules,
+      ownedOptions,
+      { membership: membershipOnce }
+    );
 }
 
 // ─── File-admin delegated permission authorization ───────────────────────────
@@ -1414,7 +1604,7 @@ export async function queryAllPages(input: QueryCommandInput): Promise<Permissio
   const items: PermissionRule[] = [];
   let exclusiveStartKey: Record<string, unknown> | undefined;
   do {
-    const page = await docClient.send(
+    const page = await authorityCommand(docClient,
       new QueryCommand({
         ...input,
         ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
@@ -1523,9 +1713,17 @@ function principalLookupValues(userId: string, aliases: string[] | undefined): s
  * @returns Whether the path matches the pattern
  */
 export function pathMatchesPattern(filePath: string, pattern: string): boolean {
-  // Normalize paths
+  // Normalize paths. Consecutive globstars (`/**/**/x`) match exactly what a
+  // single `**` matches, but every extra `.*` the translation below emits
+  // multiplies the regex engine's backtracking on a non-matching path — a
+  // rule with a dozen of them stalls evaluation for the whole subtree. Fold
+  // them before translating; the permissions writers bound them at write time
+  // (`validatePathPattern` in permissions/handler.ts).
   const normalizedPath = filePath.replace(/\/+/g, '/').replace(/\/$/, '');
-  const normalizedPattern = pattern.replace(/\/+/g, '/').replace(/\/$/, '');
+  const normalizedPattern = pattern
+    .replace(/\/+/g, '/')
+    .replace(/\/$/, '')
+    .replace(/(?:\*\*\/)+\*\*/g, '**');
 
   // Exact match
   if (normalizedPath === normalizedPattern) {
@@ -1649,7 +1847,6 @@ export async function logAudit(
 ): Promise<boolean> {
   const id = entry.id || generateId();
   const timestamp = entry.timestamp || new Date().toISOString();
-  const dateStr = timestamp.split('T')[0]; // YYYY-MM-DD
 
   // Org-configurable audit filtering: an org can opt specific actions out of
   // the audit trail via settings.disabledAuditActions. Look the settings up
@@ -1668,17 +1865,70 @@ export async function logAudit(
     return true;
   }
 
-  const expiresAtTtl = computeAuditExpiryTtl(orgSettings, timestamp);
+  const auditEntry = buildAuditEntry({ ...entry, id, timestamp }, event, orgSettings);
+
+  try {
+    await docClient.send(
+      new PutCommand({
+        TableName: AUDIT_TABLE,
+        Item: auditEntry,
+      })
+    );
+    return true;
+  } catch (err) {
+    // Audit logging should never block the main operation.
+    // Signal the failure independently and return a truthful delivery outcome,
+    // but don't throw into the business operation.
+    console.error('[AUDIT_LOG_FAILURE]', (err as Error).message, {
+      action: auditEntry.action,
+      userId: auditEntry.userId,
+      orgId: auditEntry.orgId,
+    });
+    return false;
+  }
+}
+
+/**
+ * VAULTGUARD-113: the audit channels only server code attributes an event to
+ * (`remote_mcp`: a canonical remote MCP call; `workspace_workflow`: a governed
+ * workspace transition or refusal; `approval_workflow`: a domain event applied
+ * through an approved access workflow). `buildAuditEntry` never keeps one of these
+ * from entry metadata.
+ */
+export type ServerAuditChannel = 'remote_mcp' | 'workspace_workflow';
+export const RESERVED_AUDIT_CHANNELS: ReadonlySet<string> = new Set(['remote_mcp', 'workspace_workflow', 'approval_workflow']);
+
+/** Canonical audit row construction for mutations whose audit must share their transaction. */
+export function buildAuditEntry(
+  entry: Omit<AuditEntry, 'id' | 'timestamp'> & { id?: string; timestamp?: string },
+  event?: APIGatewayProxyEvent,
+  settings: Partial<Pick<OrgSettings, 'retentionDays'>> | null = null,
+  trusted: { channel?: ServerAuditChannel } = {},
+): Record<string, unknown> {
+  const id = entry.id || generateId(), timestamp = entry.timestamp || new Date().toISOString(), dateStr = timestamp.split('T')[0];
+  const expiresAtTtl = computeAuditExpiryTtl(settings, timestamp);
   const vaultId = entry.vaultId
     || extractVaultIdFromMetadata(entry.metadata)
     || extractVaultIdFromResourcePath(entry.resourcePath);
 
   // Header-derived agent attribution wins over caller metadata (see fn doc).
   const agentHeaders = extractAgentHeaders(event);
+  // VAULTGUARD-113. Every channel a server writer attributes an event to is
+  // reserved: entry metadata can carry caller-supplied values (the member-writable
+  // bridge route copies them), so a reserved channel and the `workflow` key are
+  // removed from it unconditionally. A channel is set only through `trusted`, by
+  // the canonical writer that produced the event, and an approved access
+  // workflow's correlation (P4-GAP-3) only from the invocation-local authority
+  // runtime. The producing writer's own channel wins over that correlation.
+  const correlation = currentAuthorityAuditCorrelation();
+  const { workflow: _unclaimedWorkflow, ...callerMetadata } = entry.metadata ?? {};
+  if (RESERVED_AUDIT_CHANNELS.has(callerMetadata.channel as string)) delete callerMetadata.channel;
   const metadata = {
-    ...(entry.metadata ?? {}),
+    ...callerMetadata,
     ...(agentHeaders.agentName ? { agentName: agentHeaders.agentName } : {}),
     ...(agentHeaders.leaseId ? { leaseId: agentHeaders.leaseId } : {}),
+    ...(correlation ? { channel: correlation.channel, workflow: accessWorkflowAuditMetadata(correlation) } : {}),
+    ...(trusted.channel && RESERVED_AUDIT_CHANNELS.has(trusted.channel) ? { channel: trusted.channel } : {}),
   };
 
   const auditEntry: Record<string, unknown> = {
@@ -1705,25 +1955,33 @@ export async function logAudit(
     auditEntry.userEmail = entry.userEmail;
   }
 
-  try {
-    await docClient.send(
-      new PutCommand({
-        TableName: AUDIT_TABLE,
-        Item: auditEntry,
-      })
-    );
-    return true;
-  } catch (err) {
-    // Audit logging should never block the main operation.
-    // Signal the failure independently and return a truthful delivery outcome,
-    // but don't throw into the business operation.
-    console.error('[AUDIT_LOG_FAILURE]', (err as Error).message, {
-      action: auditEntry.action,
-      userId: auditEntry.userId,
-      orgId: auditEntry.orgId,
-    });
-    return false;
-  }
+  return Object.fromEntries(Object.entries(auditEntry).filter(([, value]) => value !== undefined));
+}
+
+/** The closed correlation fields of an approved access operation; nothing else is copied. */
+function accessWorkflowAuditMetadata(correlation: AuthorityAuditCorrelation): Record<string, unknown> {
+  const delegated = correlation.applierKind === 'delegated-agent';
+  return {
+    kind: correlation.workflow,
+    proposalId: correlation.proposalId,
+    receiptId: correlation.receiptId,
+    operationIndex: correlation.operationIndex,
+    approvalId: correlation.approvalId,
+    reviewerUserId: correlation.reviewerUserId,
+    reviewerSessionId: correlation.reviewerSessionId,
+    applierKind: correlation.applierKind,
+    applierUserId: correlation.applierUserId,
+    applierSessionId: correlation.applierSessionId,
+    ...(delegated
+      ? {
+          agentIdentityId: correlation.agentIdentityId,
+          agentSessionId: correlation.agentSessionId,
+          grantId: correlation.grantId,
+          clientId: correlation.clientId,
+          hostKind: correlation.hostKind,
+        }
+      : { applierChannel: correlation.applierChannel }),
+  };
 }
 
 function extractVaultIdFromMetadata(metadata: Record<string, unknown> | undefined): string | undefined {
@@ -1737,7 +1995,7 @@ function extractVaultIdFromResourcePath(resourcePath: string | undefined): strin
   return match?.[1] ? decodeURIComponent(match[1]) : undefined;
 }
 
-function computeAuditExpiryTtl(settings: OrgSettings | null, timestamp: string): number {
+function computeAuditExpiryTtl(settings: Partial<Pick<OrgSettings, 'retentionDays'>> | null, timestamp: string): number {
   const retentionDays = settings?.retentionDays ?? DEFAULT_ORG_SETTINGS.retentionDays;
   const eventTimeMs = new Date(timestamp).getTime();
   const baseTimeMs = Number.isNaN(eventTimeMs) ? Date.now() : eventTimeMs;
@@ -1965,11 +2223,16 @@ export function parseBody(
  * @returns Client IP address string
  */
 export function getClientIp(event: APIGatewayProxyEvent): string {
-  return (
-    event.headers?.['X-Forwarded-For']?.split(',')[0]?.trim() ||
-    event.requestContext?.identity?.sourceIp ||
-    'unknown'
-  );
+  // API Gateway resolves the caller's address into requestContext.identity.
+  // sourceIp; a client-supplied X-Forwarded-For header is APPENDED to, never
+  // replaces, that chain, so its first element is attacker-chosen. Prefer the
+  // gateway's value and, when only the header is present (local harnesses),
+  // take the LAST element — the one written by the nearest trusted hop.
+  const sourceIp = event.requestContext?.identity?.sourceIp?.trim();
+  if (sourceIp) return sourceIp;
+  const forwarded = event.headers?.['X-Forwarded-For'] ?? event.headers?.['x-forwarded-for'];
+  const hops = (forwarded ?? '').split(',').map((hop) => hop.trim()).filter(Boolean);
+  return hops[hops.length - 1] || 'unknown';
 }
 
 /**
@@ -2158,6 +2421,8 @@ export const PLAN_LIMITS: Record<PlanTier, PlanLimits> = {
 };
 
 export interface OrgSettings {
+  /** Durable connector consent; independent of human browser/device session policy. */
+  connectorAuthorizationDays?: number;
   orgId: string;
   orgName: string;
   syncMode: 'realtime' | 'periodic' | 'manual';
@@ -2208,6 +2473,35 @@ export interface OrgSettings {
    * DISABLEABLE_AUDIT_ACTIONS.
    */
   disabledAuditActions: string[];
+  /**
+   * Remote MCP tool families (contract §5 `policyFeature` ids) this
+   * organization has NOT enabled — the single organization-policy owner of
+   * D-014 / VAULTGUARD-114. Read families are enabled and propose, apply and
+   * admin families disabled until an organization administrator stores a list
+   * that omits them; see `shared/remote-mcp-feature-policy.ts`. Only an absent
+   * stored value resolves to that default. A stored value that is not a list of
+   * known feature ids is malformed: it reads here as every family disabled, and
+   * the MCP hosts fail closed on it (`temporarily_unavailable`).
+   */
+  disabledRemoteMcpFeatures: RemoteMcpPolicyFeature[];
+  /**
+   * VAULTGUARD-91: connector client registrations this organization refuses,
+   * at token issuance and on every authorized request. A block refuses the
+   * existing grants of that client without deleting or revoking them; see
+   * `shared/organization-connector-policy.ts`.
+   */
+  blockedConnectorClientIds: string[];
+  /** VAULTGUARD-91: connector host kinds this organization refuses, as above. */
+  blockedConnectorHostKinds: ConnectorHostKind[];
+  /**
+   * VAULTGUARD-91: the organization kill switch. Engaged, every remote MCP
+   * family is disabled and every connector grant and session in the
+   * organization is refused at the authorization boundary, `get_capabilities`
+   * included. Reversible: nothing is revoked or deleted. A stored connector
+   * policy that is not the documented shape reads here as engaged with every
+   * host kind blocked, and the hosts refuse every connector.
+   */
+  remoteMcpKillSwitch: boolean;
 }
 
 export type PersistedOrgSettings = Omit<OrgSettings, 'orgId' | 'orgName'>;
@@ -2222,6 +2516,7 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
   // only supplies this default when the field is absent. Tracks the 30-day
   // refresh-token window so active users are not force-relogin'd ~daily.
   maxSessionDurationHours: 720,
+  connectorAuthorizationDays: 30,
   requireMfa: false,
   allowedDomains: [],
   retentionDays: 365,
@@ -2232,6 +2527,14 @@ export const DEFAULT_ORG_SETTINGS: PersistedOrgSettings = {
   idleAction: 'lock',
   allowAdminPerFileRestrictions: false,
   disabledAuditActions: [],
+  // D-014: propose, apply and admin remote MCP families stay disabled until an
+  // organization administrator explicitly enables them.
+  disabledRemoteMcpFeatures: [...DEFAULT_DISABLED_REMOTE_MCP_FEATURES],
+  // VAULTGUARD-91: nothing blocked and the kill switch released until an
+  // organization administrator decides otherwise.
+  blockedConnectorClientIds: [],
+  blockedConnectorHostKinds: [],
+  remoteMcpKillSwitch: false,
 };
 
 export const DISABLEABLE_AUDIT_ACTIONS = [
@@ -2271,9 +2574,20 @@ export interface OrgRecord {
   stripeSubscriptionId?: string;
   legalTermsVersion?: string;
   legalAcceptedAt?: string;
+  legalAcceptedBy?: string;
   createdAt?: string;
   updatedAt?: string;
   settings?: Partial<PersistedOrgSettings> | null;
+  /** Monotonic invalidation counter for authorization policy changes. */
+  policyRevision?: number;
+  /**
+   * VAULTGUARD-91: monotonic counter of organization settings writes. The
+   * settings routes read it consistently and write only while it is unchanged,
+   * so two concurrent saves can never silently undo one another (for example
+   * release a kill switch another administrator just engaged). Unlike
+   * `policyRevision` it invalidates no credential.
+   */
+  settingsRevision?: number;
 }
 
 /** Result of an org enforcement check. */
@@ -2288,7 +2602,10 @@ export interface OrgEnforcementResult {
  * Looks up the org by orgId (from the user's token) and checks that it is active.
  * Returns the org record if found and active, or an error result.
  */
-export async function getActiveOrg(orgId: string): Promise<OrgEnforcementResult> {
+export async function getActiveOrg(
+  orgId: string,
+  options: { consistentRead?: boolean } = {},
+): Promise<OrgEnforcementResult> {
   if (!orgId) {
     return { allowed: false, org: null, reason: 'No organization ID in user context', code: 'ORG_NOT_FOUND' };
   }
@@ -2302,7 +2619,19 @@ export async function getActiveOrg(orgId: string): Promise<OrgEnforcementResult>
     })
   );
 
-  const org = result.Items?.[0] as OrgRecord | undefined;
+  let org = result.Items?.[0] as OrgRecord | undefined;
+  if (options.consistentRead && org) {
+    // The orgId GSI is only a locator. Authorization-generation checks require
+    // current state from the base table because GSIs cannot read consistently.
+    if (!org.slug) return { allowed: false, org: null, code: 'ORG_NOT_FOUND' };
+    const current = await docClient.send(new GetCommand({
+      TableName: ORGANIZATIONS_TABLE,
+      Key: { slug: org.slug },
+      ConsistentRead: true,
+    }));
+    org = current.Item as OrgRecord | undefined;
+    if (org?.orgId !== orgId) org = undefined;
+  }
 
   if (!org) {
     return { allowed: false, org: null, reason: `Organization not found: ${orgId}`, code: 'ORG_NOT_FOUND' };
@@ -2317,6 +2646,17 @@ export async function getActiveOrg(orgId: string): Promise<OrgEnforcementResult>
   }
 
   return { allowed: true, org };
+}
+
+/**
+ * VAULTGUARD-91: the organization connector admission owner every production
+ * composition shares -- the stored connector policy of the ACTIVE organization
+ * record, read consistently so a block or kill switch applies to the very next
+ * issuance or request. No active record and a malformed stored value answer
+ * `null`, and a store error throws; callers refuse on both.
+ */
+export async function readOrganizationConnectorPolicy(orgId: string): Promise<OrganizationConnectorPolicy | null> {
+  return organizationConnectorPolicyOf(await getActiveOrg(orgId, { consistentRead: true }));
 }
 
 export function buildOrgSettings(orgId: string, org: OrgRecord): OrgSettings {
@@ -2351,6 +2691,11 @@ export function normalizeStoredOrgSettings(
     normalized.syncIntervalMinutes = syncIntervalMinutes;
   }
 
+  if (rawSettings.connectorAuthorizationDays !== undefined) {
+    // Preserve malformed policy as zero: issuance fails closed, never falls back to 30 days.
+    const days = rawSettings.connectorAuthorizationDays;
+    normalized.connectorAuthorizationDays = Number.isSafeInteger(days) && Number(days) >= 1 && Number(days) <= 90 ? Number(days) : 0;
+  }
   const maxSessionDurationHours = parsePositiveInteger(
     rawSettings.maxSessionDurationHours,
     undefined
@@ -2399,6 +2744,47 @@ export function normalizeStoredOrgSettings(
   const disabledAuditActions = normalizeDisabledAuditActions(rawSettings.disabledAuditActions, undefined);
   if (disabledAuditActions !== undefined) {
     normalized.disabledAuditActions = disabledAuditActions;
+  }
+
+  // D-014. An absent value falls through to the default (propose/apply/admin
+  // families disabled) and a list of known ids is the organization's decision.
+  // A malformed value is never trimmed to its recognisable entries, which would
+  // silently ENABLE every family an unrecognised entry meant to disable: it
+  // reads as every family disabled, so this settings view and a later unrelated
+  // settings update can only narrow. The MCP hosts do not read this projection
+  // for a malformed value; they fail closed (`productionOrganizationFeaturePolicy`).
+  const storedRemoteMcpPolicy = readStoredRemoteMcpFeaturePolicy(rawSettings.disabledRemoteMcpFeatures);
+  if (storedRemoteMcpPolicy.state === 'explicit') {
+    normalized.disabledRemoteMcpFeatures = storedRemoteMcpPolicy.disabled;
+  } else if (storedRemoteMcpPolicy.state === 'malformed') {
+    normalized.disabledRemoteMcpFeatures = [...REMOTE_MCP_POLICY_FEATURES];
+  }
+
+  // VAULTGUARD-91. Absent fields fall through to the defaults. A malformed
+  // connector policy is never trimmed to its recognisable entries (that would
+  // admit a connector an unrecognised entry meant to block): it reads as the
+  // kill switch engaged with every host kind blocked, so this settings view and
+  // a later unrelated update can only narrow. The hosts refuse every connector
+  // for it (`organizationConnectorPolicyOf`).
+  const storedConnectorPolicy = readStoredOrganizationConnectorPolicy(rawSettings);
+  if (storedConnectorPolicy.state === 'readable') {
+    const raw = rawSettings as Record<string, unknown>;
+    if (raw.blockedConnectorClientIds !== undefined) {
+      normalized.blockedConnectorClientIds = [...storedConnectorPolicy.policy.blockedClientIds];
+    }
+    if (raw.blockedConnectorHostKinds !== undefined) {
+      normalized.blockedConnectorHostKinds = [...storedConnectorPolicy.policy.blockedHostKinds];
+    }
+    if (raw.remoteMcpKillSwitch !== undefined) {
+      normalized.remoteMcpKillSwitch = storedConnectorPolicy.policy.killSwitch;
+    }
+  } else {
+    const clients = readStoredOrganizationConnectorPolicy({
+      blockedConnectorClientIds: (rawSettings as Record<string, unknown>).blockedConnectorClientIds,
+    });
+    normalized.blockedConnectorClientIds = clients.state === 'readable' ? [...clients.policy.blockedClientIds] : [];
+    normalized.blockedConnectorHostKinds = [...CONNECTOR_HOST_KINDS];
+    normalized.remoteMcpKillSwitch = true;
   }
 
   return normalized;
@@ -2643,6 +3029,7 @@ export async function getVault(orgId: string, vaultId: string): Promise<VaultRec
     new GetCommand({
       TableName: VAULTS_TABLE,
       Key: { orgId, vaultId },
+      ConsistentRead: true,
     })
   );
   const item = result.Item as VaultRecord | undefined;
@@ -2680,10 +3067,11 @@ export async function getStoredVaultMembership(
   userId: string
 ): Promise<VaultMemberRecord | null> {
   if (!vaultId || !userId) return null;
-  const result = await docClient.send(
+  const result = await authorityCommand(docClient,
     new GetCommand({
       TableName: VAULT_MEMBERS_TABLE,
       Key: { vaultId, userId },
+      ConsistentRead: true,
     })
   );
   return (result.Item as VaultMemberRecord | undefined) ?? null;
@@ -2757,11 +3145,30 @@ export async function listVaultsForOrg(orgId: string): Promise<VaultRecord[]> {
 }
 
 /**
+ * The vaults `user` may see — THE vault-visibility rule, shared by
+ * `GET /vaults` and the remote MCP `list_vaults` tool so the two can never
+ * disagree about who sees which vault.
+ *
+ *   - An org admin sees every vault in the org, archived ones included (they
+ *     manage and restore them).
+ *   - Everyone else sees only the non-archived vaults they hold an active,
+ *     unexpired membership in.
+ */
+export async function listVisibleVaults(user: UserContext): Promise<VaultRecord[]> {
+  const orgId = requireOrgId(user);
+  const orgAdmin = isAdmin(user);
+  const vaults = orgAdmin
+    ? await listVaultsForOrg(orgId)
+    : await listVaultsForUser(orgId, user.userId);
+  return vaults.filter((vault) => vault.orgId === orgId && (!vault.archived || orgAdmin));
+}
+
+/**
  * Lists every member of a vault.
  */
 export async function listVaultMembers(vaultId: string): Promise<VaultMemberRecord[]> {
   if (!vaultId) return [];
-  const result = await docClient.send(
+  const result = await authorityCommand(docClient,
     new QueryCommand({
       TableName: VAULT_MEMBERS_TABLE,
       KeyConditionExpression: 'vaultId = :vaultId',
@@ -2895,6 +3302,7 @@ export interface VaultMutationIntent {
   status: 'pending';
   createdAt: string;
   createdAtMs: number;
+  authorizationGenerations?: VaultAuthorizationGenerationKind[];
   verification?:
     | { kind: 'object-metadata' }
     | { kind: 'delete-head' }
@@ -2940,6 +3348,7 @@ export async function beginVaultMutationIntent(params: {
   action: VaultActivityAction;
   path: string;
   actorUserId: string;
+  authorizationGenerations?: VaultAuthorizationGenerationKind[];
   verification?: VaultMutationIntent['verification'];
 }): Promise<VaultMutationIntent> {
   const intentId = generateId();
@@ -2963,15 +3372,19 @@ export async function beginVaultMutationIntent(params: {
     status: 'pending',
     createdAt: now.toISOString(),
     createdAtMs: now.getTime(),
+    ...(params.authorizationGenerations
+      ? { authorizationGenerations: uniqueVaultGenerationKinds(params.authorizationGenerations) }
+      : {}),
     ...(params.verification ? { verification: params.verification } : {}),
   };
-  await docClient.send(
-    new PutCommand({
-      TableName: VAULT_ACTIVITY_TABLE,
-      Item: intent,
-      ConditionExpression: 'attribute_not_exists(vaultId) AND attribute_not_exists(sk)',
-    }),
-  );
+  const put = { TableName: VAULT_ACTIVITY_TABLE, Item: intent,
+    ConditionExpression: 'attribute_not_exists(vaultId) AND attribute_not_exists(sk)' };
+  await authorityCommand(docClient, params.authorizationGenerations?.length
+    ? new TransactWriteCommand({ TransactItems: [
+        { ConditionCheck: authorizationMutationAdmission(VAULTS_TABLE, params, Date.now(), currentAuthorizationMutationLease()) },
+        { Put: put },
+      ] })
+    : new PutCommand(put));
   return intent;
 }
 
@@ -2986,7 +3399,15 @@ export async function commitVaultMutationIntent(intent: VaultMutationIntent): Pr
   // the same ClientRequestToken remain byte-identical after an ambiguous SDK
   // response.
   const activity = activityRecordFor(intent, activityId, new Date(intent.createdAtMs));
-  await docClient.send(
+  const authorizationGenerations = uniqueVaultGenerationKinds(intent.authorizationGenerations);
+  const revisionNames: Record<string, string> = { '#rev': 'revision' };
+  const revisionAdds = ['#rev :one'];
+  for (const generation of authorizationGenerations) {
+    const placeholder = generation === 'membership' ? '#membershipRev' : '#permissionRev';
+    revisionNames[placeholder] = `${generation}Revision`;
+    revisionAdds.push(`${placeholder} :one`);
+  }
+  await authorityCommand(docClient,
     new TransactWriteCommand({
       ClientRequestToken: activityId.replace(/[^A-Za-z0-9-]/g, '').slice(0, 36),
       TransactItems: [
@@ -3001,9 +3422,9 @@ export async function commitVaultMutationIntent(intent: VaultMutationIntent): Pr
           Update: {
             TableName: VAULTS_TABLE,
             Key: { orgId: intent.orgId, vaultId: intent.vaultId },
-            UpdateExpression: 'ADD #rev :one SET lastChangedAt = :ts',
+            UpdateExpression: `ADD ${revisionAdds.join(', ')} SET lastChangedAt = :ts`,
             ConditionExpression: 'attribute_exists(orgId) AND attribute_exists(vaultId)',
-            ExpressionAttributeNames: { '#rev': 'revision' },
+            ExpressionAttributeNames: revisionNames,
             ExpressionAttributeValues: { ':one': 1, ':ts': activity.changedAt },
           },
         },
@@ -3044,6 +3465,7 @@ export async function abortVaultMutationIntent(intent: VaultMutationIntent): Pro
 export async function listPendingVaultMutationIntents(
   vaultId: string,
   limit = 100,
+  options: { requireComplete?: boolean } = {},
 ): Promise<VaultMutationIntent[]> {
   const result = await docClient.send(
     new QueryCommand({
@@ -3060,6 +3482,12 @@ export async function listPendingVaultMutationIntents(
       Limit: Math.max(1, Math.min(limit, 100)),
     }),
   );
+  // An authorization fence cannot treat a bounded first page as proof that no
+  // later intent exists. Ordinary sync/recovery callers retain their bounded
+  // work contract; pre-egress callers must fail closed on truncation.
+  if (options.requireComplete && result.LastEvaluatedKey) {
+    throw new AuthError('Vault mutation status is not fully available', 403);
+  }
   return (result.Items ?? []) as VaultMutationIntent[];
 }
 

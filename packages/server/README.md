@@ -21,7 +21,9 @@ operational and convenience features stay in the managed Pro plan — see
 # 1. Clone and install Lambda deps
 git clone <this-repo>
 cd vaultguard-server/infrastructure
-npm install
+nvm install
+nvm use
+npm ci --no-audit --no-fund
 
 # 2. Build Lambda bundles
 npm run build
@@ -35,6 +37,19 @@ cp environments/ce.tfvars.example environments/ce.tfvars
 terraform init
 terraform apply -var-file=environments/ce.tfvars
 ```
+
+Lambda packaging requires a clean Git commit and bundles built from that same
+commit. Commit source changes before building; keep populated var-files ignored.
+Terraform verifies the build inventory and packages a retained snapshot. Every
+new Lambda zip includes `build-info.json` with its source commit. Rebuild after
+changing commits. Keep the worktree, `.build/` snapshots, and archives until any
+saved plan is applied or discarded. No VaultGuard CI account or artifact bucket
+is needed. `npm run deploy:plan -- --commit <commit> --worktree /absolute/new-lane`
+from `infrastructure/` prepares an isolated clean build. Add
+`--plan --var-file /absolute/your.tfvars` only when you intend to initialize and
+plan your backend.
+The wrapper never applies. A non-Git source archive can build for inspection but
+must be committed in your own Git repository before deployment.
 
 After `terraform apply` finishes, the outputs section prints:
 

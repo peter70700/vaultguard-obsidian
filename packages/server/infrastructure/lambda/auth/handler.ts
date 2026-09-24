@@ -23,6 +23,7 @@ import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge
 import type { QueryCommandInput } from '@aws-sdk/lib-dynamodb';
 import { createHmac, randomInt, timingSafeEqual } from 'crypto';
 import { emitSecurityMetric } from '../shared/metrics';
+import { endUserConnectorAccess } from '../shared/connector-subject-revocation';
 import {
   docClient,
   verifyToken,
@@ -3098,6 +3099,7 @@ async function handleConfirmReset(
   let sweepStep = 'global_signout';
   let invalidatedSessions = 0;
   let revokedLeases = 0;
+  let endedConnectors: Awaited<ReturnType<typeof endUserConnectorAccess>> | null = null;
 
   try {
     // Username: email matches how AdminSetUserPassword addresses this pool
@@ -3136,6 +3138,16 @@ async function handleConfirmReset(
     sweepStep = 'revoke_leases';
     revokedLeases = await revokeAllUserLeases(identity.userId, 'password-reset');
 
+    // Custom connector grants and agent sessions have their own long-lived
+    // issuer. End them under the forward-only subject cutoff before success;
+    // an incomplete teardown leaves the reset code retryable.
+    sweepStep = 'end_connectors';
+    if (!identity.orgId && process.env.CONNECTOR_AUTH_TABLE) throw Error('Recovery organization unavailable');
+    endedConnectors = await endUserConnectorAccess({
+      orgId: identity.orgId ?? '', userId: identity.userId, actorUserId: identity.userId,
+      cause: 'recovery', reason: 'compromised_account_recovery', event,
+    });
+
     // Recovery is invisible in the audit trail today. An empty orgId is safe:
     // logAudit guards its settings lookup with `if (entry.orgId)` and
     // partitions on `entry.orgId || 'system'`.
@@ -3149,7 +3161,9 @@ async function handleConfirmReset(
       outcome: 'success',
       ipAddress: getClientIp(event),
       userAgent: getUserAgent(event),
-      metadata: { invalidatedSessions, revokedLeases, globalSignOut: true },
+      metadata: { invalidatedSessions, revokedLeases, globalSignOut: true,
+        connectorAccess: endedConnectors?.state ?? 'unknown',
+        ...(endedConnectors?.state === 'ended' ? { connectorGrantsRevoked: endedConnectors.grantsRevoked, connectorSessionsRevoked: endedConnectors.sessionsRevoked } : {}) },
     });
   } catch (err: unknown) {
     // Position-based classification again: nothing after the password set

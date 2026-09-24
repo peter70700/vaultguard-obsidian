@@ -109,7 +109,7 @@ resource "aws_wafv2_web_acl" "vaultguard" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "SmallPublicJsonBodyLimit"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
@@ -148,7 +148,7 @@ resource "aws_wafv2_web_acl" "vaultguard" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "AWSManagedRulesCommonRuleSet"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
@@ -171,7 +171,7 @@ resource "aws_wafv2_web_acl" "vaultguard" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "AWSManagedRulesKnownBadInputsRuleSet"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
@@ -194,7 +194,7 @@ resource "aws_wafv2_web_acl" "vaultguard" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "RateLimitRule"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
@@ -216,14 +216,43 @@ resource "aws_wafv2_web_acl" "vaultguard" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "GeoRestriction"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
+
+  # Existing production routes only. This coarse edge limit supplements the
+  # authenticated tenant/principal/action budgets; it grants no authority.
+  rule {
+    name     = "WorkspaceRequestRate"
+    priority = 5
+    action { block {} }
+    statement {
+      rate_based_statement {
+        limit              = 600
+        aggregate_key_type = "IP"
+        scope_down_statement {
+          regex_match_statement {
+            regex_string = "^/(mcp|vaults/[^/]+/workspace(/.*)?)$"
+            field_to_match { uri_path {} }
+            text_transformation {
+              priority = 0
+              type     = "NONE"
+            }
+          }
+        }
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WorkspaceRequestRate"
+      sampled_requests_enabled   = false
+    }
+  }
   visibility_config {
     cloudwatch_metrics_enabled = true
     metric_name                = "vaultguard-waf-${var.stage}"
-    sampled_requests_enabled   = true
+    sampled_requests_enabled   = false
   }
 
   tags = { Name = "obsidian-vaultguard-waf-${var.stage}" }

@@ -78,7 +78,8 @@ const TURNSTILE_EXPECTED_HOSTNAMES = (
 // website events, so it must never be empty.
 const ADMIN_BASE_URL = process.env.BASE_URL || 'https://admin.example.com';
 const SIGNUP_JSON_BODY_MAX_BYTES = 16 * 1024;
-export const SIGNUP_LEGAL_VERSION = '2026-08-24';
+export { MANAGED_LEGAL_VERSION as SIGNUP_LEGAL_VERSION } from '../shared/legal-version';
+import { MANAGED_LEGAL_VERSION as SIGNUP_LEGAL_VERSION } from '../shared/legal-version';
 const PUBLISHED_SIGNUP_LEGAL_VERSION = (process.env.SIGNUP_LEGAL_VERSION || '').trim();
 
 // Email domains flagged as internal/company accounts. LA6: a domain match is

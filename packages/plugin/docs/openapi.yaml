@@ -1217,9 +1217,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OrgSettings'
+        '409':
+          description: >-
+            The settings changed concurrently, or are no longer at expectedSettingsRevision. Nothing
+            was saved; reload and retry.
     delete:
       tags: [Users]
       summary: Reset organization settings to defaults
+      description: >-
+        Returns every setting to its default except the connector deny-lists and the kill switch
+        (D-019, D-020), which only their dedicated controls change.
       responses:
         '200':
           description: Reset organization settings.
@@ -1227,6 +1234,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OrgSettings'
+        '409':
+          description: The settings changed concurrently. Nothing was reset; reload and retry.
 
   /billing/subscription:
     get:
@@ -1924,6 +1933,7 @@ components:
         - autoLockMinutes
         - allowAdminPerFileRestrictions
         - disabledAuditActions
+        - disabledRemoteMcpFeatures
       properties:
         orgId: { type: string }
         orgName: { type: string }
@@ -1933,6 +1943,12 @@ components:
         syncIntervalMinutes: { type: integer }
         enforceEncryption: { type: boolean }
         maxSessionDurationHours: { type: integer }
+        connectorAuthorizationDays:
+          type: integer
+          minimum: 1
+          maximum: 90
+          default: 30
+          description: Fresh connector consent duration, independent of browser sessions. A change requires fresh authentication and invalidates existing policy-bound credentials; grants are never extended.
         requireMfa: { type: boolean }
         allowedDomains:
           type: array
@@ -1943,6 +1959,44 @@ components:
         disabledAuditActions:
           type: array
           items: { type: string }
+        disabledRemoteMcpFeatures:
+          type: array
+          description: >-
+            Remote MCP policy feature ids this organization has not enabled (D-014).
+            Absent from the stored record, it defaults to the propose, apply and admin
+            families (remote_mcp_changes, remote_mcp_access, remote_mcp_context,
+            remote_mcp_coordination); an empty list enables every family. A stored
+            value that is not a list of known ids is shown as every family disabled,
+            and the MCP hosts fail closed on it.
+          items:
+            type: string
+            enum: [remote_mcp, remote_mcp_files, remote_mcp_transfers, remote_mcp_graph, remote_mcp_knowledge, semantic_discovery, remote_mcp_changes, remote_mcp_access, remote_mcp_context, remote_mcp_coordination]
+        blockedConnectorClientIds:
+          type: array
+          maxItems: 100
+          description: >-
+            Connector client IDs this organization refuses at consent, issuance and on every
+            authorized request (D-019). A block revokes and deletes nothing.
+          items: { type: string }
+        blockedConnectorHostKinds:
+          type: array
+          description: Connector host kinds this organization refuses, as above (D-019).
+          items:
+            type: string
+            enum: [chatgpt, claude, custom-mcp]
+        remoteMcpKillSwitch:
+          type: boolean
+          description: >-
+            The organization kill switch (D-020). Engaged, every remote MCP family is disabled and
+            every connector grant and session is refused, get_capabilities included; releasing it
+            revokes nothing. A stored connector policy that is not this shape is shown as the switch
+            engaged with every host kind blocked, and every connector is refused.
+        settingsRevision:
+          type: integer
+          minimum: 0
+          description: >-
+            The stored settings revision this view was read at (VAULTGUARD-91). Returned, never
+            stored as a setting; send it back as expectedSettingsRevision to refuse a stale save.
       additionalProperties: true
 
     OrgSettingsUpdateRequest:
@@ -1955,6 +2009,12 @@ components:
         syncIntervalMinutes: { type: integer }
         enforceEncryption: { type: boolean }
         maxSessionDurationHours: { type: integer }
+        connectorAuthorizationDays:
+          type: integer
+          minimum: 1
+          maximum: 90
+          default: 30
+          description: Fresh connector consent duration, independent of browser sessions. A change requires fresh authentication and invalidates existing policy-bound credentials; grants are never extended.
         requireMfa: { type: boolean }
         allowedDomains:
           type: array
@@ -1965,6 +2025,38 @@ components:
         disabledAuditActions:
           type: array
           items: { type: string }
+        disabledRemoteMcpFeatures:
+          type: array
+          description: >-
+            Replaces the organization's disabled remote MCP families (D-014). An unknown
+            id, a non-string entry or a non-list value is refused with 400.
+          items:
+            type: string
+            enum: [remote_mcp, remote_mcp_files, remote_mcp_transfers, remote_mcp_graph, remote_mcp_knowledge, semantic_discovery, remote_mcp_changes, remote_mcp_access, remote_mcp_context, remote_mcp_coordination]
+        blockedConnectorClientIds:
+          type: array
+          maxItems: 100
+          description: Replaces the blocked connector client IDs (D-019); a value outside the connector id vocabulary or a list over 100 is refused with 400.
+          items: { type: string }
+        blockedConnectorHostKinds:
+          type: array
+          description: Replaces the blocked host kinds (D-019); an unknown kind is refused with 400.
+          items:
+            type: string
+            enum: [chatgpt, claude, custom-mcp]
+        remoteMcpKillSwitch:
+          type: boolean
+          description: >-
+            Engages or releases the organization kill switch (D-020); a non-boolean is refused with 400.
+            An update confined to the connector admission fields does not move policyRevision, so
+            existing connections resume when the switch is released or a block is removed.
+        expectedSettingsRevision:
+          type: integer
+          minimum: 0
+          description: >-
+            Optional precondition (VAULTGUARD-91): the update is refused with 409 unless the stored
+            settings are still at this settingsRevision. Every update is also refused with 409 when
+            the settings change concurrently while it is being saved.
       additionalProperties: true
 
     AuthSessionRequest:

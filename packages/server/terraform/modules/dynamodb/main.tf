@@ -928,10 +928,119 @@ resource "aws_dynamodb_table" "platform_metrics" {
   tags = { Name = "VaultGuard-${var.stage}-PlatformMetrics" }
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Immutable logical file versions
+#
+# PK: vaultKey = ORG#{orgId}#VAULT#{vaultId}
+# SK: fileVersionId for records; STORAGE#{sha256(locator)} for atomic bindings
+#     (logical identity remains independent of the S3 VersionId locator)
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_dynamodb_table" "file_versions" {
+  name         = "VaultGuard-${var.stage}-FileVersions"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "vaultKey"
+  range_key    = "fileVersionId"
+
+  deletion_protection_enabled = local.deletion_protection
+  point_in_time_recovery { enabled = local.pitr_enabled }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  attribute {
+    name = "vaultKey"
+    type = "S"
+  }
+  attribute {
+    name = "fileVersionId"
+    type = "S"
+  }
+  attribute {
+    name = "fileScopeId"
+    type = "S"
+  }
+  attribute {
+    name = "createdAtVersionId"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "file-history-index"
+    hash_key        = "fileScopeId"
+    range_key       = "createdAtVersionId"
+    projection_type = "ALL"
+  }
+
+  tags = { Name = "VaultGuard-${var.stage}-FileVersions" }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Immutable Workspace Revisions + Mutable Workspace Head
+#
+# PK: WORKSPACE#{encodedOrgId}#{encodedVaultId}
+# SK: HEAD | REVISION#{encodedRevisionId}#PREPARED|COMMITTED
+#
+# Prepared and committed rows are immutable conditional puts. The HEAD row is
+# the only mutable record and is published by one conditional transaction.
+# Manifests themselves are content-addressed immutable objects in the existing
+# KMS-encrypted, versioned vault bucket.
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_dynamodb_table" "workspace_revisions" {
+  name         = "VaultGuard-${var.stage}-WorkspaceRevisions"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  deletion_protection_enabled = local.deletion_protection
+  point_in_time_recovery { enabled = local.pitr_enabled }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.kms_key_arn
+  }
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  attribute {
+    name = "recordType"
+    type = "S"
+  }
+  # Discovery only; consumers strongly re-read each durable head before work.
+  global_secondary_index {
+    name            = "workspace-record-type-index"
+    hash_key        = "recordType"
+    range_key       = "pk"
+    projection_type = "KEYS_ONLY"
+  }
+
+  # Collaboration expiry is logical. Durable revision storage has no TTL;
+  # physical cleanup requires the explicit retention/recovery owner.
+
+  tags = { Name = "VaultGuard-${var.stage}-WorkspaceRevisions" }
+}
+
 # ─── Outputs ─────────────────────────────────────────────────────────────────
 
 output "platform_metrics_table_name" { value = aws_dynamodb_table.platform_metrics.name }
 output "platform_metrics_table_arn" { value = aws_dynamodb_table.platform_metrics.arn }
+
+output "file_versions_table_name" { value = aws_dynamodb_table.file_versions.name }
+output "file_versions_table_arn" { value = aws_dynamodb_table.file_versions.arn }
+
+output "workspace_revisions_table_name" { value = aws_dynamodb_table.workspace_revisions.name }
+output "workspace_revisions_table_arn" { value = aws_dynamodb_table.workspace_revisions.arn }
 
 output "shares_table_name" { value = aws_dynamodb_table.shares.name }
 output "shares_table_arn" { value = aws_dynamodb_table.shares.arn }

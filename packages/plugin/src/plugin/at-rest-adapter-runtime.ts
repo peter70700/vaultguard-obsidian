@@ -3039,6 +3039,11 @@ export class AtRestAdapterRuntime {
       return this.hostReadPlainFromDisk(path);
     }
 
+    // The revision replica owns cloud freshness. A native editor must always see
+    // its local pending bytes, never the legacy path reader's newest cloud image.
+    // Unknown compatibility also stays local until explicit legacy discovery.
+    if (this.ctx.shouldReadWorkspaceLocally?.()) return this.hostReadPlainFromDisk(path);
+
     // Phase-8 limited-access primary branch (OD-4): if this path is a known
     // 36-byte VG1 placeholder, hydrate via the server-side decrypt endpoint
     // and replace the on-disk placeholder with LAK-encrypted plaintext.
@@ -3371,6 +3376,12 @@ export class AtRestAdapterRuntime {
       throw new Error(
         `VaultGuard Sync: Access denied. You do not have write permission for "${path}".`
       );
+    }
+
+    if (this.ctx.handleWorkspaceWrite && await this.ctx.handleWorkspaceWrite(path, new TextEncoder().encode(data).buffer)) {
+      await this.emitAuditEvent("file.write", path, { outcome: "local-pending", writeModel: "reviewed_exact_base" });
+      this.updateStatusBar();
+      return;
     }
 
     const textBytesView = new TextEncoder().encode(data);
@@ -4229,6 +4240,11 @@ export class AtRestAdapterRuntime {
         `VaultGuard Sync: Access denied. You do not have write permission for "${path}".`
       );
     }
+    if (this.ctx.handleWorkspaceWrite && await this.ctx.handleWorkspaceWrite(path, data)) {
+      await this.emitAuditEvent("file.write", path, { outcome: "local-pending", writeModel: "reviewed_exact_base" });
+      this.updateStatusBar();
+      return;
+    }
     // Files over the JSON ceiling use a direct encrypted transfer. The
     // canonical server copy is finalized before local VG1 encryption. If that
     // cannot happen yet, preserve the exact plaintext bytes locally and persist
@@ -4512,6 +4528,11 @@ export class AtRestAdapterRuntime {
    */
   async interceptedDelete(path: string): Promise<void> {
     this.evictResourcePreview(path);
+    if (this.applyingRemoteWrite) {
+      if (this.originalAdapterMethods.remove) await this.originalAdapterMethods.remove(path);
+      await this.forgetAtRestProtected(path);
+      return;
+    }
     if (this.isLocalProjectMemoryModeEnabled()) {
       if (this.originalAdapterMethods.remove) {
         await this.originalAdapterMethods.remove(path);
@@ -4536,6 +4557,13 @@ export class AtRestAdapterRuntime {
       throw new Error(
         `VaultGuard Sync: Access denied. You do not have permission to delete "${path}".`
       );
+    }
+
+    if (this.ctx.handleWorkspaceMutation && await this.ctx.handleWorkspaceMutation("delete", path)) {
+      if (!this.originalAdapterMethods.remove) this.failIfAdapterDetached("remove", path);
+      else { await this.originalAdapterMethods.remove(path); await this.forgetAtRestProtected(path); }
+      await this.emitAuditEvent("file.delete", path, { outcome: "local-pending" });
+      return;
     }
 
     // Tombstone the local removal up front (the point we commit to deleting
@@ -4611,9 +4639,22 @@ export class AtRestAdapterRuntime {
     this.evictResourcePreview(oldNormalized);
     this.evictResourcePreview(oldPath);
 
-    // Local rename happens first regardless of permissions or network — the
-    // existing adapter behaviour the user expects. Server reconciliation is
-    // best-effort on top.
+    // Revision intent must survive before the file moves: otherwise a crash or
+    // journal failure would make the destination look like an unrelated new file.
+    if (!this.applyingRemoteWrite && !this.isLocalProjectMemoryModeEnabled() && this.session &&
+      this.settings.serverVaultId && !this.isPathExcluded(oldNormalized) && !this.isPathExcluded(newNormalized) &&
+      !this.isFolderMarkerPath(oldNormalized) && !this.isFolderMarkerPath(newNormalized) && this.ctx.handleWorkspaceMutation) {
+      if (!this.originalAdapterMethods.rename) this.failIfAdapterDetached("rename", oldPath);
+      const operation = this.app.vault.getAbstractFileByPath(oldPath) instanceof TFolder ? "move_folder" : "rename";
+      if (await this.ctx.handleWorkspaceMutation(operation, oldNormalized, newNormalized)) {
+        await this.originalAdapterMethods.rename!(oldPath, newPath);
+        await this.atRestProtectionState?.move(oldPath, newPath);
+        this.permissionStore.emit("changed", { path: oldNormalized });
+        return;
+      }
+    }
+
+    // Legacy path sync preserves its existing local-first rename behavior.
     if (this.originalAdapterMethods.rename) {
       await this.originalAdapterMethods.rename(oldPath, newPath);
       await this.atRestProtectionState?.move(oldPath, newPath);
@@ -4621,7 +4662,7 @@ export class AtRestAdapterRuntime {
       this.failIfAdapterDetached("rename", oldPath);
     }
 
-    if (this.isLocalProjectMemoryModeEnabled()) {
+    if (this.applyingRemoteWrite || this.isLocalProjectMemoryModeEnabled()) {
       return;
     }
 

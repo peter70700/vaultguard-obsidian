@@ -44,6 +44,11 @@ import {
   logAudit,
 } from './utils';
 import type { OrgRecord } from './utils';
+import {
+  connectorTeardownFailureCode,
+  endUserConnectorAccess,
+  type UserConnectorAccessOutcome,
+} from './connector-subject-revocation';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -177,11 +182,49 @@ export interface RevokeUserCryptoAccessParams {
   markerWrite?: MarkerWriteMode;
 }
 
+/**
+ * VAULTGUARD-129: what the revocation did to the user's remote-MCP connector
+ * grants and sessions. `incomplete` never leaves a usable grant: the marker
+ * already refuses every request, and reactivation completes the teardown before
+ * the marker can be removed. It carries a content-free failure code only.
+ */
+export type ConnectorRevocationOutcome =
+  | UserConnectorAccessOutcome
+  | { state: 'incomplete'; failure: string };
+
 export interface RevokeUserCryptoAccessResult {
   invalidatedSessions: number;
   revokedLeases: number;
   revokedAt: string;
   reEncryptionJobId: string | null;
+  connectorAccess: ConnectorRevocationOutcome;
+}
+
+/**
+ * VAULTGUARD-129: ends the user's connector grants and sessions and never
+ * throws. Revocation calls it after the marker is written, and a repeated
+ * revoke calls it again; reactivation calls `endUserConnectorAccess` directly,
+ * because there an incomplete teardown must refuse.
+ */
+export async function endRevokedUserConnectorAccess(params: {
+  orgId: string;
+  userId: string;
+  actorUserId: string;
+  reason: string;
+}): Promise<ConnectorRevocationOutcome> {
+  try {
+    return await endUserConnectorAccess({
+      orgId: params.orgId,
+      userId: params.userId,
+      actorUserId: params.actorUserId,
+      reason: params.reason,
+      cause: 'revocation',
+    });
+  } catch (error) {
+    const failure = connectorTeardownFailureCode(error);
+    console.error('[USER_REVOKE_CONNECTOR_TEARDOWN_INCOMPLETE]', { userId: params.userId, orgId: params.orgId, failure });
+    return { state: 'incomplete', failure };
+  }
 }
 
 export async function revokeUserCryptoAccess(
@@ -277,6 +320,19 @@ export async function revokeUserCryptoAccess(
     if (markerWrite !== 'ifAbsent' || !isConditionalCheckFailure(error)) throw error;
   }
 
+  // VAULTGUARD-129 — after the marker, so every connector request of this user
+  // is already refused while the grants and sessions are revoked. Non-fatal by
+  // design: the account is disabled and the marker written, and an incomplete
+  // teardown leaves no usable grant (the marker refuses now, the cutoff and
+  // reactivation's own teardown refuse later), so it is recorded and re-driven
+  // rather than failing a revocation that has already taken effect.
+  const connectorAccess = await endRevokedUserConnectorAccess({
+    orgId: params.orgId,
+    userId: params.targetUserId,
+    actorUserId: params.adminUserId,
+    reason: params.reason,
+  });
+
   let reEncryptionJobId: string | null = triggerReEncryption ? generateId() : null;
   if (triggerReEncryption) {
     try {
@@ -308,7 +364,26 @@ export async function revokeUserCryptoAccess(
     revokedLeases: activeLeases.length,
     revokedAt,
     reEncryptionJobId,
+    connectorAccess,
   };
+}
+
+/**
+ * VAULTGUARD-129: the content-free audit fields for a revocation's connector
+ * outcome, shared by every revocation audit row so they cannot drift apart.
+ */
+export function connectorRevocationAuditMetadata(outcome: ConnectorRevocationOutcome): Record<string, unknown> {
+  if (outcome.state === 'ended') {
+    return {
+      connectorAccess: 'ended',
+      connectorGrantsRevoked: outcome.grantsRevoked,
+      connectorSessionsRevoked: outcome.sessionsRevoked,
+    };
+  }
+  if (outcome.state === 'incomplete') {
+    return { connectorAccess: 'incomplete', connectorTeardownFailure: outcome.failure };
+  }
+  return { connectorAccess: 'not_configured' };
 }
 
 // ─── Guest teardown ──────────────────────────────────────────────────────────
@@ -576,6 +651,7 @@ export async function endGuestAccess(params: EndGuestAccessParams): Promise<EndG
       seatReleased,
       invalidatedSessions: crypto.invalidatedSessions,
       revokedLeases: crypto.revokedLeases,
+      ...connectorRevocationAuditMetadata(crypto.connectorAccess),
     },
   });
 

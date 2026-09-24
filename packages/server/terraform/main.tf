@@ -52,6 +52,8 @@ module "dynamodb" {
   stage       = var.stage
   is_prod     = local.is_prod
   kms_key_arn = module.kms.key_arn
+
+  connector_oauth_resource = var.connector_oauth_resource
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,19 +65,24 @@ module "cognito" {
 
   production_hardening = var.production_hardening
 
-  stage                         = var.stage
-  is_prod                       = local.is_prod
-  callback_urls                 = var.cognito_callback_urls
-  logout_urls                   = var.cognito_logout_urls
-  ses_sender_email              = var.sender_email
-  mfa_configuration             = var.cognito_mfa_configuration
-  advanced_security_mode        = var.cognito_advanced_security_mode
-  login_verification_mode       = var.login_verification_mode
-  login_verification_client_ids = var.login_verification_client_ids
-  sessions_table_name           = module.dynamodb.sessions_table_name
-  sessions_table_arn            = module.dynamodb.sessions_table_arn
-  kms_key_arn                   = module.kms.key_arn
-  turnstile_secret_arn          = var.turnstile_secret_arn
+  stage                    = var.stage
+  is_prod                  = local.is_prod
+  callback_urls            = var.cognito_callback_urls
+  logout_urls              = var.cognito_logout_urls
+  connector_oauth_resource = var.connector_oauth_resource
+  connector_oauth_clients  = var.connector_oauth_clients
+  # ADR-003: Cognito is the identity provider for connectors, not the
+  # authorization server. This callback is VaultGuard's own, never a provider's.
+  connector_identity_callback_url = var.connector_oauth_resource == "" ? "" : "${trimsuffix(var.connector_oauth_resource, "/mcp")}/oauth/callback"
+  ses_sender_email                = var.sender_email
+  mfa_configuration               = var.cognito_mfa_configuration
+  advanced_security_mode          = var.cognito_advanced_security_mode
+  login_verification_mode         = var.login_verification_mode
+  login_verification_client_ids   = var.login_verification_client_ids
+  sessions_table_name             = module.dynamodb.sessions_table_name
+  sessions_table_arn              = module.dynamodb.sessions_table_arn
+  kms_key_arn                     = module.kms.key_arn
+  turnstile_secret_arn            = var.turnstile_secret_arn
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,7 +90,35 @@ module "cognito" {
 # ─────────────────────────────────────────────────────────────────────────────
 
 module "lambda" {
-  source = "./modules/lambda"
+  # VAULTGUARD-49 / ADR-003: VaultGuard's own connector authorization server.
+  connector_oauth_resource     = var.connector_oauth_resource
+  connector_hosted_ui_domain   = module.cognito.connector_hosted_ui_domain
+  connector_identity_client_id = module.cognito.connector_identity_client_id
+  connector_auth_table_name    = module.dynamodb.connector_auth_table_name
+  connector_auth_table_arn     = module.dynamodb.connector_auth_table_arn
+  mcp_cursor_key_secret_arn    = var.mcp_cursor_key_secret_arn
+
+  workspace_revisions_table_name      = module.dynamodb.workspace_revisions_table_name
+  workspace_revisions_table_arn       = module.dynamodb.workspace_revisions_table_arn
+  workspace_capabilities              = var.workspace_capabilities
+  workspace_web_cursor_key_secret_arn = var.workspace_web_cursor_key_secret_arn
+  workspace_web_origin                = var.workspace_web_origin
+  workspace_cohort_controls_enabled   = var.workspace_cohort_controls_enabled
+  workspace_operator_enabled          = var.workspace_operator_enabled
+  workspace_operator_environment_id   = var.workspace_operator_environment_id
+  workspace_migration_redaction_key_secret_arn = var.workspace_migration_redaction_key_secret_arn
+  workspace_projection_delivery_enabled = var.workspace_projection_delivery_enabled
+  workspace_mcp_profile               = var.workspace_mcp_profile
+  workspace_mcp_write_admission       = var.workspace_mcp_write_admission
+  mcp_transfer_nonce_key_secret_arn    = var.mcp_transfer_nonce_key_secret_arn
+  workspace_cost_controls             = var.workspace_cost_controls
+  workspace_cost_telemetry             = var.workspace_cost_telemetry
+  workspace_slo_telemetry              = var.workspace_slo_telemetry
+  workspace_economics_table_name       = module.dynamodb.workspace_economics_table_name
+  workspace_economics_table_arn        = module.dynamodb.workspace_economics_table_arn
+  workspace_semantic_provider_profile = var.workspace_semantic_provider_profile
+  workspace_semantic_secret_arn       = var.workspace_semantic_secret_arn
+  source                              = "./modules/lambda"
 
   stage                            = var.stage
   is_prod                          = local.is_prod
@@ -102,6 +137,8 @@ module "lambda" {
   sessions_table_arn               = module.dynamodb.sessions_table_arn
   user_keys_table_name             = module.dynamodb.user_keys_table_name
   user_keys_table_arn              = module.dynamodb.user_keys_table_arn
+  file_versions_table_name         = module.dynamodb.file_versions_table_name
+  file_versions_table_arn          = module.dynamodb.file_versions_table_arn
   cognito_user_pool_arn            = module.cognito.user_pool_arn
   cognito_user_pool_id             = module.cognito.user_pool_id
   cognito_client_id                = module.cognito.client_id
@@ -166,32 +203,50 @@ module "apigateway" {
   production_hardening   = var.production_hardening
   api_data_trace_enabled = var.api_data_trace_enabled
 
-  stage                          = var.stage
-  is_prod                        = local.is_prod
-  cognito_user_pool_arn          = module.cognito.user_pool_arn
-  auth_lambda_invoke_arn         = module.lambda.auth_function_invoke_arn
-  auth_lambda_name               = module.lambda.auth_function_name
-  files_lambda_invoke_arn        = module.lambda.files_function_invoke_arn
-  files_lambda_name              = module.lambda.files_function_name
-  perms_lambda_invoke_arn        = module.lambda.permissions_function_invoke_arn
-  perms_lambda_name              = module.lambda.permissions_function_name
-  audit_lambda_invoke_arn        = module.lambda.audit_function_invoke_arn
-  audit_lambda_name              = module.lambda.audit_function_name
-  signup_lambda_invoke_arn       = module.lambda.signup_function_invoke_arn
-  signup_lambda_name             = module.lambda.signup_function_name
-  billing_lambda_invoke_arn      = module.lambda.billing_function_invoke_arn
-  billing_lambda_name            = module.lambda.billing_function_name
-  users_lambda_invoke_arn        = module.lambda.users_function_invoke_arn
-  users_lambda_name              = module.lambda.users_function_name
-  reencryption_lambda_invoke_arn = module.lambda.reencryption_function_invoke_arn
-  reencryption_lambda_name       = module.lambda.reencryption_function_name
-  vaults_lambda_invoke_arn       = module.lambda.vaults_function_invoke_arn
-  vaults_lambda_name             = module.lambda.vaults_function_name
-  shares_lambda_invoke_arn       = module.lambda.shares_function_invoke_arn
-  shares_lambda_name             = module.lambda.shares_function_name
-  superadmin_lambda_invoke_arn   = module.lambda.superadmin_function_invoke_arn
-  superadmin_lambda_name         = module.lambda.superadmin_function_name
-  domain_name                    = var.domain_name
+  stage                    = var.stage
+  is_prod                  = local.is_prod
+  cognito_user_pool_arn    = module.cognito.user_pool_arn
+  connector_oauth_resource = module.cognito.connector_resource_identifier
+  # VAULTGUARD-49 / ADR-003. This used to be `module.cognito.authorization_server_issuer`.
+  # Cognito's discovery document is AWS-generated and can never advertise
+  # `offline_access`; Cognito also fails authentication outright on a client that
+  # requests a scope it has not associated, so a ChatGPT connector following
+  # OpenAI's own instruction gets an authorization error rather than degrading.
+  # OpenAI's remedy for adding the scope late is recreating the app, so the
+  # issuer has to be right before any connector exists.
+  connector_authorization_server    = module.lambda.connector_authorization_server
+  connector_oauth_lambda_invoke_arn = module.lambda.connector_oauth_function_invoke_arn
+  connector_oauth_lambda_name       = module.lambda.connector_oauth_function_name
+  workspace_web_enabled             = module.lambda.workspace_web_enabled
+  workspace_web_lambda_invoke_arn   = module.lambda.workspace_web_function_invoke_arn
+  workspace_web_lambda_name         = module.lambda.workspace_web_function_name
+  workspace_mcp_profile             = var.workspace_mcp_profile
+  mcp_read_enabled                  = module.lambda.mcp_read_enabled
+  mcp_read_lambda_invoke_arn        = module.lambda.mcp_read_function_invoke_arn
+  mcp_read_lambda_name              = module.lambda.mcp_read_function_name
+  auth_lambda_invoke_arn            = module.lambda.auth_function_invoke_arn
+  auth_lambda_name                  = module.lambda.auth_function_name
+  files_lambda_invoke_arn           = module.lambda.files_function_invoke_arn
+  files_lambda_name                 = module.lambda.files_function_name
+  perms_lambda_invoke_arn           = module.lambda.permissions_function_invoke_arn
+  perms_lambda_name                 = module.lambda.permissions_function_name
+  audit_lambda_invoke_arn           = module.lambda.audit_function_invoke_arn
+  audit_lambda_name                 = module.lambda.audit_function_name
+  signup_lambda_invoke_arn          = module.lambda.signup_function_invoke_arn
+  signup_lambda_name                = module.lambda.signup_function_name
+  billing_lambda_invoke_arn         = module.lambda.billing_function_invoke_arn
+  billing_lambda_name               = module.lambda.billing_function_name
+  users_lambda_invoke_arn           = module.lambda.users_function_invoke_arn
+  users_lambda_name                 = module.lambda.users_function_name
+  reencryption_lambda_invoke_arn    = module.lambda.reencryption_function_invoke_arn
+  reencryption_lambda_name          = module.lambda.reencryption_function_name
+  vaults_lambda_invoke_arn          = module.lambda.vaults_function_invoke_arn
+  vaults_lambda_name                = module.lambda.vaults_function_name
+  shares_lambda_invoke_arn          = module.lambda.shares_function_invoke_arn
+  shares_lambda_name                = module.lambda.shares_function_name
+  superadmin_lambda_invoke_arn      = module.lambda.superadmin_function_invoke_arn
+  superadmin_lambda_name            = module.lambda.superadmin_function_name
+  domain_name                       = var.domain_name
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,7 +322,9 @@ resource "aws_api_gateway_base_path_mapping" "api" {
 # ─────────────────────────────────────────────────────────────────────────────
 
 module "monitoring" {
-  source = "./modules/monitoring"
+  workspace_recovery_failure_queue_name = module.lambda.workspace_recovery_failure_queue_name
+  workspace_revisions_table_name = module.dynamodb.workspace_revisions_table_name
+  source                         = "./modules/monitoring"
 
   stage             = var.stage
   admin_email       = var.admin_email

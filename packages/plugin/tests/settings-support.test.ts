@@ -100,6 +100,26 @@ describe("settings-support", () => {
     expect(settingsSource).toContain("the plaintext local-only vault setting currently supersedes it");
   });
 
+  it("describes excluded-path server removal as recoverable instead of a purge", () => {
+    const settingsSource = readFileSync("src/plugin/settings.ts", "utf8");
+
+    // The vault-scoped DELETE calls behind this control create recoverable
+    // delete markers; retained noncurrent versions survive. Claiming erasure
+    // here is the same false-erasure class as the 2026-07-28 privacy-policy
+    // correction, so the wording is a guarded contract and not just copy.
+    expect(settingsSource).toContain(
+      '.setName("Remove excluded paths from server (recoverable)")'
+    );
+    expect(settingsSource).toContain("is recoverable and is not permanent erasure");
+    expect(settingsSource).toContain(
+      "This creates recoverable delete markers; it does not permanently erase retained versions."
+    );
+    expect(settingsSource).toContain('.setButtonText("Remove from server")');
+    expect(settingsSource).not.toContain('.setName("Purge excluded paths from server")');
+    expect(settingsSource).not.toContain('.setButtonText("Purge from server")');
+    expect(settingsSource).not.toContain("PURGE FROM SERVER");
+  });
+
   it("keeps origin's searchable single-page shell instead of the incompatible category shell", () => {
     const settingsSource = readFileSync("src/plugin/settings.ts", "utf8");
 

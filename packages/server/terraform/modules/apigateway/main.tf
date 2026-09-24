@@ -6,6 +6,14 @@ variable "api_data_trace_enabled" {
   default = false
 }
 variable "cognito_user_pool_arn" { type = string }
+variable "connector_oauth_resource" {
+  type    = string
+  default = ""
+}
+variable "connector_authorization_server" {
+  type    = string
+  default = ""
+}
 variable "auth_lambda_invoke_arn" { type = string }
 variable "auth_lambda_name" { type = string }
 variable "files_lambda_invoke_arn" { type = string }
@@ -1513,6 +1521,21 @@ resource "aws_api_gateway_deployment" "vaultguard" {
   rest_api_id = aws_api_gateway_rest_api.vaultguard.id
 
   depends_on = [
+    # Explicitly ordered only when these counted resources exist.
+    aws_api_gateway_integration.workspace_web_read,
+    aws_api_gateway_integration.workspace_web_knowledge,
+    aws_api_gateway_integration.workspace_web_approvals,
+    aws_api_gateway_integration.workspace_web_access,
+    aws_api_gateway_integration.workspace_browser_operations,
+    aws_api_gateway_integration.workspace_web_options,
+    aws_api_gateway_integration_response.workspace_web_options,
+    aws_api_gateway_method_response.workspace_web_options,
+    aws_api_gateway_integration.mcp_read_post,
+    aws_api_gateway_integration.mcp_read_get,
+    aws_api_gateway_integration.mcp_read_delete,
+    aws_api_gateway_integration.mcp_read_options,
+    aws_api_gateway_integration_response.mcp_read_options,
+    aws_api_gateway_method_response.mcp_read_options,
     # Auth
     aws_api_gateway_integration.auth_login_post,
     aws_api_gateway_integration.auth_session_post,
@@ -1616,6 +1639,13 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     aws_api_gateway_integration.superadmin_users_get,
     aws_api_gateway_integration.superadmin_growth_get,
     aws_api_gateway_integration.superadmin_costs_get,
+    # Connector authorization server (VAULTGUARD-49)
+    aws_api_gateway_integration.oauth_authorization_server_get,
+    aws_api_gateway_integration.oauth_action_get,
+    aws_api_gateway_integration.oauth_action_post,
+    # Public OAuth protected-resource discovery for the isolated MCP lane.
+    aws_api_gateway_integration.oauth_protected_resource_get,
+    aws_api_gateway_integration.oauth_protected_resource_options,
     # CORS — gateway error responses
     aws_api_gateway_gateway_response.cors_4xx,
     aws_api_gateway_gateway_response.cors_5xx,
@@ -1626,7 +1656,7 @@ resource "aws_api_gateway_deployment" "vaultguard" {
     # The CORS integration_response IDs are critical — the deployment must
     # capture the API state AFTER these are fully created. Including them
     # here creates an implicit dependency AND forces redeployment on change.
-    redeployment = sha1(jsonencode([
+    redeployment = sha1(jsonencode(concat([
       # All method integrations (Lambda)
       aws_api_gateway_integration.auth_login_post.id,
       aws_api_gateway_integration.auth_session_post.id,
@@ -1725,11 +1755,44 @@ resource "aws_api_gateway_deployment" "vaultguard" {
       aws_api_gateway_integration.superadmin_users_get.id,
       aws_api_gateway_integration.superadmin_growth_get.id,
       aws_api_gateway_integration.superadmin_costs_get.id,
+      aws_api_gateway_integration.oauth_protected_resource_get[*].id,
+      aws_api_gateway_integration_response.oauth_protected_resource_get[*].id,
+      aws_api_gateway_method_response.oauth_protected_resource_get[*].id,
+      aws_api_gateway_integration.oauth_protected_resource_options[*].id,
+      aws_api_gateway_integration_response.oauth_protected_resource_options[*].id,
+      aws_api_gateway_method_response.oauth_protected_resource_options[*].id,
+      # VaultGuard's own connector authorization server (VAULTGUARD-49). A route
+      # missing from this trigger is created but never deployed to the stage.
+      aws_api_gateway_integration.oauth_authorization_server_get[*].id,
+      aws_api_gateway_integration.oauth_action_get[*].id,
+      aws_api_gateway_integration.oauth_action_post[*].id,
+      values(aws_api_gateway_integration.connector_oauth_options)[*].id,
+      values(aws_api_gateway_integration_response.connector_oauth_options)[*].id,
+      values(aws_api_gateway_method_response.connector_oauth_options)[*].id,
       # CORS OPTIONS — integrations AND integration responses
       values(aws_api_gateway_integration.cors_options)[*].id,
       values(aws_api_gateway_integration_response.cors_options)[*].id,
       values(aws_api_gateway_method_response.cors_options)[*].id,
-    ]))
+      ], var.mcp_read_enabled ? [
+      var.workspace_mcp_profile,
+      # Keep the legacy trigger shape byte-identical while disabled (D-012).
+      # Separate production read host and its explicit CORS contract.
+      aws_api_gateway_integration.mcp_read_post[*].id,
+      aws_api_gateway_integration.mcp_read_get[*].id,
+      aws_api_gateway_integration.mcp_read_delete[*].id,
+      aws_api_gateway_integration.mcp_read_options[*].id,
+      aws_api_gateway_integration_response.mcp_read_options[*].id,
+      aws_api_gateway_method_response.mcp_read_options[*].id,
+      ] : [], var.workspace_web_enabled ? [
+      values(aws_api_gateway_integration.workspace_web_read)[*].id,
+      aws_api_gateway_integration.workspace_web_knowledge[*].id,
+      aws_api_gateway_integration.workspace_web_approvals[*].id,
+      aws_api_gateway_integration.workspace_web_access[*].id,
+      values(aws_api_gateway_integration.workspace_browser_operations)[*].id,
+      values(aws_api_gateway_integration.workspace_web_options)[*].id,
+      values(aws_api_gateway_integration_response.workspace_web_options)[*].id,
+      values(aws_api_gateway_method_response.workspace_web_options)[*].id,
+    ] : [])))
   }
 
   lifecycle {
@@ -1901,7 +1964,7 @@ resource "aws_wafv2_web_acl" "api_regional" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "SmallPublicJsonBodyLimit"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
@@ -1940,7 +2003,7 @@ resource "aws_wafv2_web_acl" "api_regional" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "AWSManagedRulesCommonRuleSet"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
@@ -1963,7 +2026,7 @@ resource "aws_wafv2_web_acl" "api_regional" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "AWSManagedRulesKnownBadInputsRuleSet"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
@@ -1986,7 +2049,7 @@ resource "aws_wafv2_web_acl" "api_regional" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "RateLimitRule"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
@@ -2008,16 +2071,45 @@ resource "aws_wafv2_web_acl" "api_regional" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "GeoRestriction"
-      sampled_requests_enabled   = true
+      sampled_requests_enabled   = false
     }
   }
 
   visibility_config {
     cloudwatch_metrics_enabled = true
     metric_name                = "vaultguard-api-waf-${var.stage}"
-    sampled_requests_enabled   = true
+    sampled_requests_enabled   = false
   }
 
+
+  # Existing production routes only. This coarse edge limit supplements the
+  # authenticated tenant/principal/action budgets; it grants no authority.
+  rule {
+    name     = "WorkspaceRequestRate"
+    priority = 5
+    action { block {} }
+    statement {
+      rate_based_statement {
+        limit              = 600
+        aggregate_key_type = "IP"
+        scope_down_statement {
+          regex_match_statement {
+            regex_string = "^/(mcp|vaults/[^/]+/workspace(/.*)?)$"
+            field_to_match { uri_path {} }
+            text_transformation {
+              priority = 0
+              type     = "NONE"
+            }
+          }
+        }
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WorkspaceRequestRate"
+      sampled_requests_enabled   = false
+    }
+  }
   tags = { Name = "obsidian-vaultguard-api-waf-${var.stage}" }
 }
 

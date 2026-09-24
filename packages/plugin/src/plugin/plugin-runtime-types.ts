@@ -131,6 +131,7 @@ export interface AttachmentPreviewReport {
 }
 
 export interface VaultGuardCommandContext {
+  openWorkspaceSyncRecovery?(): void;
   app: App;
   logPrefix: string;
   addCommand(command: Command): void;
@@ -563,6 +564,9 @@ export type ProtectedContentGate =
     };
 
 export interface AtRestAdapterRuntimeContext {
+  shouldReadWorkspaceLocally?(): boolean;
+  handleWorkspaceWrite?(path: string, bytes: ArrayBuffer): Promise<boolean>;
+  handleWorkspaceMutation?(operation: "delete" | "rename" | "create_folder" | "move_folder" | "delete_folder", path: string, newPath?: string): Promise<boolean>;
   app: App;
   readonly manifestId: string | undefined;
   readonly settings: VaultGuardSettings;
@@ -785,6 +789,7 @@ export interface LargeFileDownloadResult {
 }
 
 export interface SyncRuntimeContext {
+  performWorkspaceSync?(): Promise<boolean>;
   app: App;
   normalizeVaultPath(path: string): string;
   isPathExcluded(path: string): boolean;

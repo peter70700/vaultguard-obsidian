@@ -3,8 +3,10 @@ terraform {
 
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.40"
+      source = "hashicorp/aws"
+      # Cognito refresh-token rotation support entered the v5 provider line in
+      # 5.98. Keep the current major while requiring the schema P0-004 uses.
+      version = "~> 5.98"
     }
     archive = {
       source  = "hashicorp/archive"

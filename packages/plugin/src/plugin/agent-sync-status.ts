@@ -29,6 +29,7 @@ export type AgentSyncConnectionState =
   | "unknown";
 
 export interface AgentSyncStatus {
+  workspace?: { writeModel: "reviewed_exact_base" | "unavailable"; local: "pending" | "observed"; reviewRequired: number; held: number; graph: "indexed" | "later" | "pending" | "unavailable"; search: "indexed" | "later" | "pending" | "unavailable" };
   vaultId: string | null;
   engineState: AgentSyncEngineState;
   connectionState: AgentSyncConnectionState;
@@ -43,6 +44,7 @@ export interface AgentSyncStatus {
 }
 
 export interface AgentSyncRuntimeState {
+  workspace?: unknown;
   status?: unknown;
   pendingChanges?: unknown;
   conflicts?: unknown;
@@ -210,6 +212,14 @@ export function projectAgentSyncStatus(source: AgentSyncStatusSource): AgentSync
   }
 
   const runtime = source.syncState ?? {};
+  const rawWorkspace = runtime.workspace && typeof runtime.workspace === "object" ? runtime.workspace as Record<string, unknown> : null;
+  const indexState = (value: unknown): "indexed" | "later" | "pending" | "unavailable" => value === "indexed" || value === "later" || value === "pending" ? value : "unavailable";
+  const workspace: AgentSyncStatus["workspace"] = rawWorkspace && rawWorkspace.mode !== "legacy" ? {
+    writeModel: rawWorkspace.writeModel === "reviewed_exact_base" ? "reviewed_exact_base" : "unavailable",
+    local: boundedCount(rawWorkspace.pending) ? "pending" : "observed",
+    reviewRequired: boundedCount(rawWorkspace.reviewRequired), held: boundedCount(rawWorkspace.held),
+    graph: indexState(rawWorkspace.graph), search: indexState(rawWorkspace.search),
+  } : undefined;
   const engine = engineState(runtime.status);
   const connection = connectionState(source.connectionState?.status);
   return {
@@ -219,7 +229,8 @@ export function projectAgentSyncStatus(source: AgentSyncStatusSource): AgentSync
     offline: connection !== "online" || engine === "offline",
     pendingChanges: boundedCount(runtime.pendingChanges),
     queuedOperations: boundedCount(source.offlineQueueLength),
-    conflictCount: conflictCount(runtime.conflicts),
+    conflictCount: conflictCount(runtime.conflicts) + boundedCount(rawWorkspace?.conflicts),
+    ...(workspace ? { workspace } : {}),
     lastSuccessfulSync: normalizedTimestamp(runtime.lastSync, "lastSuccessfulSync"),
     lastError: redactAgentSyncError(runtime.lastError),
     // Local state is not remote proof, even if lastSync is populated.

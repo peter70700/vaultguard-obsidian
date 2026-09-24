@@ -3,6 +3,18 @@ variable "is_prod" { type = bool }
 variable "production_hardening" { type = bool }
 variable "callback_urls" { type = list(string) }
 variable "logout_urls" { type = list(string) }
+variable "connector_oauth_resource" {
+  type    = string
+  default = ""
+}
+variable "connector_oauth_clients" {
+  type = map(object({
+    host_kind     = string
+    callback_urls = list(string)
+    logout_urls   = optional(list(string), [])
+  }))
+  default = {}
+}
 variable "ses_sender_email" { type = string }
 variable "sessions_table_name" { type = string }
 variable "sessions_table_arn" { type = string }
@@ -47,7 +59,13 @@ variable "mfa_configuration" {
 }
 
 variable "advanced_security_mode" {
-  type        = string
+  type = string
+  # Unreachable from this repo's root stack: main.tf always forwards
+  # var.cognito_advanced_security_mode, whose root default is "AUDIT". Read the
+  # root default, not this one, when reasoning about what an apply will do to a
+  # live pool — mistaking this "OFF" for the effective value is what produced the
+  # incorrect root cause first recorded on VAULTGUARD-44. It stays "OFF" so that
+  # a caller embedding this module standalone opts into PLUS deliberately.
   default     = "OFF"
   description = "Explicit Cognito advanced-security posture; AUDIT/ENFORCED may incur cost."
 
@@ -185,8 +203,8 @@ resource "aws_cognito_user_pool" "main" {
 # one provider secret; it has no Cognito admin or tenant-data permissions.
 data "archive_file" "pre_authentication" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/auth"
-  output_path = "${path.module}/.build/pre-authentication.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/auth"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/pre-authentication.zip"
 }
 
 data "aws_iam_policy_document" "pre_authentication_assume" {
@@ -345,6 +363,88 @@ resource "aws_cognito_user_pool_client" "plugin" {
   write_attributes = ["email"]
 }
 
+# Phase 0 remote-MCP OAuth is isolated from the native Obsidian client. An
+# empty resource (the default) creates no connector resource server or clients.
+locals {
+  connector_scope_descriptions = {
+    "workspace:read" = "Read workspace orientation and safe status"
+    "files:list"     = "List permission-filtered file metadata"
+    "files:read"     = "Read permission-filtered exact file content"
+    "connector:read" = "Read the current connector authorization status"
+  }
+}
+
+# SUPERSEDED by ADR-003 (VAULTGUARD-49): production's connector authorization
+# server is VaultGuard's own issuer, not Cognito. MCP-4 recommended retiring or
+# fencing this lane; this is the fence. It is now gated on its own opt-in flag,
+# which defaults to false, so enabling connector OAuth no longer creates a
+# resource server nothing uses. Deleting it outright is a separate change.
+resource "aws_cognito_resource_server" "connector" {
+  count = var.connector_oauth_resource == "" || !var.connector_cognito_as_authorization_server ? 0 : 1
+
+  identifier   = var.connector_oauth_resource
+  name         = "VaultGuard remote MCP ${var.stage}"
+  user_pool_id = aws_cognito_user_pool.main.id
+
+  dynamic "scope" {
+    for_each = local.connector_scope_descriptions
+    content {
+      scope_description = scope.value
+      scope_name        = scope.key
+    }
+  }
+}
+
+resource "aws_cognito_user_pool_client" "connector" {
+  for_each = var.connector_oauth_clients
+
+  name         = "vaultguard-mcp-${each.value.host_kind}-${var.stage}"
+  user_pool_id = aws_cognito_user_pool.main.id
+
+  # ChatGPT and Claude are public OAuth clients. No provider client secret is
+  # placed in Terraform state or handed to a desktop/browser process.
+  generate_secret = false
+
+  allowed_oauth_flows                  = ["code"]
+  allowed_oauth_flows_user_pool_client = true
+  allowed_oauth_scopes = concat(
+    ["openid", "email", "profile"],
+    [
+      for scope_name in keys(local.connector_scope_descriptions) :
+      "${aws_cognito_resource_server.connector[0].identifier}/${scope_name}"
+    ]
+  )
+  callback_urls                = each.value.callback_urls
+  logout_urls                  = length(each.value.logout_urls) > 0 ? each.value.logout_urls : null
+  supported_identity_providers = ["COGNITO"]
+
+  # Keep spike credentials short-lived. Refresh remains long enough to prove
+  # the provider refresh/disconnect lane without creating a standing 30-day
+  # credential. Server-side grant status is still rechecked on every MCP call.
+  access_token_validity  = 5
+  id_token_validity      = 5
+  refresh_token_validity = 1
+
+  token_validity_units {
+    access_token  = "minutes"
+    id_token      = "minutes"
+    refresh_token = "days"
+  }
+
+  enable_token_revocation       = true
+  prevent_user_existence_errors = "ENABLED"
+  read_attributes               = ["email", "email_verified"]
+  write_attributes              = []
+
+  # Rotate on every token-endpoint refresh and allow no replay grace. The
+  # deployed resource server must still check VaultGuard grant state because
+  # offline JWT signature/expiry validation cannot observe Cognito revocation.
+  refresh_token_rotation {
+    feature                    = "ENABLED"
+    retry_grace_period_seconds = 0
+  }
+}
+
 # Platform super-admin group — members can access the /superadmin/* platform
 # stats API (still gated by the SUPER_ADMIN_EMAILS allowlist in the Lambda).
 resource "aws_cognito_user_group" "platform_superadmin" {
@@ -362,4 +462,15 @@ resource "aws_cognito_user_pool_domain" "main" {
 output "user_pool_id" { value = aws_cognito_user_pool.main.id }
 output "user_pool_arn" { value = aws_cognito_user_pool.main.arn }
 output "client_id" { value = aws_cognito_user_pool_client.plugin.id }
+output "connector_client_ids" {
+  value = {
+    for name, client in aws_cognito_user_pool_client.connector : name => client.id
+  }
+}
+output "connector_resource_identifier" {
+  value = var.connector_oauth_resource
+}
+output "authorization_server_issuer" {
+  value = "https://${aws_cognito_user_pool.main.endpoint}"
+}
 output "pre_authentication_function_name" { value = aws_lambda_function.pre_authentication.function_name }

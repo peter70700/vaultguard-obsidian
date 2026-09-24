@@ -26,7 +26,9 @@ variable "production_hardening" {
     body tracing is DISABLED (so plaintext key-lease DEKs are never written to
     CloudWatch), the vault S3 bucket is force_destroy=false, DynamoDB tables get
     PITR + deletion protection, Secrets Manager / KMS use 30-day recovery
-    windows, and S3 keeps 365-day / 100-version noncurrent history.
+    windows. Proposed workspace source preserves referenced immutable S3 history
+    without blanket age/count expiration; D-011 policy reconciliation remains
+    required before deployment (docs/WORKSPACE-DEPLOYMENT.md).
 
     Set to false ONLY for genuinely disposable stacks (ephemeral CI, throwaway
     local test envs) that must be torn down freely. Does NOT change any
@@ -159,6 +161,50 @@ variable "cognito_logout_urls" {
   default     = ["obsidian://vaultguard/logout"]
 }
 
+variable "connector_oauth_resource" {
+  description = "Exact HTTPS RFC 8707 resource identifier for the isolated remote MCP OAuth spike. Empty keeps the lane disabled."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.connector_oauth_resource == "" || (
+      can(regex("^https://[^?#]+/mcp$", var.connector_oauth_resource)) &&
+      !can(regex("[[:space:]@]", var.connector_oauth_resource))
+    )
+    error_message = "connector_oauth_resource must be empty or an exact HTTPS URL ending in /mcp without a query or fragment."
+  }
+}
+
+variable "connector_oauth_clients" {
+  description = "Explicit provider OAuth clients for the isolated MCP spike. Populate only with callback URLs copied from the provider UI."
+  type = map(object({
+    host_kind     = string
+    callback_urls = list(string)
+    logout_urls   = optional(list(string), [])
+  }))
+  default = {}
+
+  validation {
+    condition = alltrue([
+      for client in values(var.connector_oauth_clients) :
+      contains(["chatgpt", "claude", "custom-mcp"], client.host_kind) &&
+      length(client.callback_urls) > 0 &&
+      length(distinct(client.callback_urls)) == length(client.callback_urls) &&
+      alltrue([for uri in client.callback_urls : can(regex("^https://[^#]+$", uri)) && !can(regex("[[:space:]@]", uri))]) &&
+      length(distinct(client.logout_urls)) == length(client.logout_urls) &&
+      alltrue([for uri in client.logout_urls : can(regex("^https://[^#]+$", uri)) && !can(regex("[[:space:]@]", uri))])
+    ])
+    error_message = "Each connector client needs a known host kind and unique HTTPS callback/logout URLs without fragments."
+  }
+}
+
+check "connector_oauth_resource_is_explicit" {
+  assert {
+    condition     = length(var.connector_oauth_clients) == 0 || var.connector_oauth_resource != ""
+    error_message = "connector_oauth_resource must be set before enabling any connector OAuth client."
+  }
+}
+
 variable "key_lease_duration_seconds" {
   description = "Duration of encryption key leases in seconds. CE defaults to 4 hours."
   type        = number
@@ -231,6 +277,12 @@ variable "super_admin_emails" {
 
 variable "billing_exempt_domains" {
   description = "Comma-separated email domains whose new orgs are billing-exempt (owner-domain match stamps the Subscriptions row comped=true at signup). Empty disables domain exemption. Set per-stage in environments/<stage>.tfvars."
+  type        = string
+  default     = ""
+}
+
+variable "mcp_cursor_key_secret_arn" {
+  description = "Explicit same-account/region Secrets Manager ARN for the MCP cursor key; required only when the read host is enabled."
   type        = string
   default     = ""
 }

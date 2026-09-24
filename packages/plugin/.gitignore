@@ -63,6 +63,10 @@ credentials.json
 .vaultguard-cache/
 .vaultguard-long-operation-stress/
 
+# Python bytecode from the gitflow lifecycle tooling
+__pycache__/
+*.py[cod]
+
 # Private-only tooling — planning + AI-assistant configs.
 # Mirrors scripts/templates/public-gitignore.txt; see also
 # scripts/export-validator.mjs::FORBIDDEN_AI_PATHS.

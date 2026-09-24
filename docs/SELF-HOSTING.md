@@ -32,7 +32,7 @@ roadmap.)
 | Tool       | Version  | Purpose                                |
 | ---------- | -------- | -------------------------------------- |
 | AWS CLI    | >= 2.x   | AWS account interaction                |
-| Node.js    | >= 20.x  | Lambda bundling and plugin build       |
+| Node.js    | `infrastructure/.nvmrc` | Lambda bundling and plugin build       |
 | Terraform  | >= 1.6   | Infrastructure deployment              |
 | npm        | Latest   | Package management                     |
 | Git        | >= 2.x   | Source control                         |
@@ -51,7 +51,7 @@ roadmap.)
 
 ```bash
 aws --version        # AWS CLI v2.x
-node --version       # v20+
+node --version       # match infrastructure/.nvmrc
 terraform --version  # 1.6+
 npm --version        # 9+
 git --version        # 2.x
@@ -161,14 +161,29 @@ defaults are sensible for a first deployment; you only need to change
 
 ### 1. Build the Lambda Bundles
 
-The Terraform module deploys pre-bundled Lambda artifacts from
-`infrastructure/dist/`. Build them first:
+The builder writes `infrastructure/dist/` and a verified snapshot for Terraform
+to package. Build it from a clean commit first:
 
 ```bash
 cd packages/server/infrastructure
-npm install
+nvm install
+nvm use
+npm ci --no-audit --no-fund
 npm run build:lambdas
 ```
+
+Lambda packaging requires a clean Git commit and bundles built from that same
+commit. Commit source changes before building; keep populated var-files ignored.
+Terraform verifies the build inventory and packages a retained snapshot. Every
+new Lambda zip includes `build-info.json` with its source commit. Rebuild after
+changing commits. Keep the worktree, `.build/` snapshots, and archives until any
+saved plan is applied or discarded. No VaultGuard CI account or artifact bucket
+is needed. `npm run deploy:plan -- --commit <commit> --worktree /absolute/new-lane`
+from `infrastructure/` prepares an isolated clean build. Add
+`--plan --var-file /absolute/your.tfvars` only when you intend to initialize and
+plan your backend.
+The wrapper never applies. A non-Git source archive can build for inspection but
+must be committed in your own Git repository before deployment.
 
 ### 2. Terraform Init / Plan / Apply
 
@@ -461,14 +476,13 @@ that domain (or its parent) in the same AWS account. Either:
 
 ### `npm run build:lambdas` fails with a Node version error
 
-Lambda bundling requires **Node.js 20** locally. If `node --version` reports
-18 or lower (or 22+), install Node 20 via `nvm` or your platform's package
-manager and retry:
+Lambda bundling requires the exact Node version in `infrastructure/.nvmrc`.
+Run from `packages/server/infrastructure`:
 
 ```bash
-nvm install 20
-nvm use 20
-node --version  # v20.x.x
+nvm install
+nvm use
+node --version
 ```
 
 ### Terraform state lock stuck after an interrupted apply

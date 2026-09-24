@@ -1,3 +1,4 @@
+import { selectLegacySync } from "./helpers/legacy-sync-fixture";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -146,6 +147,8 @@ function makePlugin() {
   plugin.getProtectedContentGate = vi.fn(() => ({ ok: true }));
 
   installTestPermissionStore(plugin);
+
+  selectLegacySync(plugin);
 
   return plugin;
 }

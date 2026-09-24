@@ -151,6 +151,24 @@ PATCH  /vaults/{vaultId}/members/{userId}      → change role (vault-admin)
 DELETE /vaults/{vaultId}/members/{userId}      → remove member (vault-admin, can't remove last admin)
 ```
 
+### Member-role safety boundary
+
+`Implemented` UI behavior: the plugin disables the signed-in user's own vault
+role dropdown and hides their temporary-access **End now** action. Extending
+their own temporary access remains available when otherwise permitted. The
+**End now** action uses organization-wide `revokeUser`, not removal from just
+this vault. Source: [settings](../../plugin/src/plugin/settings.ts),
+`guestMemberControlsFor`. The corresponding settings-member tests remain in the private development repository.
+
+`Partial` server protection: [vaults handler](../infrastructure/lambda/vaults/handler.ts)
+`handleRemoveMember` refuses removal of the last vault admin, but
+`handleUpdateMember` has no equivalent last-admin or self-demotion check in its
+permanent-member role branch. Its existing membership/guest checks and permission
+updates do not provide that guard. Disabling a UI control is not API enforcement.
+Use another administrator for role changes and retain administrator access;
+closing the backend gap is follow-up implementation work. Organization role
+and revoke refusals are separate controls.
+
 ### Files (vault-scoped)
 
 ```
@@ -591,3 +609,153 @@ model with `terraform apply`; no extra steps needed.
 `dev-server/server.ts` mirrors all vault routes against an in-memory store.
 A default vault `vault-dev-001` is seeded with the three test users as
 members. Use it to exercise the full flow without AWS.
+
+
+## Reviewed access changes
+
+`Implemented` source: the [access workflow](../infrastructure/lambda/workspace-access/index.ts)
+adds encrypted proposals, exact human review and separately authorized apply through
+the existing domain owners. Each domain has durable receipts; partial or interrupted
+outcomes never imply rollback or safe blind repetition. Internal links remain pointers
+requiring membership and current read access. Whole-vault effects that cannot be proved
+inside delegated path bounds require human administration. Capability defaults remain
+disabled. See [P4-008 source and verification boundaries](../reports/p4-008-access-share-workflows-2026-09-13.md).
+The four §8.7 MCP adapters reach the same workflow under the live connector's delegated
+authentication; a delegated agent's first access or share proposal opens its agent
+identity and session, and no deployed host composes them. See
+[VAULTGUARD-109 source evidence](../reports/vaultguard-109-access-share-mcp-tools-2026-09-16.md).
+
+
+## Publish approved workspace changes
+
+`Implemented` source — [P4-005 evidence](../reports/p4-005-atomic-publication-2026-09-13.md) routes the
+[concrete publication factory](../infrastructure/lambda/workspace-publication/index.ts),
+[one canonical transaction and durable recovery](../infrastructure/lambda/workspace-publication/service.ts),
+[encrypted manifests](../infrastructure/lambda/workspace-revisions/manifest-store.ts), and
+[SDK/concurrency verification](../tests/workspace-publication.test.ts).
+Exact HEAD, logical versions, identity/path history, approval, storage accounting,
+receipt and governed outbox commit together. Restore can use an explicit free destination;
+retained tombstones cannot hide a later live identity. Rebase is VAULTGUARD-76;
+the MCP write foundation is VAULTGUARD-103 and the change-set propose, get,
+list, apply and cancel tools are served as source by
+[VAULTGUARD-107 evidence](../reports/vaultguard-107-mcp-change-set-tools-2026-09-16.md)
+([adapters](../infrastructure/lambda/mcp/change-set-tools.ts),
+[SDK verification](../tests/workspace-change-set-sdk.test.ts)); no deployment composes
+them, and final acceptance remains VAULTGUARD-69.
+[VAULTGUARD-125 residuals](../reports/vaultguard-125-mcp-write-family-residuals-2026-09-17.md)
+reconcile a pending apply under the apply grant alone, verify a `workIntentId` on
+`propose_change_set`, serve the owner-only discussion on `get_change_set` and the keyed
+`comment_on_change_set` write, and add the `applied` list filter
+([adapter](../tests/mcp-change-set-tools.test.ts), [SDK](../tests/workspace-change-set-sdk.test.ts) and
+[real-chain](../tests/delegated-session-lifetimes.test.ts) verification).
+
+
+`Implemented` source — [VAULTGUARD-131 evidence](../reports/vaultguard-131-publication-final-answers-2026-09-20.md)
+and [owner tests](../tests/workspace-publication-final-answers.test.ts) cover the same-account
+lookup after the original session ends: it settles a fenced moved-head key to its conflict or
+durable failure without rebinding or replaying publication. The boundary proofs replace the
+session and reconcile through `recover` and the worker alone. Generation changes after approval
+capture answer the permanent approval refusal on the first delivery. Unchanged-base keys retain
+their approval slot. D-023 ratifies permanent one-admission-per-approval; a slot
+is not released or adopted after a terminal attempt. D-030 keeps unrecognized
+derivation failures pending for reconciliation; D-029 permits only a content-free
+creator-owned marker from an otherwise authorized delegated applier. Current
+source and deferred fixtures are in the [approved-policy handoff](../reports/vaultguard-130-approved-policy-source-2026-09-21.md).
+
+
+## Recover conflicting workspace changes
+
+`Implemented` source — [P4-006 evidence](../reports/p4-006-conflict-recovery-2026-09-13.md) routes the
+[concrete conflict service](../infrastructure/lambda/workspace-conflicts/index.ts),
+[shared contract](../packages/workspace-contracts/src/conflicts.ts) and
+[synthetic SDK verification](../tests/workspace-conflicts.test.ts). Exact rebase produces
+a new reviewed proposal; encrypted copies, bounded reads and durable resolution survive
+interruption. Existing approvals cannot authorize the new subject. MCP composition
+is VAULTGUARD-103 (write foundation) plus the served `list_conflicts`, `get_conflict`
+and `propose_conflict_resolution` adapters in
+[VAULTGUARD-107 evidence](../reports/vaultguard-107-mcp-change-set-tools-2026-09-16.md);
+the web inbox/conflict center is VAULTGUARD-84; final acceptance remains VAULTGUARD-69.
+
+
+## Recover versions and transfer files in the browser
+
+`Implemented` source — [P5-006 evidence](../reports/p5-006-history-transfers-governance-2026-09-13.md) routes
+[exact history and deleted recovery](../infrastructure/lambda/workspace-web/history-service.ts),
+[bounded encrypted transfers](../infrastructure/lambda/workspace-web/transfer-service.ts),
+[canonical publication and human handoffs](../infrastructure/lambda/workspace-web/handler.ts), and
+[real browser-host verification](../tests/workspace-browser-operations.test.ts).
+Original connector/agent-stop guards survive transfer review/apply; read-only receipt recovery
+remains available to a currently authorized human after disconnect. Connector management uses
+an owner directory and atomic revocation audit. Current Context policy remains explicitly
+unconfigured until a human choice. Source adapters for VAULTGUARD-103 (write
+foundation), VAULTGUARD-81 and VAULTGUARD-84, and retained final VAULTGUARD-69 checks,
+are described in the evidence report. The §8.8 MCP transfer tools are served by the
+separate, disabled-by-default
+[transfer host](../infrastructure/lambda/mcp/production-transfer-handler.ts) (VAULTGUARD-111,
+source only, `workspace-transfer-v1`) over the shared
+[transfer composition](../infrastructure/lambda/mcp/transfer-host.ts); status reports
+`completed`/`failed` from the canonical proposal, change-set and receipt records and per-file
+export delivery, `unique_path` is refused at issuance, and only the preparing connection sees
+the reviewed change-set reference, guarded on apply by the
+[transfer origin](../infrastructure/lambda/workspace-web/transfer-origin.ts) on every write host
+that serves change sets. Evidence:
+[composed host tests](../tests/mcp-transfer-host.test.ts) and
+[web-host and agent-applied import tests](../tests/mcp-transfer-browser.test.ts). IAM and
+deploy wiring stay with VAULTGUARD-100; deployed and provider acceptance with VAULTGUARD-69.
+The §8.6 MCP restore tools are served as source by
+[VAULTGUARD-108 evidence](../reports/vaultguard-108-mcp-restore-tools-2026-09-17.md)
+([adapters](../infrastructure/lambda/mcp/restore-tools.ts),
+[SDK verification](../tests/workspace-restore-sdk.test.ts)): `restore_file_version` and
+`restore_deleted_file` prepare one canonical restore proposal with a `restore_review`
+handoff, then apply by `approvalId` through the change-set publication path, with the
+approved subject resolved on the server; `list_file_history` discovers deleted files
+(`deleted: true`) and, on request (`includeRestoreSources: true`), each version's
+`sourceWorkspaceRevisionId` under current and historical path authorization; the generic
+change-set tools require `history:restore` for a restore operation. No deployment composes them; deployed and provider
+acceptance with VAULTGUARD-69.
+The same governance route also consumes a P4-003 REVIEW handoff:
+[the review-handoff bridge](../reports/mcpw-gap-3-review-handoff-bridge-2026-09-16.md)
+routes an MCP creator's proposal to the human who decides it and reports that
+decision back content-free (VAULTGUARD-106, source only).
+
+
+## Edit an exact version in the browser
+
+`Implemented` source — [P5-002 evidence](../reports/p5-002-exact-version-editor-2026-09-16.md) routes
+[the exact-version editor and its draft states](../admin-panel/src/features/workspace/editor/EditorPage.tsx),
+[the base/draft/failure model](../admin-panel/src/features/workspace/editor/editor-model.ts),
+[encrypted device draft retention](../admin-panel/src/features/workspace/editor/draft-store.ts), and
+[real host and rendered verification](../tests/workspace-editor.test.ts).
+Saving is proposal-first through the canonical `changes` and `approvals` owners with the exact base
+version and hash; the editor cannot approve, apply or write content. Reload, session expiry, network
+loss, revoke and concurrent edit keep a recoverable draft, retained as ciphertext bound to the account
+and vault. Every draft kept for the vault is listed on the page with per-draft download and discard
+and a discard-all action; a draft also clears itself once its bytes are the committed version, and an
+unreadable record can always be removed. Other
+actors' proposals and intents belong to VAULTGUARD-84; typed conflict outcomes belong to
+VAULTGUARD-104; final acceptance remains VAULTGUARD-69.
+
+## Review proposals and resolve conflicts in the browser
+
+`Implemented` source — [P5-005 evidence](../reports/p5-005-proposal-inbox-conflict-center-2026-09-16.md) routes
+[the proposal inbox and conflict list](../admin-panel/src/features/workspace/changes/ChangeCenterPage.tsx),
+[one proposal's exact diff, receipts and comments](../admin-panel/src/features/workspace/changes/ProposalPage.tsx),
+[the conflict center](../admin-panel/src/features/workspace/changes/ConflictPage.tsx),
+[the distinguishable lifecycle model](../admin-panel/src/features/workspace/changes/lifecycle.ts),
+[the web adapter over the canonical owners](../infrastructure/lambda/workspace-web/change-center.ts), and
+[real host](../tests/workspace-change-center.test.ts) and [rendered](../tests/workspace-change-center-ui.test.ts) verification.
+[VAULTGUARD-126 residuals](../reports/vaultguard-126-web-inbox-conflict-residuals-2026-09-17.md) add the stale-proposal check (`conflict_inspect`), expired
+review and approval states with review reopening, per-file receipt version pairs, owner-only agent and
+run identity, a bounded link-impact breakdown, per-file manual merges, content-free closed descriptors
+(`inspect_closed`) and advisory agent reservations on an open file (`activity`, through the
+[read-only human coordination adapter](../infrastructure/lambda/workspace-web/coordination-authority.ts)),
+with [host](../tests/workspace-change-center-residuals.test.ts) and
+[rendered](../tests/workspace-change-center-residuals-ui.test.ts) verification.
+Everything is served by the existing `workspace/changes` route; reads need `revision_reads` and
+cancel, comment, resolve and refresh also need `web_editing`. The inspection is owner-only,
+`readPreview`-authorized, audited and revalidated before egress, shows the reader's live rights, and has
+one 256 KiB diff budget. Comments are a new owner-only, encrypted, keyed, bounded collaboration record on
+the canonical proposal owner. A transfer-created proposal keeps its origin guard on every route that
+discloses or continues its bytes, and a derived resolution inherits the association. Index follow-up comes only from the ready
+index heads and device sync is stated as unconfirmed. MCP comments, other actors' intents on an open
+file (WEB-002) and physical/deployed acceptance remain open; final acceptance remains VAULTGUARD-69.

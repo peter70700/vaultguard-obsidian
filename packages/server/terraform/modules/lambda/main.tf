@@ -15,6 +15,8 @@ variable "sessions_table_name" { type = string }
 variable "sessions_table_arn" { type = string }
 variable "user_keys_table_name" { type = string }
 variable "user_keys_table_arn" { type = string }
+variable "file_versions_table_name" { type = string }
+variable "file_versions_table_arn" { type = string }
 variable "cognito_user_pool_arn" { type = string }
 variable "cognito_user_pool_id" { type = string }
 variable "cognito_client_id" { type = string }
@@ -184,6 +186,15 @@ data "aws_caller_identity" "current" {}
 
 locals {
   common_env = {
+    WORKSPACE_COHORT_CONTROL_TABLE     = var.workspace_cohort_controls_enabled ? var.workspace_revisions_table_name : ""
+    WORKSPACE_REMOTE_MCP_ENABLED      = tostring(var.workspace_capabilities.remote_mcp)
+    WORKSPACE_REVISION_READS_ENABLED  = tostring(var.workspace_capabilities.revision_reads)
+    WORKSPACE_REVISION_WRITES_ENABLED = tostring(var.workspace_capabilities.revision_writes)
+    WORKSPACE_PROJECTIONS_ENABLED     = tostring(var.workspace_capabilities.projections)
+    WORKSPACE_CONTEXT_ENABLED         = tostring(var.workspace_capabilities.context)
+    WORKSPACE_WEB_EDITING_ENABLED     = tostring(var.workspace_capabilities.web_editing)
+    WORKSPACE_FIRST_PARTY_SYNC_ENABLED = tostring(var.workspace_capabilities.first_party_sync)
+
     STAGE                    = var.stage
     VAULT_BUCKET             = var.vault_bucket_name
     PERMISSIONS_TABLE        = var.permissions_table_name
@@ -224,84 +235,84 @@ locals {
 }
 
 # ─── Lambda Source Packaging ─────────────────────────────────────────────────
-# Uses compiled JS bundles from infrastructure/dist/ (run build-lambdas.mjs first)
+# Uses verified commit-addressed snapshots (run build-lambdas.mjs first)
 
 data "archive_file" "auth_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/auth"
-  output_path = "${path.module}/.build/auth.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/auth"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/auth.zip"
 }
 
 data "archive_file" "files_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/files"
-  output_path = "${path.module}/.build/files.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/files"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/files.zip"
 }
 
 data "archive_file" "permissions_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/permissions"
-  output_path = "${path.module}/.build/permissions.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/permissions"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/permissions.zip"
 }
 
 data "archive_file" "audit_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/audit"
-  output_path = "${path.module}/.build/audit.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/audit"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/audit.zip"
 }
 
 data "archive_file" "billing_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/billing"
-  output_path = "${path.module}/.build/billing.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/billing"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/billing.zip"
 }
 
 data "archive_file" "signup_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/signup"
-  output_path = "${path.module}/.build/signup.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/signup"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/signup.zip"
 }
 
 data "archive_file" "users_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/users"
-  output_path = "${path.module}/.build/users.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/users"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/users.zip"
 }
 
 data "archive_file" "reencryption_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/reencryption"
-  output_path = "${path.module}/.build/reencryption.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/reencryption"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/reencryption.zip"
 }
 
 data "archive_file" "reconciler_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/reconciler"
-  output_path = "${path.module}/.build/reconciler.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/reconciler"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/reconciler.zip"
 }
 
 data "archive_file" "detector_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/detector"
-  output_path = "${path.module}/.build/detector.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/detector"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/detector.zip"
 }
 
 data "archive_file" "vaults_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/vaults"
-  output_path = "${path.module}/.build/vaults.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/vaults"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/vaults.zip"
 }
 
 data "archive_file" "shares_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/shares"
-  output_path = "${path.module}/.build/shares.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/shares"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/shares.zip"
 }
 
 data "archive_file" "superadmin_lambda" {
   type        = "zip"
-  source_dir  = "${path.module}/../../../infrastructure/dist/superadmin"
-  output_path = "${path.module}/.build/superadmin.zip"
+  source_dir  = "${data.external.lambda_build.result.directory}/superadmin"
+  output_path = "${path.module}/.build/${data.external.lambda_build.result.digest}/superadmin.zip"
 }
 
 # ─── IAM Roles ───────────────────────────────────────────────────────────────
@@ -431,6 +442,45 @@ data "aws_iam_policy_document" "auth_lambda" {
     actions   = ["dynamodb:PutItem"]
     resources = [var.audit_table_arn]
   }
+  # Compromised-account recovery ends the subject's connector grants and
+  # sessions before consuming the reset code. Keep this role's connector access
+  # on the same owner keys as the users and reconciler revocation paths.
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:GetItem", "dynamodb:Query"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR#GRANT#*", "CONNECTOR#SESSION#*", "CONNECTOR-OWNER#*", "CONNECTOR-SUBJECT-CUTOFF#*", "CONNECTOR-REVOCATION#*"]
+      }
+    }
+  }
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:UpdateItem"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR#GRANT#*", "CONNECTOR#SESSION#*"]
+      }
+    }
+  }
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:PutItem"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR-SUBJECT-CUTOFF#*", "CONNECTOR-REVOCATION#*"]
+      }
+    }
+  }
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:Query"]
     resources = [var.organizations_table_arn, "${var.organizations_table_arn}/index/*"]
@@ -485,6 +535,7 @@ resource "aws_lambda_function" "auth" {
 
   environment {
     variables = merge(local.common_env, {
+      CONNECTOR_AUTH_TABLE               = var.connector_auth_table_name
       KMS_KEY_ARN                        = var.kms_key_arn
       KEY_LEASE_DURATION_SECONDS         = tostring(var.key_lease_duration_seconds)
       SESSION_DURATION_SECONDS           = tostring(var.session_duration_seconds)
@@ -578,6 +629,22 @@ data "aws_iam_policy_document" "files_lambda" {
       var.user_keys_table_arn, "${var.user_keys_table_arn}/index/*",
     ]
   }
+  # Logical file-version records and provider bindings are append-only. DynamoDB
+  # authorizes transaction members through PutItem, not a TransactWriteItems
+  # IAM action. Restrict puts to the atomic record+binding transaction.
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.file_versions_table_arn]
+  }
+  statement {
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.file_versions_table_arn]
+    condition {
+      test     = "ForAnyValue:StringEquals"
+      variable = "dynamodb:EnclosingOperation"
+      values   = ["TransactWriteItems"]
+    }
+  }
   statement {
     actions   = ["dynamodb:GetItem"]
     resources = [var.revoked_keys_table_arn]
@@ -638,8 +705,10 @@ resource "aws_lambda_function" "files" {
 
   environment {
     variables = merge(local.common_env, {
-      VAULT_S3_BUCKET = var.vault_bucket_name
-      MAX_FILE_SIZE   = tostring(var.max_file_size_bytes)
+      VAULT_S3_BUCKET     = var.vault_bucket_name
+      WORKSPACE_REVISIONS_TABLE = var.workspace_revisions_table_name
+      FILE_VERSIONS_TABLE = var.file_versions_table_name
+      MAX_FILE_SIZE       = tostring(var.max_file_size_bytes)
     })
   }
 
@@ -664,6 +733,11 @@ resource "aws_iam_role_policy_attachment" "perms_logging" {
 }
 
 data "aws_iam_policy_document" "permissions_lambda" {
+  # Canonical authorization mutation admission is checked in the outbox/share transaction.
+  statement {
+    actions   = ["dynamodb:ConditionCheckItem"]
+    resources = [var.vaults_table_arn]
+  }
   # SaaS subscription gate — see auth_lambda for the full explainer.
   statement {
     actions   = ["dynamodb:GetItem"]
@@ -1205,6 +1279,50 @@ data "aws_iam_policy_document" "users_lambda" {
     actions   = ["dynamodb:PutItem"]
     resources = [var.audit_table_arn]
   }
+  # VAULTGUARD-129 — user revocation ends the user's remote-MCP connector grants
+  # and agent sessions, and reactivation completes that before re-enabling the
+  # account (shared/connector-subject-revocation.ts, reached from users/handler.ts through shared/access-revocation.ts).
+  # Present only when the connector authorization table exists. Exact-key reads
+  # of grant and session rows, owner-directory references, the user connector
+  # cutoff and revocation receipts, plus the owner-directory Query.
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:GetItem", "dynamodb:Query"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR#GRANT#*", "CONNECTOR#SESSION#*", "CONNECTOR-OWNER#*", "CONNECTOR-SUBJECT-CUTOFF#*", "CONNECTOR-REVOCATION#*"]
+      }
+    }
+  }
+  # Grant and session status only, inside the audited revocation transaction.
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:UpdateItem"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR#GRANT#*", "CONNECTOR#SESSION#*"]
+      }
+    }
+  }
+  # The forward-only user connector cutoff and the revocation receipt.
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:PutItem"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR-SUBJECT-CUTOFF#*", "CONNECTOR-REVOCATION#*"]
+      }
+    }
+  }
   # Documented exception to the append-only rule above: GET /users/{userId}/activity
   # (handleGetActivity, users/handler.ts) queries userId-index directly from THIS
   # role to render the admin panel's per-user activity view, so the index ARN is
@@ -1342,6 +1460,9 @@ resource "aws_lambda_function" "users" {
     variables = merge(local.common_env, {
       USER_POOL_ID      = var.cognito_user_pool_id
       STRIPE_SECRET_ARN = var.stripe_secret_arn
+      # VAULTGUARD-129: empty exactly when no connector table (and so no
+      # connector grant) exists; revocation then has no connections to end.
+      CONNECTOR_AUTH_TABLE = var.connector_auth_table_name
     })
   }
 
@@ -1706,6 +1827,50 @@ data "aws_iam_policy_document" "reconciler_lambda" {
   # that way. Its ViaService condition is table-agnostic, so it already covers
   # every table added above with no edit; and the recorded 2026-07-11 outage
   # came from stripping a CMK decrypt grant off a role that touched DynamoDB.
+  # VAULTGUARD-129 — user revocation ends the user's remote-MCP connector grants
+  # and agent sessions, and reactivation completes that before re-enabling the
+  # account (shared/connector-subject-revocation.ts, reached from reconciler/guest-sweeper.ts through shared/access-revocation.ts).
+  # Present only when the connector authorization table exists. Exact-key reads
+  # of grant and session rows, owner-directory references, the user connector
+  # cutoff and revocation receipts, plus the owner-directory Query.
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:GetItem", "dynamodb:Query"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR#GRANT#*", "CONNECTOR#SESSION#*", "CONNECTOR-OWNER#*", "CONNECTOR-SUBJECT-CUTOFF#*", "CONNECTOR-REVOCATION#*"]
+      }
+    }
+  }
+  # Grant and session status only, inside the audited revocation transaction.
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:UpdateItem"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR#GRANT#*", "CONNECTOR#SESSION#*"]
+      }
+    }
+  }
+  # The forward-only user connector cutoff and the revocation receipt.
+  dynamic "statement" {
+    for_each = var.connector_auth_table_arn == "" ? [] : [var.connector_auth_table_arn]
+    content {
+      actions   = ["dynamodb:PutItem"]
+      resources = [statement.value]
+      condition {
+        test     = "ForAllValues:StringLike"
+        variable = "dynamodb:LeadingKeys"
+        values   = ["CONNECTOR-SUBJECT-CUTOFF#*", "CONNECTOR-REVOCATION#*"]
+      }
+    }
+  }
   # ─── End of expired-guest sweeper additions ───────────────────────────────
   # KMS — Organizations / Subscriptions / Audit tables are encrypted with the
   # project master key; without service-scoped Decrypt, the first table
@@ -1763,6 +1928,8 @@ resource "aws_lambda_function" "reconciler" {
       # other than "enforce" runs the sweep read-only: full discovery and the
       # real decision logic, zero writes and zero Cognito calls.
       GUEST_SWEEP_MODE = var.guest_sweep_mode
+      # VAULTGUARD-129: an expired guest's connector grants end with the sweep.
+      CONNECTOR_AUTH_TABLE = var.connector_auth_table_name
     })
   }
 
@@ -1922,6 +2089,11 @@ resource "aws_iam_role_policy_attachment" "vaults_logging" {
 }
 
 data "aws_iam_policy_document" "vaults_lambda" {
+  # Canonical authorization mutation admission is checked in the outbox/share transaction.
+  statement {
+    actions   = ["dynamodb:ConditionCheckItem"]
+    resources = [var.vaults_table_arn]
+  }
   # SaaS subscription gate — see auth_lambda for the full explainer.
   statement {
     actions   = ["dynamodb:GetItem"]
@@ -2056,6 +2228,11 @@ resource "aws_iam_role_policy_attachment" "shares_logging" {
 }
 
 data "aws_iam_policy_document" "shares_lambda" {
+  # Canonical authorization mutation admission is checked in the outbox/share transaction.
+  statement {
+    actions   = ["dynamodb:ConditionCheckItem"]
+    resources = [var.vaults_table_arn]
+  }
   # SaaS subscription gate — see auth_lambda for the full explainer.
   statement {
     actions   = ["dynamodb:GetItem"]
@@ -2345,7 +2522,7 @@ output "reencryption_dlq_arn" { value = aws_sqs_queue.reencryption_dlq.arn }
 # leaves it unmonitored, so the list is derived from the resources themselves
 # rather than hand-maintained as strings.
 output "all_function_names" {
-  value = [
+  value = concat([
     aws_lambda_function.auth.function_name,
     aws_lambda_function.files.function_name,
     aws_lambda_function.permissions.function_name,
@@ -2355,11 +2532,12 @@ output "all_function_names" {
     aws_lambda_function.users.function_name,
     aws_lambda_function.reencryption.function_name,
     aws_lambda_function.reconciler.function_name,
+    aws_lambda_function.workspace_recovery.function_name,
     aws_lambda_function.detector.function_name,
     aws_lambda_function.vaults.function_name,
     aws_lambda_function.shares.function_name,
     aws_lambda_function.superadmin.function_name,
-  ]
+  ], aws_lambda_function.connector_oauth[*].function_name, aws_lambda_function.mcp_read[*].function_name, aws_lambda_function.mcp_read_prepare[*].function_name, aws_lambda_function.mcp_write[*].function_name, aws_lambda_function.mcp_write_prepare[*].function_name, aws_lambda_function.workspace_projection[*].function_name, aws_lambda_function.workspace_projection_delivery[*].function_name, aws_lambda_function.workspace_operator[*].function_name, aws_lambda_function.workspace_migration[*].function_name, aws_lambda_function.workspace_web[*].function_name)
 }
 
 # Concrete log-group dependencies for monitoring metric filters. Passing names
@@ -2367,7 +2545,7 @@ output "all_function_names" {
 # monitoring module) prevents apply-time races where a filter is created before
 # its Lambda log group exists.
 output "all_log_group_names" {
-  value = [
+  value = concat([
     aws_cloudwatch_log_group.auth.name,
     aws_cloudwatch_log_group.files.name,
     aws_cloudwatch_log_group.permissions.name,
@@ -2377,9 +2555,10 @@ output "all_log_group_names" {
     aws_cloudwatch_log_group.users.name,
     aws_cloudwatch_log_group.reencryption.name,
     aws_cloudwatch_log_group.reconciler.name,
+    aws_cloudwatch_log_group.workspace_recovery.name,
     aws_cloudwatch_log_group.detector.name,
     aws_cloudwatch_log_group.vaults.name,
     aws_cloudwatch_log_group.shares.name,
     aws_cloudwatch_log_group.superadmin.name,
-  ]
+  ], aws_cloudwatch_log_group.connector_oauth[*].name, aws_cloudwatch_log_group.mcp_read[*].name, aws_cloudwatch_log_group.mcp_read_prepare[*].name, aws_cloudwatch_log_group.mcp_write[*].name, aws_cloudwatch_log_group.mcp_write_prepare[*].name, aws_cloudwatch_log_group.workspace_projection[*].name, aws_cloudwatch_log_group.workspace_projection_delivery[*].name, aws_cloudwatch_log_group.workspace_operator[*].name, aws_cloudwatch_log_group.workspace_migration[*].name, aws_cloudwatch_log_group.workspace_web[*].name)
 }

@@ -26,7 +26,7 @@ import {
   GenerateDataKeyCommand,
   DecryptCommand,
 } from '@aws-sdk/client-kms';
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import {
   docClient,
@@ -57,6 +57,24 @@ import {
   type RotationLease,
 } from '../shared/rotation-fence';
 import { emitSecurityMetric } from '../shared/metrics';
+import {
+  aesDecrypt,
+  aesEncrypt,
+  getActiveScopeDataKey,
+  scopeKeyPk,
+  scopeKmsContext,
+  takeAndWipeKmsPlaintext,
+} from '../shared/vault-crypto-core';
+
+// Preserve the established public imports while moving their implementation
+// out of this route handler.
+export {
+  aesDecrypt,
+  aesEncrypt,
+  getActiveScopeDataKey,
+  scopeKmsContext,
+  takeAndWipeKmsPlaintext,
+} from '../shared/vault-crypto-core';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -69,10 +87,6 @@ const REGION = process.env.AWS_REGION || 'eu-west-1';
 const s3Client = new S3Client({ region: REGION });
 const kmsClient = new KMSClient({ region: REGION });
 
-/** VaultGuard encrypted payload format constants */
-const IV_LENGTH = 12;
-const AUTH_TAG_LENGTH = 16;
-const AES_ALGORITHM = 'aes-256-gcm';
 const QUERY_MAX_PAGES = 100;
 const QUERY_MAX_ITEMS = 10_000;
 const MAX_FILE_ATTEMPTS = 3;
@@ -135,17 +149,6 @@ interface ReEncryptionPlan extends AffectedVaultScope {
   oldKey: { key: Buffer; keyId: string };
   newKey: PreparedScopeKey;
   s3Keys: string[];
-}
-
-/**
- * Copy KMS plaintext into the caller-owned buffer and immediately wipe the SDK
- * response view. The returned buffer must itself be wiped by its owner in a
- * `finally` block.
- */
-export function takeAndWipeKmsPlaintext(plaintext: Uint8Array): Buffer {
-  const owned = Buffer.from(plaintext);
-  plaintext.fill(0);
-  return owned;
 }
 
 function wipeBuffers(buffers: Iterable<Buffer | null | undefined>): void {
@@ -761,70 +764,6 @@ async function recoverOldDeks(userId: string, orgId: string): Promise<RecoveredD
 
 // ─── AES-256-GCM Operations ────────────────────────────────────────────────
 
-/**
- * Decrypt a VaultGuard-format encrypted payload.
- * Format: [IV (12 bytes)][Ciphertext][Auth Tag (16 bytes)]
- */
-export function aesDecrypt(payload: Buffer, key: Buffer): Buffer {
-  if (payload.length < IV_LENGTH + AUTH_TAG_LENGTH) {
-    throw new Error(`Payload too short for decryption: ${payload.length} bytes`);
-  }
-
-  const iv = payload.subarray(0, IV_LENGTH);
-  const authTag = payload.subarray(payload.length - AUTH_TAG_LENGTH);
-  const ciphertext = payload.subarray(IV_LENGTH, payload.length - AUTH_TAG_LENGTH);
-
-  const decipher = createDecipheriv(AES_ALGORITHM, key, iv);
-  decipher.setAuthTag(authTag);
-
-  const updated = decipher.update(ciphertext);
-  let finalized: Buffer | null = null;
-  try {
-    finalized = decipher.final();
-    const decrypted = Buffer.alloc(updated.length + finalized.length);
-    updated.copy(decrypted, 0);
-    finalized.copy(decrypted, updated.length);
-    return decrypted;
-  } finally {
-    // `decipher.update()` can yield unauthenticated plaintext before final()
-    // verifies the GCM tag. Keep explicit ownership so both success and tag
-    // failure wipe every transient plaintext buffer.
-    updated.fill(0);
-    finalized?.fill(0);
-  }
-}
-
-/**
- * Encrypt plaintext into VaultGuard format with a new random IV.
- * Returns: [IV (12 bytes)][Ciphertext][Auth Tag (16 bytes)]
- */
-export function aesEncrypt(plaintext: Buffer, key: Buffer): Buffer {
-  const iv = randomBytes(IV_LENGTH);
-  const cipher = createCipheriv(AES_ALGORITHM, key, iv);
-
-  const updated = cipher.update(plaintext);
-  let finalized: Buffer | null = null;
-  let authTag: Buffer | null = null;
-  try {
-    finalized = cipher.final();
-    authTag = cipher.getAuthTag();
-
-    // Pack exactly like the plugin Web Crypto path: [IV][ciphertext || tag].
-    const encryptedLength = updated.length + finalized.length;
-    const result = Buffer.alloc(IV_LENGTH + AUTH_TAG_LENGTH + encryptedLength);
-    iv.copy(result, 0);
-    updated.copy(result, IV_LENGTH);
-    finalized.copy(result, IV_LENGTH + updated.length);
-    authTag.copy(result, IV_LENGTH + encryptedLength);
-    return result;
-  } finally {
-    iv.fill(0);
-    updated.fill(0);
-    finalized?.fill(0);
-    authTag?.fill(0);
-  }
-}
-
 // ─── File Re-encryption ────────────────────────────────────────────────────
 
 /**
@@ -930,35 +869,6 @@ function vaultS3Prefix(orgId: string, vaultId: string): string {
   return `${S3_PREFIX_BASE}${orgId}/${vaultId}/`;
 }
 
-function encodedScope(scope: string): string {
-  return Buffer.from(scope, 'utf8')
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
-}
-
-function scopeKeyPk(orgId: string, scope: string, vaultId?: string): string {
-  const scopePart = encodedScope(scope);
-  if (vaultId) {
-    return `ORG#${orgId}#VAULT#${vaultId}#SCOPE#${scopePart}`;
-  }
-  return `ORG#${orgId}#SCOPE#${scopePart}`;
-}
-
-// Exported so Phase 7's restore endpoint and the Plan 06-03 EncryptionContext
-// preservation test can reconstruct the KMS EncryptionContext from a
-// GSI-projected user_keys row (orgId + scope + vaultId). Pure function with
-// no I/O — safe to widen surface.
-export function scopeKmsContext(orgId: string, scope: string, vaultId?: string): Record<string, string> {
-  return {
-    orgId,
-    ...(vaultId ? { vaultId } : {}),
-    scope,
-    purpose: 'vault-scope-dek',
-  };
-}
-
 async function getAffectedVaultScopes(
   userId: string,
   orgId: string,
@@ -1017,46 +927,6 @@ async function getAffectedVaultScopes(
   return Array.from(scopesByVault.entries()).flatMap(([vaultId, scopes]) =>
     Array.from(scopes).map((scope) => ({ vaultId, scope }))
   );
-}
-
-export async function getActiveScopeDataKey(
-  orgId: string,
-  vaultId: string | undefined,
-  scope: string
-): Promise<{ key: Buffer; keyId: string } | null> {
-  const result = await docClient.send(
-    new GetCommand({
-      TableName: USER_KEYS_TABLE,
-      Key: { pk: scopeKeyPk(orgId, scope, vaultId), sk: 'ACTIVE' },
-      ConsistentRead: true,
-    })
-  );
-
-  const item = result.Item as
-    | { encryptedDataKey?: string; status?: string; keyId?: string }
-    | undefined;
-  if (!item?.encryptedDataKey || item.status !== 'active') {
-    return null;
-  }
-
-  const decryptResponse = await kmsClient.send(
-    new DecryptCommand({
-      CiphertextBlob: Buffer.from(item.encryptedDataKey, 'base64'),
-      EncryptionContext: scopeKmsContext(orgId, scope, vaultId),
-    })
-  );
-
-  if (!decryptResponse.Plaintext) {
-    throw new Error(`KMS Decrypt did not return key material for vault ${vaultId || '(legacy)'}`);
-  }
-
-  // Backwards-compat: rows written before Phase 6 don't yet have `keyId`.
-  // Use `'legacy'` sentinel; the backfill script populates real UUIDs.
-  // Phase 7's restore endpoint will fall back to current-ACTIVE-DEK + warning
-  // audit when the keyId on an S3 object is `'legacy'` or absent.
-  const keyId = typeof item.keyId === 'string' && item.keyId.length > 0 ? item.keyId : 'legacy';
-
-  return { key: takeAndWipeKmsPlaintext(decryptResponse.Plaintext), keyId };
 }
 
 async function resolveOldScopeKey(
