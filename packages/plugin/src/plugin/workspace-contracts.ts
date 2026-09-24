@@ -2,7 +2,7 @@ import {
   parseStableId,
   revisionSelectorCodec,
   type RevisionSelector,
-} from "../../packages/workspace-contracts";
+} from "../vendor/workspace-contracts/src";
 
 /** Plugin boundary for revision selectors received from persisted or remote JSON. */
 export function decodePluginRevisionSelector(serialized: string): RevisionSelector {

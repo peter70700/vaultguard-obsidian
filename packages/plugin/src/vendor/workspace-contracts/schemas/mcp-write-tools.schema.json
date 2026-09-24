@@ -1,0 +1,565 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:mcp-write-tools",
+  "title": "VaultGuard Spec 021 MCP write-tool inputs (contract sections 8.5-8.7)",
+  "description": "Normative closed input schemas for every unserved write tool, reconciled with the implemented closed contracts (CreateProposalInput, ApplyProposalInput, ResolveConflictInput, the restore proposal operation, AccessCommand and ContextDefinition). Section 8.9 of contracts/mcp-tools.md holds the adapter-mapping table that names every rename. Registering an MCP write descriptor whose property names or required fields differ from the entry here is refused by the Lambda write registry.",
+  "$defs": {
+    "vaultId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/vaultId" },
+    "safeId": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId" },
+    "path": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safePath" },
+    "sha256": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" },
+    "timestamp": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/timestamp" },
+    "proposalRevision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "idempotencyKey": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+    "cursor": { "type": "string", "minLength": 16, "maxLength": 2048, "format": "opaque-cursor" },
+    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+    "ttlSeconds": { "type": "integer", "minimum": 30, "maximum": 86400 },
+    "role": { "enum": ["viewer", "editor", "admin"] },
+    "accessOperation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "pathPattern", "principal", "level"],
+          "properties": {
+            "op": { "const": "set_path_level" },
+            "pathPattern": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^/[^\\\\\\u0000-\\u001f\\u007f]*$",
+              "format": "vault-path-pattern",
+              "description": "An absolute vault path pattern as the permission owner stores it: a leading slash, no backslash and no control character (U+0000-U+001F, U+007F), at most 1024 UTF-8 bytes. The wildcard and glob rules stay the permission authority's."
+            },
+            "principal": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["userId"],
+                  "properties": { "userId": { "$ref": "#/$defs/safeId" } }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["role"],
+                  "properties": { "role": { "$ref": "#/$defs/role" } }
+                }
+              ]
+            },
+            "level": { "enum": ["none", "read", "write", "admin"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "userId", "role"],
+          "properties": {
+            "op": { "const": "add_member" },
+            "userId": { "$ref": "#/$defs/safeId" },
+            "role": { "$ref": "#/$defs/role" },
+            "expiresAt": { "$ref": "#/$defs/timestamp" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "userId", "expectedMembershipRevision", "role"],
+          "properties": {
+            "op": { "const": "set_member_role" },
+            "userId": { "$ref": "#/$defs/safeId" },
+            "expectedMembershipRevision": { "$ref": "#/$defs/safeId" },
+            "role": { "$ref": "#/$defs/role" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "userId", "expectedMembershipRevision"],
+          "properties": {
+            "op": { "const": "remove_member" },
+            "userId": { "$ref": "#/$defs/safeId" },
+            "expectedMembershipRevision": { "$ref": "#/$defs/safeId" }
+          }
+        }
+      ]
+    },
+    "shareOperation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "file"],
+          "properties": {
+            "op": { "const": "create_share" },
+            "file": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fileId", "fileVersionId", "path"],
+              "properties": {
+                "fileId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileId" },
+                "fileVersionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" },
+                "path": { "$ref": "#/$defs/path" }
+              }
+            },
+            "expiresAt": { "$ref": "#/$defs/timestamp" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "shareId"],
+          "properties": {
+            "op": { "const": "revoke_share" },
+            "shareId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/shareId" }
+          }
+        }
+      ]
+    },
+    "contextSelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "fileId"],
+          "properties": {
+            "kind": { "const": "file" },
+            "fileId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileId" },
+            "fileVersionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" },
+            "workspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "folderId"],
+          "properties": {
+            "kind": { "const": "folder" },
+            "folderId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/folderId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "tag"],
+          "properties": {
+            "kind": { "const": "tag" },
+            "tag": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "query"],
+          "properties": {
+            "kind": { "const": "search" },
+            "query": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "fileId", "depth"],
+          "properties": {
+            "kind": { "const": "graph" },
+            "fileId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileId" },
+            "depth": { "type": "integer", "minimum": 1, "maximum": 3 },
+            "edgeKinds": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z-]+$" }
+            }
+          }
+        }
+      ]
+    },
+    "contextDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "purpose", "instructions", "selectors", "baseWorkspaceRevisionId", "refreshPolicy", "status"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "purpose": { "type": "string", "maxLength": 2048 },
+        "instructions": { "type": "string", "maxLength": 16384 },
+        "selectors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/contextSelector" }
+        },
+        "baseWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+        "refreshPolicy": { "enum": ["pinned", "latest-authorized", "review-on-change"] },
+        "status": { "enum": ["active", "archived"] }
+      }
+    },
+    "resourceClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "resourceId", "access"],
+      "properties": {
+        "kind": { "enum": ["file", "path", "block", "property", "task", "vault_metadata"] },
+        "resourceId": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "access": { "enum": ["read", "propose", "write"] },
+        "expectedVersionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" }
+      }
+    },
+
+    "propose_change_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "baseWorkspaceRevisionId", "operations", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "baseWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+        "workIntentId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workIntentId" },
+        "contextPackVersionIds": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/contextPackVersionId" }
+        },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "urn:vaultguard:workspace-contracts:1:proposal-operation" }
+        },
+        "rationale": { "type": "string", "maxLength": 2000 },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "get_change_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "proposalId"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+        "proposalRevision": { "$ref": "#/$defs/proposalRevision" },
+        "referenceCursor": { "$ref": "#/$defs/cursor" }
+      }
+    },
+    "list_change_sets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "state": {
+          "enum": ["draft", "validated", "awaiting_approval", "approved", "applied", "rejected", "superseded", "expired"]
+        },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "limit": { "$ref": "#/$defs/limit" }
+      }
+    },
+    "apply_change_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vaultId",
+        "proposalId",
+        "proposalRevision",
+        "approvedOperationsHash",
+        "previewHash",
+        "approvalId",
+        "expectedBaseWorkspaceRevisionId",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+        "proposalRevision": { "$ref": "#/$defs/proposalRevision" },
+        "approvedOperationsHash": { "$ref": "#/$defs/sha256" },
+        "previewHash": { "$ref": "#/$defs/sha256" },
+        "approvalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/approvalId" },
+        "expectedBaseWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+        "workIntentId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workIntentId" },
+        "reservationFencingTokens": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 16, "maxLength": 256, "pattern": "^[A-Za-z0-9_-]+$" }
+        },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "cancel_change_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "proposalId", "proposalRevision", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+        "proposalRevision": { "$ref": "#/$defs/proposalRevision" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" },
+        "cursor": { "$ref": "#/$defs/cursor" }
+      }
+    },
+    "comment_on_change_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "proposalId", "proposalRevision", "body", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+        "proposalRevision": { "$ref": "#/$defs/proposalRevision" },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "Plain text for the proposal's owner: not blank, at most 2000 characters and 8192 UTF-8 bytes, with no control character other than tab and line feed and no bidirectional, zero-width, separator or tag character (the canonical proposal comment rule)."
+        },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "list_conflicts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "state": { "enum": ["open", "resolved"] },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "limit": { "$ref": "#/$defs/limit" }
+      }
+    },
+    "get_conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "conflictId"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "conflictId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/conflictId" }
+      }
+    },
+    "propose_conflict_resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "conflictId", "expectedCurrentWorkspaceRevisionId", "strategy", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "conflictId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/conflictId" },
+        "expectedCurrentWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+        "strategy": { "enum": ["keep_current", "cancel", "rebase", "merge", "manual", "duplicate", "rename"] },
+        "targetPath": { "$ref": "#/$defs/path" },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "urn:vaultguard:workspace-contracts:1:proposal-operation" }
+        },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+
+    "restore_file_version": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vaultId",
+        "sourceWorkspaceRevisionId",
+        "restoreVersionId",
+        "expectedVersionId",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "fileId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileId" },
+        "path": { "$ref": "#/$defs/path" },
+        "sourceWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+        "restoreVersionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" },
+        "expectedVersionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" },
+        "approvalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/approvalId" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      },
+      "oneOf": [
+        { "required": ["fileId"], "not": { "required": ["path"] } },
+        { "required": ["path"], "not": { "required": ["fileId"] } }
+      ]
+    },
+    "restore_deleted_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vaultId",
+        "sourceWorkspaceRevisionId",
+        "restoreVersionId",
+        "expectedVersionId",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "fileId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileId" },
+        "path": { "$ref": "#/$defs/path" },
+        "sourceWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+        "restoreVersionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" },
+        "expectedVersionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" },
+        "targetPath": { "$ref": "#/$defs/path" },
+        "approvalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/approvalId" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      },
+      "oneOf": [
+        { "required": ["fileId"], "not": { "required": ["path"] } },
+        { "required": ["path"], "not": { "required": ["fileId"] } }
+      ]
+    },
+
+    "propose_access_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "expectedPermissionRevision", "operations", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "expectedPermissionRevision": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/permissionRevisionId" },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/accessOperation" }
+        },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "apply_access_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "proposalId", "proposalRevision", "previewHash", "approvalId", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+        "proposalRevision": { "$ref": "#/$defs/proposalRevision" },
+        "previewHash": { "$ref": "#/$defs/sha256" },
+        "approvalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/approvalId" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "propose_share_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "expectedPermissionRevision", "operations", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "expectedPermissionRevision": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/permissionRevisionId" },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/shareOperation" }
+        },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "apply_share_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "proposalId", "proposalRevision", "previewHash", "approvalId", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+        "proposalRevision": { "$ref": "#/$defs/proposalRevision" },
+        "previewHash": { "$ref": "#/$defs/sha256" },
+        "approvalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/approvalId" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+
+    "propose_context_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "contextPackId", "expectedVersionId", "definition", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "contextPackId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/contextPackId" },
+        "expectedVersionId": {
+          "oneOf": [
+            { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/contextPackVersionId" },
+            { "type": "null" }
+          ]
+        },
+        "definition": { "$ref": "#/$defs/contextDefinition" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+
+    "list_work_items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "status": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*$" },
+        "cursor": { "$ref": "#/$defs/cursor" },
+        "limit": { "$ref": "#/$defs/limit" }
+      }
+    },
+    "get_work_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "workItemId"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "workItemId": { "$ref": "#/$defs/safeId" }
+      }
+    },
+    "claim_work_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "workItemId", "expectedRevision", "ttlSeconds", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "workItemId": { "$ref": "#/$defs/safeId" },
+        "expectedRevision": { "$ref": "#/$defs/safeId" },
+        "ttlSeconds": { "$ref": "#/$defs/ttlSeconds" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "release_work_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "workItemId", "claimId", "fencingToken", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "workItemId": { "$ref": "#/$defs/safeId" },
+        "claimId": { "$ref": "#/$defs/safeId" },
+        "fencingToken": { "$ref": "#/$defs/safeId" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "declare_path_intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "resources", "ttlSeconds", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "workItemId": { "$ref": "#/$defs/safeId" },
+        "resources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": { "$ref": "#/$defs/resourceClaim" }
+        },
+        "ttlSeconds": { "$ref": "#/$defs/ttlSeconds" },
+        "exclusiveWrite": { "type": "boolean" },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    },
+    "release_path_intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaultId", "workIntentId", "fencingTokens", "idempotencyKey"],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "workIntentId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workIntentId" },
+        "fencingTokens": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/safeId" }
+        },
+        "idempotencyKey": { "$ref": "#/$defs/idempotencyKey" }
+      }
+    }
+  }
+}

@@ -1,0 +1,622 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:proposal-operation",
+  "title": "VaultGuard proposal operation",
+  "oneOf": [
+    { "$ref": "#/$defs/createText" },
+    { "$ref": "#/$defs/patchText" },
+    { "$ref": "#/$defs/insertText" },
+    { "$ref": "#/$defs/setProperty" },
+    { "$ref": "#/$defs/removeProperty" },
+    { "$ref": "#/$defs/createTask" },
+    { "$ref": "#/$defs/updateTask" },
+    { "$ref": "#/$defs/toggleTask" },
+    { "$ref": "#/$defs/createFromTemplate" },
+    { "$ref": "#/$defs/rename" },
+    { "$ref": "#/$defs/delete" },
+    { "$ref": "#/$defs/replaceBinary" },
+    { "$ref": "#/$defs/replaceText" },
+    { "$ref": "#/$defs/move" },
+    { "$ref": "#/$defs/restore" },
+    { "$ref": "#/$defs/createFolder" },
+    { "$ref": "#/$defs/moveFolder" },
+    { "$ref": "#/$defs/deleteFolder" },
+    { "$ref": "#/$defs/createBinary" },
+    { "$ref": "#/$defs/editCanvas" },
+    { "$ref": "#/$defs/editBaseSource" },
+    { "$ref": "#/$defs/createUploadedText" },
+    { "$ref": "#/$defs/replaceUploadedText" }
+  ],
+  "$defs": {
+    "operationId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/operationId" },
+    "file": { "$ref": "urn:vaultguard:workspace-contracts:1:file-selector" },
+    "versionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" },
+    "hash": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" },
+    "path": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safePath" },
+    "boundedText": { "type": "string", "maxLength": 262144 },
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "idOrHash", "expectedSourceHash"],
+      "properties": {
+        "kind": { "enum": ["heading", "block", "task", "byte_range"] },
+        "idOrHash": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "expectedSourceHash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "createText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "path", "mustBeAbsent", "content"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "create_text" },
+        "path": { "$ref": "#/$defs/path" },
+        "mustBeAbsent": { "const": true },
+        "content": { "$ref": "#/$defs/boundedText" }
+      }
+    },
+    "patchText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "expectedHash", "diff"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "patch_text" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "expectedHash": { "$ref": "#/$defs/hash" },
+        "diff": { "$ref": "#/$defs/boundedText" }
+      }
+    },
+    "insertText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "anchor", "position", "text"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "insert_text" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "anchor": { "$ref": "#/$defs/anchor" },
+        "position": { "enum": ["append", "prepend"] },
+        "text": { "$ref": "#/$defs/boundedText" }
+      }
+    },
+    "setProperty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "key", "value"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "set_property" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "value": true
+      }
+    },
+    "removeProperty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "key"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "remove_property" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "createTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "text"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "create_task" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 8192 }
+      }
+    },
+    "updateTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "taskRef", "text"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "update_task" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "taskRef": { "$ref": "#/$defs/anchor" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 8192 }
+      }
+    },
+    "toggleTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "taskRef", "status"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "toggle_task" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "taskRef": { "$ref": "#/$defs/anchor" },
+        "status": { "type": "string", "minLength": 1, "maxLength": 32 }
+      }
+    },
+    "createFromTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "template", "templateVersionId", "path", "mustBeAbsent", "variables"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "create_from_template" },
+        "template": { "$ref": "#/$defs/file" },
+        "templateVersionId": { "$ref": "#/$defs/versionId" },
+        "path": { "$ref": "#/$defs/path" },
+        "mustBeAbsent": { "const": true },
+        "variables": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "maxLength": 8192 },
+          "maxProperties": 64,
+          "propertyNames": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$" }
+        }
+      }
+    },
+    "rename": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "newPath", "destinationMustBeAbsent", "referencePolicy"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "rename" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "newPath": { "$ref": "#/$defs/path" },
+        "destinationMustBeAbsent": { "const": true },
+        "referencePolicy": { "enum": ["path_only", "update_references"] }
+      }
+    },
+    "delete": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "delete" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" }
+      }
+    },
+    "replaceBinary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "op", "file", "expectedVersionId", "uploadArtifactId", "expectedSha256"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/operationId" },
+        "op": { "const": "replace_binary" },
+        "file": { "$ref": "#/$defs/file" },
+        "expectedVersionId": { "$ref": "#/$defs/versionId" },
+        "uploadArtifactId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/artifactId" },
+        "expectedSha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "replaceText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "file",
+        "expectedVersionId",
+        "expectedHash",
+        "content"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "replace_text"
+        },
+        "file": {
+          "$ref": "#/$defs/file"
+        },
+        "expectedVersionId": {
+          "$ref": "#/$defs/versionId"
+        },
+        "expectedHash": {
+          "$ref": "#/$defs/hash"
+        },
+        "content": {
+          "$ref": "#/$defs/boundedText"
+        }
+      }
+    },
+    "move": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "file",
+        "expectedVersionId",
+        "newPath",
+        "destinationMustBeAbsent",
+        "referencePolicy"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "move"
+        },
+        "file": {
+          "$ref": "#/$defs/file"
+        },
+        "expectedVersionId": {
+          "$ref": "#/$defs/versionId"
+        },
+        "newPath": {
+          "$ref": "#/$defs/path"
+        },
+        "destinationMustBeAbsent": {
+          "const": true
+        },
+        "referencePolicy": {
+          "enum": [
+            "path_only",
+            "update_references"
+          ]
+        }
+      }
+    },
+    "restore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "file",
+        "expectedVersionId",
+        "sourceWorkspaceRevisionId",
+        "restoreVersionId"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "restore"
+        },
+        "file": {
+          "$ref": "#/$defs/file"
+        },
+        "expectedVersionId": {
+          "$ref": "#/$defs/versionId"
+        },
+        "sourceWorkspaceRevisionId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId"
+        },
+        "restoreVersionId": {
+          "$ref": "#/$defs/versionId"
+        },
+        "targetPath": { "$ref": "#/$defs/path" }
+      }
+    },
+    "createFolder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "path",
+        "mustBeAbsent"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "create_folder"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "mustBeAbsent": {
+          "const": true
+        }
+      }
+    },
+    "moveFolder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "folderId",
+        "path",
+        "newPath",
+        "destinationMustBeAbsent",
+        "referencePolicy"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "move_folder"
+        },
+        "folderId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/folderId"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "newPath": {
+          "$ref": "#/$defs/path"
+        },
+        "destinationMustBeAbsent": {
+          "const": true
+        },
+        "referencePolicy": {
+          "enum": [
+            "path_only",
+            "update_references"
+          ]
+        }
+      }
+    },
+    "deleteFolder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "folderId",
+        "path",
+        "recursive"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "delete_folder"
+        },
+        "folderId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/folderId"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "recursive": {
+          "type": "boolean"
+        }
+      }
+    },
+    "createBinary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "path",
+        "mustBeAbsent",
+        "uploadArtifactId",
+        "expectedSha256"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "create_binary"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "mustBeAbsent": {
+          "const": true
+        },
+        "uploadArtifactId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/artifactId"
+        },
+        "expectedSha256": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "editCanvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "file",
+        "expectedVersionId",
+        "expectedHash",
+        "edits"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "edit_canvas"
+        },
+        "file": {
+          "$ref": "#/$defs/file"
+        },
+        "expectedVersionId": {
+          "$ref": "#/$defs/versionId"
+        },
+        "expectedHash": {
+          "$ref": "#/$defs/hash"
+        },
+        "edits": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "startByte",
+              "endByte",
+              "expectedSourceHash",
+              "replacement"
+            ],
+            "properties": {
+              "startByte": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "endByte": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "expectedSourceHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "replacement": {
+                "$ref": "#/$defs/boundedText"
+              }
+            }
+          }
+        }
+      }
+    },
+    "editBaseSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "file",
+        "expectedVersionId",
+        "expectedHash",
+        "edits"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "edit_base_source"
+        },
+        "file": {
+          "$ref": "#/$defs/file"
+        },
+        "expectedVersionId": {
+          "$ref": "#/$defs/versionId"
+        },
+        "expectedHash": {
+          "$ref": "#/$defs/hash"
+        },
+        "edits": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "startByte",
+              "endByte",
+              "expectedSourceHash",
+              "replacement"
+            ],
+            "properties": {
+              "startByte": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "endByte": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "expectedSourceHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "replacement": {
+                "$ref": "#/$defs/boundedText"
+              }
+            }
+          }
+        }
+      }
+    },
+    "createUploadedText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "path",
+        "mustBeAbsent",
+        "uploadArtifactId",
+        "expectedSha256"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "create_uploaded_text"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "mustBeAbsent": {
+          "const": true
+        },
+        "uploadArtifactId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/artifactId"
+        },
+        "expectedSha256": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "replaceUploadedText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "op",
+        "file",
+        "expectedVersionId",
+        "uploadArtifactId",
+        "expectedSha256",
+        "expectedHash"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/operationId"
+        },
+        "op": {
+          "const": "replace_uploaded_text"
+        },
+        "file": {
+          "$ref": "#/$defs/file"
+        },
+        "expectedVersionId": {
+          "$ref": "#/$defs/versionId"
+        },
+        "uploadArtifactId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/artifactId"
+        },
+        "expectedSha256": {
+          "$ref": "#/$defs/hash"
+        },
+        "expectedHash": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    }
+  }
+}

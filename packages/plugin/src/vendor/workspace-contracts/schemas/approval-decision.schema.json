@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:approval-decision",
+  "title": "VaultGuard approval decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "approvalId", "proposalId", "proposalRevision", "decidedBySubjectId", "decidedAt", "decision", "approvedOperationsHash", "previewHash", "policyRevisionId", "permissionRevisionId", "expiresAt", "channel"],
+  "properties": {
+    "schemaVersion": { "type": "string", "maxLength": 32, "format": "semver" },
+    "approvalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/approvalId" },
+    "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+    "proposalRevision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "decidedBySubjectId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/subjectId" },
+    "decidedAt": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/timestamp" },
+    "decision": { "enum": ["approve", "reject"] },
+    "approvedOperationsHash": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" },
+    "previewHash": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" },
+    "policyRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/policyRevisionId" },
+    "permissionRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/permissionRevisionId" },
+    "expiresAt": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/timestamp" },
+    "channel": { "enum": ["vaultguard_web", "signed_host", "admin_workflow"] }
+  }
+}

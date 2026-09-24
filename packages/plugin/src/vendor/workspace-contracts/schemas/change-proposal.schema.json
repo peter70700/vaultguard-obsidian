@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:change-proposal",
+  "title": "VaultGuard immutable change proposal revision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "proposalId", "proposalRevision", "orgId", "vaultId", "creator", "baseWorkspaceRevisionId", "operationsHash", "previewHash", "affectedFileIds", "affectedPathHashes", "affectedPolicyDomains", "riskClass", "requiredApprovalPolicyId", "status", "validation", "createdAt", "expiresAt"],
+  "properties": {
+    "schemaVersion": { "type": "string", "maxLength": 32, "format": "semver" },
+    "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+    "proposalRevision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "previousProposalRevision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "orgId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/organizationId" },
+    "vaultId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/vaultId" },
+    "creator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subjectId"],
+      "properties": {
+        "subjectId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/subjectId" },
+        "agentIdentityId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/agentIdentityId" },
+        "agentSessionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/agentSessionId" }
+      }
+    },
+    "baseWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+    "operationsHash": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" },
+    "previewHash": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" },
+    "affectedFileIds": {
+      "type": "array",
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileId" }
+    },
+    "affectedPathHashes": {
+      "type": "array",
+      "maxItems": 100,
+      "uniqueItems": true,
+      "items": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" }
+    },
+    "affectedPolicyDomains": {
+      "type": "array",
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": { "enum": ["content", "folders", "context", "permissions", "membership", "shares"] }
+    },
+    "riskClass": { "enum": ["propose", "apply", "admin"] },
+    "requiredApprovalPolicyId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/policyRevisionId" },
+    "status": { "enum": ["draft", "validated", "awaiting_approval", "approved", "rejected", "superseded", "expired"] },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspaceRevisionId", "permissionRevisionId", "policyRevisionId", "validatedAt"],
+      "properties": {
+        "workspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+        "permissionRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/permissionRevisionId" },
+        "policyRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/policyRevisionId" },
+        "validatedAt": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/timestamp" }
+      }
+    },
+    "createdAt": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/timestamp" },
+    "expiresAt": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/timestamp" }
+  }
+}

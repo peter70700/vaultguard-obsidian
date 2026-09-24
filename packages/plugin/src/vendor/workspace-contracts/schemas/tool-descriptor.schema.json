@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:tool-descriptor",
+  "title": "VaultGuard provider-neutral tool descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "schemaVersion", "inputSchemaId", "outputSchemaId", "annotations", "requiredScopes", "policyFeature", "riskClass", "bounds", "optionalUi", "availability"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*$" },
+    "schemaVersion": { "type": "string", "maxLength": 32, "format": "semver" },
+    "inputSchemaId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/schemaDocumentId" },
+    "outputSchemaId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/schemaDocumentId" },
+    "annotations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readOnly", "idempotent", "destructive", "externalEffect"],
+      "properties": {
+        "readOnly": { "type": "boolean" },
+        "idempotent": { "type": "boolean" },
+        "destructive": { "type": "boolean" },
+        "externalEffect": { "type": "boolean" }
+      }
+    },
+    "requiredScopes": {
+      "type": "array",
+      "maxItems": 25,
+      "uniqueItems": true,
+      "items": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/scope" }
+    },
+    "policyFeature": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/featureId" },
+    "riskClass": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/riskClass" },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "maxProperties": 4,
+      "properties": {
+        "maxPageSize": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "maxInputBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "maxOutputBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "maxItems": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "optionalUi": { "type": "boolean" },
+    "availability": { "const": "available" }
+  }
+}

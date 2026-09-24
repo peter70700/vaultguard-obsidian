@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:apply-proposal-input",
+  "title": "VaultGuard apply proposal input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vaultId", "proposalId", "proposalRevision", "approvedOperationsHash", "previewHash", "approvalId", "expectedBaseWorkspaceRevisionId", "idempotencyKey"],
+  "properties": {
+    "vaultId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/vaultId" },
+    "workIntentId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workIntentId" },
+    "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+    "proposalRevision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "approvedOperationsHash": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" },
+    "previewHash": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256" },
+    "approvalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/approvalId" },
+    "expectedBaseWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+    "reservationFencingTokens": {
+      "type": "array",
+      "maxItems": 100,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 16, "maxLength": 256, "pattern": "^[A-Za-z0-9_-]+$" }
+    },
+    "idempotencyKey": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" }
+  }
+}

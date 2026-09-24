@@ -4,7 +4,7 @@ import {
   type SyncEntry, type SyncNegotiation, type SyncIndexCheckpoint, type SyncInventoryPage, type SyncCommand,
   type SyncIntentResult, type SyncActivityPage, type TransferView, type BrowserProposal, type HistoryBytes,
   type ChangeProposalView, type ChangeClosedProposalView, type CreateProposalInput, type ProposalOperation,
-} from '../../packages/workspace-contracts';
+} from '../vendor/workspace-contracts/src';
 
 export type ReplicaOrigin = 'human' | 'local-agent' | 'unknown';
 export interface ReplicaFile extends SyncEntry { localHash?: string; workspaceRevisionId: string }

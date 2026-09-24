@@ -1,0 +1,178 @@
+{
+  "fixtureVersion": "1.0.0",
+  "specId": "021",
+  "sourceContract": "mcp-tools",
+  "schemaCatalogVersion": "1.0.0",
+  "sessionContext": {
+    "kind": "trusted-session-context",
+    "schemaVersion": "1.0.0",
+    "orgId": "org_atlas",
+    "vaultId": "vlt_atlas",
+    "subjectId": "usr_editor",
+    "oauthClientId": "client_chatgpt",
+    "oauthGrantId": "grant_42",
+    "agentIdentityId": "agent_researcher",
+    "agentSessionId": "session_20260904_a",
+    "providerProfileId": "openai-chatgpt",
+    "scopes": ["workspace:read", "files:list", "files:read", "changes:read", "changes:apply"],
+    "riskCeiling": "apply",
+    "permissionRevisionId": "perm_17",
+    "policyRevisionId": "policy_9",
+    "expiresAt": "2026-09-04T20:00:00.000Z",
+    "revocationCheckedAt": "2026-09-04T12:00:00.000Z"
+  },
+  "revision": {
+    "kind": "resolved-workspace-revision",
+    "selector": { "mode": "latest" },
+    "workspaceRevisionId": "wr_0042",
+    "currentWorkspaceRevisionId": "wr_0042",
+    "consistency": "exact"
+  },
+  "versionCitation": {
+    "vaultId": "vlt_atlas",
+    "workspaceRevisionId": "wr_0042",
+    "fileId": "fil_9",
+    "fileVersionId": "fv_12",
+    "path": "Projects/Atlas.md",
+    "contentHash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "pagination": {
+    "request": { "limit": 50 },
+    "pageInfo": {
+      "nextCursor": null,
+      "returned": 1,
+      "truncated": false,
+      "consistency": "exact"
+    }
+  },
+  "error": {
+    "error": {
+      "code": "conflict",
+      "message": "The file changed after this proposal was prepared. Review or rebase the proposal.",
+      "requestId": "req_301",
+      "retryable": false,
+      "conflictId": "con_27"
+    }
+  },
+  "receipt": {
+    "receiptId": "receipt_42",
+    "changeSetId": "changeset_42",
+    "proposalId": "proposal_88",
+    "proposalRevision": 1,
+    "result": "applied",
+    "oldWorkspaceRevisionId": "wr_0041",
+    "newWorkspaceRevisionId": "wr_0042",
+    "files": [
+      {
+        "fileId": "fil_9",
+        "path": "Projects/Atlas.md",
+        "oldVersionId": "fv_11",
+        "newVersionId": "fv_12",
+        "newHash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }
+    ],
+    "verification": "verified"
+  },
+  "secureHandoff": {
+    "handoff": {
+      "handoffId": "ho_14",
+      "purpose": "proposal_review",
+      "url": "https://app.vaultguard.example/handoff/opaque-single-use-value",
+      "expiresAt": "2026-09-04T18:00:00.000Z",
+      "statusTool": "get_handoff_status",
+      "statusArgs": { "handoffId": "ho_14" }
+    },
+    "binding": {
+      "subjectId": "usr_editor",
+      "oauthClientId": "client_chatgpt",
+      "vaultId": "vlt_atlas",
+      "nonceHash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "singleUse": true,
+      "independentlyAuthenticated": true,
+      "stepUp": "policy"
+    }
+  },
+  "providerProfiles": [
+    {
+      "profileId": "generic-text",
+      "schemaCatalogVersion": "1.0.0",
+      "coreSchemas": "identical",
+      "fallbackProfileId": "generic-text",
+      "permittedAdaptations": ["plain-structured-text", "web-handoff", "conservative-annotations"],
+      "structuredResultRequired": true,
+      "safetyDisclosuresRequired": true
+    },
+    {
+      "profileId": "openai-chatgpt",
+      "schemaCatalogVersion": "1.0.0",
+      "coreSchemas": "identical",
+      "fallbackProfileId": "generic-text",
+      "permittedAdaptations": ["registered-oauth-metadata", "tool-annotations", "optional-ui-resources", "provider-conformance-metadata"],
+      "structuredResultRequired": true,
+      "safetyDisclosuresRequired": true
+    },
+    {
+      "profileId": "anthropic-claude",
+      "schemaCatalogVersion": "1.0.0",
+      "coreSchemas": "identical",
+      "fallbackProfileId": "generic-text",
+      "permittedAdaptations": ["registered-oauth-metadata", "interactive-connector-presentation", "provider-conformance-metadata"],
+      "structuredResultRequired": true,
+      "safetyDisclosuresRequired": true
+    }
+  ],
+  "discovery": {
+    "schemaCatalogVersion": "1.0.0",
+    "providerProfileId": "openai-chatgpt",
+    "agentSessionId": "session_20260904_a",
+    "tools": [
+      {
+        "name": "get_capabilities",
+        "schemaVersion": "1.0.0",
+        "inputSchemaId": "schema_get_capabilities_input_v1",
+        "outputSchemaId": "schema_get_capabilities_output_v1",
+        "annotations": {
+          "readOnly": true,
+          "idempotent": true,
+          "destructive": false,
+          "externalEffect": false
+        },
+        "requiredScopes": [],
+        "policyFeature": "remote_mcp",
+        "riskClass": "read",
+        "bounds": { "maxOutputBytes": 32768, "maxItems": 128 },
+        "optionalUi": false,
+        "availability": "available"
+      },
+      {
+        "name": "read_file",
+        "schemaVersion": "1.0.0",
+        "inputSchemaId": "schema_read_file_input_v1",
+        "outputSchemaId": "schema_read_file_output_v1",
+        "annotations": {
+          "readOnly": true,
+          "idempotent": true,
+          "destructive": false,
+          "externalEffect": false
+        },
+        "requiredScopes": ["files:read"],
+        "policyFeature": "remote_mcp",
+        "riskClass": "read",
+        "bounds": { "maxInputBytes": 4096, "maxOutputBytes": 262144, "maxItems": 1 },
+        "optionalUi": true,
+        "availability": "available"
+      }
+    ],
+    "unavailable": [
+      { "name": "propose_access_change", "reason": "scope_required" }
+    ],
+    "reconnectRequired": false,
+    "limits": {
+      "defaultPageSize": 50,
+      "maxPageSize": 200,
+      "maxReadWindowBytes": 262144,
+      "maxBatchReadBytes": 524288,
+      "maxBatchFiles": 20
+    }
+  }
+}

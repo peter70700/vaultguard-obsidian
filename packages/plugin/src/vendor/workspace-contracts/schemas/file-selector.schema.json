@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:file-selector",
+  "title": "VaultGuard unambiguous file selector",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileId"],
+      "properties": {
+        "fileId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileId" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safePath" }
+      }
+    }
+  ]
+}

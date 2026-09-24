@@ -1,0 +1,88 @@
+{
+  "fixtureVersion": "1.0.0",
+  "specId": "021",
+  "sourceContract": "collaboration-security",
+  "schemaCatalogVersion": "1.0.0",
+  "sessionContext": {
+    "kind": "trusted-session-context",
+    "schemaVersion": "1.0.0",
+    "orgId": "org_atlas",
+    "vaultId": "vlt_atlas",
+    "subjectId": "usr_editor",
+    "oauthClientId": "client_claude",
+    "oauthGrantId": "grant_99",
+    "agentIdentityId": "agent_writer",
+    "agentSessionId": "session_20260904_c",
+    "providerProfileId": "anthropic-claude",
+    "scopes": ["workspace:read", "files:read", "changes:read", "changes:propose", "changes:apply"],
+    "riskCeiling": "apply",
+    "permissionRevisionId": "perm_22",
+    "policyRevisionId": "policy_11",
+    "expiresAt": "2026-09-04T20:00:00.000Z",
+    "revocationCheckedAt": "2026-09-04T12:02:00.000Z"
+  },
+  "revision": {
+    "kind": "resolved-workspace-revision",
+    "selector": { "mode": "exact", "workspaceRevisionId": "wrev_204" },
+    "workspaceRevisionId": "wrev_204",
+    "currentWorkspaceRevisionId": "wrev_205",
+    "consistency": "stale"
+  },
+  "mutationGuard": {
+    "baseWorkspaceRevisionId": "wrev_204",
+    "baseFileVersionId": "fver_atlas_20",
+    "baseContentHash": "2222222222222222222222222222222222222222222222222222222222222222",
+    "idempotencyKey": "apply_atlas_20260904_0001",
+    "canonicalRequestHash": "3333333333333333333333333333333333333333333333333333333333333333",
+    "approvalBinding": {
+      "approvalId": "approval_34",
+      "proposalRevision": 2,
+      "approvedOperationsHash": "4444444444444444444444444444444444444444444444444444444444444444",
+      "previewHash": "5555555555555555555555555555555555555555555555555555555555555555"
+    }
+  },
+  "receipt": {
+    "receiptId": "receipt_conflict_12",
+    "changeSetId": "changeset_203",
+    "proposalId": "proposal_34",
+    "proposalRevision": 2,
+    "result": "conflicted",
+    "oldWorkspaceRevisionId": "wrev_204",
+    "files": [
+      {
+        "fileId": "fil_atlas",
+        "path": "Projects/Atlas.md",
+        "oldVersionId": "fver_atlas_20"
+      }
+    ],
+    "verification": "unknown"
+  },
+  "error": {
+    "error": {
+      "code": "WORKSPACE_BASE_STALE",
+      "message": "The workspace changed after this proposal was prepared. Review or rebase it.",
+      "requestId": "req_collab_12",
+      "retryable": false,
+      "conflictId": "conflict_12"
+    }
+  },
+  "secureHandoff": {
+    "handoff": {
+      "handoffId": "ho_34",
+      "purpose": "proposal_review",
+      "url": "https://app.vaultguard.example/handoff/review-conflict-34",
+      "expiresAt": "2026-09-04T18:30:00.000Z",
+      "statusTool": "get_handoff_status",
+      "statusArgs": { "handoffId": "ho_34" }
+    },
+    "binding": {
+      "subjectId": "usr_editor",
+      "oauthClientId": "client_claude",
+      "vaultId": "vlt_atlas",
+      "nonceHash": "6666666666666666666666666666666666666666666666666666666666666666",
+      "singleUse": true,
+      "independentlyAuthenticated": true,
+      "stepUp": "policy"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "schemaCatalogVersion": "1.0.0",
+  "specId": "021",
+  "schemas": [
+    { "name": "sync-client", "id": "urn:vaultguard:workspace-contracts:1:sync-client", "file": "schemas/sync-client.schema.json" },
+    { "name": "shared-protocol", "id": "urn:vaultguard:workspace-contracts:1:shared-protocol", "file": "schemas/shared-protocol.schema.json" },
+    { "name": "stable-id", "id": "urn:vaultguard:workspace-contracts:1:stable-id", "file": "schemas/stable-id.schema.json" },
+    { "name": "revision-selector", "id": "urn:vaultguard:workspace-contracts:1:revision-selector", "file": "schemas/revision-selector.schema.json" },
+    { "name": "file-selector", "id": "urn:vaultguard:workspace-contracts:1:file-selector", "file": "schemas/file-selector.schema.json" },
+    { "name": "tool-descriptor", "id": "urn:vaultguard:workspace-contracts:1:tool-descriptor", "file": "schemas/tool-descriptor.schema.json" },
+    { "name": "audit-event", "id": "urn:vaultguard:workspace-contracts:1:audit-event", "file": "schemas/audit-event.schema.json" },
+    { "name": "proposal-operation", "id": "urn:vaultguard:workspace-contracts:1:proposal-operation", "file": "schemas/proposal-operation.schema.json" },
+    { "name": "create-proposal-input", "id": "urn:vaultguard:workspace-contracts:1:create-proposal-input", "file": "schemas/create-proposal-input.schema.json" },
+    { "name": "change-proposal", "id": "urn:vaultguard:workspace-contracts:1:change-proposal", "file": "schemas/change-proposal.schema.json" },
+    { "name": "approval-decision", "id": "urn:vaultguard:workspace-contracts:1:approval-decision", "file": "schemas/approval-decision.schema.json" },
+    { "name": "apply-proposal-input", "id": "urn:vaultguard:workspace-contracts:1:apply-proposal-input", "file": "schemas/apply-proposal-input.schema.json" },
+    { "name": "change-set", "id": "urn:vaultguard:workspace-contracts:1:change-set", "file": "schemas/change-set.schema.json" },
+    { "name": "mcp-write-tools", "id": "urn:vaultguard:workspace-contracts:1:mcp-write-tools", "file": "schemas/mcp-write-tools.schema.json" },
+    { "name": "session-context", "id": "urn:vaultguard:workspace-contracts:1:session-context", "file": "schemas/session-context.schema.json" },
+    { "name": "exact-revision", "id": "urn:vaultguard:workspace-contracts:1:exact-revision", "file": "schemas/exact-revision.schema.json" },
+    { "name": "citation", "id": "urn:vaultguard:workspace-contracts:1:citation", "file": "schemas/citation.schema.json" },
+    { "name": "pagination", "id": "urn:vaultguard:workspace-contracts:1:pagination", "file": "schemas/pagination.schema.json" },
+    { "name": "stable-error", "id": "urn:vaultguard:workspace-contracts:1:stable-error", "file": "schemas/stable-error.schema.json" },
+    { "name": "mutation-receipt", "id": "urn:vaultguard:workspace-contracts:1:mutation-receipt", "file": "schemas/mutation-receipt.schema.json" },
+    { "name": "secure-handoff", "id": "urn:vaultguard:workspace-contracts:1:secure-handoff", "file": "schemas/secure-handoff.schema.json" },
+    { "name": "provider-profile", "id": "urn:vaultguard:workspace-contracts:1:provider-profile", "file": "schemas/provider-profile.schema.json" },
+    { "name": "discovery", "id": "urn:vaultguard:workspace-contracts:1:discovery", "file": "schemas/discovery.schema.json" },
+    { "name": "contract-fixture", "id": "urn:vaultguard:workspace-contracts:1:contract-fixture", "file": "schemas/contract-fixture.schema.json" },
+    { "name": "catalog", "id": "urn:vaultguard:workspace-contracts:1:catalog", "file": "schemas/catalog.schema.json" }
+  ],
+  "normativeExamples": [
+    { "contract": "mcp-tools", "file": "examples/mcp-tools.json", "schemaId": "urn:vaultguard:workspace-contracts:1:contract-fixture" },
+    { "contract": "graph-context", "file": "examples/graph-context.json", "schemaId": "urn:vaultguard:workspace-contracts:1:contract-fixture" },
+    { "contract": "collaboration-security", "file": "examples/collaboration-security.json", "schemaId": "urn:vaultguard:workspace-contracts:1:contract-fixture" }
+  ]
+}

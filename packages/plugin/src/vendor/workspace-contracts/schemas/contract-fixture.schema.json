@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:contract-fixture",
+  "title": "VaultGuard Spec 021 normative contract fixture",
+  "$defs": {
+    "commonProperties": {
+      "fixtureVersion": { "const": "1.0.0" },
+      "specId": { "const": "021" },
+      "schemaCatalogVersion": { "const": "1.0.0" },
+      "sessionContext": {
+        "$ref": "urn:vaultguard:workspace-contracts:1:session-context"
+      },
+      "revision": {
+        "$ref": "urn:vaultguard:workspace-contracts:1:exact-revision"
+      }
+    },
+    "graphSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fileId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+        },
+        "path": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safePath"
+        }
+      },
+      "anyOf": [
+        { "required": ["fileId"] },
+        { "required": ["path"] }
+      ]
+    },
+    "graphQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request", "response"],
+      "properties": {
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "target", "direction", "edgeKinds", "depth", "limit", "consistency"],
+          "properties": {
+            "op": {
+              "enum": [
+                "neighbors",
+                "related",
+                "traverse",
+                "path",
+                "tag",
+                "orphans",
+                "hubs",
+                "overview",
+                "unresolved",
+                "canvas"
+              ]
+            },
+            "target": { "$ref": "#/$defs/graphSelector" },
+            "to": { "$ref": "#/$defs/graphSelector" },
+            "tag": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "direction": { "enum": ["outgoing", "incoming", "both"] },
+            "edgeKinds": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "folder-contains",
+                  "wiki-link",
+                  "markdown-link",
+                  "embed",
+                  "heading-reference",
+                  "block-reference",
+                  "canvas-contains",
+                  "canvas-edge",
+                  "canvas-file-reference",
+                  "base-selects",
+                  "tagged-with",
+                  "tag-parent",
+                  "property-reference",
+                  "task-in-heading"
+                ]
+              }
+            },
+            "depth": { "type": "integer", "minimum": 1, "maximum": 3 },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "cursor": {
+              "type": "string",
+              "minLength": 16,
+              "maxLength": 2048,
+              "format": "opaque-cursor"
+            },
+            "atWorkspaceRevisionId": {
+              "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+            },
+            "consistency": { "enum": ["exact", "allow_stale"] },
+            "includeOccurrences": { "type": "boolean" },
+            "includeDerivedSemantic": { "type": "boolean" }
+          }
+        },
+        "response": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requestId",
+            "op",
+            "workspaceRevisionId",
+            "sourceWorkspaceRevisionId",
+            "graphRevisionId",
+            "consistency",
+            "projectionLagRevisions",
+            "parserBundleVersion",
+            "resolverVersion",
+            "nodes",
+            "edges",
+            "ranked",
+            "counts",
+            "nextCursor",
+            "truncated"
+          ],
+          "properties": {
+            "requestId": {
+              "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+            },
+            "op": { "enum": ["neighbors", "related", "traverse", "path", "tag", "orphans", "hubs", "overview", "unresolved", "canvas"] },
+            "workspaceRevisionId": {
+              "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+            },
+            "sourceWorkspaceRevisionId": {
+              "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+            },
+            "graphRevisionId": {
+              "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+            },
+            "consistency": { "enum": ["exact", "stale", "unavailable"] },
+            "projectionLagRevisions": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+            "parserBundleVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "resolverVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "nodes": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["nodeId", "kind", "fileId", "path", "fileVersionId"],
+                "properties": {
+                  "nodeId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "kind": { "const": "file" },
+                  "fileId": {
+                    "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+                  },
+                  "path": {
+                    "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safePath"
+                  },
+                  "fileVersionId": {
+                    "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+                  }
+                }
+              }
+            },
+            "edges": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["edgeId", "kind", "sourceNodeId", "targetNodeId", "occurrenceCount"],
+                "properties": {
+                  "edgeId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "kind": { "enum": ["wiki-link", "markdown-link", "embed", "tagged-with"] },
+                  "sourceNodeId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "targetNodeId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "occurrenceCount": { "type": "integer", "minimum": 1, "maximum": 100 },
+                  "occurrences": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["rawTarget", "sourceRange"],
+                      "properties": {
+                        "rawTarget": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                        "displayText": { "type": "string", "maxLength": 1024 },
+                        "sourceRange": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["start", "end"],
+                          "properties": {
+                            "start": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+                            "end": { "type": "integer", "minimum": 0, "maximum": 2147483647 }
+                          }
+                        },
+                        "targetHeadingNodeId": { "type": "string", "minLength": 1, "maxLength": 256 }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "ranked": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["nodeId", "score", "reasons"],
+                "properties": {
+                  "nodeId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "score": { "type": "number", "minimum": 0, "maximum": 1000000 },
+                  "reasons": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "weight"],
+                      "properties": {
+                        "kind": { "enum": ["wiki-link", "markdown-link", "embed", "shared-tag", "canvas-relation", "semantic-similarity"] },
+                        "weight": { "type": "number", "minimum": 0, "maximum": 1000000 },
+                        "distance": { "type": "integer", "minimum": 1, "maximum": 3 },
+                        "tags": {
+                          "type": "array",
+                          "maxItems": 16,
+                          "uniqueItems": true,
+                          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "counts": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["visibleNodes", "visibleEdges"],
+              "properties": {
+                "visibleNodes": { "type": "integer", "minimum": 0, "maximum": 100 },
+                "visibleEdges": { "type": "integer", "minimum": 0, "maximum": 100 }
+              }
+            },
+            "nextCursor": {
+              "oneOf": [
+                { "type": "string", "minLength": 16, "maxLength": 2048, "format": "opaque-cursor" },
+                { "type": "null" }
+              ]
+            },
+            "truncated": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "mutationGuard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseWorkspaceRevisionId",
+        "baseFileVersionId",
+        "baseContentHash",
+        "idempotencyKey",
+        "canonicalRequestHash",
+        "approvalBinding"
+      ],
+      "properties": {
+        "baseWorkspaceRevisionId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+        },
+        "baseFileVersionId": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+        },
+        "baseContentHash": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "format": "safe-id"
+        },
+        "canonicalRequestHash": {
+          "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256"
+        },
+        "approvalBinding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "approvalId",
+            "proposalRevision",
+            "approvedOperationsHash",
+            "previewHash"
+          ],
+          "properties": {
+            "approvalId": {
+              "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/safeId"
+            },
+            "proposalRevision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+            "approvedOperationsHash": {
+              "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256"
+            },
+            "previewHash": {
+              "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/sha256"
+            }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixtureVersion",
+        "specId",
+        "sourceContract",
+        "schemaCatalogVersion",
+        "sessionContext",
+        "revision",
+        "versionCitation",
+        "pagination",
+        "error",
+        "receipt",
+        "secureHandoff",
+        "providerProfiles",
+        "discovery"
+      ],
+      "properties": {
+        "fixtureVersion": { "$ref": "#/$defs/commonProperties/fixtureVersion" },
+        "specId": { "$ref": "#/$defs/commonProperties/specId" },
+        "sourceContract": { "const": "mcp-tools" },
+        "schemaCatalogVersion": { "$ref": "#/$defs/commonProperties/schemaCatalogVersion" },
+        "sessionContext": { "$ref": "#/$defs/commonProperties/sessionContext" },
+        "revision": { "$ref": "#/$defs/commonProperties/revision" },
+        "versionCitation": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/versionCitation" },
+        "pagination": { "$ref": "urn:vaultguard:workspace-contracts:1:pagination" },
+        "error": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-error" },
+        "receipt": { "$ref": "urn:vaultguard:workspace-contracts:1:mutation-receipt" },
+        "secureHandoff": { "$ref": "urn:vaultguard:workspace-contracts:1:secure-handoff" },
+        "providerProfiles": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/providerProfileCatalog" },
+        "discovery": { "$ref": "urn:vaultguard:workspace-contracts:1:discovery" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixtureVersion",
+        "specId",
+        "sourceContract",
+        "schemaCatalogVersion",
+        "sessionContext",
+        "revision",
+        "projectionCitation",
+        "pagination",
+        "graphQuery",
+        "discovery"
+      ],
+      "properties": {
+        "fixtureVersion": { "$ref": "#/$defs/commonProperties/fixtureVersion" },
+        "specId": { "$ref": "#/$defs/commonProperties/specId" },
+        "sourceContract": { "const": "graph-context" },
+        "schemaCatalogVersion": { "$ref": "#/$defs/commonProperties/schemaCatalogVersion" },
+        "sessionContext": { "$ref": "#/$defs/commonProperties/sessionContext" },
+        "revision": { "$ref": "#/$defs/commonProperties/revision" },
+        "projectionCitation": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/projectionCitation" },
+        "pagination": { "$ref": "urn:vaultguard:workspace-contracts:1:pagination" },
+        "graphQuery": { "$ref": "#/$defs/graphQuery" },
+        "discovery": { "$ref": "urn:vaultguard:workspace-contracts:1:discovery" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixtureVersion",
+        "specId",
+        "sourceContract",
+        "schemaCatalogVersion",
+        "sessionContext",
+        "revision",
+        "mutationGuard",
+        "receipt",
+        "error",
+        "secureHandoff"
+      ],
+      "properties": {
+        "fixtureVersion": { "$ref": "#/$defs/commonProperties/fixtureVersion" },
+        "specId": { "$ref": "#/$defs/commonProperties/specId" },
+        "sourceContract": { "const": "collaboration-security" },
+        "schemaCatalogVersion": { "$ref": "#/$defs/commonProperties/schemaCatalogVersion" },
+        "sessionContext": { "$ref": "#/$defs/commonProperties/sessionContext" },
+        "revision": { "$ref": "#/$defs/commonProperties/revision" },
+        "mutationGuard": { "$ref": "#/$defs/mutationGuard" },
+        "receipt": { "$ref": "urn:vaultguard:workspace-contracts:1:mutation-receipt" },
+        "error": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-error" },
+        "secureHandoff": { "$ref": "urn:vaultguard:workspace-contracts:1:secure-handoff" }
+      }
+    }
+  ]
+}

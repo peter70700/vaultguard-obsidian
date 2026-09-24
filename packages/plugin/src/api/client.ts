@@ -10,7 +10,7 @@ import { RequestUrlResponse, requestUrl } from "obsidian";
 import type {
   SyncClientSignal, SyncCommand, SyncNegotiation, SyncPageInput, SyncInventoryPage,
   SyncActivityPage, SyncIndexCheckpoint, SyncCompatibilityDiscovery,
-} from "../../packages/workspace-contracts";
+} from "../vendor/workspace-contracts/src";
 import {
   looksLikeAwsSignatureError,
   normalizeVaultGuardApiBaseUrl,

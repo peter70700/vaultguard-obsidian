@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:revision-selector",
+  "title": "VaultGuard workspace revision selector",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "workspaceRevisionId"],
+      "properties": {
+        "mode": { "const": "exact" },
+        "workspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "const": "latest" }
+      }
+    }
+  ]
+}

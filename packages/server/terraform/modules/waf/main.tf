@@ -226,7 +226,9 @@ resource "aws_wafv2_web_acl" "vaultguard" {
   rule {
     name     = "WorkspaceRequestRate"
     priority = 5
-    action { block {} }
+    action {
+      block {}
+    }
     statement {
       rate_based_statement {
         limit              = 600
@@ -234,7 +236,9 @@ resource "aws_wafv2_web_acl" "vaultguard" {
         scope_down_statement {
           regex_match_statement {
             regex_string = "^/(mcp|vaults/[^/]+/workspace(/.*)?)$"
-            field_to_match { uri_path {} }
+            field_to_match {
+              uri_path {}
+            }
             text_transformation {
               priority = 0
               type     = "NONE"

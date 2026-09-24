@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaCatalogVersion", "specId", "schemas", "normativeExamples"],
+  "properties": {
+    "schemaCatalogVersion": { "const": "1.0.0" },
+    "specId": { "const": "021" },
+    "schemas": {
+      "type": "array",
+      "minItems": 25,
+      "maxItems": 25,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "id", "file"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z][a-z0-9-]*$" },
+          "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^urn:vaultguard:workspace-contracts:1:[a-z][a-z0-9-]*$" },
+          "file": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^schemas/[a-z][a-z0-9-]*\\.schema\\.json$" }
+        }
+      }
+    },
+    "normativeExamples": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["contract", "file", "schemaId"],
+        "properties": {
+          "contract": { "enum": ["mcp-tools", "graph-context", "collaboration-security"] },
+          "file": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^examples/[a-z][a-z0-9-]*\\.json$" },
+          "schemaId": { "const": "urn:vaultguard:workspace-contracts:1:contract-fixture" }
+        }
+      }
+    }
+  }
+}

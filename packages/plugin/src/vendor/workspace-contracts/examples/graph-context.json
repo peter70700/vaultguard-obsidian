@@ -1,0 +1,170 @@
+{
+  "fixtureVersion": "1.0.0",
+  "specId": "021",
+  "sourceContract": "graph-context",
+  "schemaCatalogVersion": "1.0.0",
+  "sessionContext": {
+    "kind": "trusted-session-context",
+    "schemaVersion": "1.0.0",
+    "orgId": "org_atlas",
+    "vaultId": "vlt_atlas",
+    "subjectId": "usr_reader",
+    "oauthClientId": "client_generic",
+    "oauthGrantId": "grant_77",
+    "agentIdentityId": "agent_mapper",
+    "agentSessionId": "session_20260904_b",
+    "providerProfileId": "generic-text",
+    "scopes": ["workspace:read", "graph:read"],
+    "riskCeiling": "read",
+    "permissionRevisionId": "perm_17",
+    "policyRevisionId": "policy_9",
+    "expiresAt": "2026-09-04T19:00:00.000Z",
+    "revocationCheckedAt": "2026-09-04T12:01:00.000Z"
+  },
+  "revision": {
+    "kind": "resolved-workspace-revision",
+    "selector": { "mode": "exact", "workspaceRevisionId": "wrev_104" },
+    "workspaceRevisionId": "wrev_104",
+    "currentWorkspaceRevisionId": "wrev_104",
+    "consistency": "exact"
+  },
+  "projectionCitation": {
+    "sourceWorkspaceRevisionId": "wrev_104",
+    "currentWorkspaceRevisionId": "wrev_104",
+    "projectionRevisionId": "grev_104_1",
+    "permissionRevisionId": "perm_17",
+    "consistency": "exact"
+  },
+  "pagination": {
+    "request": { "limit": 25 },
+    "pageInfo": {
+      "nextCursor": null,
+      "returned": 2,
+      "truncated": false,
+      "consistency": "exact"
+    }
+  },
+  "graphQuery": {
+    "request": {
+      "op": "neighbors",
+      "target": { "path": "Projects/Atlas.md" },
+      "direction": "both",
+      "edgeKinds": ["wiki-link", "markdown-link", "embed", "tagged-with"],
+      "depth": 1,
+      "limit": 25,
+      "consistency": "exact",
+      "includeOccurrences": true
+    },
+    "response": {
+      "requestId": "req_01K4A",
+      "op": "neighbors",
+      "workspaceRevisionId": "wrev_104",
+      "sourceWorkspaceRevisionId": "wrev_104",
+      "graphRevisionId": "grev_104_1",
+      "consistency": "exact",
+      "projectionLagRevisions": 0,
+      "parserBundleVersion": "markdown-canvas/1",
+      "resolverVersion": "obsidian-compatible/1",
+      "nodes": [
+        {
+          "nodeId": "file:fil_atlas",
+          "kind": "file",
+          "fileId": "fil_atlas",
+          "path": "Projects/Atlas.md",
+          "fileVersionId": "fver_atlas_12"
+        },
+        {
+          "nodeId": "file:fil_api",
+          "kind": "file",
+          "fileId": "fil_api",
+          "path": "Specs/Atlas API.md",
+          "fileVersionId": "fver_api_7"
+        }
+      ],
+      "edges": [
+        {
+          "edgeId": "occ_fver_atlas_12_418_443",
+          "kind": "wiki-link",
+          "sourceNodeId": "file:fil_atlas",
+          "targetNodeId": "file:fil_api",
+          "occurrenceCount": 1,
+          "occurrences": [
+            {
+              "rawTarget": "Specs/Atlas API#Authentication",
+              "displayText": "API auth",
+              "sourceRange": { "start": 418, "end": 443 },
+              "targetHeadingNodeId": "heading:fver_api_7:authentication:1"
+            }
+          ]
+        }
+      ],
+      "ranked": [
+        {
+          "nodeId": "file:fil_api",
+          "score": 9,
+          "reasons": [
+            { "kind": "wiki-link", "weight": 6, "distance": 1 },
+            { "kind": "shared-tag", "weight": 3, "tags": ["project/atlas"] }
+          ]
+        }
+      ],
+      "counts": { "visibleNodes": 2, "visibleEdges": 1 },
+      "nextCursor": null,
+      "truncated": false
+    }
+  },
+  "discovery": {
+    "schemaCatalogVersion": "1.0.0",
+    "providerProfileId": "generic-text",
+    "agentSessionId": "session_20260904_b",
+    "tools": [
+      {
+        "name": "get_capabilities",
+        "schemaVersion": "1.0.0",
+        "inputSchemaId": "schema_get_capabilities_input_v1",
+        "outputSchemaId": "schema_get_capabilities_output_v1",
+        "annotations": {
+          "readOnly": true,
+          "idempotent": true,
+          "destructive": false,
+          "externalEffect": false
+        },
+        "requiredScopes": [],
+        "policyFeature": "remote_mcp",
+        "riskClass": "read",
+        "bounds": { "maxOutputBytes": 32768, "maxItems": 128 },
+        "optionalUi": false,
+        "availability": "available"
+      },
+      {
+        "name": "vaultguard_graph_query",
+        "schemaVersion": "1.0.0",
+        "inputSchemaId": "schema_graph_query_input_v1",
+        "outputSchemaId": "schema_graph_query_output_v1",
+        "annotations": {
+          "readOnly": true,
+          "idempotent": true,
+          "destructive": false,
+          "externalEffect": false
+        },
+        "requiredScopes": ["graph:read"],
+        "policyFeature": "structural_graph",
+        "riskClass": "read",
+        "bounds": { "maxPageSize": 100, "maxOutputBytes": 262144, "maxItems": 100 },
+        "optionalUi": true,
+        "availability": "available"
+      }
+    ],
+    "unavailable": [
+      { "name": "query_semantic_index", "reason": "feature_disabled" }
+    ],
+    "reconnectRequired": false,
+    "limits": {
+      "defaultPageSize": 50,
+      "maxPageSize": 200,
+      "maxReadWindowBytes": 262144,
+      "maxBatchReadBytes": 524288,
+      "maxBatchFiles": 20
+    }
+  }
+}

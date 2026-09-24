@@ -1,0 +1,644 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:shared-protocol",
+  "title": "VaultGuard Spec 021 shared protocol definitions",
+  "$defs": {
+    "safeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "format": "safe-id"
+    },
+    "agentIdentityId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/agentIdentityId" },
+    "agentSessionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/agentSessionId" },
+    "changeSetId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/changeSetId" },
+    "conflictId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/conflictId" },
+    "featureId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/featureId" },
+    "fileId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileId" },
+    "fileVersionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/fileVersionId" },
+    "handoffId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/handoffId" },
+    "oauthClientId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/oauthClientId" },
+    "oauthGrantId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/oauthGrantId" },
+    "organizationId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/organizationId" },
+    "permissionRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/permissionRevisionId" },
+    "policyRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/policyRevisionId" },
+    "projectionRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/projectionRevisionId" },
+    "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+    "receiptId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/receiptId" },
+    "requestId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/requestId" },
+    "schemaDocumentId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/schemaDocumentId" },
+    "subjectId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/subjectId" },
+    "vaultId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/vaultId" },
+    "workspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "safePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "format": "vault-relative-path"
+    },
+    "timestamp": {
+      "type": "string",
+      "maxLength": 32,
+      "format": "iso-date-time"
+    },
+    "scope": {
+      "enum": [
+        "workspace:read",
+        "files:list",
+        "files:search",
+        "files:read",
+        "history:read",
+        "history:restore",
+        "graph:read",
+        "semantic:read",
+        "context:read",
+        "context:propose",
+        "changes:read",
+        "changes:propose",
+        "changes:apply",
+        "coordination:read",
+        "coordination:write",
+        "access:read",
+        "permissions:read",
+        "access:propose",
+        "access:apply",
+        "members:read",
+        "shares:read",
+        "shares:write",
+        "audit:read",
+        "transfers:prepare",
+        "connector:read"
+      ]
+    },
+    "riskClass": {
+      "enum": ["read", "propose", "apply", "admin", "ceremony"]
+    },
+    "providerProfileId": {
+      "enum": ["generic-text", "openai-chatgpt", "anthropic-claude"]
+    },
+    "sessionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schemaVersion",
+        "orgId",
+        "vaultId",
+        "subjectId",
+        "oauthClientId",
+        "oauthGrantId",
+        "agentIdentityId",
+        "agentSessionId",
+        "providerProfileId",
+        "scopes",
+        "riskCeiling",
+        "permissionRevisionId",
+        "policyRevisionId",
+        "expiresAt",
+        "revocationCheckedAt"
+      ],
+      "properties": {
+        "kind": { "const": "trusted-session-context" },
+        "schemaVersion": { "type": "string", "maxLength": 32, "format": "semver" },
+        "orgId": { "$ref": "#/$defs/organizationId" },
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "subjectId": { "$ref": "#/$defs/subjectId" },
+        "oauthClientId": { "$ref": "#/$defs/oauthClientId" },
+        "oauthGrantId": { "$ref": "#/$defs/oauthGrantId" },
+        "agentIdentityId": { "$ref": "#/$defs/agentIdentityId" },
+        "agentSessionId": { "$ref": "#/$defs/agentSessionId" },
+        "providerProfileId": { "$ref": "#/$defs/providerProfileId" },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 25,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/scope" }
+        },
+        "riskCeiling": { "$ref": "#/$defs/riskClass" },
+        "permissionRevisionId": { "$ref": "#/$defs/permissionRevisionId" },
+        "policyRevisionId": { "$ref": "#/$defs/policyRevisionId" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "revocationCheckedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "revisionSelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "workspaceRevisionId"],
+          "properties": {
+            "mode": { "const": "exact" },
+            "workspaceRevisionId": { "$ref": "#/$defs/workspaceRevisionId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "const": "latest" }
+          }
+        }
+      ]
+    },
+    "exactRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "selector",
+        "workspaceRevisionId",
+        "currentWorkspaceRevisionId",
+        "consistency"
+      ],
+      "properties": {
+        "kind": { "const": "resolved-workspace-revision" },
+        "selector": { "$ref": "#/$defs/revisionSelector" },
+        "workspaceRevisionId": { "$ref": "#/$defs/workspaceRevisionId" },
+        "currentWorkspaceRevisionId": { "$ref": "#/$defs/workspaceRevisionId" },
+        "consistency": { "enum": ["exact", "stale", "unavailable"] }
+      }
+    },
+    "versionCitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vaultId",
+        "workspaceRevisionId",
+        "fileId",
+        "fileVersionId",
+        "path",
+        "contentHash"
+      ],
+      "properties": {
+        "vaultId": { "$ref": "#/$defs/vaultId" },
+        "workspaceRevisionId": { "$ref": "#/$defs/workspaceRevisionId" },
+        "fileId": { "$ref": "#/$defs/fileId" },
+        "fileVersionId": { "$ref": "#/$defs/fileVersionId" },
+        "path": { "$ref": "#/$defs/safePath" },
+        "contentHash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "projectionCitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceWorkspaceRevisionId",
+        "currentWorkspaceRevisionId",
+        "projectionRevisionId",
+        "permissionRevisionId",
+        "consistency"
+      ],
+      "properties": {
+        "sourceWorkspaceRevisionId": { "$ref": "#/$defs/workspaceRevisionId" },
+        "currentWorkspaceRevisionId": { "$ref": "#/$defs/workspaceRevisionId" },
+        "projectionRevisionId": {
+          "oneOf": [{ "$ref": "#/$defs/projectionRevisionId" }, { "type": "null" }]
+        },
+        "permissionRevisionId": { "$ref": "#/$defs/permissionRevisionId" },
+        "consistency": { "enum": ["exact", "stale", "unavailable"] }
+      }
+    },
+    "citation": {
+      "oneOf": [
+        { "$ref": "#/$defs/versionCitation" },
+        { "$ref": "#/$defs/projectionCitation" }
+      ]
+    },
+    "pageRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 2048,
+          "format": "opaque-cursor"
+        },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "pageInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nextCursor", "returned", "truncated", "consistency"],
+      "properties": {
+        "nextCursor": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 16,
+              "maxLength": 2048,
+              "format": "opaque-cursor"
+            },
+            { "type": "null" }
+          ]
+        },
+        "returned": { "type": "integer", "minimum": 0, "maximum": 200 },
+        "truncated": { "type": "boolean" },
+        "consistency": { "enum": ["exact", "stale", "unavailable"] }
+      }
+    },
+    "pagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request", "pageInfo"],
+      "properties": {
+        "request": { "$ref": "#/$defs/pageRequest" },
+        "pageInfo": { "$ref": "#/$defs/pageInfo" }
+      }
+    },
+    "errorCode": {
+      "enum": [
+        "invalid_request",
+        "unauthenticated",
+        "denied",
+        "not_found",
+        "stale",
+        "conflict",
+        "approval_required",
+        "approval_expired",
+        "idempotency_mismatch",
+        "unsupported",
+        "feature_disabled",
+        "rate_limited",
+        "too_large",
+        "index_stale",
+        "temporarily_unavailable",
+        "internal_error",
+        "selector_mismatch",
+        "graph_not_ready",
+        "index_unavailable",
+        "cursor_invalid",
+        "cursor_expired",
+        "revision_not_found",
+        "unsupported_source",
+        "parse_failed",
+        "AUTH_REQUIRED",
+        "TOKEN_INVALID",
+        "GRANT_INACTIVE",
+        "SESSION_INACTIVE",
+        "SCOPE_DENIED",
+        "VAULT_ACCESS_DENIED",
+        "RESOURCE_ACCESS_DENIED",
+        "VAULT_ARCHIVED",
+        "BASE_REQUIRED",
+        "WORKSPACE_BASE_STALE",
+        "FILE_BASE_STALE",
+        "PATH_CLAIM_CONFLICT",
+        "SEMANTIC_TARGET_AMBIGUOUS",
+        "LINK_IMPACT_INCOMPLETE",
+        "PARSER_INCOMPLETE",
+        "GRAPH_NOT_EXACT",
+        "APPROVAL_REQUIRED",
+        "APPROVAL_STALE",
+        "IDEMPOTENCY_KEY_REUSED",
+        "CHANGESET_CONFLICT",
+        "CHANGESET_PENDING",
+        "ROTATION_IN_PROGRESS",
+        "AUDIT_UNAVAILABLE",
+        "QUOTA_EXCEEDED",
+        "RETRYABLE_UNAVAILABLE"
+      ]
+    },
+    "handoffPurpose": {
+      "enum": [
+        "connector_authorize",
+        "connector_manage",
+        "proposal_review",
+        "access_review",
+        "share_review",
+        "restore_review",
+        "import_upload",
+        "export_download",
+        "security_settings",
+        "vault_administration",
+        "mfa",
+        "recovery",
+        "billing",
+        "legal_consent"
+      ]
+    },
+    "webHandoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["handoffId", "purpose", "url", "expiresAt", "statusTool", "statusArgs"],
+      "properties": {
+        "handoffId": { "$ref": "#/$defs/handoffId" },
+        "purpose": { "$ref": "#/$defs/handoffPurpose" },
+        "url": {
+          "type": "string",
+          "minLength": 12,
+          "maxLength": 2048,
+          "format": "secure-handoff-url"
+        },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "statusTool": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "statusArgs": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 8,
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z][A-Za-z0-9]*$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "format": "safe-id"
+          }
+        }
+      }
+    },
+    "secureHandoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["handoff", "binding"],
+      "properties": {
+        "handoff": { "$ref": "#/$defs/webHandoff" },
+        "binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "subjectId",
+            "oauthClientId",
+            "nonceHash",
+            "singleUse",
+            "independentlyAuthenticated",
+            "stepUp"
+          ],
+          "properties": {
+            "subjectId": { "$ref": "#/$defs/subjectId" },
+            "oauthClientId": { "$ref": "#/$defs/oauthClientId" },
+            "vaultId": { "$ref": "#/$defs/vaultId" },
+            "nonceHash": { "$ref": "#/$defs/sha256" },
+            "singleUse": { "const": true },
+            "independentlyAuthenticated": { "const": true },
+            "stepUp": { "enum": ["not_required", "policy"] }
+          }
+        }
+      }
+    },
+    "stableError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "requestId", "retryable"],
+          "properties": {
+            "code": { "$ref": "#/$defs/errorCode" },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "format": "safe-error-message"
+            },
+            "requestId": { "$ref": "#/$defs/safeId" },
+            "retryable": { "type": "boolean" },
+            "retryAfterMs": { "type": "integer", "minimum": 1, "maximum": 86400000 },
+            "retryAfterSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+            "conflictId": { "$ref": "#/$defs/conflictId" },
+            "handoff": { "$ref": "#/$defs/webHandoff" }
+          },
+          "not": { "required": ["retryAfterMs", "retryAfterSeconds"] }
+        }
+      }
+    },
+    "receiptFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileId", "path"],
+      "properties": {
+        "fileId": { "$ref": "#/$defs/fileId" },
+        "path": { "$ref": "#/$defs/safePath" },
+        "oldVersionId": { "$ref": "#/$defs/fileVersionId" },
+        "newVersionId": { "$ref": "#/$defs/fileVersionId" },
+        "newHash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "mutationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receiptId",
+        "changeSetId",
+        "proposalId",
+        "proposalRevision",
+        "result",
+        "oldWorkspaceRevisionId",
+        "files",
+        "verification"
+      ],
+      "properties": {
+        "receiptId": { "$ref": "#/$defs/receiptId" },
+        "changeSetId": { "$ref": "#/$defs/changeSetId" },
+        "proposalId": { "$ref": "#/$defs/proposalId" },
+        "proposalRevision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "result": { "enum": ["applied", "conflicted", "failed", "partially_applied"] },
+        "oldWorkspaceRevisionId": { "$ref": "#/$defs/workspaceRevisionId" },
+        "newWorkspaceRevisionId": { "$ref": "#/$defs/workspaceRevisionId" },
+        "files": {
+          "type": "array",
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/receiptFile" }
+        },
+        "verification": { "enum": ["verified", "failed", "unknown"] }
+      }
+    },
+    "providerAdaptation": {
+      "enum": [
+        "plain-structured-text",
+        "web-handoff",
+        "conservative-annotations",
+        "registered-oauth-metadata",
+        "tool-annotations",
+        "optional-ui-resources",
+        "provider-conformance-metadata",
+        "interactive-connector-presentation"
+      ]
+    },
+    "providerProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profileId",
+        "schemaCatalogVersion",
+        "coreSchemas",
+        "fallbackProfileId",
+        "permittedAdaptations",
+        "structuredResultRequired",
+        "safetyDisclosuresRequired"
+      ],
+      "properties": {
+        "profileId": { "$ref": "#/$defs/providerProfileId" },
+        "schemaCatalogVersion": { "type": "string", "maxLength": 32, "format": "semver" },
+        "coreSchemas": { "const": "identical" },
+        "fallbackProfileId": { "const": "generic-text" },
+        "permittedAdaptations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/providerAdaptation" }
+        },
+        "structuredResultRequired": { "const": true },
+        "safetyDisclosuresRequired": { "const": true }
+      }
+    },
+    "providerProfileCatalog": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/providerProfile" }
+    },
+    "toolBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "maxPageSize": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "maxInputBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "maxOutputBytes": { "type": "integer", "minimum": 1, "maximum": 524288 },
+        "maxItems": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "toolDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "schemaVersion",
+        "inputSchemaId",
+        "outputSchemaId",
+        "annotations",
+        "requiredScopes",
+        "policyFeature",
+        "riskClass",
+        "bounds",
+        "optionalUi",
+        "availability"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "schemaVersion": { "type": "string", "maxLength": 32, "format": "semver" },
+        "inputSchemaId": { "$ref": "#/$defs/schemaDocumentId" },
+        "outputSchemaId": { "$ref": "#/$defs/schemaDocumentId" },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["readOnly", "idempotent", "destructive", "externalEffect"],
+          "properties": {
+            "readOnly": { "type": "boolean" },
+            "idempotent": { "type": "boolean" },
+            "destructive": { "type": "boolean" },
+            "externalEffect": { "type": "boolean" }
+          }
+        },
+        "requiredScopes": {
+          "type": "array",
+          "maxItems": 25,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/scope" }
+        },
+        "policyFeature": { "$ref": "#/$defs/featureId" },
+        "riskClass": { "$ref": "#/$defs/riskClass" },
+        "bounds": { "$ref": "#/$defs/toolBounds" },
+        "optionalUi": { "type": "boolean" },
+        "availability": { "const": "available" }
+      }
+    },
+    "unavailableTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "reason"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "reason": {
+          "enum": [
+            "scope_required",
+            "role_required",
+            "feature_disabled",
+            "provider_unsupported",
+            "reconnect_required",
+            "temporarily_unavailable"
+          ]
+        }
+      }
+    },
+    "discoveryLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "defaultPageSize",
+        "maxPageSize",
+        "maxReadWindowBytes",
+        "maxBatchReadBytes",
+        "maxBatchFiles"
+      ],
+      "properties": {
+        "defaultPageSize": { "const": 50 },
+        "maxPageSize": { "const": 200 },
+        "maxReadWindowBytes": { "const": 262144 },
+        "maxBatchReadBytes": { "const": 524288 },
+        "maxBatchFiles": { "const": 20 }
+      }
+    },
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaCatalogVersion",
+        "providerProfileId",
+        "agentSessionId",
+        "tools",
+        "unavailable",
+        "reconnectRequired",
+        "limits"
+      ],
+      "properties": {
+        "schemaCatalogVersion": { "type": "string", "maxLength": 32, "format": "semver" },
+        "providerProfileId": { "$ref": "#/$defs/providerProfileId" },
+        "agentSessionId": { "$ref": "#/$defs/agentSessionId" },
+        "tools": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/toolDescriptor" }
+        },
+        "unavailable": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/unavailableTool" }
+        },
+        "reconnectRequired": { "type": "boolean" },
+        "limits": { "$ref": "#/$defs/discoveryLimits" }
+      }
+    }
+  }
+}

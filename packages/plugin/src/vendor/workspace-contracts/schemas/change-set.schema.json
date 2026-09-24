@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vaultguard:workspace-contracts:1:change-set",
+  "title": "VaultGuard multi-file change set",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "changeSetId", "proposalId", "proposalRevision", "baseWorkspaceRevisionId", "status", "actor", "idempotencyRecordId", "startedAt", "updatedAt"],
+  "properties": {
+    "schemaVersion": { "type": "string", "maxLength": 32, "format": "semver" },
+    "changeSetId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/changeSetId" },
+    "proposalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/proposalId" },
+    "proposalRevision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "baseWorkspaceRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+    "rebasedFromRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+    "preparedRevisionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/workspaceRevisionId" },
+    "status": { "enum": ["draft", "validating", "validated", "awaiting_approval", "approved", "preparing", "prepared", "committing", "applied", "conflict", "rejected", "aborted", "expired", "failed_recoverable"] },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subjectId"],
+      "properties": {
+        "subjectId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/subjectId" },
+        "agentIdentityId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/agentIdentityId" },
+        "agentSessionId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/agentSessionId" }
+      }
+    },
+    "approvalId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/approvalId" },
+    "idempotencyRecordId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/idempotencyRecordId" },
+    "startedAt": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/timestamp" },
+    "updatedAt": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/timestamp" },
+    "outcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "receiptId"],
+          "properties": {
+            "kind": { "const": "receipt" },
+            "receiptId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/receiptId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "conflictId"],
+          "properties": {
+            "kind": { "const": "conflict" },
+            "conflictId": { "$ref": "urn:vaultguard:workspace-contracts:1:stable-id#/$defs/conflictId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "errorCode"],
+          "properties": {
+            "kind": { "const": "failure" },
+            "errorCode": { "$ref": "urn:vaultguard:workspace-contracts:1:shared-protocol#/$defs/errorCode" }
+          }
+        }
+      ]
+    }
+  }
+}
